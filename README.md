@@ -77,6 +77,21 @@ cargo run --release -p nmr-cli -- nef-export --star data/fixtures/synthetic_ubiq
 cargo run --release -p nmr-cli -- nef-import --in ubq.nef --out-star roundtrip.str
 cargo run --release -p nmr-cli -- report --star data/fixtures/synthetic_ubiquitin.str --out report.html
 cargo run --release -p nmr-cli -- pipeline --star data/fixtures/synthetic_ubiquitin.str --out-dir ./out_ubq
+
+#    Real 2D/3D spectra (Bruker pdata/1, NMRPipe .ft2/.ft3, or Sparky .ucsf) -> pipeline & score:
+cargo run --release -p nmr-cli -- pipeline \
+  --seq path/to/protein.fasta \
+  --hsqc path/to/hsqc_pdata_or_ucsf \
+  --triple HNCACB=path/to/hncacb \
+  --triple CBCACONH=path/to/cbcaconh \
+  --triple HNCO=path/to/hnco \
+  --triple HNCACO=path/to/hncaco \
+  --solver evo-graph \
+  --out-dir ./out_assigned
+cargo run --release -p nmr-cli -- score \
+  --pred ./out_assigned/shifts.str \
+  --truth path/to/reference_shifts.str -v
+
 cargo run --release -p nmr-cli -- serve --bind 127.0.0.1:8080 --storage ./jobs
 
 # 8. Octet-Draw CLI: IUPAC Name <-> Structure, InChIKey, CDXML/CDX/MOL/SVG/PDF/JCAMP-DX & 1D NMR

@@ -2,9 +2,9 @@
 //! - Sequence-derived stoichiometry peak budgeting and spectral artifact suppression
 //! - Two-pass chemical-shift reference offset estimation (Mixture -> Anchor)
 //! - Hybrid evolutionary sequential-fragment crossover + local simulated annealing
-//! - 2-layer sequence-graph self-consistency and optional 3D `(phi, psi)` conditioning
+//! - 2-layer sequence-graph self-consistency
 //! - Synthetic ubiquitin (7-exp and 5-exp Bruker-like subset without `HNCA`)
-//! - Optional local real Bruker 5-spectrum ubiquitin benchmark (5 seeds, sequence-only and with `1d3z.pdb`)
+//! - Optional local real Bruker 5-spectrum ubiquitin benchmark (5 seeds, sequence-only)
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,7 +17,7 @@ use nmr_core::evo_graph::{
     apply_offsets_to_priors, assign_evo_graph, assign_evo_graph_from_peaks,
     build_stoichiometric_spin_systems, estimate_mixture_reference_offsets,
     expected_experiment_peaks, filter_peaks_stoichiometric, refine_anchor_reference_offsets,
-    torsions_from_pdb_path, EvoGraphConfig, ReferenceOffsets,
+    EvoGraphConfig, ReferenceOffsets,
 };
 use nmr_core::nmrstar::{read_star, Reference};
 use nmr_core::peaks::Peak;
@@ -447,7 +447,7 @@ fn map_spin_systems_to_truth(
 }
 
 #[test]
-fn real_bruker_ubiquitin_5seed_classical_pick_and_pdb_torsions() {
+fn real_bruker_ubiquitin_5seed_classical_pick_sequence_only() {
     let Some(data_dir) = resolve_local_real_data_dir() else {
         eprintln!(
             "Skipping real Bruker ubiquitin test: local data/ubiquitin directory not present"
@@ -511,16 +511,8 @@ fn real_bruker_ubiquitin_5seed_classical_pick_and_pdb_torsions() {
     assert_eq!(raw_peaks.len(), 972);
 
     let priors = Priors::provisional();
-    let pdb_path = workspace_root().join("data/pdb_refs/1d3z.pdb");
-    let torsions = torsions_from_pdb_path(&pdb_path, &sequence).expect("parse 1d3z.pdb torsions");
-
-    for (mode_label, opt_tors) in [
-        ("Sequence-Only (from 24,562 raw classical peaks)", None),
-        (
-            "With 1d3z.pdb (phi, psi) Torsions",
-            Some(torsions.as_slice()),
-        ),
-    ] {
+    let mode_label = "Sequence-Only (from raw classical peaks)";
+    {
         println!("\n==================== {mode_label} ====================");
         let mut accs = Vec::new();
         let mut recs = Vec::new();
@@ -532,7 +524,7 @@ fn real_bruker_ubiquitin_5seed_classical_pick_and_pdb_torsions() {
         for seed in 0..5u64 {
             let t0 = Instant::now();
             let cfg = EvoGraphConfig {
-                structure_torsions: opt_tors,
+                structure_torsions: None,
                 seed,
                 ..Default::default()
             };

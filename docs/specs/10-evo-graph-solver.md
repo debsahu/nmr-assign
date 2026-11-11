@@ -189,16 +189,20 @@ occupying exchange-broadened backbone slots.
   in Pass 2 while final energies and confidences are always evaluated on the
   unmodified physical scoring matrix; low-consistency clashing outliers are
   penalized and unlocked in Pass-2 warm seeds.
-- **Optional 3D Structure $(\phi, \psi)$ Conditioning**: when
-  `structure_torsions` is provided, empirical secondary chemical shifts
-  $\Delta\delta_X(\phi_k, \psi_k)$ for `CA`, `CB`, and `C'` (parameterized from
-  Spera & Bax 1991 and Wishart et al. 1995) refine residue expectations
-  $\mu_{\text{struct}} = \mu_{\text{RC}} + \Delta\delta_X(\phi, \psi)$ with
-  tightened standard deviations, leaving `None` mode 100% sequence-only.
+- **Optional 3D Structure $(\phi, \psi)$ Conditioning (Library-Only)**: when
+  `structure_torsions` is provided programmatically, empirical secondary
+  chemical shifts $\Delta\delta_X(\phi_k, \psi_k)$ for `CA`, `CB`, and `C'`
+  (parameterized from Spera & Bax 1991 and Wishart et al. 1995) refine residue
+  expectations $\mu_{\text{struct}} = \mu_{\text{RC}} + \Delta\delta_X(\phi,
+  \psi)$. All CLI backbone-assignment and benchmark commands (`assign`,
+  `pipeline`, `benchmark`, `benchmark-suite`) run strictly sequence-only
+  (`structure_torsions: None`, with no `--pdb` flag) to prevent structural
+  ground-truth leakage.
 
 ## 4. Verification Benchmarks
 
-Verified via `cargo test --release -p nmr-core --test evo_graph_tests`:
+Verified sequence-only via `cargo test --release -p nmr-core --test evo_graph_tests`
+and cold out-of-sample CLI evaluation:
 
 | Dataset / Mode | Assignable | Assigned | Accuracy | Recall | HC Precision ($\ge 0.8$) | HC Recall | Runtime |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -206,7 +210,7 @@ Verified via `cargo test --release -p nmr-core --test evo_graph_tests`:
 | Synthetic Ubiquitin (`7`-exp, `assign_evo_graph_from_peaks`) | 68 | 67 | **98.5%** (66/67) | **97.1%** | **98.5%** (66/67) | **97.1%** | ~0.22 s |
 | Synthetic Ubiquitin (`5`-exp without `HNCA`/`HNCOCA`) | 71 | 68 | **98.5%** (67/68) | **94.4%** | **98.5%** (66/67) | **93.0%** | ~0.22 s |
 | Real Bruker Ubiquitin (`24,562` raw classical peaks, sequence-only, 5-seed mean) | 70 | 63.0 | **95.24%** | **85.71%** | **98.02%** | **70.86%** | **0.24 s** |
-| Real Bruker Ubiquitin (`24,562` raw classical peaks + `1d3z.pdb` $(\phi,\psi)$, 5-seed mean) | 70 | 64.8 | **95.37%** | **88.29%** | **98.08%** | **72.86%** | **0.24 s** |
+| Cold Out-of-Sample Bruker `CISD3` (`BMRB 51439`, `700.13 MHz`, 93 aa, missing `HNCACB`, `seed 0` / 5-seed mean) | 51 (38 picked) | 35 | **65.7%** (23/35) / **59.4%** | **45.1%** (60.5% of picked) / **40.8%** | **92.9%** (13/14) / **88.9%** | **25.5%** / **22.7%** | **0.31 s** |
 
 On the 5-spectrum Bruker TopSpin ubiquitin dataset (`HSQC`, `HNCACB`,
 `CBCACONH`, `HNCO`, `HNCACO`; `24,562` raw classical local-maxima peaks across

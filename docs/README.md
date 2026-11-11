@@ -13,4 +13,5 @@ working on. Roadmap: `../TODO.md`.
 | 05-benchmark.md | simulator, metrics, baselines |
 | 06-julia-core.md | Julia port plan |
 | 07-sidechain-assignment.md | sidechain shifts |
-| 08-service.md | upload, jobs, reports |
+| 08-service.md | upload, jobs, reports, local `pipeline` |
+| 10-evo-graph-solver.md | stoichiometry-guided evolutionary + graph solver |

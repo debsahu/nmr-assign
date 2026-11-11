@@ -4,8 +4,28 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## 2026-11-11 — WebGPU Auto-Referencing Parity, Unified CLI `--solver` / `--pdb` Dispatch & End-to-End Real-Spectrum Integration (`nmr-gpu`, `nmr-cli`, `nmr-core`)
+## 2026-11-11 — Out-of-Sample Cold Validation (`BMRB 51439` `CISD3`), Hz-Scaled $^3J_{\text{HNH}\alpha}$ Doublet Coalescing, and Removal of `tripeptide` & CLI `--pdb` (`nmr-core`, `nmr-cli`, `docs`)
 
+- **Architectural Summary:**
+  - **Field-Independent Hz Doublet Threshold (`crates/nmr-core/src/picker.rs`, `docs/specs/02-peak-picking.md`):** Replaced the hardcoded `0.019 ppm` $^{15}\text{N}$-HSQC $^3J_{\text{HNH}\alpha}$ doublet coalescing cutoff (`~9.5 Hz` only at `500 MHz`) and `0.008 ppm` grid step check with `PickerConfig::max_j_hnha_hz: f64` (default `9.5 Hz`), converted dynamically to ppm via `spec.axis_x.obs_mhz` (`max_j_ppm = max_j_hnha_hz / obs_mhz`), paired with Hz-scaled digital-resolution gating (`|step_ppm| * obs_mhz <= 6.5 Hz/pt`, covering `SI = 2048, SW = 14 ppm` up to `950 MHz`) and direct-dimension sinc-sidelobe lower spacing (`max(12.0 / obs_mhz, max_j_ppm)`). Verified at `500 MHz` vs `800 MHz` in `test_hsqc_j_doublet_threshold_scales_with_spectrometer_mhz`.
+  - **Solver Consolidation & Structural-Leakage Elimination (`crates/nmr-core`, `crates/nmr-cli`, `docs/specs/`):** Removed `nmr_core::tripeptide` (`tripeptide.rs`, `tripeptide_tests.rs`, `09-tripeptide-solver.md`) after out-of-sample evaluation showed miscalibrated high-confidence false positives on gapped chains without outperforming `standard` on complete data, while retaining `--solver standard|evo-graph`. Removed `--pdb` from all backbone assignment and benchmark CLI commands (`assign`, `pipeline`, `benchmark`, `benchmark-suite`) and removed `1d3z.pdb` from `evo_graph_tests.rs` so every assignment benchmark runs strictly sequence-only.
+  - **`nmrassign score` Global Reference-Frame Alignment & CLI Docs (`crates/nmr-cli/src/main.rs`, `README.md`, `docs/specs/08-service.md`):** Updated `nmrassign score` to detect systematic global `(dH, dN, dCA, dCB, dC)` reference offsets (`pred - truth`) when scoring experimental-frame `.str` outputs against DSS/liquid-$\text{NH}_3$-referenced BMRB depositions (remaining exact `0.0` when already aligned), and documented the real-spectrum `nmrassign pipeline` flags (`--triple EXP=path` and `--out-dir <dir>`).
+- **Verified Metrics:**
+  - **Synthetic Ubiquitin Gate (`synthetic_ubiquitin.str`, 7-Experiment):**
+    - `--solver standard --engine gpu`: **`100.0% (68/68)` accuracy**, **`100.0%` recall**, **`100.0% (52/52)` HC precision** (`0.91 s`).
+    - `--solver evo-graph`: **`98.5% (66/67)` accuracy**, **`97.1%` recall**, **`98.5% (66/67)` HC precision** (`0.15 s`).
+  - **Cold Out-of-Sample Real Bruker Dataset — Human Mitochondrial `CISD3` (`BMRB 51439` / `BMRbig 82`, `700.13 MHz`, 93 aa, `HSQC` + `HNCA` + `HNCOCA` + `CBCACONH` + `HNCO`, no `HNCACB`, `51` BMRB amides / `38` picked roots, zero parameter tuning):**
+    - `--solver standard --engine gpu`: **`38.9% (14/36)` accuracy** on `seed 0` (**`43.9%` 5-seed mean**, range `36.1%–50.0%`), **`27.5%` recall** vs all `51` BMRB amides (**`31.0%` 5-seed mean**, `41.6%` of `38` picked roots), **`100.0% (2/2..3/3)` HC precision**, **`5.1%` mean HC recall** (`0.73 s` pipeline).
+    - `--solver evo-graph` (sequence-only): **`65.7% (23/35)` accuracy** on `seed 0` (**`59.4%` 5-seed mean**, `65.7%` on 3/5 seeds), **`45.1%` recall** vs all `51` BMRB amides (`60.5%` of `38` picked roots on `seed 0`, **`40.8%` 5-seed mean**), **`92.9% (13/14)` HC precision** on `seed 0` (**`88.9%` 5-seed mean**), **`25.5%` HC recall** (`4.5×–6.5×` more high-confidence correct residues than `standard`, `0.31 s` pipeline).
+  - **Real 5-Spectrum Ubiquitin `.ucsf` (`500.13 MHz`, Sequence-Only):**
+    - `--solver standard --engine gpu`: **`97.1% (67/69)` accuracy**, **`95.7%` recall**, **`98.3% (57/58)` HC precision** (`1.77 s`).
+    - `--solver evo-graph`: **`95.7% (66/69)` accuracy**, **`94.3%` recall**, **`97.0% (64/66)` HC precision**, **`91.4%` HC recall** (`0.57 s`).
+
+---
+
+## `2d17df6` — 2026-11-11 — WebGPU Auto-Referencing Parity, Unified CLI `--solver` / `--pdb` Dispatch & End-to-End Real-Spectrum Integration (`nmr-gpu`, `nmr-cli`, `nmr-core`)
+
+- **Commit:** `2d17df6`
 - **Architectural Summary:**
   - **WebGPU Automatic $^{13}\text{C}$ Referencing & Excess-Root Gating (`crates/nmr-gpu/src/lib.rs`, `crates/nmr-gpu/src/shaders/scoring.wgsl`):** Wired `prepare_scoring_priors` (`ShiftOffsets`) and `CA`-less excess-root protection (`has_excess_roots`, `multi_slot_dataset`, `GLY_IDX` / `PRO_IDX` exemptions, and `-4.5` uncorroborated single-slot penalty) directly into `GpuEngine::score_matrices_gpu` and `compute_unary`, achieving exact CPU-vs-WebGPU `U`-matrix parity (`max |U_cpu - U_gpu| < 1e-3`) on TMS-shifted (`-2.75 ppm` $^{13}\text{C}$) and decoy-flooded (`S = 700`, `S = 1,200`) datasets.
   - **Unified CLI `--solver` & `--pdb` Dispatch + Loud `--engine gpu` Enforcement (`crates/nmr-cli/src/main.rs`):** Added `--solver standard|tripeptide|evo-graph` (default `standard`) and `--pdb <structure.pdb>` (for `evo-graph` $(\phi, \psi)$ torsion conditioning) across `assign`, `pipeline`, `benchmark`, and `benchmark-suite`. Explicitly passing `--engine gpu` with CPU-only solvers (`tripeptide`, `evo-graph`) returns a loud error rather than silently falling back to CPU, while omitting `--engine` defaults cleanly to WebGPU for `standard` and CPU (`f64`) for `tripeptide` / `evo-graph`. Effective shifted `Priors` are passed into `to_reference` for candidate disambiguation while keeping emitted chemical shifts strictly in the experimental spectrum's `ppm` frame and recording non-zero fitted offsets in logs and `# nmrassign ... fitted_prior_reference_offsets` `.str` headers.

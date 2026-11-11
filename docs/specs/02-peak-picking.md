@@ -11,7 +11,7 @@ triple-resonance spectra first; NOESY later.
 3. Indirect-axis `t1` ridge and FT truncation sinc-sidelobe suppression:
    - In high-dynamic-range spectra (`max_abs > 40 * global_mad`), computes two-pass outlier-trimmed local column/row/strip MAD along indirect axes and requires `|v| >= max(snr_threshold * global_mad, ridge_snr * local_mad, sinc_frac * max_abs_in_col_or_strip)`, followed by Lorentzian-decaying near-parent sinc sidelobe suppression along F1/F2/F3.
    - Single-sign backbone 3D experiments (`HNCA`, `HNCOCA`, `CBCACONH`, `HNCO`, `HNCACO`) automatically detect `180°` inverted phase polarity (`max_neg > 2.5 * max(max_pos, threshold)`) and emit positive `sign = 1` peak heights.
-   - High-resolution `15N`-HSQC spectra (`|step_ppm| <= 0.008`) coalesce resolved symmetric `^3J_HNHa` `1H` doublets (`|dN| <= 0.08 ppm`, `|dH| <= 0.019 ppm`, `min_height >= 0.40 * max_height`) into intensity-weighted centroids.
+   - High-resolution `15N`-HSQC spectra (`|step_ppm| * obs_mhz <= 6.5 Hz`) coalesce resolved symmetric `^3J_HNHa` `1H` doublets (`|dN| <= 0.08 ppm`, `|dH| * obs_mhz <= max_j_hnha_hz` with default `9.5 Hz`, `min_height >= 0.40 * max_height`) into intensity-weighted centroids using the `1H` axis spectrometer frequency `obs_mhz`.
 4. Local extrema detection with phase sign (`+1` / `-1` for phase-sensitive `HNCACB`), sub-voxel 3-point log-Gaussian / parabolic centre refinement along every axis, and `(H, N)` strip restriction under HSQC roots.
 5. Asn/Gln sidechain `NH2` paired `1H` doublets (`|dN| <= 0.12 ppm` and `0.30 <= |dH| <= 1.20 ppm`) lacking credible intra-residue `CA(i)` support are rejected during spin-system assembly.
 

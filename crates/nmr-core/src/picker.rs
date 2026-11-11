@@ -26,9 +26,12 @@ pub struct PickerConfig {
     pub ridge_snr: f32,
     /// Minimum fraction of column/strip parent amplitude for FT truncation sinc suppression (default `0.025`).
     pub sinc_frac: f32,
-    /// Coalesce resolved `^3J_HNHa` `1H` doublets (`|dH| <= 0.019 ppm`, `|dN| <= 0.08 ppm`) in
-    /// high-digital-resolution `15N-HSQC` spectra (default `true`).
+    /// Coalesce resolved `^3J_HNHa` `1H` doublets (`|dH| * obs_mhz <= max_j_hnha_hz`, `|dN| <= 0.08 ppm`)
+    /// in high-digital-resolution `15N-HSQC` spectra (`|step_ppm| * obs_mhz <= 6.5 Hz`, default `true`).
     pub coalesce_j_doublets: bool,
+    /// Maximum `^3J_HNHa` scalar splitting in Hz for `15N-HSQC` doublet coalescing (default `9.5` Hz),
+    /// converted to ppm via the `1H` axis spectrometer frequency `obs_mhz`.
+    pub max_j_hnha_hz: f64,
 }
 
 impl Default for PickerConfig {
@@ -42,6 +45,7 @@ impl Default for PickerConfig {
             ridge_snr: 5.5,
             sinc_frac: 0.025,
             coalesce_j_doublets: true,
+            max_j_hnha_hz: 9.5,
         }
     }
 }
@@ -172,10 +176,11 @@ fn carbon_bounds_for_exp(exp: &str) -> Option<(f64, f64)> {
     }
 }
 
-/// Coalesce symmetric `^3J_HNHa` `1H` doublets (`|dN| <= 0.08 ppm`, `|dH| <= 0.019 ppm`,
-/// `min_ht >= 0.40 * max_ht`) in high-resolution `15N-HSQC` spectra into intensity-weighted centroids.
-fn coalesce_hsqc_j_doublets(mut peaks: Vec<Peak>) -> Vec<Peak> {
-    if peaks.len() < 2 {
+/// Coalesce symmetric `^3J_HNHa` `1H` doublets (`|dN| <= 0.08 ppm`, `|dH| <= max_j_ppm`,
+/// `min_ht >= 0.40 * max_ht`) in high-resolution `15N-HSQC` spectra into intensity-weighted centroids,
+/// where `max_j_ppm = max_j_hnha_hz / obs_mhz`.
+fn coalesce_hsqc_j_doublets(mut peaks: Vec<Peak>, max_j_ppm: f64) -> Vec<Peak> {
+    if peaks.len() < 2 || max_j_ppm <= 0.0 {
         return peaks;
     }
     peaks.sort_by(|a, b| b.height.unwrap_or(0.0).total_cmp(&a.height.unwrap_or(0.0)));
@@ -199,7 +204,7 @@ fn coalesce_hsqc_j_doublets(mut peaks: Vec<Peak>) -> Vec<Peak> {
             let hj = pj.height.unwrap_or(0.0);
             let dn = (pi.n - pj.n).abs();
             let dh = (pi.h - pj.h).abs();
-            if dn <= 0.08 && dh <= 0.019 && hj >= 0.40 * hi && dh < best_dh {
+            if dn <= 0.08 && dh <= max_j_ppm && hj >= 0.40 * hi && dh < best_dh {
                 best_dh = dh;
                 best_j = Some(j);
             }
@@ -349,6 +354,18 @@ pub fn pick_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
         }
     }
 
+    let obs_mhz = if spec.axis_x.obs_mhz > 10.0 {
+        spec.axis_x.obs_mhz
+    } else {
+        600.0
+    };
+    let max_j_ppm = cfg.max_j_hnha_hz.max(0.0) / obs_mhz;
+    let min_f2_sidelobe_dh = (12.0 / obs_mhz).max(if cfg.coalesce_j_doublets {
+        max_j_ppm
+    } else {
+        0.0
+    });
+
     // Suppress near-parent F1 (indirect) and F2 (direct) truncation sinc sidelobes
     if high_dr && peaks.len() > 1 {
         let min_parent = (40.0 * noise) as f64;
@@ -375,8 +392,8 @@ pub fn pick_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
                         break;
                     }
                 }
-                // F2 direct sidelobe along the same indirect row
-                if dn <= 0.25 && dh > 0.020 && dh <= 0.35 {
+                // F2 direct sidelobe along the same indirect row (above ^3J_HNHa / 10 Hz in ppm)
+                if dn <= 0.25 && dh > min_f2_sidelobe_dh && dh <= 0.35 {
                     let env = 0.015 + 0.12 / (1.0 + (dh / 0.06).powi(2));
                     if hti < htj * env {
                         keep[i] = false;
@@ -394,8 +411,14 @@ pub fn pick_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
         peaks = filtered;
     }
 
-    if cfg.coalesce_j_doublets && cfg.amide_h_window.is_some() && step_h <= 0.008 {
-        peaks = coalesce_hsqc_j_doublets(peaks);
+    // Require digital resolution <= 6.5 Hz/pt (e.g. SI=2048 over 14 ppm up to 950 MHz)
+    // to resolve ^3J_HNHa doublets without merging coarse-grid peaks
+    if cfg.coalesce_j_doublets
+        && cfg.max_j_hnha_hz > 0.0
+        && cfg.amide_h_window.is_some()
+        && step_h * obs_mhz <= 6.5
+    {
+        peaks = coalesce_hsqc_j_doublets(peaks, max_j_ppm);
     }
 
     peaks
@@ -684,4 +707,69 @@ pub fn pick_triple_3d(spec: &Spectrum3D, hsqc_roots: &[Peak], cfg: &PickerConfig
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spectrum::AxisPpm;
+
+    fn render_two_peak_hsqc(obs_mhz_h: f64, dh_ppm: f64) -> Spectrum2D {
+        // 1024 points across 2.0 ppm => 0.00195 ppm/pt (~0.98 Hz/pt at 500 MHz, ~1.56 Hz/pt at 800 MHz)
+        let nx = 1024usize;
+        let ny = 64usize;
+        let axis_x = AxisPpm::from_bounds("1H", nx, 9.5, 7.5, obs_mhz_h);
+        let axis_y = AxisPpm::from_bounds("15N", ny, 128.0, 112.0, obs_mhz_h * 0.101329);
+        let mut data = vec![0.0f32; nx * ny];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = (((i * 31 + 7) % 41) as f32 - 20.0) * 0.05;
+        }
+        let h_center = 8.40f64;
+        let n_center = 120.0f64;
+        for &h_pk in &[h_center - 0.5 * dh_ppm, h_center + 0.5 * dh_ppm] {
+            let cx = axis_x.ppm_to_index(h_pk);
+            let cy = axis_y.ppm_to_index(n_center);
+            let ix0 = (cx.floor() as isize - 4).max(0) as usize;
+            let ix1 = (cx.ceil() as isize + 4).min(nx as isize - 1) as usize;
+            let iy0 = (cy.floor() as isize - 3).max(0) as usize;
+            let iy1 = (cy.ceil() as isize + 3).min(ny as isize - 1) as usize;
+            for iy in iy0..=iy1 {
+                for ix in ix0..=ix1 {
+                    let dx = (ix as f64 - cx) / 1.4;
+                    let dy = (iy as f64 - cy) / 1.2;
+                    data[iy * nx + ix] += 500.0 * (-0.5 * (dx * dx + dy * dy) as f32).exp();
+                }
+            }
+        }
+        Spectrum2D {
+            name: "HSQC".to_string(),
+            axis_x,
+            axis_y,
+            data,
+        }
+    }
+
+    #[test]
+    fn test_hsqc_j_doublet_threshold_scales_with_spectrometer_mhz() {
+        let cfg = PickerConfig::default(); // max_j_hnha_hz = 9.5 Hz
+
+        // 0.015 ppm separation = 7.5 Hz at 500 MHz (<= 9.5 Hz -> coalesced to 1 centroid)
+        let spec_500 = render_two_peak_hsqc(500.0, 0.015);
+        let pks_500 = pick_hsqc_2d(&spec_500, &cfg);
+        assert_eq!(
+            pks_500.len(),
+            1,
+            "0.015 ppm (7.5 Hz at 500 MHz) must coalesce into 1 doublet centroid, got {pks_500:?}"
+        );
+        assert!((pks_500[0].h - 8.40).abs() < 0.002);
+
+        // Same 0.015 ppm separation = 12.0 Hz at 800 MHz (> 9.5 Hz -> two distinct resonances!)
+        let spec_800 = render_two_peak_hsqc(800.0, 0.015);
+        let pks_800 = pick_hsqc_2d(&spec_800, &cfg);
+        assert_eq!(
+            pks_800.len(),
+            2,
+            "0.015 ppm (12.0 Hz at 800 MHz) exceeds 9.5 Hz and must remain 2 distinct peaks, got {pks_800:?}"
+        );
+    }
 }

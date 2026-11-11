@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use nmr_core::dihedrals::{predict_dihedrals, validate_dihedrals_against_torsions};
 use nmr_core::evaluate::{compare_shifts, score, to_reference, Metrics};
-use nmr_core::evo_graph::{assign_evo_graph_from_peaks, torsions_from_pdb_path, EvoGraphConfig};
+use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::nef::{read_nef_file, write_nef_file, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
@@ -65,7 +65,6 @@ use nmr_core::structure::{
     calculate_structure_iterative, validate_ensemble, write_pdb_ensemble, StructureCalcConfig,
 };
 use nmr_core::topology::SidechainPriors;
-use nmr_core::tripeptide::{assign_tripeptide, TripeptideConfig};
 use nmr_gpu::neural_gpu::{GpuNeuralPicker, GpuNeuralPickerConfig, PRETRAINED_WEIGHTS_3D_GPU};
 use nmr_gpu::GpuEngine;
 
@@ -78,27 +77,16 @@ enum EngineKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SolverKind {
     Standard,
-    Tripeptide,
     EvoGraph,
-}
-
-impl SolverKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            SolverKind::Standard => "standard",
-            SolverKind::Tripeptide => "tripeptide",
-            SolverKind::EvoGraph => "evo-graph",
-        }
-    }
 }
 
 fn usage() -> &'static str {
     "nmrassign (Rust + WebGPU)\n\
      Usage:\n\
-       nmrassign benchmark       --star <ref.str> [--solver standard|tripeptide|evo-graph] [--pdb <ref.pdb>] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
-       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|tripeptide|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
+       nmrassign benchmark       --star <ref.str> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
+       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|tripeptide|evo-graph] [--pdb <ref.pdb>] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
+       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            --hsqc <path> [--triple EXP=path ...] --out <peaks.tsv> [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
@@ -108,7 +96,7 @@ fn usage() -> &'static str {
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--solver standard|tripeptide|evo-graph] [--pdb <ref.pdb>] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}>] [--solvent CDCl3] [--mhz 400]\n"
 }
@@ -146,10 +134,9 @@ fn parse_engine(val: &str) -> Result<EngineKind, String> {
 fn parse_solver(val: &str) -> Result<SolverKind, String> {
     match val.to_ascii_lowercase().as_str() {
         "standard" => Ok(SolverKind::Standard),
-        "tripeptide" => Ok(SolverKind::Tripeptide),
         "evo-graph" | "evograph" | "evo_graph" => Ok(SolverKind::EvoGraph),
         other => Err(format!(
-            "unknown --solver {other:?}; expected standard, tripeptide, or evo-graph"
+            "unknown --solver {other:?}; expected standard or evo-graph"
         )),
     }
 }
@@ -161,15 +148,11 @@ fn resolve_solver_engine(
     match (solver, engine_opt) {
         (SolverKind::Standard, Some(e)) => Ok(e),
         (SolverKind::Standard, None) => Ok(EngineKind::Gpu),
-        (SolverKind::Tripeptide, Some(EngineKind::Gpu)) => Err(
-            "--engine gpu is not supported with --solver tripeptide (CPU-only); use --engine cpu (or omit --engine) or --solver standard"
-                .to_string(),
-        ),
         (SolverKind::EvoGraph, Some(EngineKind::Gpu)) => Err(
             "--engine gpu is not supported with --solver evo-graph (CPU-only); use --engine cpu (or omit --engine) or --solver standard"
                 .to_string(),
         ),
-        (SolverKind::Tripeptide | SolverKind::EvoGraph, _) => Ok(EngineKind::Cpu),
+        (SolverKind::EvoGraph, _) => Ok(EngineKind::Cpu),
     }
 }
 
@@ -196,14 +179,7 @@ fn execute_assignment_workflow(
     steps_opt: Option<usize>,
     default_cpu_runs: usize,
     seed: u64,
-    pdb_path: Option<&Path>,
 ) -> Result<SolverWorkflowOutput, String> {
-    if pdb_path.is_some() && solver != SolverKind::EvoGraph {
-        return Err(format!(
-            "--pdb torsion conditioning is only supported with --solver evo-graph (got --solver {})",
-            solver.as_str()
-        ));
-    }
     let engine = resolve_solver_engine(solver, engine_opt)?;
 
     match solver {
@@ -235,55 +211,11 @@ fn execute_assignment_workflow(
                 steps_per_system: anneal_cfg.steps_per_system,
             })
         }
-        SolverKind::Tripeptide => {
-            let systems = build_spin_systems(peaks, &Tolerances::default(), 3, false)?;
-            let mut tri_cfg = TripeptideConfig {
-                score: score_cfg.clone(),
-                auto_reference: score_cfg.auto_reference,
-                ..TripeptideConfig::default()
-            };
-            if let Some(r) = runs_opt {
-                tri_cfg.anneal.runs = r.max(1);
-            }
-            if let Some(st) = steps_opt {
-                tri_cfg.anneal.steps_per_system = st.max(1);
-            }
-            tri_cfg.anneal.seed = seed;
-            let offsets = if tri_cfg.auto_reference {
-                let o =
-                    nmr_core::tripeptide::estimate_reference_offsets(&systems, sequence, priors);
-                ShiftOffsets {
-                    h: o.dh,
-                    n: o.dn,
-                    ca: o.dca,
-                    cb: o.dcb,
-                    c: o.dc,
-                }
-            } else {
-                ShiftOffsets::default()
-            };
-            let effective_priors = priors.with_offsets(&offsets);
-            let result = assign_tripeptide(&systems, sequence, priors, &tri_cfg);
-            Ok(SolverWorkflowOutput {
-                systems,
-                kept_hsqc_indices: None,
-                result,
-                effective_priors,
-                offsets,
-                engine_label: "CPU (f64, tripeptide)".to_string(),
-                replicas: tri_cfg.anneal.runs,
-                steps_per_system: tri_cfg.anneal.steps_per_system,
-            })
-        }
         SolverKind::EvoGraph => {
-            let torsions_vec = match pdb_path {
-                Some(p) => Some(torsions_from_pdb_path(p, sequence)?),
-                None => None,
-            };
             let mut evo_cfg = EvoGraphConfig {
                 score_cfg: score_cfg.clone(),
                 auto_reference: score_cfg.auto_reference,
-                structure_torsions: torsions_vec.as_deref(),
+                structure_torsions: None,
                 seed,
                 ..EvoGraphConfig::default()
             };
@@ -304,11 +236,7 @@ fn execute_assignment_workflow(
                 c: rep.final_offsets.d_c,
             };
             let effective_priors = rep.shifted_priors(priors);
-            let engine_label = if pdb_path.is_some() {
-                "CPU (f64, evo-graph+pdb)".to_string()
-            } else {
-                "CPU (f64, evo-graph)".to_string()
-            };
+            let engine_label = "CPU (f64, evo-graph)".to_string();
             Ok(SolverWorkflowOutput {
                 systems,
                 kept_hsqc_indices: Some(rep.kept_hsqc_indices),
@@ -353,7 +281,6 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     let mut missing = 0.06f64;
     let mut spurious = 0.04f64;
     let mut solver = SolverKind::Standard;
-    let mut pdb_path: Option<PathBuf> = None;
     let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
@@ -379,10 +306,6 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
             "--solver" => {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing value for --solver")?)?;
-            }
-            "--pdb" => {
-                i += 1;
-                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing value for --pdb")?));
             }
             "--missing" => {
                 i += 1;
@@ -484,7 +407,6 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         steps,
         12,
         seed,
-        pdb_path.as_deref(),
     )?;
     let elapsed = t0.elapsed().as_secs_f64();
 
@@ -659,7 +581,6 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut priors_path: Option<String> = None;
     let mut first_seq_id = 1i32;
     let mut solver = SolverKind::Standard;
-    let mut pdb_path: Option<PathBuf> = None;
     let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
@@ -693,10 +614,6 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "--solver" => {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
-            }
-            "--pdb" => {
-                i += 1;
-                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing --pdb")?));
             }
             "--first-seq-id" => {
                 i += 1;
@@ -768,17 +685,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         ..ScoreConfig::default()
     };
     let wf = execute_assignment_workflow(
-        solver,
-        engine_opt,
-        &peaks,
-        &sequence,
-        &pri,
-        &score_cfg,
-        runs,
-        steps,
-        12,
-        seed,
-        pdb_path.as_deref(),
+        solver, engine_opt, &peaks, &sequence, &pri, &score_cfg, runs, steps, 12, seed,
     )?;
     log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
 
@@ -1168,7 +1075,6 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
             format!("WebGPU ({}, {})", g.adapter_name, g.backend_name)
         }
         (SolverKind::Standard, None) => "CPU (f64)".to_string(),
-        (SolverKind::Tripeptide, _) => "CPU (f64, tripeptide)".to_string(),
         (SolverKind::EvoGraph, _) => "CPU (f64, evo-graph)".to_string(),
     };
 
@@ -1237,7 +1143,6 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
                     steps,
                     32,
                     seed,
-                    None,
                 )?;
                 let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
                     Some(kept) => kept
@@ -1862,7 +1767,6 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut prob = 0.45f32;
     let mut priors_path: Option<String> = None;
     let mut solver = SolverKind::Standard;
-    let mut pdb_path: Option<PathBuf> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
@@ -1945,10 +1849,6 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
             }
-            "--pdb" => {
-                i += 1;
-                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing --pdb")?));
-            }
             "--runs" => {
                 i += 1;
                 runs = Some(
@@ -2010,12 +1910,6 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    if pdb_path.is_some() && solver != SolverKind::EvoGraph {
-        return Err(format!(
-            "--pdb torsion conditioning is only supported with --solver evo-graph (got --solver {})",
-            solver.as_str()
-        ));
-    }
     let _validated_solver_engine = resolve_solver_engine(solver, engine_opt)?;
     let picker_engine = engine_opt.unwrap_or(EngineKind::Gpu);
 
@@ -2147,7 +2041,6 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         steps,
         32,
         seed,
-        pdb_path.as_deref(),
     )?;
     let dt_solve = t_solve.elapsed().as_secs_f64();
     log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
@@ -2604,17 +2497,102 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
     let tol_h = 0.045f64;
     let tol_n = 0.45f64;
 
+    // Detect global systematic reference offset `(dH, dN)` (`pred - truth`) when comparing
+    // experimental-frame predictions against DSS/liquid-NH3 BMRB depositions.
+    let greedy_hn_matches =
+        |probes: &[(f64, f64)], dh_off: f64, dn_off: f64| -> Vec<(usize, usize)> {
+            let mut cands: Vec<(f64, usize, usize)> = Vec::new();
+            for (pi, &(ph, pn)) in probes.iter().enumerate() {
+                for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
+                    let dh = (ph - (th + dh_off)).abs();
+                    let dn = (pn - (tn + dn_off)).abs();
+                    if dh <= tol_h && dn <= tol_n {
+                        cands.push(((dh / tol_h).powi(2) + (dn / tol_n).powi(2), pi, ti));
+                    }
+                }
+            }
+            cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut up = vec![false; probes.len()];
+            let mut ut = vec![false; true_roots.len()];
+            let mut matched = Vec::new();
+            for &(_, pi, ti) in &cands {
+                if !up[pi] && !ut[ti] {
+                    up[pi] = true;
+                    ut[ti] = true;
+                    matched.push((pi, ti));
+                }
+            }
+            matched
+        };
+
+    let median_f64 = |vals: &mut [f64]| -> f64 {
+        vals.sort_by(|a, b| a.total_cmp(b));
+        let m = vals.len() / 2;
+        if vals.len().is_multiple_of(2) {
+            0.5 * (vals[m - 1] + vals[m])
+        } else {
+            vals[m]
+        }
+    };
+
+    let opt_systems = if let Some(pp) = &peaks_path {
+        let pks = read_peaks(pp)?;
+        Some(build_spin_systems(&pks, &Tolerances::default(), 3, false)?)
+    } else {
+        None
+    };
+
+    let probe_hn: Vec<(f64, f64)> = if let Some(ref systems) = opt_systems {
+        systems.iter().map(|s| (s.h, s.n)).collect()
+    } else {
+        placed_roots
+            .iter()
+            .map(|&(_, ph, pn, _)| (ph, pn))
+            .collect()
+    };
+
+    let zero_hn = greedy_hn_matches(&probe_hn, 0.0, 0.0);
+    let min_pool = probe_hn.len().min(true_roots.len());
+    let (truth_dh, truth_dn) = if min_pool >= 5 && zero_hn.len() * 2 < min_pool {
+        let mut best_m = zero_hn;
+        for &(ph, pn) in &probe_hn {
+            for &(_, th, tn) in &true_roots {
+                let cdh = ph - th;
+                let cdn = pn - tn;
+                if cdh.abs() <= 0.50 && cdn.abs() <= 4.00 {
+                    let m = greedy_hn_matches(&probe_hn, cdh, cdn);
+                    if m.len() > best_m.len() {
+                        best_m = m;
+                    }
+                }
+            }
+        }
+        if best_m.len() >= 5 && best_m.len() >= greedy_hn_matches(&probe_hn, 0.0, 0.0).len() + 4 {
+            let mut dhs: Vec<f64> = best_m
+                .iter()
+                .map(|&(pi, ti)| probe_hn[pi].0 - true_roots[ti].1)
+                .collect();
+            let mut dns: Vec<f64> = best_m
+                .iter()
+                .map(|&(pi, ti)| probe_hn[pi].1 - true_roots[ti].2)
+                .collect();
+            (median_f64(&mut dhs), median_f64(&mut dns))
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0)
+    };
+
     // Determine true residue `true_k: i32` (`-1` if spurious) for each placed root.
     // When `--peaks` is provided, match ALL spin-system HSQC roots 1-to-1 against `true_roots`
     // first so a spurious ripple adjacent to an unassigned/displaced true root cannot steal its identity.
-    let placed_true_k: Vec<(Option<usize>, i32)> = if let Some(pp) = &peaks_path {
-        let pks = read_peaks(pp)?;
-        let systems = build_spin_systems(&pks, &Tolerances::default(), 3, false)?;
+    let placed_true_k: Vec<(Option<usize>, i32)> = if let Some(systems) = &opt_systems {
         let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
         for (si, ss) in systems.iter().enumerate() {
             for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
-                let dh = (ss.h - th).abs();
-                let dn = (ss.n - tn).abs();
+                let dh = (ss.h - (th + truth_dh)).abs();
+                let dn = (ss.n - (tn + truth_dn)).abs();
                 if dh <= tol_h && dn <= tol_n {
                     let d2 = (dh / tol_h).powi(2) + (dn / tol_n).powi(2);
                     pairs.push((d2, si, ti));
@@ -2660,8 +2638,8 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
         for (pi, &(_, ph, pn, _)) in placed_roots.iter().enumerate() {
             for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
-                let dh = (ph - th).abs();
-                let dn = (pn - tn).abs();
+                let dh = (ph - (th + truth_dh)).abs();
+                let dn = (pn - (tn + truth_dn)).abs();
                 if dh <= tol_h && dn <= tol_n {
                     let d2 = (dh / tol_h).powi(2) + (dn / tol_n).powi(2);
                     pairs.push((d2, pi, ti));
@@ -2725,6 +2703,52 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         0.0
     };
 
+    // Detect systematic 13C reference offset (`pred - truth`) across CA, CB, C when comparing
+    // experimental-frame predictions against DSS-referenced BMRB truth files.
+    let mut truth_for_cmp = truth_ref.clone();
+    if truth_dh != 0.0 || truth_dn != 0.0 {
+        for ((_, atom), val) in &mut truth_for_cmp.shifts {
+            if atom == "H" {
+                *val += truth_dh;
+            } else if atom == "N" {
+                *val += truth_dn;
+            }
+        }
+    }
+    let mut carbon_offs = [
+        ("CA", 0.0f64, 0.30f64),
+        ("CB", 0.0f64, 0.40f64),
+        ("C", 0.0f64, 0.30f64),
+    ];
+    for (atom_name, off_slot, atom_tol) in &mut carbon_offs {
+        let mut diffs: Vec<f64> = (0..truth_ref.sequence.len())
+            .filter_map(|k| {
+                let pv = pred_aligned.shifts.get(&(k, (*atom_name).to_string()))?;
+                let tv = truth_ref.shifts.get(&(k, (*atom_name).to_string()))?;
+                Some(*pv - *tv)
+            })
+            .collect();
+        if diffs.len() >= 5 {
+            let zero_ok = diffs.iter().filter(|&&d| d.abs() <= *atom_tol).count();
+            let med = median_f64(&mut diffs);
+            if med.abs() > 0.35 && med.abs() <= 5.0 {
+                let shifted_ok = diffs
+                    .iter()
+                    .filter(|&&d| (d - med).abs() <= *atom_tol)
+                    .count();
+                if shifted_ok >= zero_ok + 4 {
+                    *off_slot = med;
+                    for ((_, a), val) in &mut truth_for_cmp.shifts {
+                        if a == *atom_name {
+                            *val += med;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (truth_dca, truth_dcb, truth_dc) = (carbon_offs[0].1, carbon_offs[1].1, carbon_offs[2].1);
+
     println!(
         "truth format            : {} ({} residues, {} backbone shifts, {} uncertain '?' values excluded)",
         truth_fmt,
@@ -2732,6 +2756,12 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         truth_ref.shifts.len(),
         excluded_q
     );
+    if truth_dh != 0.0 || truth_dn != 0.0 || truth_dca != 0.0 || truth_dcb != 0.0 || truth_dc != 0.0
+    {
+        println!(
+            "truth reference offset  : dH={truth_dh:+.3}, dN={truth_dn:+.2}, dCA={truth_dca:+.2}, dCB={truth_dcb:+.2}, dC={truth_dc:+.2} ppm (pred - truth)"
+        );
+    }
     println!("assignable spin systems : {assignable}");
     println!("assigned                : {assigned}");
     println!(
@@ -2752,7 +2782,7 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         hc_rec * 100.0
     );
     println!("shift agreement with reference (within tolerance / predicted):");
-    let cmp = compare_shifts(&pred_aligned, &truth_ref);
+    let cmp = compare_shifts(&pred_aligned, &truth_for_cmp);
     for atom in ["H", "N", "CA", "CB", "C"] {
         if let Some(&(ok, n)) = cmp.get(atom) {
             let pct = if n > 0 {
@@ -3325,8 +3355,6 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         fs::create_dir_all(&dir).unwrap();
 
         let star = fixture_star_path();
-        let pdb_ref =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/pdb_refs/1d3z.pdb");
         let ref_data = read_star(&star, None).unwrap();
         let seq_1letter: String = ref_data
             .sequence
@@ -3376,28 +3404,26 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         let peaks_path = dir.join("tms_peaks.tsv");
         write_peaks(&peaks_path, &sim_peaks).unwrap();
 
-        // 1. Loud GPU rejection for CPU-only solvers (`tripeptide` and `evo-graph`)
-        for solver_name in ["tripeptide", "evo-graph"] {
-            let err = cmd_assign(&[
-                "--peaks".into(),
-                peaks_path.to_string_lossy().into_owned(),
-                "--seq".into(),
-                fasta_path.to_string_lossy().into_owned(),
-                "--out".into(),
-                dir.join("bad.str").to_string_lossy().into_owned(),
-                "--solver".into(),
-                solver_name.into(),
-                "--engine".into(),
-                "gpu".into(),
-            ])
-            .unwrap_err();
-            assert!(
-                err.contains("CPU-only") && err.contains("--engine gpu"),
-                "expected loud CPU-only GPU rejection for {solver_name}, got: {err}"
-            );
-        }
+        // 1. Loud GPU rejection for CPU-only `evo-graph` solver
+        let err = cmd_assign(&[
+            "--peaks".into(),
+            peaks_path.to_string_lossy().into_owned(),
+            "--seq".into(),
+            fasta_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            dir.join("bad.str").to_string_lossy().into_owned(),
+            "--solver".into(),
+            "evo-graph".into(),
+            "--engine".into(),
+            "gpu".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            err.contains("CPU-only") && err.contains("--engine gpu"),
+            "expected loud CPU-only GPU rejection for evo-graph, got: {err}"
+        );
 
-        // 2. Loud rejection when --pdb is passed to non-evo-graph solver
+        // 2. Loud rejection of removed `--pdb` flag and removed `tripeptide` solver
         let pdb_err = cmd_assign(&[
             "--peaks".into(),
             peaks_path.to_string_lossy().into_owned(),
@@ -3405,27 +3431,36 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             fasta_path.to_string_lossy().into_owned(),
             "--out".into(),
             dir.join("bad_pdb.str").to_string_lossy().into_owned(),
-            "--solver".into(),
-            "standard".into(),
             "--pdb".into(),
-            pdb_ref.to_string_lossy().into_owned(),
+            "any.pdb".into(),
         ])
         .unwrap_err();
         assert!(
-            pdb_err.contains("only supported with --solver evo-graph"),
-            "unexpected pdb error: {pdb_err}"
+            pdb_err.contains("unknown assign flag"),
+            "expected unknown flag rejection for --pdb, got: {pdb_err}"
         );
 
-        // 3. Default engine omission works cleanly for standard (GPU), tripeptide (CPU), and evo-graph (+ --pdb),
+        let tri_err = cmd_assign(&[
+            "--peaks".into(),
+            peaks_path.to_string_lossy().into_owned(),
+            "--seq".into(),
+            fasta_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            dir.join("bad_tri.str").to_string_lossy().into_owned(),
+            "--solver".into(),
+            "tripeptide".into(),
+        ])
+        .unwrap_err();
+        assert!(
+            tri_err.contains("expected standard or evo-graph"),
+            "expected unknown solver rejection for tripeptide, got: {tri_err}"
+        );
+
+        // 3. Default engine omission works cleanly for standard (GPU) and evo-graph (CPU),
         //    and emits '#' offset header while preserving experimental TMS ppm shifts.
-        for (tag, solver_name, with_pdb) in [
-            ("standard", "standard", false),
-            ("tripeptide", "tripeptide", false),
-            ("evo_graph", "evo-graph", false),
-            ("evo_graph_pdb", "evo-graph", true),
-        ] {
+        for (tag, solver_name) in [("standard", "standard"), ("evo_graph", "evo-graph")] {
             let out_str = dir.join(format!("out_{tag}.str"));
-            let mut args: Vec<String> = vec![
+            let args: Vec<String> = vec![
                 "--peaks".into(),
                 peaks_path.to_string_lossy().into_owned(),
                 "--seq".into(),
@@ -3439,10 +3474,6 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
                 "--steps".into(),
                 "400".into(),
             ];
-            if with_pdb {
-                args.push("--pdb".into());
-                args.push(pdb_ref.to_string_lossy().into_owned());
-            }
             cmd_assign(&args).unwrap();
             let content = fs::read_to_string(&out_str).unwrap();
             assert!(
