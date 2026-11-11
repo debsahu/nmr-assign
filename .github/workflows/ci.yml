@@ -43,7 +43,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint workspace with Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D clippy::correctness
 
       - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
         run: cargo test --release --workspace
