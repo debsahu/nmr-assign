@@ -9,6 +9,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test-and-lint:
@@ -38,8 +39,11 @@ jobs:
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Check formatting with rustfmt
+        run: cargo fmt --all -- --check
+
       - name: Lint workspace with Clippy
-        run: cargo clippy --workspace --all-targets -- -A clippy::approx_constant
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
         run: cargo test --release --workspace
@@ -48,7 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          OUT="$(cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine cpu --runs 32)"
+          OUT="$(CARGO_TERM_COLOR=never cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine cpu)"
           echo "$OUT"
           OUT_TEXT="$OUT" python3 - <<'PY'
           import os, re, sys
