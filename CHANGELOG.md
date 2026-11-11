@@ -4,9 +4,21 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## 2026-11-11 — Clean-Room UCSF `.ucsf` v2 Spectrum I/O, Real-Data `pipeline` & `score` CLI, and Loud `--engine gpu` Error Propagation (`nmr-core`, `nmr-cli`)
+## 2026-11-11 — Realistic Bruker Peak & 2D/3D Volumetric Spectrum Physics Simulator (`nmr-core`)
 
-- **Source Branch / Reviewed Commit:** `swarm/cli-io` (`be27f1407e82028b10f78316ff59f38d4342cd05`, squashing `7140849` + `be27f14`)
+- **Source Branch / Reviewed Commit:** `swarm/simulator` (`b3a5c1202e1bf024e29eee409bc5622c191c162f`)
+- **Architectural Summary:**
+  - **Realistic Bruker Peak & Volumetric Presets (`crates/nmr-core/src/simulate.rs`, `neural_picker.rs`, `docs/specs/05-benchmark.md`):** Added `SimConfig::realistic_bruker()`, `SpectrumRenderConfig::realistic_bruker()`, and `E2eBenchmarkConfig::realistic_bruker()` modeling standard 5-experiment triple-resonance acquisitions (`HSQC`, `HNCACB`, `CBCACONH`, `HNCO`, `HNCACO` without `HNCA`/`HNCOCA`) while preserving bit-for-bit default PRNG stream parity when realistic options are inactive.
+  - **Experimental Artifact & Referencing Physics:** Models uncropped spectral sweep widths (`11.75..-2.25 ppm` $^{1}\text{H}$, `137.5..100.2 ppm` $^{15}\text{N}$, `76.5..1.63 ppm` aliphatic $^{13}\text{C}$, `187.0..165.0 ppm` carbonyl $^{13}\text{C}$), high dynamic range (`max_abs / MAD > 1,000`), finite-$TD$ cosine-bell apodized `sinc` truncation sidelobes (`2–6%` positive/negative lobes, `> 20x–30x MAD`), multiplicative $t_1$ indirect column/strip noise ridges (`> 5x MAD`), residual `~4.77 ppm` water suppression stripe (`> 20x–50x MAD`), `< 4.3 ppm` aliphatic bleed, paired Asn/Gln sidechain $\text{NH}_2$ doublets with `HNCO`/`CBCACONH` correlations, wide log-normal conformational exchange dispersion, and `-2.75 ppm` $^{13}\text{C}$ (`-0.02 ppm` $^{1}\text{H}$, `+0.25 ppm` $^{15}\text{N}$) TMS-vs-DSS chemical-shift referencing offsets.
+- **Verified Metrics:**
+  - **Realistic Simulation Suite (`crates/nmr-core/tests/realistic_sim_tests.rs`):** All `5/5` volumetric & peak physics verification tests passing (`SNR > 1,000`, `sinc` ripple, $t_1$ ridge, water stripe, $\text{NH}_2$ doublet, and `-2.75 ppm` $^{13}\text{C}$ offset assertions).
+  - **Default PRNG Parity & Synthetic Ubiquitin Gate:** Produces exact `855` peaks / `84` spin systems / `68` assignable -> **97.1% accuracy**, **97.1% recall**, **100.0% high-confidence precision (55/55)** on GPU (**3.689 s**) and CPU (**0.042 s**).
+
+---
+
+## `97b8483` — 2026-11-11 — Clean-Room UCSF `.ucsf` v2 Spectrum I/O, Real-Data `pipeline` & `score` CLI, and Loud `--engine gpu` Error Propagation (`nmr-core`, `nmr-cli`)
+
+- **Commit:** `97b8483` (from `swarm/cli-io` `be27f1407e82028b10f78316ff59f38d4342cd05`, squashing `7140849` + `be27f14`)
 - **Architectural Summary:**
   - **Clean-Room UCSF Sparky `.ucsf` v2 2D/3D Reader & Writer (`crates/nmr-core/src/spectrum.rs`):** Implemented `is_ucsf_bytes`, `is_ucsf_file`, `read_ucsf_2d`, `write_ucsf_2d`, `write_ucsf_2d_tiled`, `read_ucsf_3d`, `write_ucsf_3d`, and `write_ucsf_3d_tiled` from the public UCSF Sparky v2 file format specification, including exact `xmtr_ppm` carrier-center referencing (`first_ppm = xmtr_ppm + 0.5 * sw_hz / obs_mhz`), zero-padded partial boundary tile handling, and automatic `(1H, 15N, 13C)` axis permutation, wired into CLI auto-detection alongside Bruker `pdata` and NMRPipe.
   - **Real-Data `nmrassign pipeline` & `nmrassign score` (`crates/nmr-cli/src/main.rs`):** Extended `pipeline` to accept `--seq <fasta_or_1letter>` with either raw spectra (`--hsqc` + repeatable `--triple EXP=path`, `--method classical|neural`, `--snr`, `--prob`) or `--peaks <peaks.tsv>` (emitting `peaks.tsv`, `shifts.str`, `shifts.tsv`, `result.nef`, and `report.html`). Added `nmrassign score` supporting both NMR-STAR and whitespace-delimited backbone shift tables with `-` missing handling and strict exclusion + exact count reporting of `?`-tagged uncertain values (including fused tokens).

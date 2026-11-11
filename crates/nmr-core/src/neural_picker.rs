@@ -2984,6 +2984,16 @@ pub struct E2eBenchmarkConfig {
     pub anneal_runs: usize,
     pub anneal_steps: usize,
     pub seed: u64,
+    /// Enable full uncropped realistic Bruker 5-spectrum physics (`HSQC`, `HNCACB`, `CBCACONH`,
+    /// `HNCO`, `HNCACO`), finite-`TD` sinc wiggles, water/aliphatic artifacts, paired `NH2`,
+    /// conformational-exchange dispersion, and `-2.75 ppm` `13C` referencing offset.
+    pub realistic_bruker_mode: bool,
+    pub ref_offset_h_ppm: f64,
+    pub ref_offset_n_ppm: f64,
+    pub ref_offset_c_ppm: f64,
+    pub sinc_amp: f64,
+    pub p_missing_root: f64,
+    pub include_sidechain_nh2: bool,
 }
 
 impl Default for E2eBenchmarkConfig {
@@ -3003,6 +3013,46 @@ impl Default for E2eBenchmarkConfig {
             anneal_runs: 16,
             anneal_steps: 1800,
             seed: 42,
+            realistic_bruker_mode: false,
+            ref_offset_h_ppm: 0.0,
+            ref_offset_n_ppm: 0.0,
+            ref_offset_c_ppm: 0.0,
+            sinc_amp: 0.0,
+            p_missing_root: 0.0,
+            include_sidechain_nh2: false,
+        }
+    }
+}
+
+impl E2eBenchmarkConfig {
+    /// Realistic Bruker 5-spectrum volumetric blind benchmark configuration (`HSQC`, `HNCACB`,
+    /// `CBCACONH`, `HNCO`, `HNCACO` — no `HNCA`/`HNCOCA`), uncropped sweep widths, high dynamic
+    /// range (`peak_amp / thermal_noise ~ 2,500–3,500`), finite-`TD` apodized `sinc` ripples,
+    /// multiplicative `t1` ridges, `~4.77 ppm` water artifact, paired `NH2` doublets, and
+    /// `-2.75 ppm` `13C` referencing offset.
+    pub fn realistic_bruker() -> Self {
+        Self {
+            nx_h_2d: 768,
+            ny_n_2d: 128,
+            nx_h_3d: 512,
+            ny_n_3d: 128,
+            nz_c_3d: 256,
+            thermal_noise_2d: 0.035,
+            thermal_noise_3d: 0.040,
+            ridge_rel_amp: 0.0085,
+            baseline_roll_sigma: 0.55,
+            classical_snr: 5.0,
+            neural_prob: 0.455,
+            anneal_runs: 16,
+            anneal_steps: 1800,
+            seed: 42,
+            realistic_bruker_mode: true,
+            ref_offset_h_ppm: -0.02,
+            ref_offset_n_ppm: 0.25,
+            ref_offset_c_ppm: -2.75,
+            sinc_amp: 0.36,
+            p_missing_root: 0.04,
+            include_sidechain_nh2: true,
         }
     }
 }
@@ -3587,6 +3637,9 @@ pub fn run_e2e_blind_benchmark(
     ref_data: &Reference,
     cfg: &E2eBenchmarkConfig,
 ) -> Result<E2eBenchmarkComparison, String> {
+    if cfg.realistic_bruker_mode {
+        return run_e2e_realistic_bruker_benchmark(ref_data, cfg);
+    }
     let mut rng = Rng::new(cfg.seed);
     let triple_exps = ["HNCA", "HNCOCA", "HNCACB", "CBCACONH", "HNCO"];
     let mut raw_peaks: Vec<Peak> = Vec::new();
@@ -3746,6 +3799,232 @@ pub fn run_e2e_blind_benchmark(
         &obs_truth_by_exp,
         &true_backbone_roots,
         ref_data,
+        &anneal_cfg,
+        t_neu.elapsed().as_secs_f64() * 1000.0,
+    )?;
+
+    Ok(E2eBenchmarkComparison { classical, neural })
+}
+
+fn run_e2e_realistic_bruker_benchmark(
+    ref_data: &Reference,
+    cfg: &E2eBenchmarkConfig,
+) -> Result<E2eBenchmarkComparison, String> {
+    use crate::simulate::{render_hsqc_2d, render_triple_3d, SpectrumRenderConfig};
+
+    let mut rng = Rng::new(cfg.seed);
+    let triple_exps = ["HNCACB", "CBCACONH", "HNCO", "HNCACO"];
+    let mut backbone_peaks: Vec<Peak> = Vec::new();
+    let mut render_peaks: Vec<Peak> = Vec::new();
+    let mut true_backbone_roots: Vec<(usize, f64, f64)> = Vec::new();
+
+    for (k, res) in ref_data.sequence.iter().enumerate() {
+        if k == 0 || res == "PRO" {
+            continue;
+        }
+        let Some(&h_raw) = ref_data.shifts.get(&(k, "H".to_string())) else {
+            continue;
+        };
+        let Some(&n_raw) = ref_data.shifts.get(&(k, "N".to_string())) else {
+            continue;
+        };
+        if cfg.p_missing_root > 0.0 && rng.f64() < cfg.p_missing_root {
+            continue;
+        }
+        let h_val = h_raw + cfg.ref_offset_h_ppm;
+        let n_val = n_raw + cfg.ref_offset_n_ppm;
+        true_backbone_roots.push((k, h_val, n_val));
+
+        let res_scale = (rng.normal(0.0, 0.55)).exp().clamp(0.14, 2.5);
+        let root_ht = 115.0 * (rng.normal(0.0, 0.16)).exp() * res_scale;
+        let hsqc_pk = Peak::hsqc(h_val, n_val).with_intensity(root_ht, Some(root_ht * 4.2));
+        backbone_peaks.push(hsqc_pk.clone());
+        render_peaks.push(hsqc_pk);
+
+        for &exp in &triple_exps {
+            let Some(rules) = experiment_rules(exp) else {
+                continue;
+            };
+            let has_both = rules.iter().any(|r| r.1 == 0) && rules.iter().any(|r| r.1 == -1);
+            for &(atom, off, sign) in rules {
+                let target = (k as isize) + (off as isize);
+                if target < 0 {
+                    continue;
+                }
+                let Some(&c_raw) = ref_data.shifts.get(&(target as usize, atom.to_string())) else {
+                    continue;
+                };
+                let c_val = c_raw + cfg.ref_offset_c_ppm;
+                let base_amp = match (exp, atom, has_both, off) {
+                    ("HNCACB", "CB", true, -1) => 38.0,
+                    ("HNCACB", "CA", true, -1) => 42.0,
+                    ("HNCACB", "CB", true, 0) => 80.0,
+                    ("HNCACB", "CA", true, 0) => 96.0,
+                    ("HNCACO", "C", true, -1) => 22.0,
+                    ("HNCACO", "C", true, 0) => 42.0,
+                    (_, _, true, -1) => 44.0,
+                    (_, _, true, 0) => 98.0,
+                    _ => 88.0,
+                };
+                let ht = base_amp * (rng.normal(0.0, 0.16)).exp() * res_scale;
+                let p3 =
+                    Peak::triple(exp, h_val, n_val, c_val, sign).with_intensity(ht, Some(ht * 5.8));
+                backbone_peaks.push(p3.clone());
+                render_peaks.push(p3);
+            }
+        }
+    }
+
+    if cfg.include_sidechain_nh2 {
+        for res in &ref_data.sequence {
+            if res == "ASN" || res == "GLN" {
+                let n_sc = rng.normal(112.5, 1.0) + cfg.ref_offset_n_ppm;
+                let sep = rng.uniform(0.55, 0.85);
+                let mid = 7.20 + cfg.ref_offset_h_ppm + rng.normal(0.0, 0.08);
+                let c_co = if res == "ASN" { 177.2 } else { 180.1 }
+                    + cfg.ref_offset_c_ppm
+                    + rng.normal(0.0, 0.30);
+                let c_cb = if res == "ASN" { 38.6 } else { 33.8 }
+                    + cfg.ref_offset_c_ppm
+                    + rng.normal(0.0, 0.40);
+                for h_sc in [mid - 0.5 * sep, mid + 0.5 * sep] {
+                    let ht = 85.0 * (rng.normal(0.0, 0.18)).exp();
+                    render_peaks.push(Peak::hsqc(h_sc, n_sc).with_intensity(ht, Some(ht * 4.0)));
+                    render_peaks.push(
+                        Peak::triple("HNCO", h_sc, n_sc, c_co, 1)
+                            .with_intensity(ht * 0.8, Some(ht * 4.5)),
+                    );
+                    render_peaks.push(
+                        Peak::triple("CBCACONH", h_sc, n_sc, c_cb, 1)
+                            .with_intensity(ht * 0.65, Some(ht * 4.2)),
+                    );
+                }
+            }
+        }
+    }
+
+    // Observable ground-truth peak sets contain only true backbone resonances
+    let mut obs_truth_by_exp: BTreeMap<String, Vec<Peak>> = BTreeMap::new();
+    let hsqc_raw: Vec<Peak> = backbone_peaks
+        .iter()
+        .filter(|p| p.exp == "HSQC")
+        .cloned()
+        .collect();
+    obs_truth_by_exp.insert(
+        "HSQC".to_string(),
+        coalesce_observable_peaks(&hsqc_raw, 0.015, 0.18, 0.0),
+    );
+    for &exp in &triple_exps {
+        let exp_raw: Vec<Peak> = backbone_peaks
+            .iter()
+            .filter(|p| p.exp == exp)
+            .cloned()
+            .collect();
+        let c_coal = if exp == "HNCO" || exp == "HNCACO" {
+            0.18
+        } else {
+            0.45
+        };
+        obs_truth_by_exp.insert(
+            exp.to_string(),
+            coalesce_observable_peaks(&exp_raw, 0.020, 0.28, c_coal),
+        );
+    }
+
+    let rcfg_2d = SpectrumRenderConfig {
+        nx_h: cfg.nx_h_2d,
+        ny_n: cfg.ny_n_2d,
+        noise_level: cfg.thermal_noise_2d,
+        sinc_amp: cfg.sinc_amp,
+        t1_ridge_fraction: cfg.ridge_rel_amp as f64,
+        baseline_roll_amp: (cfg.baseline_roll_sigma * cfg.thermal_noise_2d) as f64,
+        seed: cfg.seed.wrapping_add(10),
+        ..SpectrumRenderConfig::realistic_bruker()
+    };
+    let hsqc_spec = render_hsqc_2d(&render_peaks, &rcfg_2d);
+
+    let mut specs_3d: Vec<(&str, Spectrum3D)> = Vec::with_capacity(triple_exps.len());
+    for (idx, &exp) in triple_exps.iter().enumerate() {
+        let rcfg_3d = SpectrumRenderConfig {
+            nx_h: cfg.nx_h_3d,
+            ny_n: cfg.ny_n_3d,
+            nz_c: cfg.nz_c_3d,
+            noise_level: cfg.thermal_noise_3d,
+            sinc_amp: cfg.sinc_amp,
+            t1_ridge_fraction: cfg.ridge_rel_amp as f64,
+            baseline_roll_amp: (cfg.baseline_roll_sigma * cfg.thermal_noise_3d) as f64,
+            seed: cfg.seed.wrapping_add(100 + idx as u64),
+            ..SpectrumRenderConfig::realistic_bruker()
+        };
+        specs_3d.push((exp, render_triple_3d(exp, &render_peaks, &rcfg_3d)));
+    }
+
+    // Shift reference truth into the experimental spectrometer ppm frame for shift-agreement scoring
+    let mut shifted_ref = ref_data.clone();
+    for ((_, atom), val) in &mut shifted_ref.shifts {
+        match atom.as_str() {
+            "H" => *val += cfg.ref_offset_h_ppm,
+            "N" => *val += cfg.ref_offset_n_ppm,
+            "CA" | "CB" | "C" => *val += cfg.ref_offset_c_ppm,
+            _ => {}
+        }
+    }
+
+    let anneal_cfg = AnnealConfig {
+        runs: cfg.anneal_runs,
+        steps_per_system: cfg.anneal_steps,
+        seed: cfg.seed,
+        ..AnnealConfig::default()
+    };
+
+    let t_cls = Instant::now();
+    let cls_cfg = PickerConfig {
+        snr_threshold: cfg.classical_snr,
+        ..PickerConfig::default()
+    };
+    let cls_hsqc = pick_hsqc_2d(&hsqc_spec, &cls_cfg);
+    let mut cls_3d = Vec::with_capacity(specs_3d.len());
+    for (exp, s3) in &specs_3d {
+        let mut exp_cfg = cls_cfg.clone();
+        if *exp == "HNCACB" {
+            exp_cfg.allow_negative = true;
+        }
+        cls_3d.push((*exp, pick_triple_3d(s3, &cls_hsqc, &exp_cfg)));
+    }
+    let classical = evaluate_blind_pipeline(
+        "Classical",
+        cls_hsqc,
+        &cls_3d,
+        &obs_truth_by_exp,
+        &true_backbone_roots,
+        &shifted_ref,
+        &anneal_cfg,
+        t_cls.elapsed().as_secs_f64() * 1000.0,
+    )?;
+
+    let neural_model = NeuralPicker::pretrained();
+    let t_neu = Instant::now();
+    let neu_cfg_2d = NeuralPickerConfig {
+        prob_threshold: cfg.neural_prob,
+        ..NeuralPickerConfig::default()
+    };
+    let neu_hsqc = neural_model.pick_2d(&hsqc_spec, &neu_cfg_2d);
+    let neu_cfg_3d = NeuralPickerConfig {
+        prob_threshold: cfg.neural_prob,
+        hsqc_roots: neu_hsqc.clone(),
+        ..NeuralPickerConfig::default()
+    };
+    let mut neu_3d = Vec::with_capacity(specs_3d.len());
+    for (exp, s3) in &specs_3d {
+        neu_3d.push((*exp, neural_model.pick_3d(s3, exp, &neu_cfg_3d)));
+    }
+    let neural = evaluate_blind_pipeline(
+        "Neural",
+        neu_hsqc,
+        &neu_3d,
+        &obs_truth_by_exp,
+        &true_backbone_roots,
+        &shifted_ref,
         &anneal_cfg,
         t_neu.elapsed().as_secs_f64() * 1000.0,
     )?;
