@@ -10,6 +10,7 @@
 
 pub mod dihedrals;
 pub mod evaluate;
+pub mod evo_graph;
 pub mod nef;
 pub mod neural_picker;
 pub mod nmrstar;

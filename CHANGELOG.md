@@ -4,9 +4,28 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## 2026-11-11 — Clean-Room Parallel Tripeptide Fragment Assignment Solver (`nmr-core`)
+## 2026-11-11 — Stoichiometry-Guided Evolutionary Fragment Crossover & Residue-Graph Self-Consistency Solver (`nmr-core`)
 
-- **Source Branch / Reviewed Commit:** `swarm/tripeptide` (`c03e85443d479007978a095346bb45af7e5a2a8c`)
+- **Source Branch / Reviewed Commit:** `swarm/evo-graph` (`73aada2a661814a1107df8558761f797e6c426f9`)
+- **Architectural Summary:**
+  - **Sequence-Stoichiometry Peak Budgeting & Artifact Suppression (`crates/nmr-core/src/evo_graph.rs`, `docs/specs/10-evo-graph-solver.md`):** Implemented `expected_experiment_peaks`, `filter_peaks_stoichiometric`, and `build_stoichiometric_spin_systems` with physical window gating (`5.5..=11.5 ppm` amide $^{1}\text{H}$, `8..=76 ppm` aliphatic $^{13}\text{C}$, `164..=187 ppm` carbonyl $^{13}\text{C}$), indirect $t_1$ column/sinc sidelobe & $^{3}J_{\text{HNH}\alpha}$ doublet suppression, paired Asn/Gln $\text{NH}_2$ doublet rejection, cross-spectrum $(^{1}\text{H}, {}^{15}\text{N})$ drift registration, and per-strip top-$M_{\text{exp}}$ + `1.6x` $N_{\text{exp}}$ stoichiometric budgeting (compressing `24,562` noisy classical Bruker peaks to `834` peaks across `94` roots while retaining all `70/70` observable backbone roots, and preserving exact legacy pass-through when heights are `None`).
+  - **Two-Pass Reference-Offset Estimation:** Pass 1 fits LLR-gated sequence-weighted mixture offsets (`estimate_mixture_reference_offsets`), keeping DSS-referenced synthetic spectra at `0.00 ppm` while recovering TMS-vs-DSS $^{13}\text{C}$ offsets; Pass 2 refines offsets directly from `>= 0.70` consensus anchors (`refine_anchor_reference_offsets`) onto a working copy of `Priors` while keeping all `SpinSystem` candidates and `to_reference` emitted shifts strictly in the experimental `ppm` frame.
+  - **Parallel Multi-Island Evolutionary Crossover + Graph Self-Consistency + Optional PDB $(\phi, \psi)$ Conditioning:** Implemented `assign_evo_graph` and `assign_evo_graph_from_peaks` running 64 individuals across 16 islands via `std::thread::scope` (`wasm32`-safe fallback) combining tournament selection, contiguous sequential fragment splicing (`P(s_k, s_{k+1})`), local Metropolis–Hastings SA (`single/swap`, `block swap`, `unassign` with `min_assign_cost` null penalty), Boltzmann margin confidence calibration, a 2-layer residue-graph secondary-shift self-consistency pass between Pass 1 and Pass 2, and optional 3D structure $(\phi, \psi)$ conditioning (`structure_torsions`, `torsions_from_pdb_path` / `torsions_from_pdb_chain`).
+  - **Clean-Room Provenance:** Implemented strictly from Schmidt & Güntert (*JACS* 2012), Klukowski et al. (*Bioinformatics* 2018; *Nat. Commun.* 2022; *Sci. Adv.* 2023), Spera & Bax (*JACS* 1991), and Wishart et al. (*J. Biomol. NMR* 1995).
+- **Verified Metrics:**
+  - **Synthetic Ubiquitin (`synthetic_ubiquitin.str`):**
+    - 7-exp `assign_evo_graph`: **`97.1% (66/68)` accuracy**, **`97.1%` recall**, **`100.0% (66/66)` high-confidence precision**, **`97.1%` HC recall**.
+    - 7-exp `assign_evo_graph_from_peaks`: **`98.5% (66/67)` accuracy**, **`97.1%` recall**, **`98.5% (66/67)` high-confidence precision**.
+    - 5-exp without `HNCA` / `HNCOCA`: **`98.5% (67/68)` accuracy**, **`94.4%` recall**, **`98.5% (66/67)` high-confidence precision**.
+  - **Real 5-Spectrum Bruker Ubiquitin (`24,562` Raw Classical Peaks, `70` Observable Amides, `359` Non-`?` Shifts, 5 Seeds `0..4`):**
+    - **Sequence-Only (5-Seed Mean):** **`95.24%` accuracy** (`60/63`), **`85.71%` recall**, **`98.02%` high-confidence precision** (`50/51`), **`70.86%` HC recall**, **`94.48% (308/326)` per-atom shift agreement** (`H 95.2%, N 98.4%, CA 93.2%, CB 95.5%, C 90.0%`; `median(pred - truth)` within `0.001..0.058 ppm` in experimental TMS frame), **`0.24 s`/seed**.
+    - **With `data/pdb_refs/1d3z.pdb` $(\phi, \psi)$ Torsions (5-Seed Mean):** **`95.37%` accuracy** (`61.8/64.8`), **`88.29%` recall** (`+2.58%` gain), **`98.08%` high-confidence precision** (`51/52`), **`72.86%` HC recall**, **`0.24 s`/seed**.
+
+---
+
+## `1c5452b` — 2026-11-11 — Clean-Room Parallel Tripeptide Fragment Assignment Solver (`nmr-core`)
+
+- **Commit:** `1c5452b` (from `swarm/tripeptide` `c03e85443d479007978a095346bb45af7e5a2a8c`)
 - **Architectural Summary:**
   - **Cooperative Tripeptide Fragment Engine (`crates/nmr-core/src/tripeptide.rs`, `docs/specs/09-tripeptide-solver.md`):** Implemented `TripeptideSolver`, `TripeptideConfig`, `TripeptideFragmentDb`, `TripeptidePairTensor`, `ReferenceOffsets`, `estimate_reference_offsets`, `assign_tripeptide`, and `assign_tripeptide_with_db`. Evaluates bounded cooperative 3-residue secondary-shift $(\Delta\delta\text{C}^\alpha, \Delta\delta\text{C}^\beta, \Delta\delta\text{C}', \Delta\delta\text{N}, \Delta\delta\text{H}^{\text{N}})$ log-Bayes-factors relative to uncorrelated single-residue marginals (avoiding single-atom prior double-counting) across a WASM-ready embedded 4-state (`Helix`, `Sheet`, `Ppii`, `Turn`) corpus and optional public BMRB entries filtered by `< 35%` global Needleman–Wunsch sequence identity and zero shared 7-mer peptide substrings.
   - **Internal Prior Reference Shifting:** Fits global `(dCA, dCB, dC, dH, dN)` chemical-shift referencing offsets against sequence-weighted `Priors` and applies them internally during scoring while keeping `SpinSystem` candidates and `to_reference` output shifts strictly in the experimental spectrum's `ppm` frame.
