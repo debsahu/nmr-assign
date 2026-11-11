@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-lint:
+    name: Test, Lint & Benchmark Gate (CPU + WebGPU)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux GUI & Mesa Vulkan (Lavapipe) packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Lint workspace with Clippy
+        run: cargo clippy --workspace --all-targets -- -A clippy::approx_constant
+
+      - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
+        run: cargo test --release --workspace
+
+      - name: Synthetic Ubiquitin Benchmark Gate (Accuracy >= 95%, HC Precision >= 97%)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$(cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine cpu --runs 32)"
+          echo "$OUT"
+          OUT_TEXT="$OUT" python3 - <<'PY'
+          import os, re, sys
+
+          out = os.environ["OUT_TEXT"]
+          acc_m = re.search(r"accuracy\s*\(correct/assigned\)\s*:\s*([0-9]+(?:\.[0-9]+)?)%", out)
+          hcp_m = re.search(r"high-confidence\s*\(>=0\.8\)\s*precision\s*:\s*([0-9]+(?:\.[0-9]+)?)%", out)
+          if not acc_m or not hcp_m:
+              print("ERROR: failed to parse benchmark metrics from nmr-cli output", file=sys.stderr)
+              sys.exit(1)
+
+          acc = float(acc_m.group(1))
+          hcp = float(hcp_m.group(1))
+          print(f"Parsed benchmark gate -> accuracy={acc:.1f}% (min 95.0%), hc_precision={hcp:.1f}% (min 97.0%)")
+
+          if acc < 95.0:
+              print(f"FAIL: accuracy {acc:.1f}% regressed below 95.0% gate", file=sys.stderr)
+              sys.exit(1)
+          if hcp < 97.0:
+              print(f"FAIL: high-confidence precision {hcp:.1f}% regressed below 97.0% gate", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  wasm-check:
+    name: WebAssembly + WebGPU GUI Check (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain with wasm32-unknown-unknown
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry & WASM target artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - name: Check nmr-gui for wasm32-unknown-unknown
+        run: cargo check --release -p nmr-gui --target wasm32-unknown-unknown

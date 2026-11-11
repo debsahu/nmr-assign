@@ -7,3 +7,6 @@ result*.str
 result*.tsv
 ruvector.db
 .DS_Store
+# Local symlink to Google Drive ubiquitin dataset
+/data/ubiquitin
+/data/ubiquitin_backbone_assignment_191104.txt

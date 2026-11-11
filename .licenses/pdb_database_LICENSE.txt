@@ -1,0 +1,17 @@
+RCSB Protein Data Bank (PDB) Data Usage Policy Notification
+===========================================================
+Timestamp (UTC): 2026-11-11T07:08:50Z
+Usage Policy URL: https://www.rcsb.org/pages/usage-policy
+License: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication
+
+Notification:
+Experimental macromolecular structure coordinate files and metadata retrieved via the
+RCSB Protein Data Bank (`pdb-database` skill) are subject to the RCSB PDB Usage Policy
+at https://www.rcsb.org/pages/usage-policy. Data files contained in the PDB archive
+(https://ftp.wwpdb.org) are free of all copyright restrictions and made fully and freely
+available for both non-commercial and commercial use under CC0 1.0 Public Domain Dedication.
+
+Downloaded Reference Entries:
+- 1D3Z: Human ubiquitin (solution NMR ensemble, Cornilescu et al., 1998; paired with BMRB 17769)
+- 1MJC: E. coli major cold-shock protein CspA (beta-barrel; paired with BMRB 4296)
+- 1ENH: Drosophila engrailed homeodomain (3-helix bundle; paired with BMRB 15536)

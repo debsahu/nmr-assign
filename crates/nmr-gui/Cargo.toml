@@ -13,7 +13,21 @@ path = "src/main.rs"
 
 [dependencies]
 nmr-core = { path = "../nmr-core" }
-nmr-gpu = { path = "../nmr-gpu" }
 bytemuck.workspace = true
 eframe.workspace = true
+serde_json.workspace = true
 wgpu.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nmr-gpu = { path = "../nmr-gpu" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Performance",
+    "Window",
+] }

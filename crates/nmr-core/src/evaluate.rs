@@ -37,23 +37,30 @@ pub fn to_reference(
         }
     }
 
-    let pick = |cands: &[(f64, usize)], res: &str, atom: &str, partner: Option<&[(f64, usize)]>| -> f64 {
-        if let Some(part) = partner {
-            if !part.is_empty() {
-                return cands
-                    .iter()
-                    .min_by(|a, b| {
-                        let da = part.iter().map(|p| (a.0 - p.0).abs()).fold(f64::INFINITY, f64::min);
-                        let db = part.iter().map(|p| (b.0 - p.0).abs()).fold(f64::INFINITY, f64::min);
-                        da.total_cmp(&db)
-                    })
-                    .map(|c| c.0)
-                    .unwrap_or(cands[0].0);
+    let pick =
+        |cands: &[(f64, usize)], res: &str, atom: &str, partner: Option<&[(f64, usize)]>| -> f64 {
+            if let Some(part) = partner {
+                if !part.is_empty() {
+                    return cands
+                        .iter()
+                        .min_by(|a, b| {
+                            let da = part
+                                .iter()
+                                .map(|p| (a.0 - p.0).abs())
+                                .fold(f64::INFINITY, f64::min);
+                            let db = part
+                                .iter()
+                                .map(|p| (b.0 - p.0).abs())
+                                .fold(f64::INFINITY, f64::min);
+                            da.total_cmp(&db)
+                        })
+                        .map(|c| c.0)
+                        .unwrap_or(cands[0].0);
+                }
             }
-        }
-        let (_, idx) = candidate_llr(pri, res, atom, cands, 0.7);
-        cands[idx].0
-    };
+            let (_, idx) = candidate_llr(pri, res, atom, cands, 0.7);
+            cands[idx].0
+        };
 
     for (s, &k_raw) in result.position.iter().enumerate() {
         if k_raw < 0 || result.confidence[s] < min_conf {
@@ -187,10 +194,7 @@ pub fn score(result: &AssignResult, truth: &[i32], hc: f64) -> Metrics {
     }
 }
 
-pub fn compare_shifts(
-    pred: &Reference,
-    ref_data: &Reference,
-) -> BTreeMap<String, (usize, usize)> {
+pub fn compare_shifts(pred: &Reference, ref_data: &Reference) -> BTreeMap<String, (usize, usize)> {
     let tols = [
         ("H", 0.05),
         ("N", 0.50),
@@ -198,10 +202,8 @@ pub fn compare_shifts(
         ("CB", 0.40),
         ("C", 0.30),
     ];
-    let mut out: BTreeMap<String, (usize, usize)> = tols
-        .iter()
-        .map(|&(a, _)| (a.to_string(), (0, 0)))
-        .collect();
+    let mut out: BTreeMap<String, (usize, usize)> =
+        tols.iter().map(|&(a, _)| (a.to_string(), (0, 0))).collect();
 
     for ((k, atom), &v) in &pred.shifts {
         let Some(&r) = ref_data.shifts.get(&(*k, atom.clone())) else {

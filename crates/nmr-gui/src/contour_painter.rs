@@ -184,7 +184,13 @@ impl egui_wgpu::CallbackTrait for ContourCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(res) = resources.get_mut::<ContourPipelineResource>() {
-            res.update(device, queue, &self.uniforms, self.spec_gen, &self.spec_data);
+            res.update(
+                device,
+                queue,
+                &self.uniforms,
+                self.spec_gen,
+                &self.spec_data,
+            );
         }
         Vec::new()
     }

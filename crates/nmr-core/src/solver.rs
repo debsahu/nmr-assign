@@ -187,18 +187,22 @@ pub fn pair_matrix(systems: &[SpinSystem], cfg: &ScoreConfig) -> Matrix2D {
         let key_im1 = (atom.to_string(), -1);
 
         for s in 0..s_len {
-            let Some(a_raw) = systems[s].cands.get(&key_i) else { continue };
+            let Some(a_raw) = systems[s].cands.get(&key_i) else {
+                continue;
+            };
             let a_slice = &a_raw[..a_raw.len().min(max_n)];
             if a_slice.is_empty() {
                 continue;
             }
             let na = a_slice.len();
 
-            for t in 0..s_len {
+            for (t, sys_t) in systems.iter().enumerate().take(s_len) {
                 if s == t {
                     continue;
                 }
-                let Some(b_raw) = systems[t].cands.get(&key_im1) else { continue };
+                let Some(b_raw) = sys_t.cands.get(&key_im1) else {
+                    continue;
+                };
                 let b_slice = &b_raw[..b_raw.len().min(max_n)];
                 if b_slice.is_empty() {
                     continue;

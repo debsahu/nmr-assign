@@ -19,8 +19,7 @@ use nmr_core::spectrum::{
 use nmr_core::spinsystems::{build_spin_systems, Tolerances};
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../data/fixtures/synthetic_ubiquitin.str")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/fixtures/synthetic_ubiquitin.str")
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -45,7 +44,13 @@ fn test_star_and_peaks_roundtrip() {
     assert_eq!(back_star.sequence, ref_data.sequence);
     assert_eq!(back_star.shifts.len(), ref_data.shifts.len());
 
-    let (peaks, _) = simulate(&ref_data, &SimConfig { seed: 1, ..SimConfig::default() });
+    let (peaks, _) = simulate(
+        &ref_data,
+        &SimConfig {
+            seed: 1,
+            ..SimConfig::default()
+        },
+    );
     let p_tsv = dir.join("peaks.tsv");
     write_peaks(&p_tsv, &peaks).unwrap();
     let back_peaks = read_peaks(&p_tsv).unwrap();
@@ -99,10 +104,7 @@ fn test_clean_data_spin_systems_exact() {
         }
     }
 
-    assert!(
-        (lost as f64) / (total as f64) < 0.06,
-        "lost={lost}/{total}"
-    );
+    assert!((lost as f64) / (total as f64) < 0.06, "lost={lost}/{total}");
     assert!(
         (top_wrong as f64) / (total as f64) < 0.03,
         "top_wrong={top_wrong}/{total}"
@@ -183,7 +185,13 @@ fn test_spectrum_io_and_classical_picker_roundtrip() {
 fn test_full_set_benchmark_floor_and_priors() {
     let fpath = fixture_path();
     let ref_data = read_star(&fpath, None).unwrap();
-    let (peaks, truth) = simulate(&ref_data, &SimConfig { seed: 0, ..SimConfig::default() });
+    let (peaks, truth) = simulate(
+        &ref_data,
+        &SimConfig {
+            seed: 0,
+            ..SimConfig::default()
+        },
+    );
     let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
 
     let res = assign(
@@ -205,7 +213,10 @@ fn test_full_set_benchmark_floor_and_priors() {
     // Zero-carbon sidechain NH2 decoy roots (truth == -1) must remain unassigned
     for (s, &t) in truth.iter().enumerate() {
         if t < 0 && !systems[s].has_observed_carbons() {
-            assert_eq!(res.position[s], -1, "0-carbon decoy SS #{s} should stay unassigned");
+            assert_eq!(
+                res.position[s], -1,
+                "0-carbon decoy SS #{s} should stay unassigned"
+            );
         }
     }
 

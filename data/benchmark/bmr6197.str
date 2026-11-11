@@ -1,0 +1,405 @@
+# BMRB ID: bmr6197
+# PDB ID: 1RUW
+# Protein: Yeast myosin-I Myo3 SH3 domain
+# Fold class: alpha
+# Residues: 70 (Seq_ID 1..70)
+# Source: BioMagResBank (https://bmrb.io, public domain / CC0)
+
+data_nmr_assign_output
+
+save_entity_1
+   _Entity.Sf_category  entity
+   _Entity.ID           1
+
+   loop_
+      _Entity_poly_seq.Entity_ID
+      _Entity_poly_seq.Num
+      _Entity_poly_seq.Mon_ID
+
+      1     1 GLY
+      1     2 LYS
+      1     3 ASP
+      1     4 PRO
+      1     5 LYS
+      1     6 PHE
+      1     7 GLU
+      1     8 ALA
+      1     9 ALA
+      1    10 TYR
+      1    11 ASP
+      1    12 PHE
+      1    13 PRO
+      1    14 GLY
+      1    15 SER
+      1    16 GLY
+      1    17 SER
+      1    18 SER
+      1    19 SER
+      1    20 GLU
+      1    21 LEU
+      1    22 PRO
+      1    23 LEU
+      1    24 LYS
+      1    25 LYS
+      1    26 GLY
+      1    27 ASP
+      1    28 ILE
+      1    29 VAL
+      1    30 PHE
+      1    31 ILE
+      1    32 SER
+      1    33 ARG
+      1    34 ASP
+      1    35 GLU
+      1    36 PRO
+      1    37 SER
+      1    38 GLY
+      1    39 TRP
+      1    40 SER
+      1    41 LEU
+      1    42 ALA
+      1    43 LYS
+      1    44 LEU
+      1    45 LEU
+      1    46 ASP
+      1    47 GLY
+      1    48 SER
+      1    49 LYS
+      1    50 GLU
+      1    51 GLY
+      1    52 TRP
+      1    53 VAL
+      1    54 PRO
+      1    55 THR
+      1    56 ALA
+      1    57 TYR
+      1    58 MET
+      1    59 THR
+      1    60 PRO
+      1    61 TYR
+      1    62 LYS
+      1    63 ASP
+      1    64 THR
+      1    65 ARG
+      1    66 ASN
+      1    67 THR
+      1    68 VAL
+      1    69 PRO
+      1    70 VAL
+   stop_
+save_
+
+save_assigned_chem_shift_list_1
+   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts
+
+   loop_
+      _Atom_chem_shift.ID
+      _Atom_chem_shift.Entity_ID
+      _Atom_chem_shift.Seq_ID
+      _Atom_chem_shift.Comp_ID
+      _Atom_chem_shift.Atom_ID
+      _Atom_chem_shift.Atom_type
+      _Atom_chem_shift.Val
+      _Atom_chem_shift.Ambiguity_code
+      _Atom_chem_shift.Details
+
+          1 1     1 GLY C    C   174.933 1 .
+          2 1     2 LYS H    H     8.255 1 .
+          3 1     2 LYS N    N   122.574 1 .
+          4 1     2 LYS CA   C    56.019 1 .
+          5 1     2 LYS CB   C    33.025 1 .
+          6 1     2 LYS C    C   175.961 1 .
+          7 1     3 ASP H    H     8.090 1 .
+          8 1     3 ASP N    N   123.350 1 .
+          9 1     3 ASP CA   C    52.788 1 .
+         10 1     3 ASP CB   C    41.023 1 .
+         11 1     4 PRO CA   C    62.941 1 .
+         12 1     4 PRO CB   C    32.348 1 .
+         13 1     4 PRO C    C   175.834 1 .
+         14 1     5 LYS H    H     8.235 1 .
+         15 1     5 LYS N    N   118.525 1 .
+         16 1     5 LYS CA   C    55.255 1 .
+         17 1     5 LYS CB   C    35.335 1 .
+         18 1     5 LYS C    C   176.597 1 .
+         19 1     6 PHE H    H     9.553 1 .
+         20 1     6 PHE N    N   122.142 1 .
+         21 1     6 PHE CA   C    56.746 1 .
+         22 1     6 PHE CB   C    44.633 1 .
+         23 1     6 PHE C    C   172.402 1 .
+         24 1     7 GLU H    H     9.761 1 .
+         25 1     7 GLU N    N   120.270 1 .
+         26 1     7 GLU CA   C    52.765 1 .
+         27 1     7 GLU CB   C    34.610 1 .
+         28 1     7 GLU C    C   176.193 1 .
+         29 1     8 ALA H    H     8.969 1 .
+         30 1     8 ALA N    N   127.194 1 .
+         31 1     8 ALA CA   C    52.206 1 .
+         32 1     8 ALA CB   C    18.401 1 .
+         33 1     8 ALA C    C   178.252 1 .
+         34 1     9 ALA H    H     9.879 1 .
+         35 1     9 ALA N    N   131.178 1 .
+         36 1     9 ALA CA   C    53.151 1 .
+         37 1     9 ALA CB   C    19.125 1 .
+         38 1     9 ALA C    C   175.021 1 .
+         39 1    10 TYR H    H     7.253 1 .
+         40 1    10 TYR N    N   112.500 1 .
+         41 1    10 TYR CA   C    54.534 1 .
+         42 1    10 TYR CB   C    42.411 1 .
+         43 1    10 TYR C    C   173.754 1 .
+         44 1    11 ASP H    H     8.364 1 .
+         45 1    11 ASP N    N   117.166 1 .
+         46 1    11 ASP CA   C    55.671 1 .
+         47 1    11 ASP CB   C    42.017 1 .
+         48 1    11 ASP C    C   175.720 1 .
+         49 1    12 PHE H    H     9.117 1 .
+         50 1    12 PHE N    N   120.040 1 .
+         51 1    12 PHE CA   C    53.753 1 .
+         52 1    12 PHE CB   C    41.493 1 .
+         53 1    13 PRO CA   C    63.649 1 .
+         54 1    13 PRO CB   C    32.281 1 .
+         55 1    13 PRO C    C   177.984 1 .
+         56 1    14 GLY H    H     6.299 1 .
+         57 1    14 GLY N    N   103.307 1 .
+         58 1    14 GLY CA   C    45.166 1 .
+         59 1    15 SER H    H    10.017 1 .
+         60 1    15 SER N    N   115.629 1 .
+         61 1    15 SER CA   C    58.083 1 .
+         62 1    15 SER CB   C    65.373 1 .
+         63 1    15 SER C    C   175.836 1 .
+         64 1    16 GLY H    H     8.838 1 .
+         65 1    16 GLY N    N   113.094 1 .
+         66 1    16 GLY CA   C    45.548 1 .
+         67 1    16 GLY C    C   174.571 1 .
+         68 1    17 SER H    H     7.350 1 .
+         69 1    17 SER N    N   114.240 1 .
+         70 1    17 SER CA   C    57.278 1 .
+         71 1    17 SER CB   C    63.740 1 .
+         72 1    17 SER C    C   175.196 1 .
+         73 1    18 SER H    H     8.109 1 .
+         74 1    18 SER N    N   114.659 1 .
+         75 1    18 SER CA   C    59.147 1 .
+         76 1    18 SER CB   C    63.571 1 .
+         77 1    19 SER CA   C    58.884 1 .
+         78 1    19 SER CB   C    63.886 1 .
+         79 1    19 SER C    C   174.647 1 .
+         80 1    20 GLU H    H     7.268 1 .
+         81 1    20 GLU N    N   120.883 1 .
+         82 1    20 GLU CA   C    55.552 1 .
+         83 1    20 GLU CB   C    32.065 1 .
+         84 1    20 GLU C    C   175.678 1 .
+         85 1    21 LEU H    H     8.304 1 .
+         86 1    21 LEU N    N   125.363 1 .
+         87 1    21 LEU CA   C    51.368 1 .
+         88 1    21 LEU CB   C    44.034 1 .
+         89 1    22 PRO CA   C    63.090 1 .
+         90 1    22 PRO CB   C    32.188 1 .
+         91 1    22 PRO C    C   177.132 1 .
+         92 1    23 LEU H    H     8.858 1 .
+         93 1    23 LEU N    N   119.947 1 .
+         94 1    23 LEU CA   C    53.325 1 .
+         95 1    23 LEU CB   C    48.157 1 .
+         96 1    23 LEU C    C   177.180 1 .
+         97 1    24 LYS H    H     9.139 1 .
+         98 1    24 LYS N    N   124.649 1 .
+         99 1    24 LYS CA   C    53.712 1 .
+        100 1    24 LYS CB   C    33.827 1 .
+        101 1    24 LYS C    C   175.584 1 .
+        102 1    25 LYS H    H     8.998 1 .
+        103 1    25 LYS N    N   122.138 1 .
+        104 1    25 LYS CA   C    58.967 1 .
+        105 1    25 LYS CB   C    32.508 1 .
+        106 1    25 LYS C    C   177.762 1 .
+        107 1    26 GLY H    H     9.376 1 .
+        108 1    26 GLY N    N   116.596 1 .
+        109 1    26 GLY CA   C    44.605 1 .
+        110 1    26 GLY C    C   174.722 1 .
+        111 1    27 ASP H    H     8.649 1 .
+        112 1    27 ASP N    N   123.462 1 .
+        113 1    27 ASP CA   C    56.015 1 .
+        114 1    27 ASP CB   C    41.873 1 .
+        115 1    27 ASP C    C   174.854 1 .
+        116 1    28 ILE H    H     7.964 1 .
+        117 1    28 ILE N    N   120.939 1 .
+        118 1    28 ILE CA   C    59.430 1 .
+        119 1    28 ILE CB   C    38.931 1 .
+        120 1    28 ILE C    C   175.338 1 .
+        121 1    29 VAL H    H     8.945 1 .
+        122 1    29 VAL N    N   116.745 1 .
+        123 1    29 VAL CA   C    58.440 1 .
+        124 1    29 VAL CB   C    36.134 1 .
+        125 1    29 VAL C    C   175.354 1 .
+        126 1    30 PHE H    H     8.856 1 .
+        127 1    30 PHE N    N   117.826 1 .
+        128 1    30 PHE CA   C    56.669 1 .
+        129 1    30 PHE CB   C    41.767 1 .
+        130 1    30 PHE C    C   177.290 1 .
+        131 1    31 ILE H    H     8.448 1 .
+        132 1    31 ILE N    N   119.768 1 .
+        133 1    31 ILE CA   C    59.702 1 .
+        134 1    31 ILE CB   C    38.794 1 .
+        135 1    31 ILE C    C   176.056 1 .
+        136 1    32 SER H    H     8.672 1 .
+        137 1    32 SER N    N   120.835 1 .
+        138 1    32 SER CA   C    59.074 1 .
+        139 1    32 SER CB   C    64.464 1 .
+        140 1    32 SER C    C   174.792 1 .
+        141 1    33 ARG H    H     7.093 1 .
+        142 1    33 ARG N    N   117.700 1 .
+        143 1    33 ARG CA   C    55.879 1 .
+        144 1    33 ARG CB   C    33.048 1 .
+        145 1    33 ARG C    C   172.852 1 .
+        146 1    34 ASP H    H     8.638 1 .
+        147 1    34 ASP N    N   121.837 1 .
+        148 1    34 ASP CA   C    53.591 1 .
+        149 1    34 ASP CB   C    43.740 1 .
+        150 1    34 ASP C    C   175.278 1 .
+        151 1    35 GLU H    H     9.082 1 .
+        152 1    35 GLU N    N   120.556 1 .
+        153 1    35 GLU CA   C    53.847 1 .
+        154 1    35 GLU CB   C    31.396 1 .
+        155 1    36 PRO CA   C    64.997 1 .
+        156 1    36 PRO CB   C    31.749 1 .
+        157 1    36 PRO C    C   176.107 1 .
+        158 1    37 SER H    H     7.528 1 .
+        159 1    37 SER N    N   112.246 1 .
+        160 1    37 SER CA   C    58.353 1 .
+        161 1    37 SER CB   C    63.570 1 .
+        162 1    37 SER C    C   175.186 1 .
+        163 1    38 GLY H    H     8.167 1 .
+        164 1    38 GLY N    N   107.307 1 .
+        165 1    38 GLY CA   C    45.798 1 .
+        166 1    38 GLY C    C   173.423 1 .
+        167 1    39 TRP H    H     7.170 1 .
+        168 1    39 TRP N    N   121.618 1 .
+        169 1    39 TRP CA   C    56.477 1 .
+        170 1    39 TRP CB   C    32.539 1 .
+        171 1    39 TRP C    C   174.616 1 .
+        172 1    40 SER H    H    10.030 1 .
+        173 1    40 SER N    N   117.751 1 .
+        174 1    40 SER CA   C    58.593 1 .
+        175 1    40 SER CB   C    66.170 1 .
+        176 1    40 SER C    C   171.346 1 .
+        177 1    41 LEU H    H     8.558 1 .
+        178 1    41 LEU N    N   127.849 1 .
+        179 1    41 LEU CA   C    54.393 1 .
+        180 1    41 LEU CB   C    41.214 1 .
+        181 1    41 LEU C    C   173.311 1 .
+        182 1    42 ALA H    H     8.911 1 .
+        183 1    42 ALA N    N   131.788 1 .
+        184 1    42 ALA CA   C    49.710 1 .
+        185 1    42 ALA CB   C    24.088 1 .
+        186 1    42 ALA C    C   175.297 1 .
+        187 1    43 LYS H    H     8.866 1 .
+        188 1    43 LYS N    N   118.392 1 .
+        189 1    43 LYS CA   C    54.915 1 .
+        190 1    43 LYS CB   C    37.221 1 .
+        191 1    43 LYS C    C   175.845 1 .
+        192 1    44 LEU H    H     7.986 1 .
+        193 1    44 LEU N    N   121.486 1 .
+        194 1    44 LEU CA   C    55.710 1 .
+        195 1    44 LEU CB   C    42.550 1 .
+        196 1    44 LEU C    C   179.188 1 .
+        197 1    45 LEU H    H     8.419 1 .
+        198 1    45 LEU N    N   120.420 1 .
+        199 1    45 LEU CA   C    57.656 1 .
+        200 1    45 LEU CB   C    41.117 1 .
+        201 1    45 LEU C    C   178.513 1 .
+        202 1    46 ASP H    H     7.964 1 .
+        203 1    46 ASP N    N   114.644 1 .
+        204 1    46 ASP CA   C    52.952 1 .
+        205 1    46 ASP CB   C    39.755 1 .
+        206 1    46 ASP C    C   178.005 1 .
+        207 1    47 GLY H    H     8.613 1 .
+        208 1    47 GLY N    N   109.122 1 .
+        209 1    47 GLY CA   C    45.808 1 .
+        210 1    47 GLY C    C   175.948 1 .
+        211 1    48 SER H    H     8.527 1 .
+        212 1    48 SER N    N   114.964 1 .
+        213 1    48 SER CA   C    61.438 1 .
+        214 1    48 SER CB   C    63.668 1 .
+        215 1    48 SER C    C   174.520 1 .
+        216 1    49 LYS H    H     6.939 1 .
+        217 1    49 LYS N    N   118.725 1 .
+        218 1    49 LYS CA   C    55.863 1 .
+        219 1    49 LYS CB   C    37.787 1 .
+        220 1    49 LYS C    C   173.403 1 .
+        221 1    50 GLU H    H     8.330 1 .
+        222 1    50 GLU N    N   121.140 1 .
+        223 1    50 GLU CA   C    53.890 1 .
+        224 1    50 GLU CB   C    34.284 1 .
+        225 1    50 GLU C    C   175.004 1 .
+        226 1    51 GLY H    H     9.204 1 .
+        227 1    51 GLY N    N   109.988 1 .
+        228 1    51 GLY CA   C    45.278 1 .
+        229 1    51 GLY C    C   170.545 1 .
+        230 1    52 TRP H    H     9.018 1 .
+        231 1    52 TRP N    N   121.286 1 .
+        232 1    52 TRP CA   C    57.673 1 .
+        233 1    52 TRP CB   C    30.500 1 .
+        234 1    52 TRP C    C   177.121 1 .
+        235 1    53 VAL H    H     9.703 1 .
+        236 1    53 VAL N    N   114.644 1 .
+        237 1    53 VAL CA   C    57.934 1 .
+        238 1    53 VAL CB   C    34.563 1 .
+        239 1    54 PRO CA   C    61.649 1 .
+        240 1    54 PRO C    C   178.015 1 .
+        241 1    55 THR H    H     8.520 1 .
+        242 1    55 THR N    N   127.302 1 .
+        243 1    55 THR CA   C    67.173 1 .
+        244 1    55 THR CB   C    69.244 1 .
+        245 1    56 ALA CA   C    53.579 1 .
+        246 1    56 ALA CB   C    20.875 1 .
+        247 1    57 TYR CA   C    57.293 1 .
+        248 1    57 TYR CB   C    37.007 1 .
+        249 1    57 TYR C    C   174.067 1 .
+        250 1    58 MET H    H     7.611 1 .
+        251 1    58 MET N    N   116.777 1 .
+        252 1    58 MET CA   C    52.759 1 .
+        253 1    58 MET CB   C    31.817 1 .
+        254 1    58 MET C    C   176.363 1 .
+        255 1    59 THR H    H     9.358 1 .
+        256 1    59 THR N    N   118.430 1 .
+        257 1    59 THR CA   C    58.623 1 .
+        258 1    59 THR CB   C    71.441 1 .
+        259 1    60 PRO CA   C    64.410 1 .
+        260 1    60 PRO CB   C    31.867 1 .
+        261 1    60 PRO C    C   176.048 1 .
+        262 1    61 TYR H    H     8.063 1 .
+        263 1    61 TYR N    N   125.251 1 .
+        264 1    61 TYR CA   C    57.614 1 .
+        265 1    61 TYR CB   C    39.521 1 .
+        266 1    61 TYR C    C   174.551 1 .
+        267 1    62 LYS H    H     7.987 1 .
+        268 1    62 LYS N    N   129.111 1 .
+        269 1    62 LYS CA   C    55.135 1 .
+        270 1    62 LYS CB   C    33.357 1 .
+        271 1    62 LYS C    C   176.047 1 .
+        272 1    63 ASP H    H     7.865 1 .
+        273 1    63 ASP N    N   122.316 1 .
+        274 1    63 ASP CA   C    54.540 1 .
+        275 1    63 ASP CB   C    41.346 1 .
+        276 1    64 THR CA   C    61.817 1 .
+        277 1    64 THR CB   C    69.411 1 .
+        278 1    65 ARG CA   C    56.818 1 .
+        279 1    65 ARG CB   C    30.459 1 .
+        280 1    66 ASN CA   C    53.382 1 .
+        281 1    66 ASN CB   C    38.763 1 .
+        282 1    66 ASN C    C   176.661 1 .
+        283 1    67 THR H    H     8.035 1 .
+        284 1    67 THR N    N   114.707 1 .
+        285 1    67 THR CA   C    61.829 1 .
+        286 1    67 THR CB   C    69.697 1 .
+        287 1    67 THR C    C   174.219 1 .
+        288 1    68 VAL H    H     8.112 1 .
+        289 1    68 VAL N    N   124.244 1 .
+        290 1    68 VAL CA   C    59.845 1 .
+        291 1    68 VAL CB   C    32.467 1 .
+        292 1    69 PRO CA   C    63.525 1 .
+        293 1    69 PRO CB   C    32.213 1 .
+        294 1    69 PRO C    C   176.039 1 .
+        295 1    70 VAL H    H     7.719 1 .
+        296 1    70 VAL N    N   124.388 1 .
+        297 1    70 VAL CA   C    63.692 1 .
+        298 1    70 VAL CB   C    33.112 1 .
+   stop_
+save_

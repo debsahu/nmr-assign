@@ -1,21 +1,50 @@
 //! Interactive WebGPU + `eframe`/`egui` NMR spectrum and backbone resonance assignment workbench.
 //!
-//! Provenance: Original scientific GUI built on `eframe`, `wgpu`, `nmr-core`, and `nmr-gpu`.
+//! Provenance: Original scientific GUI built on `eframe`, `wgpu`, `nmr-core`, and `nmr-gpu`
+//! (native Metal/Vulkan/DX12 and browser `wasm32-unknown-unknown` + WebGPU).
 
 mod contour_painter;
+#[allow(dead_code)]
+mod octet_canvas;
 
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use contour_painter::{ContourCallback, ContourPipelineResource, ContourUniforms};
 use eframe::{egui, egui_wgpu};
 use nmr_core::evaluate::{score, to_reference, Metrics};
-use nmr_core::nmrstar::{read_star, write_star, Reference};
-use nmr_core::peaks::{read_peaks, Peak};
+use nmr_core::nef::read_nef_str;
+use nmr_core::neural_picker::{pick_hsqc_2d_neural, NeuralPickerConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::nmrstar::{read_star, write_star};
+use nmr_core::nmrstar::{read_star_str, Reference};
+use nmr_core::octet_analyt::iupac_naming::{iupac_name_to_mol, mol_to_iupac_name};
+use nmr_core::octet_analyt::jcamp_spec1d::{
+    pick_1d_multiplets, read_jcamp, synthesize_1d_nmr, write_jcamp_nmr, JcampCompression,
+    Synthesize1dOptions,
+};
+use nmr_core::octet_analyt::mass_props::compute_phys_chem_props;
+use nmr_core::octet_analyt::nmr_predict::{predict_nmr, NmrNucleus};
+use nmr_core::octet_analyt::AnalytMol;
+use nmr_core::octet_mol::{
+    build_peptide_2d, clean_2d, expand_abbreviations, kekulize, parse_biopolymer_sequence,
+    parse_condensed_formula, parse_inchi, parse_reaction_smiles, parse_smiles, perceive_sssr,
+    read_cdx, read_cdxml, read_mol, read_oct, read_sdf, write_canonical_smiles, write_cdx,
+    write_cdxml, write_inchi, write_inchikey, write_mol_v2000, write_oct, write_reaction_smiles,
+    write_sdf, ChemDocument, Molecule, SdfRecord,
+};
+use nmr_core::octet_render::{
+    render_scene_svg, DocumentStyle, RenderScene, SceneSpectrum1D, SpectrumSignal1D,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::peaks::read_peaks;
+use nmr_core::peaks::{read_peaks_str, Peak};
 use nmr_core::picker::{estimate_noise_mad, pick_hsqc_2d, PickerConfig};
-use nmr_core::priors::{one_to_three, three_to_one, Priors};
+use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
 use nmr_core::rng::Rng;
 use nmr_core::simulate::{
     render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
@@ -24,17 +53,67 @@ use nmr_core::solver::{
     assign_from_matrices, pair_matrix, unary_matrix, AnnealConfig, AssignResult, Matrix2D,
     ScoreConfig, FORBID,
 };
-use nmr_core::spectrum::{
-    read_bruker_pdata_2d, read_nmrpipe_2d, Spectrum2D, Spectrum3D,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::spectrum::{read_bruker_pdata_2d, read_nmrpipe_2d};
+use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
+#[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
+use octet_canvas::{IoFormat, MolecularPropertiesSummary, OctetBackendAdapter, OctetDrawPanel};
 
 const UBIQUITIN_SEQ: &str =
     "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG";
 
+const SYNTHETIC_UBIQUITIN_STR: &str =
+    include_str!("../../../data/fixtures/synthetic_ubiquitin.str");
+
+struct PerfTimer {
+    #[cfg(not(target_arch = "wasm32"))]
+    start: Instant,
+    #[cfg(target_arch = "wasm32")]
+    start_ms: f64,
+}
+
+impl PerfTimer {
+    fn start() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self {
+                start: Instant::now(),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let start_ms = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or(0.0);
+            Self { start_ms }
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.start.elapsed().as_secs_f64() * 1000.0
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let now_ms = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or(self.start_ms);
+            (now_ms - self.start_ms).max(0.0)
+        }
+    }
+}
+
 fn build_synthetic_ubiquitin() -> Reference {
+    #[cfg(not(target_arch = "wasm32"))]
     if let Ok(r) = read_star("data/fixtures/synthetic_ubiquitin.str", None) {
+        return r;
+    }
+    if let Ok(r) = read_star_str(SYNTHETIC_UBIQUITIN_STR, None) {
         return r;
     }
     let pri = Priors::provisional();
@@ -58,9 +137,577 @@ fn build_synthetic_ubiquitin() -> Reference {
     r
 }
 
+fn format_star_in_memory(
+    ref_data: &Reference,
+    confidence: Option<&BTreeMap<usize, f64>>,
+) -> String {
+    let mut lines = vec![
+        "data_nmr_assign_output".to_string(),
+        String::new(),
+        "save_assigned_chem_shift_list_1".to_string(),
+        "   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts".to_string(),
+        String::new(),
+        "   loop_".to_string(),
+    ];
+    for t in [
+        "ID",
+        "Entity_ID",
+        "Seq_ID",
+        "Comp_ID",
+        "Atom_ID",
+        "Atom_type",
+        "Val",
+        "Ambiguity_code",
+        "Details",
+    ] {
+        lines.push(format!("      _Atom_chem_shift.{t}"));
+    }
+    lines.push(String::new());
+
+    let mut entries: Vec<(usize, &str, f64)> = ref_data
+        .shifts
+        .iter()
+        .map(|(&(idx, ref atom), &v)| (idx, atom.as_str(), v))
+        .collect();
+    entries.sort_by(|&(ia, aa, _), &(ib, ab, _)| {
+        let oa = ATOMS.iter().position(|&a| a == aa).unwrap_or(99);
+        let ob = ATOMS.iter().position(|&a| a == ab).unwrap_or(99);
+        (ia, oa, aa).cmp(&(ib, ob, ab))
+    });
+
+    for (i, (idx, atom, v)) in entries.into_iter().enumerate() {
+        let det = confidence
+            .and_then(|c| c.get(&idx))
+            .map(|&c| format!("conf={c:.2}"))
+            .unwrap_or_else(|| ".".to_string());
+        let atom_type = atom
+            .chars()
+            .find(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "X".to_string());
+        lines.push(format!(
+            "      {:5} 1 {:5} {:3} {:4} {} {:9.3} 1 {}",
+            i + 1,
+            ref_data.seq_ids[idx],
+            ref_data.sequence[idx],
+            atom,
+            atom_type,
+            v,
+            det
+        ));
+    }
+    lines.push("   stop_".to_string());
+    lines.push("save_".to_string());
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceMode {
+    ProteinNmr,
+    OctetChem,
+}
+
+struct CoreOctetBackendAdapter;
+
+impl CoreOctetBackendAdapter {
+    fn encode_hex_pretty(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 3 + 64);
+        out.push_str("# Binary ChemDraw CDX (VjCD0100) hex stream\n");
+        for (i, b) in bytes.iter().enumerate() {
+            if i > 0 {
+                if i % 24 == 0 {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            out.push_str(&format!("{b:02X}"));
+        }
+        out
+    }
+
+    fn decode_hex_bytes(input: &str) -> Result<Vec<u8>, String> {
+        let mut hex_chars = Vec::new();
+        for line in input.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                continue;
+            }
+            for ch in trimmed.chars() {
+                if ch.is_ascii_hexdigit() {
+                    hex_chars.push(ch);
+                } else if !ch.is_whitespace() && ch != ',' && ch != ':' && ch != '-' {
+                    return Err(format!(
+                        "Unexpected non-hex character '{ch}' in CDX hex buffer"
+                    ));
+                }
+            }
+        }
+        if hex_chars.len() % 2 != 0 {
+            return Err("CDX hex stream must have an even number of hex digits".to_string());
+        }
+        let mut bytes = Vec::with_capacity(hex_chars.len() / 2);
+        for pair in hex_chars.chunks_exact(2) {
+            let s: String = pair.iter().collect();
+            let v =
+                u8::from_str_radix(&s, 16).map_err(|e| format!("Invalid hex byte '{s}': {e}"))?;
+            bytes.push(v);
+        }
+        Ok(bytes)
+    }
+
+    fn mol_with_cip_to_scene(mut mol: Molecule) -> RenderScene {
+        let _ = kekulize(&mut mol);
+        let mut scene = RenderScene::from(&mol);
+        let [cx, cy] = scene.atom_centroid();
+        scene.translate(-cx, -cy);
+        scene
+    }
+}
+
+impl OctetBackendAdapter for CoreOctetBackendAdapter {
+    fn clean_2d(&self, scene: &RenderScene) -> Option<RenderScene> {
+        if scene.atoms.is_empty() {
+            return Some(scene.clone());
+        }
+        let orig_centroid = scene.atom_centroid();
+        let mut mol = Molecule::from(scene);
+        let _ = expand_abbreviations(&mut mol);
+        clean_2d(&mut mol);
+        let mut cleaned = Self::mol_with_cip_to_scene(mol);
+        cleaned.translate(orig_centroid[0], orig_centroid[1]);
+        // Preserve non-molecular canvas annotations (arrows, brackets, orbitals, TLC, captions, embedded spectra)
+        cleaned.reaction_arrows = scene.reaction_arrows.clone();
+        cleaned.curved_arrows = scene.curved_arrows.clone();
+        cleaned.brackets = scene.brackets.clone();
+        cleaned.orbitals = scene.orbitals.clone();
+        cleaned.tlc_plates = scene.tlc_plates.clone();
+        cleaned.spectra_1d = scene.spectra_1d.clone();
+        cleaned.texts = scene.texts.clone();
+        Some(cleaned)
+    }
+
+    fn name_or_smiles_to_scene(&self, query: &str) -> Option<Result<RenderScene, String>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Some(Err(
+                "Enter a chemical name, SMILES, InChI, or peptide sequence".to_string(),
+            ));
+        }
+
+        // 1. Reaction SMILES (`A.B>reag>C`)
+        if q.contains(">>") || (q.matches('>').count() == 2 && !q.contains('<')) {
+            if let Ok(mut doc) = parse_reaction_smiles(q) {
+                let mut x_cursor = 0.0_f64;
+                for m in &mut doc.molecules {
+                    clean_2d(m);
+                    for a in &mut m.atoms {
+                        a.x += x_cursor * 1.54;
+                    }
+                    x_cursor += 5.5;
+                }
+                let mut scene = RenderScene::from(&doc);
+                let [cx, cy] = scene.atom_centroid();
+                scene.translate(-cx, -cy);
+                return Some(Ok(scene));
+            }
+        }
+
+        // 2. Standard InChI (`InChI=1S/...`)
+        if q.starts_with("InChI=") {
+            return Some(
+                parse_inchi(q)
+                    .map(|mut m| {
+                        clean_2d(&mut m);
+                        Self::mol_with_cip_to_scene(m)
+                    })
+                    .map_err(|e| format!("InChI parse error: {e}")),
+            );
+        }
+
+        // 3. Biopolymer HELM / peptide 3-letter notation (`PEPTIDE1{...}` or `H-Ala-Pro-OH`)
+        if q.starts_with("PEPTIDE") || q.starts_with("RNA") || q.starts_with("DNA") {
+            if let Ok(mut m) = parse_biopolymer_sequence(q) {
+                clean_2d(&mut m);
+                return Some(Ok(Self::mol_with_cip_to_scene(m)));
+            }
+        }
+
+        // 4. Offline IUPAC / common chemical name (`aspirin`, `ibuprofen`, `bicyclo[2.2.1]hept-2-ene`, `(2S)-2-aminopropanoic acid`, ...)
+        if let Ok(amol) = iupac_name_to_mol(q) {
+            let smi = amol.to_smiles();
+            if let Ok(mut m) = parse_smiles(&smi) {
+                clean_2d(&mut m);
+                return Some(Ok(Self::mol_with_cip_to_scene(m)));
+            }
+        }
+
+        // 5. SMILES (`CC(=O)Oc1ccccc1C(=O)O`)
+        if let Ok(mut m) = parse_smiles(q) {
+            clean_2d(&mut m);
+            return Some(Ok(Self::mol_with_cip_to_scene(m)));
+        }
+
+        // 6. Condensed structural formula (`CH3CH2OH`, `(CH3)3COH`, `PhCOOH`) or peptide (`Ala-Pro-Tyr`)
+        if let Ok(mut m) = parse_condensed_formula(q) {
+            clean_2d(&mut m);
+            return Some(Ok(Self::mol_with_cip_to_scene(m)));
+        }
+        if q.contains('-') {
+            if let Ok(m) = build_peptide_2d(q) {
+                return Some(Ok(Self::mol_with_cip_to_scene(m)));
+            }
+        }
+
+        None
+    }
+
+    fn scene_to_name_and_smiles(&self, scene: &RenderScene) -> Option<(String, String)> {
+        if scene.atoms.is_empty() {
+            return Some((String::new(), String::new()));
+        }
+        let mut mol = Molecule::from(scene);
+        let _ = expand_abbreviations(&mut mol);
+        let smiles = if !scene.reaction_arrows.is_empty() {
+            let doc = ChemDocument::from(scene);
+            let rxn = write_reaction_smiles(&doc);
+            if rxn.is_empty() {
+                write_canonical_smiles(&mol)
+            } else {
+                rxn
+            }
+        } else {
+            write_canonical_smiles(&mol)
+        };
+        let amol = AnalytMol::from(&mol);
+        let name = mol_to_iupac_name(&amol).unwrap_or_else(|_| {
+            compute_phys_chem_props(&amol)
+                .map(|p| p.formula)
+                .unwrap_or_else(|_| smiles.clone())
+        });
+        Some((name, smiles))
+    }
+
+    fn compute_properties(&self, scene: &RenderScene) -> Option<MolecularPropertiesSummary> {
+        if scene.atoms.is_empty() {
+            return Some(MolecularPropertiesSummary::default());
+        }
+        let mut mol = Molecule::from(scene);
+        let _ = expand_abbreviations(&mut mol);
+        let rings = perceive_sssr(&mol).len();
+        let amol = AnalytMol::from(&mol);
+        let props = compute_phys_chem_props(&amol).ok()?;
+        let heavy_atoms = amol.atoms.iter().filter(|a| a.element != "H").count();
+        Some(MolecularPropertiesSummary {
+            formula_hill: props.formula,
+            molecular_weight: props.molecular_weight,
+            exact_mass: props.monoisotopic_mass,
+            elemental_analysis: props.elemental_analysis_text,
+            heavy_atoms,
+            rings,
+            h_bond_donors: props.h_bond_donors,
+            h_bond_acceptors: props.h_bond_acceptors,
+        })
+    }
+
+    fn predict_nmr_1h_13c(
+        &self,
+        scene: &RenderScene,
+        _freq_mhz: f64,
+    ) -> Option<(Vec<SpectrumSignal1D>, Vec<SpectrumSignal1D>)> {
+        if scene.atoms.is_empty() {
+            return Some((Vec::new(), Vec::new()));
+        }
+        let raw_mol = Molecule::from(scene);
+        let has_abbrevs = raw_mol.atoms.iter().any(|a| a.superatom_label.is_some());
+        let mol = if has_abbrevs {
+            let mut m = raw_mol;
+            let _ = expand_abbreviations(&mut m);
+            m
+        } else {
+            raw_mol
+        };
+        let amol = AnalytMol::from(&mol);
+
+        let pred_h = predict_nmr(&amol, NmrNucleus::H1, Some("CDCl3"), None);
+        let pred_c = predict_nmr(&amol, NmrNucleus::C13, Some("CDCl3"), None);
+
+        let n_scene_atoms = scene.atoms.len();
+        let sigs_1h = pred_h
+            .signals
+            .into_iter()
+            .map(|s| {
+                let mult = s.multiplicity();
+                let mut couplings_hz = Vec::new();
+                for c in &s.couplings {
+                    for _ in 0..c.count.min(12) {
+                        couplings_hz.push(c.j_hz);
+                    }
+                }
+                let atom_indices: Vec<usize> = if has_abbrevs {
+                    Vec::new()
+                } else {
+                    s.atoms.into_iter().filter(|&i| i < n_scene_atoms).collect()
+                };
+                SpectrumSignal1D {
+                    ppm: s.shift_ppm,
+                    multiplicity: mult,
+                    couplings_hz,
+                    integral: s.nuclei as f64,
+                    atom_indices,
+                    assignment_label: Some(format!("{}H", s.nuclei)),
+                }
+            })
+            .collect();
+
+        let sigs_13c = pred_c
+            .signals
+            .into_iter()
+            .map(|s| {
+                let atom_indices: Vec<usize> = if has_abbrevs {
+                    Vec::new()
+                } else {
+                    s.atoms.into_iter().filter(|&i| i < n_scene_atoms).collect()
+                };
+                SpectrumSignal1D {
+                    ppm: s.shift_ppm,
+                    multiplicity: "s".to_string(),
+                    couplings_hz: Vec::new(),
+                    integral: s.nuclei as f64,
+                    atom_indices,
+                    assignment_label: Some(format!("{}C", s.nuclei)),
+                }
+            })
+            .collect();
+
+        Some((sigs_1h, sigs_13c))
+    }
+
+    fn export_custom(
+        &self,
+        scene: &RenderScene,
+        style: &DocumentStyle,
+        format: IoFormat,
+    ) -> Option<Result<String, String>> {
+        match format {
+            IoFormat::Cdxml => {
+                let doc = ChemDocument::from(scene);
+                Some(Ok(write_cdxml(&doc)))
+            }
+            IoFormat::CdxHex => {
+                let doc = ChemDocument::from(scene);
+                let bytes = write_cdx(&doc);
+                Some(Ok(Self::encode_hex_pretty(&bytes)))
+            }
+            IoFormat::OctJson => {
+                let doc = ChemDocument::from(scene);
+                Some(write_oct(&doc).map_err(|e| format!("OCT JSON export error: {e}")))
+            }
+            IoFormat::MolV2000 => {
+                let mut mol = Molecule::from(scene);
+                let _ = expand_abbreviations(&mut mol);
+                Some(write_mol_v2000(&mol).map_err(|e| format!("MOL V2000 export error: {e}")))
+            }
+            IoFormat::Sdf => {
+                let mut mol = Molecule::from(scene);
+                let _ = expand_abbreviations(&mut mol);
+                let amol = AnalytMol::from(&mol);
+                let mut props = BTreeMap::new();
+                if let Ok(pin) = mol_to_iupac_name(&amol) {
+                    props.insert("IUPAC_NAME".to_string(), pin);
+                }
+                props.insert("SMILES".to_string(), write_canonical_smiles(&mol));
+                props.insert("INCHIKEY".to_string(), write_inchikey(&mol));
+                if let Ok(pc) = compute_phys_chem_props(&amol) {
+                    props.insert("FORMULA".to_string(), pc.formula);
+                    props.insert(
+                        "EXACT_MASS".to_string(),
+                        format!("{:.5}", pc.monoisotopic_mass),
+                    );
+                }
+                Some(Ok(write_sdf(&[SdfRecord {
+                    molecule: mol,
+                    properties: props,
+                }])))
+            }
+            IoFormat::Smiles => {
+                let mut mol = Molecule::from(scene);
+                let _ = expand_abbreviations(&mut mol);
+                if !scene.reaction_arrows.is_empty() {
+                    let doc = ChemDocument::from(scene);
+                    let rxn = write_reaction_smiles(&doc);
+                    if !rxn.is_empty() {
+                        return Some(Ok(rxn));
+                    }
+                }
+                Some(Ok(write_canonical_smiles(&mol)))
+            }
+            IoFormat::InChI => {
+                let mut mol = Molecule::from(scene);
+                let _ = expand_abbreviations(&mut mol);
+                let inchi = write_inchi(&mol);
+                let key = write_inchikey(&mol);
+                Some(Ok(format!("{inchi}\nInChIKey={key}")))
+            }
+            IoFormat::JcampDx => {
+                let mut mol = Molecule::from(scene);
+                let _ = expand_abbreviations(&mut mol);
+                let amol = AnalytMol::from(&mol);
+                let pred = predict_nmr(&amol, NmrNucleus::H1, Some("CDCl3"), None);
+                let spec = synthesize_1d_nmr(&pred, &Synthesize1dOptions::default());
+                Some(Ok(write_jcamp_nmr(&spec, JcampCompression::Affn)))
+            }
+            IoFormat::Svg => Some(Ok(render_scene_svg(scene, style))),
+            IoFormat::Pdf | IoFormat::Png => None,
+        }
+    }
+
+    fn import_custom(&self, format: IoFormat, input: &str) -> Option<Result<RenderScene, String>> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Some(Err("Input buffer is empty".to_string()));
+        }
+        match format {
+            IoFormat::Cdxml => Some(
+                read_cdxml(trimmed)
+                    .map(|doc| {
+                        let mut sc = RenderScene::from(&doc);
+                        let [cx, cy] = sc.atom_centroid();
+                        sc.translate(-cx, -cy);
+                        sc
+                    })
+                    .map_err(|e| format!("CDXML import error: {e}")),
+            ),
+            IoFormat::CdxHex => Some(
+                Self::decode_hex_bytes(trimmed)
+                    .and_then(|bytes| {
+                        read_cdx(&bytes).map_err(|e| format!("CDX binary error: {e}"))
+                    })
+                    .map(|doc| {
+                        let mut sc = RenderScene::from(&doc);
+                        let [cx, cy] = sc.atom_centroid();
+                        sc.translate(-cx, -cy);
+                        sc
+                    }),
+            ),
+            IoFormat::OctJson => Some(
+                read_oct(trimmed)
+                    .map(|doc| {
+                        let mut sc = RenderScene::from(&doc);
+                        let [cx, cy] = sc.atom_centroid();
+                        sc.translate(-cx, -cy);
+                        sc
+                    })
+                    .map_err(|e| format!("OCT JSON import error: {e}")),
+            ),
+            IoFormat::MolV2000 => Some(
+                read_mol(trimmed)
+                    .map(Self::mol_with_cip_to_scene)
+                    .map_err(|e| format!("MOL import error: {e}")),
+            ),
+            IoFormat::Sdf => Some(
+                read_sdf(trimmed)
+                    .map_err(|e| format!("SDF import error: {e}"))
+                    .and_then(|recs| {
+                        recs.into_iter()
+                            .next()
+                            .map(|r| Self::mol_with_cip_to_scene(r.molecule))
+                            .ok_or_else(|| "SDF contains no molecule records".to_string())
+                    }),
+            ),
+            IoFormat::Smiles => self.name_or_smiles_to_scene(
+                trimmed
+                    .lines()
+                    .next()
+                    .unwrap_or(trimmed)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(trimmed),
+            ),
+            IoFormat::InChI => {
+                let inchi_line = trimmed
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.starts_with("InChI="))
+                    .unwrap_or(trimmed);
+                Some(
+                    parse_inchi(inchi_line)
+                        .map(|mut m| {
+                            clean_2d(&mut m);
+                            Self::mol_with_cip_to_scene(m)
+                        })
+                        .map_err(|e| format!("InChI import error: {e}")),
+                )
+            }
+            IoFormat::JcampDx => {
+                let blocks = match read_jcamp(trimmed) {
+                    Ok(b) if !b.is_empty() => b,
+                    Ok(_) => return Some(Err("No spectrum blocks found in JCAMP-DX".to_string())),
+                    Err(e) => return Some(Err(format!("JCAMP-DX import error: {e}"))),
+                };
+                let sp = &blocks[0];
+                let picked = pick_1d_multiplets(sp, 0.04, 22.0, None);
+                let signals: Vec<SpectrumSignal1D> = picked
+                    .into_iter()
+                    .map(|m| SpectrumSignal1D {
+                        ppm: m.center_ppm,
+                        multiplicity: m.estimated_multiplicity,
+                        couplings_hz: m.estimated_j_hz.into_iter().collect(),
+                        integral: m.normalized_integral.max(0.5),
+                        atom_indices: Vec::new(),
+                        assignment_label: None,
+                    })
+                    .collect();
+                let n_pts = sp.y.len();
+                let mut custom_trace = Vec::with_capacity(n_pts.min(2048));
+                let max_y =
+                    sp.y.iter()
+                        .copied()
+                        .fold(0.0_f64, |acc, v| acc.max(v.abs()))
+                        .max(1e-9);
+                let step = (n_pts / 2048).max(1);
+                for idx in (0..n_pts).step_by(step) {
+                    custom_trace.push([sp.x_at(idx), sp.y[idx] / max_y]);
+                }
+                let ppm_min = sp.first_x.min(sp.last_x);
+                let ppm_max = sp.first_x.max(sp.last_x);
+                let mut scene = RenderScene::new();
+                scene.spectra_1d.push(SceneSpectrum1D {
+                    origin: [-5.5, -2.0],
+                    width_mol: 11.0,
+                    height_mol: 4.0,
+                    nucleus: sp.nucleus.clone().unwrap_or_else(|| "1H".to_string()),
+                    spectrometer_mhz: sp.mhz.unwrap_or(400.0).max(60.0),
+                    ppm_min: if ppm_min.is_finite() { ppm_min } else { -0.5 },
+                    ppm_max: if ppm_max.is_finite() { ppm_max } else { 11.0 },
+                    linewidth_hz: 1.4,
+                    show_integrals: !signals.is_empty(),
+                    show_peak_labels: true,
+                    title: Some(if sp.title.is_empty() {
+                        "Imported JCAMP-DX 1D NMR".to_string()
+                    } else {
+                        sp.title.clone()
+                    }),
+                    signals,
+                    custom_trace,
+                });
+                Some(Ok(scene))
+            }
+            _ => None,
+        }
+    }
+}
+
 struct NmrWorkbenchApp {
+    workspace_mode: WorkspaceMode,
+    octet_app: OctetDrawPanel,
+    #[cfg(not(target_arch = "wasm32"))]
     gpu_engine: Option<GpuEngine>,
+    adapter_label: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
     use_gpu: bool,
+    use_neural_picker: bool,
     status_msg: String,
     last_solve_ms: Option<f64>,
 
@@ -105,11 +752,18 @@ struct NmrWorkbenchApp {
     sim_seed: u64,
     picker_snr: f32,
 
-    // Selection & File I/O inputs
+    // Selection & File / In-Memory Text I/O
     selected_ss: Option<usize>,
     selected_res: Option<usize>,
+    #[cfg(not(target_arch = "wasm32"))]
     path_input: String,
+    #[cfg(not(target_arch = "wasm32"))]
     export_prefix: String,
+    show_text_io_modal: bool,
+    paste_text_buf: String,
+    export_text_buf: String,
+    #[cfg(target_arch = "wasm32")]
+    pending_dropped_text: Arc<std::sync::Mutex<Option<(String, String)>>>,
 }
 
 impl NmrWorkbenchApp {
@@ -121,26 +775,50 @@ impl NmrWorkbenchApp {
         style.visuals.window_fill = egui::Color32::from_rgb(20, 25, 35);
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mut gpu_engine = None;
+        let mut adapter_label = None;
+
         if let Some(rs) = &cc.wgpu_render_state {
             let contour_res = ContourPipelineResource::new(&rs.device, rs.target_format);
-            rs.renderer
-                .write()
-                .callback_resources
-                .insert(contour_res);
+            rs.renderer.write().callback_resources.insert(contour_res);
 
             let info = rs.adapter.get_info();
-            gpu_engine = Some(GpuEngine::from_device(
-                rs.device.clone(),
-                rs.queue.clone(),
-                info.name.clone(),
-                format!("{:?}", info.backend),
-            ));
+            let name = if info.name.trim().is_empty() {
+                "WebGPU Adapter".to_string()
+            } else {
+                info.name.clone()
+            };
+            adapter_label = Some(format!("{} ({:?})", name, info.backend));
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                gpu_engine = Some(GpuEngine::from_device(
+                    rs.device.clone(),
+                    rs.queue.clone(),
+                    info.name.clone(),
+                    format!("{:?}", info.backend),
+                ));
+            }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let default_replicas = 64;
+        #[cfg(target_arch = "wasm32")]
+        let default_replicas = 16;
+
+        let mut octet_app = OctetDrawPanel::new();
+        octet_app.set_backend_adapter(Box::new(CoreOctetBackendAdapter));
+
         let mut app = Self {
+            workspace_mode: WorkspaceMode::ProteinNmr,
+            octet_app,
+            #[cfg(not(target_arch = "wasm32"))]
             use_gpu: gpu_engine.is_some(),
+            #[cfg(not(target_arch = "wasm32"))]
             gpu_engine,
+            use_neural_picker: true,
+            adapter_label,
             status_msg: String::new(),
             last_solve_ms: None,
             priors: Priors::provisional(),
@@ -169,7 +847,7 @@ impl NmrWorkbenchApp {
             contour_levels: 10,
             show_negative: true,
             show_peak_labels: true,
-            replicas: 64,
+            replicas: default_replicas,
             steps_per_sys: 1500,
             assign_cost: 0.0,
             sim_missing: 0.06,
@@ -178,8 +856,15 @@ impl NmrWorkbenchApp {
             picker_snr: 5.0,
             selected_ss: None,
             selected_res: None,
+            #[cfg(not(target_arch = "wasm32"))]
             path_input: "data/fixtures/synthetic_ubiquitin.str".to_string(),
+            #[cfg(not(target_arch = "wasm32"))]
             export_prefix: "result_gui".to_string(),
+            show_text_io_modal: false,
+            paste_text_buf: String::new(),
+            export_text_buf: String::new(),
+            #[cfg(target_arch = "wasm32")]
+            pending_dropped_text: Arc::new(std::sync::Mutex::new(None)),
         };
 
         app.load_demo_and_solve();
@@ -197,6 +882,21 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn compute_matrices(&self, sys: &[SpinSystem], scfg: &ScoreConfig) -> (Matrix2D, Matrix2D) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.use_gpu {
+            if let Some(gpu) = &self.gpu_engine {
+                if let Ok(pair) = gpu.score_matrices_gpu(sys, &self.sequence, &self.priors, scfg) {
+                    return pair;
+                }
+            }
+        }
+        (
+            unary_matrix(sys, &self.sequence, &self.priors, scfg),
+            pair_matrix(sys, scfg),
+        )
+    }
+
     fn rebuild_systems_and_matrices(&mut self) {
         match build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
             Ok(sys) => {
@@ -204,27 +904,7 @@ impl NmrWorkbenchApp {
                     assign_cost: self.assign_cost,
                     ..ScoreConfig::default()
                 };
-                let (u, p) = if self.use_gpu {
-                    if let Some(gpu) = &self.gpu_engine {
-                        gpu.score_matrices_gpu(&sys, &self.sequence, &self.priors, &scfg)
-                            .unwrap_or_else(|_| {
-                                (
-                                    unary_matrix(&sys, &self.sequence, &self.priors, &scfg),
-                                    pair_matrix(&sys, &scfg),
-                                )
-                            })
-                    } else {
-                        (
-                            unary_matrix(&sys, &self.sequence, &self.priors, &scfg),
-                            pair_matrix(&sys, &scfg),
-                        )
-                    }
-                } else {
-                    (
-                        unary_matrix(&sys, &self.sequence, &self.priors, &scfg),
-                        pair_matrix(&sys, &scfg),
-                    )
-                };
+                let (u, p) = self.compute_matrices(&sys, &scfg);
                 self.u_mat = Some(u);
                 self.p_mat = Some(p);
                 self.systems = sys;
@@ -270,6 +950,8 @@ impl NmrWorkbenchApp {
         );
         self.sequence = ref_data.sequence.clone();
         self.seq_ids = ref_data.seq_ids.clone();
+        self.octet_app
+            .set_loaded_protein_sequence(self.sequence.clone());
         self.reference = Some(ref_data);
         self.peaks = peaks;
         self.truth = Some(truth);
@@ -303,23 +985,27 @@ impl NmrWorkbenchApp {
             ..AnnealConfig::default()
         };
 
-        let t0 = Instant::now();
-        let res_opt = if self.use_gpu {
+        let timer = PerfTimer::start();
+        #[allow(unused_mut)]
+        let mut res_opt: Option<(AssignResult, &'static str)> = None;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.use_gpu {
             if let Some(gpu) = &self.gpu_engine {
                 match gpu.assign_gpu(&self.systems, &self.sequence, &self.priors, &scfg, &acfg) {
-                    Ok(r) => Some((r, "WebGPU")),
+                    Ok(r) => res_opt = Some((r, "WebGPU")),
                     Err(e) => {
                         self.status_msg = format!("GPU solver error ({e}), falling back to CPU");
-                        None
                     }
                 }
-            } else {
-                None
             }
-        } else {
-            None
-        };
+        }
 
+        let default_tag = if cfg!(target_arch = "wasm32") {
+            "WASM"
+        } else {
+            "CPU-MT"
+        };
         let (res, engine_tag) = res_opt.unwrap_or_else(|| {
             let u = unary_matrix(&self.systems, &self.sequence, &self.priors, &scfg);
             let p = self
@@ -327,10 +1013,10 @@ impl NmrWorkbenchApp {
                 .clone()
                 .unwrap_or_else(|| pair_matrix(&self.systems, &scfg));
             self.u_mat = Some(u.clone());
-            (assign_from_matrices(&u, &p, &acfg), "CPU-MT")
+            (assign_from_matrices(&u, &p, &acfg), default_tag)
         });
 
-        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let dt_ms = timer.elapsed_ms();
         self.last_solve_ms = Some(dt_ms);
 
         let (pred, conf) = to_reference(
@@ -368,6 +1054,126 @@ impl NmrWorkbenchApp {
         self.assign_res = Some(res);
     }
 
+    fn load_text_in_memory(&mut self, text: &str, source_label: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            self.status_msg =
+                "Paste NMR-STAR (.str), NEF (.nef), Peak TSV (.tsv), CDXML, MOL, or SMILES first"
+                    .to_string();
+            return;
+        }
+        let lower_label = source_label.to_ascii_lowercase();
+
+        // Check chemical structure formats first (`CDXML`, `OCT`, `MOL`/`SDF`, `InChI`, `.smi`)
+        if trimmed.contains("<CDXML")
+            || lower_label.ends_with(".cdxml")
+            || lower_label.ends_with(".oct")
+            || lower_label.ends_with(".mol")
+            || lower_label.ends_with(".sdf")
+            || lower_label.ends_with(".smi")
+            || trimmed.contains("V2000")
+            || trimmed.contains("V3000")
+            || trimmed.starts_with("InChI=")
+        {
+            let fmt = if trimmed.contains("<CDXML") || lower_label.ends_with(".cdxml") {
+                IoFormat::Cdxml
+            } else if lower_label.ends_with(".oct") || trimmed.starts_with('{') {
+                IoFormat::OctJson
+            } else if lower_label.ends_with(".sdf") || trimmed.contains("$$$$") {
+                IoFormat::Sdf
+            } else if trimmed.starts_with("InChI=") {
+                IoFormat::InChI
+            } else if trimmed.contains("V2000")
+                || trimmed.contains("V3000")
+                || lower_label.ends_with(".mol")
+            {
+                IoFormat::MolV2000
+            } else {
+                IoFormat::Smiles
+            };
+            if let Some(res) = CoreOctetBackendAdapter.import_custom(fmt, trimmed) {
+                match res {
+                    Ok(sc) => {
+                        self.octet_app.set_scene(sc);
+                        self.workspace_mode = WorkspaceMode::OctetChem;
+                        self.octet_app.status_msg =
+                            format!("Loaded {} from {source_label}", fmt.label());
+                        self.status_msg = format!("Loaded {} into Octet Studio", fmt.label());
+                    }
+                    Err(e) => self.status_msg = format!("Chemical file parse error: {e}"),
+                }
+                return;
+            }
+        }
+
+        // Check NEF v1.1 (`data_nef_...` or `save_nef_molecular_system`)
+        if lower_label.ends_with(".nef")
+            || trimmed.contains("save_nef_molecular_system")
+            || trimmed.starts_with("data_nef_")
+        {
+            match read_nef_str(trimmed) {
+                Ok(doc) => match doc.to_reference() {
+                    Ok(r) => {
+                        let nef_pks = doc.to_peaks();
+                        self.sequence = r.sequence.clone();
+                        self.seq_ids = r.seq_ids.clone();
+                        self.octet_app
+                            .set_loaded_protein_sequence(self.sequence.clone());
+                        self.reference = Some(r.clone());
+                        if !nef_pks.is_empty() {
+                            self.peaks = nef_pks;
+                            self.truth = None;
+                            self.metrics = None;
+                            self.regenerate_synthetic_spectra();
+                            self.rebuild_systems_and_matrices();
+                            self.run_assignment();
+                        } else {
+                            self.load_from_reference(r);
+                            self.run_assignment();
+                        }
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    }
+                    Err(e) => self.status_msg = format!("NEF molecular system error: {e}"),
+                },
+                Err(e) => self.status_msg = format!("NEF parse error ({source_label}): {e}"),
+            }
+            return;
+        }
+
+        let looks_like_star = trimmed.contains("loop_")
+            || trimmed.contains("_Atom_chem_shift")
+            || trimmed.contains("_Chem_shift_value")
+            || trimmed.starts_with("data_");
+
+        if looks_like_star {
+            match read_star_str(trimmed, None) {
+                Ok(r) => {
+                    self.load_from_reference(r);
+                    self.run_assignment();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                }
+                Err(e) => self.status_msg = format!("NMR-STAR parse error ({source_label}): {e}"),
+            }
+        } else {
+            match read_peaks_str(trimmed) {
+                Ok(pks) => {
+                    self.peaks = pks;
+                    self.truth = None;
+                    self.metrics = None;
+                    self.regenerate_synthetic_spectra();
+                    self.rebuild_systems_and_matrices();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.status_msg = format!(
+                        "Loaded {} peaks in memory from {source_label}",
+                        self.peaks.len()
+                    );
+                }
+                Err(e) => self.status_msg = format!("Peak TSV parse error ({source_label}): {e}"),
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_path_auto(&mut self) {
         let path_str = self.path_input.trim().to_string();
         let p = Path::new(&path_str);
@@ -376,13 +1182,18 @@ impl NmrWorkbenchApp {
             return;
         }
         if p.is_dir() || p.file_name().and_then(|s| s.to_str()) == Some("2rr") {
-            let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+            let dir = if p.is_dir() {
+                p
+            } else {
+                p.parent().unwrap_or(p)
+            };
             match read_bruker_pdata_2d(dir) {
                 Ok(spec) => {
                     self.hsqc_arc = Arc::new(spec.data.clone());
                     self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
                     self.hsqc_spec = Some(spec);
                     self.reset_view_to_spec();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg = format!("Loaded Bruker 2D pdata from {}", dir.display());
                 }
                 Err(e) => self.status_msg = format!("Bruker load error: {e}"),
@@ -397,8 +1208,15 @@ impl NmrWorkbenchApp {
             .to_ascii_lowercase();
         match ext.as_str() {
             "str" | "star" => match read_star(p, None) {
-                Ok(r) => self.load_from_reference(r),
+                Ok(r) => {
+                    self.load_from_reference(r);
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                }
                 Err(e) => self.status_msg = format!("NMR-STAR error: {e}"),
+            },
+            "nef" => match std::fs::read_to_string(p) {
+                Ok(txt) => self.load_text_in_memory(&txt, &p.display().to_string()),
+                Err(e) => self.status_msg = format!("NEF read error: {e}"),
             },
             "tsv" => match read_peaks(p) {
                 Ok(pks) => {
@@ -407,6 +1225,7 @@ impl NmrWorkbenchApp {
                     self.metrics = None;
                     self.regenerate_synthetic_spectra();
                     self.rebuild_systems_and_matrices();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg =
                         format!("Loaded {} peaks from {}", self.peaks.len(), p.display());
                 }
@@ -418,13 +1237,57 @@ impl NmrWorkbenchApp {
                     self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
                     self.hsqc_spec = Some(spec);
                     self.reset_view_to_spec();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg = format!("Loaded NMRPipe 2D spectrum {}", p.display());
                 }
                 Err(e) => self.status_msg = format!("NMRPipe load error: {e}"),
             },
+            "cdx" => match std::fs::read(p) {
+                Ok(bytes) => match read_cdx(&bytes) {
+                    Ok(doc) => {
+                        let mut sc = RenderScene::from(&doc);
+                        let [cx, cy] = sc.atom_centroid();
+                        sc.translate(-cx, -cy);
+                        self.octet_app.set_scene(sc);
+                        self.workspace_mode = WorkspaceMode::OctetChem;
+                        self.octet_app.status_msg =
+                            format!("Loaded binary ChemDraw CDX {}", p.display());
+                        self.status_msg = format!("Loaded binary CDX {}", p.display());
+                    }
+                    Err(e) => self.status_msg = format!("CDX parse error: {e}"),
+                },
+                Err(e) => self.status_msg = format!("CDX read error: {e}"),
+            },
+            "cdxml" | "oct" | "mol" | "sdf" | "smi" | "jdx" | "dx" => {
+                match std::fs::read_to_string(p) {
+                    Ok(txt) => {
+                        let fmt = match ext.as_str() {
+                            "cdxml" => IoFormat::Cdxml,
+                            "oct" => IoFormat::OctJson,
+                            "mol" => IoFormat::MolV2000,
+                            "sdf" => IoFormat::Sdf,
+                            "jdx" | "dx" => IoFormat::JcampDx,
+                            _ => IoFormat::Smiles,
+                        };
+                        if let Some(res) = CoreOctetBackendAdapter.import_custom(fmt, &txt) {
+                            match res {
+                                Ok(sc) => {
+                                    self.octet_app.set_scene(sc);
+                                    self.workspace_mode = WorkspaceMode::OctetChem;
+                                    self.octet_app.status_msg =
+                                        format!("Loaded {} from {}", fmt.label(), p.display());
+                                    self.status_msg = format!("Loaded {}", p.display());
+                                }
+                                Err(e) => self.status_msg = format!("Import error: {e}"),
+                            }
+                        }
+                    }
+                    Err(e) => self.status_msg = format!("File read error: {e}"),
+                }
+            }
             _ => {
                 self.status_msg = format!(
-                    "Unrecognized file extension .{ext} (expected .str, .tsv, .ft2, or Bruker pdata dir)"
+                    "Unrecognized file extension .{ext} (expected .str, .nef, .tsv, .ft2, pdata, .cdxml, .cdx, .oct, .mol, .sdf, .smi, .jdx)"
                 );
             }
         }
@@ -435,13 +1298,29 @@ impl NmrWorkbenchApp {
             self.status_msg = "No 2D HSQC spectrum loaded".to_string();
             return;
         };
-        let picked = pick_hsqc_2d(
-            spec,
-            &PickerConfig {
-                snr_threshold: self.picker_snr,
-                ..PickerConfig::default()
-            },
-        );
+        let (picked, method_label) = if self.use_neural_picker {
+            (
+                pick_hsqc_2d_neural(
+                    spec,
+                    &NeuralPickerConfig {
+                        prob_threshold: (0.25 + 0.035 * (self.picker_snr - 3.0)).clamp(0.20, 0.85),
+                        ..NeuralPickerConfig::default()
+                    },
+                ),
+                "Neural 2D CNN picker",
+            )
+        } else {
+            (
+                pick_hsqc_2d(
+                    spec,
+                    &PickerConfig {
+                        snr_threshold: self.picker_snr,
+                        ..PickerConfig::default()
+                    },
+                ),
+                "Classical picker",
+            )
+        };
         let n_picked = picked.len();
         // Keep existing triple-resonance peaks while replacing HSQC roots
         let mut combined = picked;
@@ -451,25 +1330,12 @@ impl NmrWorkbenchApp {
         self.metrics = None;
         self.rebuild_systems_and_matrices();
         self.status_msg = format!(
-            "Classical picker found {} HSQC roots (SNR >= {:.1}) -> rebuilt {} spin systems",
-            n_picked,
-            self.picker_snr,
+            "{method_label} found {n_picked} HSQC roots -> rebuilt {} spin systems",
             self.systems.len()
         );
     }
 
-    fn export_results(&mut self) {
-        let Some(pred) = &self.pred_ref else {
-            self.status_msg = "Run assignment first before exporting".to_string();
-            return;
-        };
-        let prefix = Path::new(self.export_prefix.trim());
-        let str_p = prefix.with_extension("str");
-        let tsv_p = prefix.with_extension("tsv");
-        if let Err(e) = write_star(&str_p, pred, Some(&self.pred_conf)) {
-            self.status_msg = format!("Export failed: {e}");
-            return;
-        }
+    fn format_shifts_tsv(&self, pred: &Reference) -> String {
         let mut rows = vec!["seq_id\tresidue\tatom\tshift\tconfidence".to_string()];
         for (&(k, ref atom), &v) in &pred.shifts {
             let c = self.pred_conf.get(&k).copied().unwrap_or(0.0);
@@ -478,40 +1344,223 @@ impl NmrWorkbenchApp {
                 self.seq_ids[k], self.sequence[k], atom, v, c
             ));
         }
-        let _ = std::fs::write(&tsv_p, rows.join("\n") + "\n");
-        self.status_msg = format!("Exported {} and {}", str_p.display(), tsv_p.display());
+        rows.join("\n") + "\n"
     }
 
-    fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
+    fn export_results(&mut self, ctx: &egui::Context) {
+        let Some(pred) = &self.pred_ref else {
+            self.status_msg = "Run assignment first before exporting".to_string();
+            return;
+        };
+        let tsv_text = self.format_shifts_tsv(pred);
+        let star_text = format_star_in_memory(pred, Some(&self.pred_conf));
+        self.export_text_buf =
+            format!("# --- NMR-STAR v3 ---\n{star_text}\n# --- Shifts TSV ---\n{tsv_text}");
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = ctx;
+            let prefix = Path::new(self.export_prefix.trim());
+            let str_p = prefix.with_extension("str");
+            let tsv_p = prefix.with_extension("tsv");
+            if let Err(e) = write_star(&str_p, pred, Some(&self.pred_conf)) {
+                self.status_msg = format!("Export failed: {e}");
+                return;
+            }
+            let _ = std::fs::write(&tsv_p, &tsv_text);
+            self.status_msg = format!("Exported {} and {}", str_p.display(), tsv_p.display());
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            ctx.copy_text(star_text);
+            self.show_text_io_modal = true;
+            self.status_msg =
+                "Exported NMR-STAR v3 + TSV in memory (NMR-STAR copied to clipboard)".to_string();
+        }
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let ready = self
+                .pending_dropped_text
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take());
+            if let Some((text, label)) = ready {
+                self.load_text_in_memory(&text, &label);
+            }
+        }
+
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(file) = dropped.into_iter().next() {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = ctx;
+                let p = file.path();
+                if p.exists() {
+                    self.path_input = p.display().to_string();
+                    self.load_path_auto();
+                } else if let Ok(bytes) = file.bytes() {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let label = p.display().to_string();
+                    self.load_text_in_memory(&text, &label);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let slot = Arc::clone(&self.pending_dropped_text);
+                let egui_ctx = ctx.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let label = file.path().display().to_string();
+                    if let Ok(bytes) = file.bytes_async().await {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some((text, label));
+                        }
+                        egui_ctx.request_repaint();
+                    }
+                });
+            }
+        }
+    }
+
+    fn draw_text_io_window(&mut self, ctx: &egui::Context) {
+        if !self.show_text_io_modal {
+            return;
+        }
+        let mut open = self.show_text_io_modal;
+        egui::Window::new("Paste / In-Memory NMR-STAR & Peak TSV")
+            .open(&mut open)
+            .default_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Paste an NMR-STAR (.str) entry or TSV peak list below (or drag & drop a .str/.tsv file onto the canvas):",
+                    )
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.small_button("Fill Synthetic Ubiquitin .str").clicked() {
+                        self.paste_text_buf = SYNTHETIC_UBIQUITIN_STR.to_string();
+                    }
+                    if ui.small_button("Load Pasted Text & Solve").clicked() {
+                        let buf = self.paste_text_buf.clone();
+                        self.load_text_in_memory(&buf, "pasted text");
+                    }
+                    if ui.small_button("Clear").clicked() {
+                        self.paste_text_buf.clear();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("paste_text_scroll")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.paste_text_buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(8)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+
+                if !self.export_text_buf.is_empty() {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Exported NMR-STAR / TSV:").small().strong());
+                        if ui.small_button("Copy All to Clipboard").clicked() {
+                            ui.ctx().copy_text(self.export_text_buf.clone());
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .id_salt("export_text_scroll")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            let mut preview = self.export_text_buf.as_str();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut preview)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_rows(8)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                }
+            });
+        self.show_text_io_modal = open;
+    }
+
+    fn draw_workspace_mode_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.heading(
                 egui::RichText::new("nmr-assign")
                     .strong()
                     .color(egui::Color32::from_rgb(110, 220, 255)),
             );
-            if let Some(gpu) = &self.gpu_engine {
+            if let Some(label) = &self.adapter_label {
                 ui.label(
-                    egui::RichText::new(format!("⚡ {} ({})", gpu.adapter_name, gpu.backend_name))
+                    egui::RichText::new(format!("⚡ {label}"))
                         .small()
                         .color(egui::Color32::from_rgb(130, 230, 175)),
                 );
             }
             ui.separator();
 
+            ui.selectable_value(
+                &mut self.workspace_mode,
+                WorkspaceMode::ProteinNmr,
+                egui::RichText::new("🧬 Protein NMR & 3D Strips").strong(),
+            );
+            ui.selectable_value(
+                &mut self.workspace_mode,
+                WorkspaceMode::OctetChem,
+                egui::RichText::new("⚗️ Octet Chemical Draw & 1D NMR").strong(),
+            );
+
+            if self.workspace_mode == WorkspaceMode::OctetChem {
+                ui.separator();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    ui.label("Path:");
+                    ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(185.0));
+                    if ui.button("📂 Load (.cdxml/.cdx/.mol/.sdf/.jdx)").clicked() {
+                        self.load_path_auto();
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(&self.octet_app.status_msg)
+                        .small()
+                        .color(egui::Color32::from_rgb(190, 210, 235)),
+                );
+            }
+        });
+    }
+
+    fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("🧬 Ubiquitin Demo").clicked() {
                 self.load_demo_and_solve();
             }
 
-            ui.label("Path:");
-            ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(210.0));
-            if ui
-                .button("📂 Load (.str / .tsv / pdata / .ft2)")
-                .clicked()
+            #[cfg(not(target_arch = "wasm32"))]
             {
-                self.load_path_auto();
+                ui.label("Path:");
+                ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(200.0));
+                if ui
+                    .button("📂 Load (.str / .nef / .tsv / pdata / .ft2)")
+                    .clicked()
+                {
+                    self.load_path_auto();
+                }
+            }
+
+            if ui.button("📋 Paste .str / .nef / .tsv").clicked() {
+                self.show_text_io_modal = !self.show_text_io_modal;
             }
 
             ui.separator();
+            #[cfg(not(target_arch = "wasm32"))]
             ui.checkbox(&mut self.use_gpu, "WebGPU Compute");
             ui.add(egui::Slider::new(&mut self.replicas, 8..=256).text("Replicas"));
             ui.add(egui::Slider::new(&mut self.steps_per_sys, 400..=4000).text("Steps/SS"));
@@ -529,7 +1578,12 @@ impl NmrWorkbenchApp {
                     assign_cost: self.assign_cost,
                     ..ScoreConfig::default()
                 };
-                self.u_mat = Some(unary_matrix(&self.systems, &self.sequence, &self.priors, &scfg));
+                self.u_mat = Some(unary_matrix(
+                    &self.systems,
+                    &self.sequence,
+                    &self.priors,
+                    &scfg,
+                ));
             }
 
             let solve_btn = egui::Button::new(
@@ -543,7 +1597,8 @@ impl NmrWorkbenchApp {
             }
 
             if ui.button("💾 Export").clicked() {
-                self.export_results();
+                let ctx = ui.ctx().clone();
+                self.export_results(&ctx);
             }
         });
 
@@ -574,6 +1629,10 @@ impl NmrWorkbenchApp {
                 }
             }
             ui.separator();
+            ui.checkbox(&mut self.use_neural_picker, "Neural CNN")
+                .on_hover_text(
+                    "Toggle 2D separable residual CNN peak picker vs classical MAD picker",
+                );
             ui.add(egui::Slider::new(&mut self.picker_snr, 3.0..=12.0).text("Pick SNR"));
             if ui.small_button("🔍 Pick 2D HSQC Peaks").clicked() {
                 self.pick_2d_roots();
@@ -654,7 +1713,10 @@ impl NmrWorkbenchApp {
                         resp.on_hover_ui(|ui| {
                             ui.label(egui::RichText::new(format!("{three} {seq_id}")).strong());
                             if let Some((ss_idx, conf)) = assigned {
-                                ui.label(format!("Spin system #{ss_idx} (conf {:.0}%)", conf * 100.0));
+                                ui.label(format!(
+                                    "Spin system #{ss_idx} (conf {:.0}%)",
+                                    conf * 100.0
+                                ));
                             } else if is_pro_or_nterm {
                                 ui.label("No amide H root (N-term / Proline)");
                             } else {
@@ -692,8 +1754,7 @@ impl NmrWorkbenchApp {
 
         let avail = ui.available_size();
         let canvas_size = egui::vec2(avail.x.max(200.0), (avail.y - 4.0).max(200.0));
-        let (rect, response) =
-            ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
 
         // Pan with drag
         if response.dragged() {
@@ -771,7 +1832,10 @@ impl NmrWorkbenchApp {
         let ppm_to_screen = |h: f64, n: f64| -> egui::Pos2 {
             let u = ((h as f32) - self.view_h_left) / (self.view_h_right - self.view_h_left);
             let v = ((n as f32) - self.view_n_top) / (self.view_n_bottom - self.view_n_top);
-            egui::pos2(rect.left() + u * rect.width(), rect.top() + v * rect.height())
+            egui::pos2(
+                rect.left() + u * rect.width(),
+                rect.top() + v * rect.height(),
+            )
         };
 
         // Click to select nearest spin system
@@ -781,7 +1845,7 @@ impl NmrWorkbenchApp {
                 for (s, ss) in self.systems.iter().enumerate() {
                     let pt = ppm_to_screen(ss.h, ss.n);
                     let dist = pt.distance(click_pos);
-                    if dist <= 18.0 && best.map_or(true, |(_, bd)| dist < bd) {
+                    if dist <= 18.0 && best.is_none_or(|(_, bd)| dist < bd) {
                         best = Some((s, dist));
                     }
                 }
@@ -951,10 +2015,7 @@ impl NmrWorkbenchApp {
         }
 
         // 2. 3D Triple-Resonance Sequential Walk Strip Plot (k-1, k, k+1)
-        ui.label(
-            egui::RichText::new("3D HNCACB / CBCA(CO)NH Sequential Walk Strips")
-                .strong(),
-        );
+        ui.label(egui::RichText::new("3D HNCACB / CBCA(CO)NH Sequential Walk Strips").strong());
         ui.label(
             egui::RichText::new("Cyan = +Cα, Coral = −Cβ, Gold ◆ = (i−1), Dashed = sequential tie")
                 .small()
@@ -968,8 +2029,11 @@ impl NmrWorkbenchApp {
 
         // Determine predecessor and successor spin systems (either from sequence assignment or best P[s,t])
         let (pred_s, succ_s) = self.find_walk_neighbors(sel_s);
-        let strip_list: Vec<(Option<usize>, &str)> =
-            vec![(pred_s, "i − 1"), (Some(sel_s), "Selected (i)"), (succ_s, "i + 1")];
+        let strip_list: Vec<(Option<usize>, &str)> = vec![
+            (pred_s, "i − 1"),
+            (Some(sel_s), "Selected (i)"),
+            (succ_s, "i + 1"),
+        ];
 
         let strip_h = 275.0f32;
         let (strip_rect, _) = ui.allocate_exact_size(
@@ -1040,7 +2104,11 @@ impl NmrWorkbenchApp {
 
                 if let Some(u_mat) = &self.u_mat {
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Top Residue Typing LLR U(s, k):").small().strong());
+                    ui.label(
+                        egui::RichText::new("Top Residue Typing LLR U(s, k):")
+                            .small()
+                            .strong(),
+                    );
                     let mut ranked: Vec<(usize, f64)> = (0..u_mat.cols)
                         .map(|k| (k, u_mat.get(sel_s, k)))
                         .filter(|&(_, v)| v > FORBID * 0.5)
@@ -1052,7 +2120,9 @@ impl NmrWorkbenchApp {
                         ranked
                             .iter()
                             .take(5)
-                            .map(|&(k, sc)| format!("{}{}: {:+.1}", self.sequence[k], self.seq_ids[k], sc))
+                            .map(|&(k, sc)| {
+                                format!("{}{}: {:+.1}", self.sequence[k], self.seq_ids[k], sc)
+                            })
                             .collect::<Vec<_>>()
                             .join("  |  ")
                     };
@@ -1088,14 +2158,8 @@ impl NmrWorkbenchApp {
         if let Some(res) = &self.assign_res {
             let k = res.position[sel_s];
             if k >= 0 {
-                let pred = res
-                    .position
-                    .iter()
-                    .position(|&pk| pk == k - 1);
-                let succ = res
-                    .position
-                    .iter()
-                    .position(|&pk| pk == k + 1);
+                let pred = res.position.iter().position(|&pk| pk == k - 1);
+                let succ = res.position.iter().position(|&pk| pk == k + 1);
                 return (pred, succ);
             }
         }
@@ -1163,7 +2227,8 @@ impl NmrWorkbenchApp {
             let cx = 0.5 * (x0 + x1);
             col_centers.push(cx);
 
-            let strip_box = egui::Rect::from_min_max(egui::pos2(x0, plot_top), egui::pos2(x1, plot_bot));
+            let strip_box =
+                egui::Rect::from_min_max(egui::pos2(x0, plot_top), egui::pos2(x1, plot_bot));
             painter.rect_stroke(
                 strip_box,
                 2.0,
@@ -1195,7 +2260,13 @@ impl NmrWorkbenchApp {
                 .assign_res
                 .as_ref()
                 .and_then(|r| (r.position[s] >= 0).then(|| r.position[s] as usize))
-                .map(|k| format!("{}{} (#{s})", three_to_one(&self.sequence[k]), self.seq_ids[k]))
+                .map(|k| {
+                    format!(
+                        "{}{} (#{s})",
+                        three_to_one(&self.sequence[k]),
+                        self.seq_ids[k]
+                    )
+                })
                 .unwrap_or_else(|| format!("SS #{s}"));
             painter.text(
                 egui::pos2(cx, rect.top() + 10.0),
@@ -1220,9 +2291,19 @@ impl NmrWorkbenchApp {
                     let norm = (val.abs() / max_v).clamp(0.0, 1.0);
                     if norm > 0.14 {
                         let col = if val >= 0.0 {
-                            egui::Color32::from_rgba_unmultiplied(40, 195, 255, (norm * 130.0) as u8)
+                            egui::Color32::from_rgba_unmultiplied(
+                                40,
+                                195,
+                                255,
+                                (norm * 130.0) as u8,
+                            )
                         } else {
-                            egui::Color32::from_rgba_unmultiplied(255, 95, 105, (norm * 130.0) as u8)
+                            egui::Color32::from_rgba_unmultiplied(
+                                255,
+                                95,
+                                105,
+                                (norm * 130.0) as u8,
+                            )
                         };
                         let half_bar = norm * (strip_box.width() * 0.36);
                         painter.line_segment(
@@ -1265,11 +2346,7 @@ impl NmrWorkbenchApp {
                             egui::pos2(cx + 8.0, y + 4.2),
                             egui::pos2(cx + 3.8, y),
                         ];
-                        painter.add(egui::Shape::convex_polygon(
-                            pts,
-                            d_col,
-                            egui::Stroke::NONE,
-                        ));
+                        painter.add(egui::Shape::convex_polygon(pts, d_col, egui::Stroke::NONE));
                     }
                 }
             }
@@ -1329,29 +2406,45 @@ impl NmrWorkbenchApp {
 
 impl eframe::App for NmrWorkbenchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("top_controls_panel").show(ui, |ui| {
-            self.draw_top_bar(ui);
-            ui.add_space(4.0);
-            self.draw_sequence_ribbon(ui);
+        let ctx = ui.ctx().clone();
+        self.handle_dropped_files(&ctx);
+        self.draw_text_io_window(&ctx);
+
+        egui::Panel::top("workspace_mode_bar").show(ui, |ui| {
+            self.draw_workspace_mode_header(ui);
         });
 
-        egui::Panel::right("right_strip_inspector")
-            .default_size(390.0)
-            .min_size(320.0)
-            .show(ui, |ui| {
-                self.draw_right_inspector(ui);
-            });
+        match self.workspace_mode {
+            WorkspaceMode::ProteinNmr => {
+                egui::Panel::top("top_controls_panel").show(ui, |ui| {
+                    self.draw_top_bar(ui);
+                    ui.add_space(4.0);
+                    self.draw_sequence_ribbon(ui);
+                });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.draw_hsqc_canvas(ui);
-        });
+                egui::Panel::right("right_strip_inspector")
+                    .default_size(390.0)
+                    .min_size(320.0)
+                    .show(ui, |ui| {
+                        self.draw_right_inspector(ui);
+                    });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.draw_hsqc_canvas(ui);
+                });
+            }
+            WorkspaceMode::OctetChem => {
+                self.octet_app.ui(ui);
+            }
+        }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("nmr-assign — WebGPU Protein NMR Spectrum & Assignment Workbench")
+            .with_title("nmr-assign — WebGPU Protein NMR & Octet Chemical Studio")
             .with_inner_size([1380.0, 860.0])
             .with_min_inner_size([960.0, 620.0]),
         ..Default::default()
@@ -1361,4 +2454,44 @@ fn main() -> eframe::Result {
         native_options,
         Box::new(|cc| Ok(Box::new(NmrWorkbenchApp::new(cc)))),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use wasm_bindgen::JsCast as _;
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("no browser Window")
+            .document()
+            .expect("no browser Document");
+
+        let canvas = document
+            .get_element_by_id("nmr_canvas")
+            .expect("missing <canvas id=\"nmr_canvas\"> element")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("nmr_canvas is not an HtmlCanvasElement");
+
+        let web_options = eframe::WebOptions::default();
+        let start_result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(NmrWorkbenchApp::new(cc)))),
+            )
+            .await;
+
+        if let Some(loading) = document.get_element_by_id("nmr_loading") {
+            match start_result {
+                Ok(()) => loading.remove(),
+                Err(e) => {
+                    loading.set_inner_html(&format!(
+                        "<p style=\"color:#ff7b7b;max-width:520px;text-align:center\">Failed to start WebGPU workbench: {:?}<br>\
+                         Ensure WebGPU is enabled in your browser (Chrome/Edge 113+, Safari 18+, Firefox Nightly).</p>",
+                        e
+                    ));
+                }
+            }
+        }
+    });
 }

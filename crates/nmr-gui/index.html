@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>nmr-assign — WebGPU Protein NMR Spectrum &amp; Assignment Workbench</title>
+  <link data-trunk rel="rust" data-bin="nmrassign-gui" data-wasm-opt="2" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #10141c;
+      color: #dbe7f5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    canvas#nmr_canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      outline: none;
+    }
+    #nmr_loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      pointer-events: none;
+      background: #10141c;
+      z-index: 10;
+    }
+    .spinner {
+      width: 34px;
+      height: 34px;
+      border: 3px solid rgba(110, 220, 255, 0.22);
+      border-top-color: #6edcff;
+      border-radius: 50%;
+      animation: spin 0.85s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div id="nmr_loading">
+    <div class="spinner"></div>
+    <div style="font-size: 14px; letter-spacing: 0.02em;">
+      Initializing <strong>nmr-assign</strong> WebGPU Workbench&hellip;
+    </div>
+  </div>
+  <canvas id="nmr_canvas"></canvas>
+</body>
+</html>

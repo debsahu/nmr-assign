@@ -1,0 +1,13 @@
+bmrb_id	pdb_id	name	fold_class	n_residues	path
+bmr16649	2KRU	Protochlorophyllide oxidoreductase PCP_red domain (CtR69A)	alpha/beta	55	data/benchmark/bmr16649.str
+bmr15536	1ENH	Drosophila engrailed homeodomain	alpha	61	data/benchmark/bmr15536.str
+bmr4296	1MJC	Escherichia coli major cold-shock protein CspA	beta	69	data/benchmark/bmr4296.str
+bmr6197	1RUW	Yeast myosin-I Myo3 SH3 domain	alpha	70	data/benchmark/bmr6197.str
+bmr15477	2JVE	Ambystoma Prod1 extracellular domain	alpha	72	data/benchmark/bmr15477.str
+bmr4375	1JO8	Urea-unfolded ubiquitin (8M urea, pH 2)	beta	76	data/benchmark/bmr4375.str
+bmr5387	1G6J	Human ubiquitin in reverse micelles	alpha/beta	76	data/benchmark/bmr5387.str
+bmr17769	1D3Z	Human ubiquitin	alpha/beta	76	data/benchmark/bmr17769.str
+bmr15176	2JQN	Phosphoprotein phosphatase inhibitor DARPP-32	alpha/beta	119	data/benchmark/bmr15176.str
+bmr6968	1XQ8	Human alpha-synuclein (IDP)	idp	140	data/benchmark/bmr6968.str
+bmr15683	2K1S	Escherichia coli lipoprotein YiaD C-terminal domain	alpha/beta	146	data/benchmark/bmr15683.str
+bmr6541	1A29	Xenopus calcium-saturated calmodulin	alpha	148	data/benchmark/bmr6541.str

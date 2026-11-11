@@ -15,7 +15,13 @@ fn test_gpu_scoring_and_annealing_parity() {
     let star_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../data/fixtures/synthetic_ubiquitin.str");
     let ref_data = read_star(star_path, None).unwrap();
-    let (peaks, truth) = simulate(&ref_data, &SimConfig { seed: 0, ..SimConfig::default() });
+    let (peaks, truth) = simulate(
+        &ref_data,
+        &SimConfig {
+            seed: 0,
+            ..SimConfig::default()
+        },
+    );
     let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
     let priors = Priors::provisional();
     let scfg = ScoreConfig::default();
@@ -55,10 +61,7 @@ fn test_gpu_scoring_and_annealing_parity() {
             if a < -1e8 {
                 assert!(b < -1e8);
             } else {
-                assert!(
-                    (a - b).abs() < 1e-3,
-                    "P mismatch at {i}: cpu={a}, gpu={b}"
-                );
+                assert!((a - b).abs() < 1e-3, "P mismatch at {i}: cpu={a}, gpu={b}");
             }
         }
     }

@@ -1,7 +1,9 @@
-//! Minimal NMR-STAR reader and writer for backbone chemical shifts.
+//! Minimal NMR-STAR reader and writer for backbone and sidechain chemical shifts.
 //!
-//! Provenance: Original implementation of the public NMR-STAR v3 and v2.1 syntax
-//! (`loop_`/`stop_` blocks, quoted and semicolon-delimited values), per `docs/specs/01-data-io.md`.
+//! Provenance: Clean-room original implementation of the public STAR / NMR-STAR v3 and v2.1
+//! syntax (`loop_`/`stop_` blocks, quoted and semicolon-delimited values; Hall, Allen & Brown,
+//! *Acta Crystallogr. A* 1991, 47, 655–685; Ulrich et al., *Nucleic Acids Res.* 2008, 36,
+//! D402–D408, "BioMagResBank"), per `docs/specs/01-data-io.md`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,7 +43,7 @@ fn atom_alias(atom: &str) -> &str {
     }
 }
 
-fn tokenize_line(line: &str, out: &mut Vec<String>) {
+fn tokenize_line(line: &str, out: &mut Vec<(String, bool)>) {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -66,19 +68,19 @@ fn tokenize_line(line: &str, out: &mut Vec<String>) {
                 buf.push(chars[i]);
                 i += 1;
             }
-            out.push(buf);
+            out.push((buf, true));
         } else {
             let mut buf = String::new();
-            while i < n && !chars[i].is_whitespace() && chars[i] != '#' {
+            while i < n && !chars[i].is_whitespace() {
                 buf.push(chars[i]);
                 i += 1;
             }
-            out.push(buf);
+            out.push((buf, false));
         }
     }
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+fn tokenize(text: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
@@ -91,7 +93,7 @@ fn tokenize(text: &str) -> Vec<String> {
                 buf.push(lines[i]);
                 i += 1;
             }
-            out.push(buf.join("\n").trim().to_string());
+            out.push((buf.join("\n").trim().to_string(), true));
             i += 1;
             continue;
         }
@@ -101,26 +103,31 @@ fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-fn parse_loops(tokens: &[String]) -> Vec<(Vec<String>, Vec<Vec<String>>)> {
+fn parse_loops(tokens: &[(String, bool)]) -> Vec<(Vec<String>, Vec<Vec<String>>)> {
     let mut loops = Vec::new();
     let mut i = 0;
     let n = tokens.len();
     while i < n {
-        if tokens[i].eq_ignore_ascii_case("loop_") {
+        if !tokens[i].1 && tokens[i].0.eq_ignore_ascii_case("loop_") {
             i += 1;
             let mut tags = Vec::new();
-            while i < n && tokens[i].starts_with('_') {
-                tags.push(tokens[i].clone());
+            while i < n && !tokens[i].1 && tokens[i].0.starts_with('_') {
+                tags.push(tokens[i].0.clone());
                 i += 1;
             }
+            let k_cols = tags.len().max(1);
             let mut vals = Vec::new();
-            while i < n
-                && !tokens[i].eq_ignore_ascii_case("stop_")
-                && !tokens[i].starts_with('_')
-                && !tokens[i].starts_with("save_")
-                && !tokens[i].eq_ignore_ascii_case("loop_")
-            {
-                vals.push(tokens[i].clone());
+            while i < n {
+                let (ref tok, is_quoted) = tokens[i];
+                if !is_quoted
+                    && (tok.eq_ignore_ascii_case("stop_")
+                        || tok.starts_with("save_")
+                        || tok.eq_ignore_ascii_case("loop_")
+                        || (vals.len() % k_cols == 0 && tok.starts_with('_')))
+                {
+                    break;
+                }
+                vals.push(tok.clone());
                 i += 1;
             }
             if !tags.is_empty() && vals.len() >= tags.len() {
@@ -157,19 +164,46 @@ pub fn read_star(path: impl AsRef<Path>, entity: Option<&str>) -> Result<Referen
     let bytes = fs::read(path.as_ref())
         .map_err(|e| format!("failed to read {}: {e}", path.as_ref().display()))?;
     let text = String::from_utf8_lossy(&bytes);
-    read_star_str(&text, entity)
+    read_star_str(&text, entity).map_err(|e| format!("{} in {}", e, path.as_ref().display()))
+}
+
+pub fn read_star_all_atoms(
+    path: impl AsRef<Path>,
+    entity: Option<&str>,
+) -> Result<Reference, String> {
+    let bytes = fs::read(path.as_ref())
+        .map_err(|e| format!("failed to read {}: {e}", path.as_ref().display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+    read_star_str_all_atoms(&text, entity)
         .map_err(|e| format!("{} in {}", e, path.as_ref().display()))
 }
 
 pub fn read_star_str(text: &str, entity: Option<&str>) -> Result<Reference, String> {
+    read_star_str_inner(text, entity, true)
+}
+
+pub fn read_star_str_all_atoms(text: &str, entity: Option<&str>) -> Result<Reference, String> {
+    read_star_str_inner(text, entity, false)
+}
+
+fn read_star_str_inner(
+    text: &str,
+    entity: Option<&str>,
+    backbone_only: bool,
+) -> Result<Reference, String> {
     let tokens = tokenize(text);
     let loops = parse_loops(&tokens);
 
     let mut shift_rows: Vec<(String, i32, String, String, f64)> = Vec::new();
     let mut seq_rows: Vec<(String, i32, String)> = Vec::new();
+    let mut loaded_shift_loop = false;
 
     for (tags, rows) in &loops {
         if let Some(val_col) = find_col(tags, &["_Atom_chem_shift.Val", "_Chem_shift_value"]) {
+            // Use only the primary assigned chemical shift loop so multi-condition BMRB entries do not collide.
+            if loaded_shift_loop {
+                continue;
+            }
             let sid_col = find_col(
                 tags,
                 &[
@@ -185,8 +219,12 @@ pub fn read_star_str(text: &str, entity: Option<&str>) -> Result<Reference, Stri
                 continue;
             };
             for r in rows {
-                let Ok(sid) = r[sid_c].parse::<i32>() else { continue };
-                let Ok(val) = r[val_col].parse::<f64>() else { continue };
+                let Ok(sid) = r[sid_c].parse::<i32>() else {
+                    continue;
+                };
+                let Ok(val) = r[val_col].parse::<f64>() else {
+                    continue;
+                };
                 let ent = ent_col
                     .map(|c| r[c].clone())
                     .unwrap_or_else(|| "1".to_string());
@@ -198,6 +236,9 @@ pub fn read_star_str(text: &str, entity: Option<&str>) -> Result<Reference, Stri
                     val,
                 ));
             }
+            if !shift_rows.is_empty() {
+                loaded_shift_loop = true;
+            }
             continue;
         }
 
@@ -207,7 +248,9 @@ pub fn read_star_str(text: &str, entity: Option<&str>) -> Result<Reference, Stri
             if find_col(tags, &["_Atom_name"]).is_none() {
                 let ent_col = find_col(tags, &["_Entity_poly_seq.Entity_ID"]);
                 for r in rows {
-                    let Ok(num) = r[num_c].parse::<i32>() else { continue };
+                    let Ok(num) = r[num_c].parse::<i32>() else {
+                        continue;
+                    };
                     let ent = ent_col
                         .map(|c| r[c].clone())
                         .unwrap_or_else(|| "1".to_string());
@@ -250,7 +293,10 @@ pub fn read_star_str(text: &str, entity: Option<&str>) -> Result<Reference, Stri
 
     let (&lo, &hi) = (
         comps.keys().next().ok_or("empty sequence in NMR-STAR")?,
-        comps.keys().next_back().ok_or("empty sequence in NMR-STAR")?,
+        comps
+            .keys()
+            .next_back()
+            .ok_or("empty sequence in NMR-STAR")?,
     );
     let seq_ids: Vec<i32> = (lo..=hi).collect();
     let sequence: Vec<String> = seq_ids
@@ -261,8 +307,17 @@ pub fn read_star_str(text: &str, entity: Option<&str>) -> Result<Reference, Stri
     let mut ref_data = Reference::new(sequence, seq_ids);
     for (e, s, _, atom_raw, v) in shift_rows {
         let atom = atom_alias(&atom_raw);
-        if e == chosen_entity && ATOMS.contains(&atom) && s >= lo && s <= hi {
-            ref_data.shifts.insert(((s - lo) as usize, atom.to_string()), v);
+        if e == chosen_entity
+            && !atom.is_empty()
+            && atom != "."
+            && atom != "?"
+            && (!backbone_only || ATOMS.contains(&atom))
+            && s >= lo
+            && s <= hi
+        {
+            ref_data
+                .shifts
+                .insert(((s - lo) as usize, atom.to_string()), v);
         }
     }
     Ok(ref_data)
@@ -273,14 +328,50 @@ pub fn write_star(
     ref_data: &Reference,
     confidence: Option<&BTreeMap<usize, f64>>,
 ) -> Result<(), String> {
-    let mut lines = vec![
+    write_star_with_header(path, ref_data, confidence, None)
+}
+
+pub fn write_star_with_header(
+    path: impl AsRef<Path>,
+    ref_data: &Reference,
+    confidence: Option<&BTreeMap<usize, f64>>,
+    header_comment: Option<&str>,
+) -> Result<(), String> {
+    let mut lines = Vec::new();
+    if let Some(hdr) = header_comment {
+        for l in hdr.lines() {
+            lines.push(format!(
+                "# {}",
+                l.trim_start_matches("# ").trim_start_matches('#')
+            ));
+        }
+        lines.push(String::new());
+    }
+    lines.extend([
         "data_nmr_assign_output".to_string(),
+        String::new(),
+        "save_entity_1".to_string(),
+        "   _Entity.Sf_category  entity".to_string(),
+        "   _Entity.ID           1".to_string(),
+        String::new(),
+        "   loop_".to_string(),
+        "      _Entity_poly_seq.Entity_ID".to_string(),
+        "      _Entity_poly_seq.Num".to_string(),
+        "      _Entity_poly_seq.Mon_ID".to_string(),
+        String::new(),
+    ]);
+    for (seq_id, mon_id) in ref_data.seq_ids.iter().zip(ref_data.sequence.iter()) {
+        lines.push(format!("      1 {:5} {:3}", seq_id, mon_id));
+    }
+    lines.extend([
+        "   stop_".to_string(),
+        "save_".to_string(),
         String::new(),
         "save_assigned_chem_shift_list_1".to_string(),
         "   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts".to_string(),
         String::new(),
         "   loop_".to_string(),
-    ];
+    ]);
     for t in [
         "ID",
         "Entity_ID",
@@ -301,9 +392,10 @@ pub fn write_star(
         .iter()
         .map(|(&(idx, ref atom), &v)| (idx, atom.as_str(), v))
         .collect();
-    entries.sort_by_key(|&(idx, atom, _)| {
-        let atom_ord = ATOMS.iter().position(|&a| a == atom).unwrap_or(99);
-        (idx, atom_ord)
+    entries.sort_by(|&(ia, aa, _), &(ib, ab, _)| {
+        let oa = ATOMS.iter().position(|&a| a == aa).unwrap_or(99);
+        let ob = ATOMS.iter().position(|&a| a == ab).unwrap_or(99);
+        (ia, oa, aa).cmp(&(ib, ob, ab))
     });
 
     for (i, (idx, atom, v)) in entries.into_iter().enumerate() {
@@ -311,9 +403,13 @@ pub fn write_star(
             .and_then(|c| c.get(&idx))
             .map(|&c| format!("conf={c:.2}"))
             .unwrap_or_else(|| ".".to_string());
-        let atom_type = &atom[..1];
+        let atom_type = atom
+            .chars()
+            .find(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "X".to_string());
         lines.push(format!(
-            "      {:5} 1 {:5} {} {:3} {} {:9.3} 1 {}",
+            "      {:5} 1 {:5} {:3} {:4} {} {:9.3} 1 {}",
             i + 1,
             ref_data.seq_ids[idx],
             ref_data.sequence[idx],

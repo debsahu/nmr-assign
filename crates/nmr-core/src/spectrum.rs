@@ -23,7 +23,13 @@ pub struct AxisPpm {
 
 impl AxisPpm {
     /// Construct a standard descending NMR axis spanning `[low_ppm, high_ppm]` across `size` points.
-    pub fn from_bounds(label: impl Into<String>, size: usize, high_ppm: f64, low_ppm: f64, obs_mhz: f64) -> Self {
+    pub fn from_bounds(
+        label: impl Into<String>,
+        size: usize,
+        high_ppm: f64,
+        low_ppm: f64,
+        obs_mhz: f64,
+    ) -> Self {
         let step_ppm = if size > 1 {
             (low_ppm - high_ppm) / ((size - 1) as f64)
         } else {
@@ -140,7 +146,9 @@ impl Spectrum3D {
     pub fn extract_strip(&self, h_ppm: f64, n_ppm: f64, half_width_h_ppm: f64) -> Spectrum2D {
         // Identify which indirect axis is 15N vs 13C by label or ppm range
         let y_is_n = self.axis_y.label.contains('N')
-            || (self.axis_y.max_ppm() > 95.0 && self.axis_y.min_ppm() < 145.0 && !self.axis_z.label.contains('N'));
+            || (self.axis_y.max_ppm() > 95.0
+                && self.axis_y.min_ppm() < 145.0
+                && !self.axis_z.label.contains('N'));
 
         let (n_axis, c_axis) = if y_is_n {
             (&self.axis_y, &self.axis_z)
@@ -210,7 +218,10 @@ fn parse_jcamp_params(text: &str) -> HashMap<String, String> {
     map
 }
 
-fn parse_bruker_axis(params: &HashMap<String, String>, fallback_label: &str) -> Result<(AxisPpm, usize, i32, i32, i32), String> {
+fn parse_bruker_axis(
+    params: &HashMap<String, String>,
+    fallback_label: &str,
+) -> Result<(AxisPpm, usize, i32, i32, i32), String> {
     let si: usize = params
         .get("SI")
         .ok_or("missing ##$SI in Bruker procs")?
@@ -272,34 +283,60 @@ fn parse_bruker_axis(params: &HashMap<String, String>, fallback_label: &str) -> 
     ))
 }
 
-fn decode_bruker_words(bytes: &[u8], bytordp: i32, dtypp: i32, nc_proc: i32, expected: usize) -> Result<Vec<f32>, String> {
+fn decode_bruker_words(
+    bytes: &[u8],
+    bytordp: i32,
+    dtypp: i32,
+    nc_proc: i32,
+    expected: usize,
+) -> Result<Vec<f32>, String> {
     let scale = 2.0_f64.powi(nc_proc);
     let big_endian = bytordp != 0;
     if dtypp == 2 {
         // 64-bit float
         if bytes.len() < expected * 8 {
-            return Err(format!("Bruker data truncated: need {} bytes, got {}", expected * 8, bytes.len()));
+            return Err(format!(
+                "Bruker data truncated: need {} bytes, got {}",
+                expected * 8,
+                bytes.len()
+            ));
         }
         let mut out = Vec::with_capacity(expected);
         for chunk in bytes[..expected * 8].chunks_exact(8) {
             let arr: [u8; 8] = chunk.try_into().unwrap();
-            let v = if big_endian { f64::from_be_bytes(arr) } else { f64::from_le_bytes(arr) };
+            let v = if big_endian {
+                f64::from_be_bytes(arr)
+            } else {
+                f64::from_le_bytes(arr)
+            };
             out.push((v * scale) as f32);
         }
         Ok(out)
     } else {
         // 32-bit int (dtypp == 0) or 32-bit float (dtypp == 1)
         if bytes.len() < expected * 4 {
-            return Err(format!("Bruker data truncated: need {} bytes, got {}", expected * 4, bytes.len()));
+            return Err(format!(
+                "Bruker data truncated: need {} bytes, got {}",
+                expected * 4,
+                bytes.len()
+            ));
         }
         let mut out = Vec::with_capacity(expected);
         for chunk in bytes[..expected * 4].chunks_exact(4) {
             let arr: [u8; 4] = chunk.try_into().unwrap();
             let v = if dtypp == 1 {
-                let f = if big_endian { f32::from_be_bytes(arr) } else { f32::from_le_bytes(arr) };
+                let f = if big_endian {
+                    f32::from_be_bytes(arr)
+                } else {
+                    f32::from_le_bytes(arr)
+                };
                 (f as f64) * scale
             } else {
-                let i = if big_endian { i32::from_be_bytes(arr) } else { i32::from_le_bytes(arr) };
+                let i = if big_endian {
+                    i32::from_be_bytes(arr)
+                } else {
+                    i32::from_le_bytes(arr)
+                };
                 (i as f64) * scale
             };
             out.push(v as f32);
@@ -352,7 +389,11 @@ pub fn read_bruker_pdata_2d(pdata_dir: impl AsRef<Path>) -> Result<Spectrum2D, S
     }
 
     Ok(Spectrum2D {
-        name: dir.file_name().and_then(|s| s.to_str()).unwrap_or("2rr").to_string(),
+        name: dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("2rr")
+            .to_string(),
         axis_x,
         axis_y,
         data,
@@ -394,19 +435,19 @@ pub fn write_bruker_pdata_2d(pdata_dir: impl AsRef<Path>, spec: &Spectrum2D) -> 
     // With XDIM == SI, single submatrix equals row-major array
     let mut bytes = Vec::with_capacity(spec.data.len() * 4);
     for &v in &spec.data {
-        let q = ((v as f64) * inv_scale).round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        let q = ((v as f64) * inv_scale)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
         bytes.extend_from_slice(&q.to_le_bytes());
     }
-    fs::write(dir.join("2rr"), bytes)
-        .map_err(|e| format!("failed to write 2rr: {e}"))
+    fs::write(dir.join("2rr"), bytes).map_err(|e| format!("failed to write 2rr: {e}"))
 }
 
 /// Read a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, and `3rrr`).
 pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
     let dir = pdata_dir.as_ref();
     let p1 = parse_jcamp_params(
-        &fs::read_to_string(dir.join("procs"))
-            .map_err(|e| format!("failed to read procs: {e}"))?,
+        &fs::read_to_string(dir.join("procs")).map_err(|e| format!("failed to read procs: {e}"))?,
     );
     let p2 = parse_jcamp_params(
         &fs::read_to_string(dir.join("proc2s"))
@@ -422,8 +463,7 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
     let (axis_z, xdim_z, ..) = parse_bruker_axis(&p3, "13C")?;
 
     let (nx, ny, nz) = (axis_x.size, axis_y.size, axis_z.size);
-    let raw_bytes = fs::read(dir.join("3rrr"))
-        .map_err(|e| format!("failed to read 3rrr: {e}"))?;
+    let raw_bytes = fs::read(dir.join("3rrr")).map_err(|e| format!("failed to read 3rrr: {e}"))?;
     let raw = decode_bruker_words(&raw_bytes, bytordp, dtypp, nc_proc, nx * ny * nz)?;
 
     let tx = xdim_x.min(nx).max(1);
@@ -458,7 +498,11 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
     }
 
     Ok(Spectrum3D {
-        name: dir.file_name().and_then(|s| s.to_str()).unwrap_or("3rrr").to_string(),
+        name: dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("3rrr")
+            .to_string(),
         exp: exp.to_string(),
         axis_x,
         axis_y,
@@ -499,7 +543,11 @@ fn decode_pipe_header(bytes: &[u8]) -> Result<(Vec<f32>, bool), String> {
     let mut hdr = Vec::with_capacity(PIPE_HEADER_FLOATS);
     for chunk in bytes[..PIPE_HEADER_BYTES].chunks_exact(4) {
         let arr: [u8; 4] = chunk.try_into().unwrap();
-        hdr.push(if big_endian { f32::from_be_bytes(arr) } else { f32::from_le_bytes(arr) });
+        hdr.push(if big_endian {
+            f32::from_be_bytes(arr)
+        } else {
+            f32::from_le_bytes(arr)
+        });
     }
     Ok((hdr, big_endian))
 }
@@ -573,7 +621,11 @@ pub fn read_nmrpipe_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
     let mut data = Vec::with_capacity(expected);
     for chunk in body[..expected * 4].chunks_exact(4) {
         let arr: [u8; 4] = chunk.try_into().unwrap();
-        data.push(if big_endian { f32::from_be_bytes(arr) } else { f32::from_le_bytes(arr) });
+        data.push(if big_endian {
+            f32::from_be_bytes(arr)
+        } else {
+            f32::from_le_bytes(arr)
+        });
     }
 
     Ok(Spectrum2D {
@@ -672,7 +724,11 @@ pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, 
     let mut data = Vec::with_capacity(expected);
     for chunk in body[..expected * 4].chunks_exact(4) {
         let arr: [u8; 4] = chunk.try_into().unwrap();
-        data.push(if big_endian { f32::from_be_bytes(arr) } else { f32::from_le_bytes(arr) });
+        data.push(if big_endian {
+            f32::from_be_bytes(arr)
+        } else {
+            f32::from_le_bytes(arr)
+        });
     }
 
     Ok(Spectrum3D {

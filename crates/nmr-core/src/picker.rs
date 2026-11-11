@@ -70,7 +70,13 @@ fn subvoxel_offset(ym1: f32, y0: f32, yp1: f32) -> f64 {
     let a = (ym1.abs()) as f64;
     let b = (y0.abs()) as f64;
     let c = (yp1.abs()) as f64;
-    if a > 0.0 && b > a && b > c && c > 0.0 && ym1.signum() == y0.signum() && yp1.signum() == y0.signum() {
+    if a > 0.0
+        && b > a
+        && b > c
+        && c > 0.0
+        && ym1.signum() == y0.signum()
+        && yp1.signum() == y0.signum()
+    {
         let la = a.ln();
         let lb = b.ln();
         let lc = c.ln();
@@ -125,16 +131,39 @@ pub fn pick_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
             let dy = subvoxel_offset(spec.get(ix, iy - 1), v, spec.get(ix, iy + 1));
             let h = spec.axis_x.index_to_ppm(ix as f64 + dx);
             let n = spec.axis_y.index_to_ppm(iy as f64 + dy);
+            let mut vol = 0.0f64;
+            for wy in -1isize..=1 {
+                for wx in -1isize..=1 {
+                    let sv = spec.get((ix as isize + wx) as usize, (iy as isize + wy) as usize);
+                    if sv.signum() == v.signum() {
+                        vol += (sv.abs()) as f64;
+                    }
+                }
+            }
             peaks.push(Peak {
                 exp: "HSQC".to_string(),
                 h,
                 n,
                 c: None,
                 sign,
+                height: Some((v.abs()) as f64),
+                volume: Some(vol),
+                h2: None,
             });
         }
     }
     peaks
+}
+
+/// Pick 2D `C13HSQC` peaks `(1H, 13C)` from an aliphatic or aromatic `13C`-HSQC spectrum.
+pub fn pick_c13_hsqc_2d(spec: &Spectrum2D, cfg: &PickerConfig) -> Vec<Peak> {
+    let mut base = pick_hsqc_2d(spec, cfg);
+    for p in &mut base {
+        p.exp = "C13HSQC".to_string();
+        p.c = Some(p.n);
+        p.n = 0.0;
+    }
+    base
 }
 
 /// Pick 3D triple-resonance peaks restricted to `(H, N)` strips around `hsqc_roots`.
@@ -148,7 +177,9 @@ pub fn pick_triple_3d(spec: &Spectrum3D, hsqc_roots: &[Peak], cfg: &PickerConfig
     let allow_neg = cfg.allow_negative || spec.exp == "HNCACB";
 
     let y_is_n = spec.axis_y.label.contains('N')
-        || (spec.axis_y.max_ppm() > 95.0 && spec.axis_y.min_ppm() < 145.0 && !spec.axis_z.label.contains('N'));
+        || (spec.axis_y.max_ppm() > 95.0
+            && spec.axis_y.min_ppm() < 145.0
+            && !spec.axis_z.label.contains('N'));
 
     let mut out = Vec::new();
 
@@ -207,21 +238,9 @@ pub fn pick_triple_3d(spec: &Spectrum3D, hsqc_roots: &[Peak], cfg: &PickerConfig
                     continue;
                 }
 
-                let dx = subvoxel_offset(
-                    spec.get(ix - 1, iy, iz),
-                    v,
-                    spec.get(ix + 1, iy, iz),
-                );
-                let dy = subvoxel_offset(
-                    spec.get(ix, iy - 1, iz),
-                    v,
-                    spec.get(ix, iy + 1, iz),
-                );
-                let dz = subvoxel_offset(
-                    spec.get(ix, iy, iz - 1),
-                    v,
-                    spec.get(ix, iy, iz + 1),
-                );
+                let dx = subvoxel_offset(spec.get(ix - 1, iy, iz), v, spec.get(ix + 1, iy, iz));
+                let dy = subvoxel_offset(spec.get(ix, iy - 1, iz), v, spec.get(ix, iy + 1, iz));
+                let dz = subvoxel_offset(spec.get(ix, iy, iz - 1), v, spec.get(ix, iy, iz + 1));
 
                 let h = spec.axis_x.index_to_ppm(ix as f64 + dx);
                 let (n, c) = if y_is_n {
@@ -236,12 +255,31 @@ pub fn pick_triple_3d(spec: &Spectrum3D, hsqc_roots: &[Peak], cfg: &PickerConfig
                     )
                 };
 
+                let mut vol = 0.0f64;
+                for wz in -1isize..=1 {
+                    for wy in -1isize..=1 {
+                        for wx in -1isize..=1 {
+                            let sv = spec.get(
+                                (ix as isize + wx) as usize,
+                                (iy as isize + wy) as usize,
+                                (iz as isize + wz) as usize,
+                            );
+                            if sv.signum() == v.signum() {
+                                vol += (sv.abs()) as f64;
+                            }
+                        }
+                    }
+                }
+
                 out.push(Peak {
                     exp: spec.exp.clone(),
                     h,
                     n,
                     c: Some(c),
                     sign,
+                    height: Some((v.abs()) as f64),
+                    volume: Some(vol),
+                    h2: None,
                 });
             }
         }

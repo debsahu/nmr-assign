@@ -6,10 +6,14 @@
 
 use std::sync::mpsc;
 
+pub mod neural_gpu;
+
 use bytemuck::{Pod, Zeroable};
 use nmr_core::priors::{Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
-use nmr_core::solver::{consensus_from_runs, AnnealConfig, AssignResult, Matrix2D, ScoreConfig, FORBID};
+use nmr_core::solver::{
+    consensus_from_runs, AnnealConfig, AssignResult, Matrix2D, ScoreConfig, FORBID,
+};
 use nmr_core::spinsystems::SpinSystem;
 use wgpu::util::DeviceExt;
 
@@ -80,8 +84,7 @@ pub struct GpuEngine {
 impl GpuEngine {
     /// Initialize a standalone high-performance headless WebGPU compute context.
     pub fn new_headless() -> Result<Self, String> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
@@ -343,7 +346,13 @@ impl GpuEngine {
 
         let total_slots = s_len * 3 * 2;
         let mut cand_counts = vec![0u32; total_slots];
-        let mut cands_flat = vec![CandEntryGpu { val: 0.0, support: 0 }; total_slots * max_cands];
+        let mut cands_flat = vec![
+            CandEntryGpu {
+                val: 0.0,
+                support: 0
+            };
+            total_slots * max_cands
+        ];
 
         for (s, ss) in systems.iter().enumerate() {
             for (atom_c, atom_name) in ["CA", "CB", "C"].iter().enumerate() {
@@ -364,18 +373,21 @@ impl GpuEngine {
         }
 
         let mk_ro = |label: &str, bytes: &[u8]| {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
         };
 
-        let u_params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("score-params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let u_params = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("score-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
         let b_priors = mk_ro("priors", bytemuck::cast_slice(&prior_table));
         let b_seq = mk_ro("seq", bytemuck::cast_slice(&seq_res));
         let b_roots = mk_ro("roots", bytemuck::cast_slice(&roots_hn));
@@ -401,20 +413,46 @@ impl GpuEngine {
             label: Some("score-bg"),
             layout: &self.score_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: u_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: b_priors.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: b_seq.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: b_roots.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: b_cands.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: b_counts.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: b_out_u.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: b_out_p.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: u_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_priors.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: b_seq.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: b_roots.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: b_cands.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: b_counts.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: b_out_u.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: b_out_p.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("score-enc"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("score-enc"),
+            });
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("score-pass"),
@@ -519,11 +557,12 @@ impl GpuEngine {
         let init_scores = vec![[0.0f32, 0.0f32]; replicas];
 
         let mk_buf = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytes,
-                usage,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytes,
+                    usage,
+                })
         };
 
         let total_steps = (cfg.steps_per_system * s_len).max(1) as u32;
@@ -536,9 +575,21 @@ impl GpuEngine {
             mapped_at_creation: false,
         });
 
-        let b_u = mk_buf("anneal-u", bytemuck::cast_slice(&u_f32), wgpu::BufferUsages::STORAGE);
-        let b_p = mk_buf("anneal-p", bytemuck::cast_slice(&p_f32), wgpu::BufferUsages::STORAGE);
-        let b_slots = mk_buf("anneal-slots", bytemuck::cast_slice(&slots_packed), wgpu::BufferUsages::STORAGE);
+        let b_u = mk_buf(
+            "anneal-u",
+            bytemuck::cast_slice(&u_f32),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let b_p = mk_buf(
+            "anneal-p",
+            bytemuck::cast_slice(&p_f32),
+            wgpu::BufferUsages::STORAGE,
+        );
+        let b_slots = mk_buf(
+            "anneal-slots",
+            bytemuck::cast_slice(&slots_packed),
+            wgpu::BufferUsages::STORAGE,
+        );
 
         let rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
         let b_at = mk_buf("anneal-at-both", bytemuck::cast_slice(&init_at_both), rw);
@@ -550,14 +601,38 @@ impl GpuEngine {
             label: Some("anneal-bg"),
             layout: &self.anneal_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: u_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: b_u.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: b_p.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: b_slots.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: b_at.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: b_pos.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: b_scores.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: b_rng.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: u_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_u.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: b_p.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: b_slots.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: b_at.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: b_pos.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: b_scores.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: b_rng.as_entire_binding(),
+                },
             ],
         });
 
@@ -577,10 +652,13 @@ impl GpuEngine {
                 t_end: cfg.t_end as f32,
                 _pad2: [0.0; 2],
             };
-            self.queue.write_buffer(&u_params, 0, bytemuck::bytes_of(&p_val));
-            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("anneal-chunk-enc"),
-            });
+            self.queue
+                .write_buffer(&u_params, 0, bytemuck::bytes_of(&p_val));
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("anneal-chunk-enc"),
+                });
             {
                 let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("anneal-chunk-pass"),
@@ -597,8 +675,7 @@ impl GpuEngine {
         let at_both_out: Vec<i32> =
             self.read_buffer_vec(&b_at, (2 * replicas * k_len * 4) as u64)?;
         let best_at_all = &at_both_out[replicas * k_len..2 * replicas * k_len];
-        let scores_out: Vec<[f32; 2]> =
-            self.read_buffer_vec(&b_scores, (replicas * 8) as u64)?;
+        let scores_out: Vec<[f32; 2]> = self.read_buffer_vec(&b_scores, (replicas * 8) as u64)?;
 
         // Reconstruct `pos` per replica and re-evaluate exact f64 total score on CPU
         let mut positions: Vec<Vec<i32>> = Vec::with_capacity(replicas);
