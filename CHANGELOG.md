@@ -4,6 +4,29 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## 2026-11-11 — WebGPU 3D Neural Picker `<= 64 MiB` Multi-Axis Tiling, Multi-Tier `>256`/`>1024` GPU Annealer & Loud Limit Enforcement (`nmr-gpu`)
+
+- **Source Branch / Reviewed Commit:** `swarm/gpu-engine` (`517e364d1f99bedf29a9bfafc9e299f56d97499c`, squashing `7595d64` + `517e364`)
+- **Architectural Summary:**
+  - **3D Neural GPU Picker Multi-Axis `(X, Y, Z)` 7-Halo Tiling (`crates/nmr-gpu/src/neural_gpu.rs`, `lib.rs`):** Added active `(1H, 15N)` root bounding-box cropping, empty-tile skipping, on-the-fly per-tile Haar noise normalization (avoiding full-cube CPU copies), and reusable `Conv3dTileWorkspace` `(X, Y, Z)` block tiling (`64x64x64` interior + `7`-voxel NMS / `6`-voxel forward halo = `78^3` padded) capping all GPU storage buffer bindings at `<= 64 MiB` (`MAX_CONV3D_BUFFER_BYTES = 67,108,864 B`) and eliminating the `512 MiB` Bruker `conv3d-bg` binding overflow crash even under baseline `wgpu::Limits::default()` (`128 MiB`).
+  - **Multi-Tier WebGPU Simulated Annealing & Replica Batching (`crates/nmr-gpu/src/lib.rs`, `shaders/anneal.wgsl`):** Removed silent CPU fallback for `S > 256 || K > 256`, eliminated WGSL function-scope stack-spilling arrays via register delta helpers, implemented tiered workgroup-SRAM shaders within the `16,384 B` WebGPU baseline (`S, K <= 256` `@workgroup_size(8)`, `257..=512` `@workgroup_size(4)`, `513..=1024` `@workgroup_size(2)`) plus a storage-backed `anneal_chunk_global` tier for `> 1024`, and added automatic multi-dispatch replica batching (`max_batch_replicas`) bounded by `max_compute_workgroups_per_dimension` and `max_storage_buffer_binding_size`.
+  - **Loud GPU Limit & Overflow Enforcement:** Validated all storage buffer sizes, workgroup dispatch counts, and NMS peak buffer capacity (`hdr.count > ws.max_peaks`) across `score_matrices_gpu`, `anneal_from_matrices_gpu`, and `neural_gpu`, returning explicit `Err(...)` with zero silent CPU fallbacks.
+- **Verified Metrics:**
+  - **Real 5-Spectrum Bruker 3D Neural GPU Pick** (`1x 2rr` + `4x 2048x128x512` `512 MiB` `3rrr` cubes): **9.88 s wall** (`1.87 s` CPU user), `275,904` peaks (`917` HSQC roots; `HNCACB` `137,460` peaks in `2.12 s`), max GPU storage binding **`63.98 MiB <= 64 MiB`**.
+  - **3D CNN CPU vs. Multi-Tile GPU Parity:** `forward_3d` `max_abs_diff = 4.40e-7` (`< 1e-4`); picked coordinate map-back `< 1e-4 ppm` vs. CPU and `< 1e-6 ppm` single-block vs. multi-tile GPU.
+  - **Large-`S` GPU Simulated Annealing:** CLI `S = 700, K = 76` (`64` replicas $\times$ `1.05M` steps) completes in **3.33 s wall / 0.04 s CPU user** (`1.27B` vs. `103.2B` CPU instructions previously); parity tests at `S = 700` (`1.714 s`, `obj = 1045.1` matching CPU, `97.1%` recall) and `S = 1200` (`5.257 s`, `obj = 1045.1`, `97.1%` recall); `S = 6000` (`144 MiB > 128 MiB` strict baseline limit) verified to return loud `Err(...)`.
+  - **Synthetic Ubiquitin Gate (`--engine gpu`):** **97.1% accuracy**, **97.1% recall**, **100.0% high-confidence precision (54/54)** in **0.873 s**.
+
+---
+
+## `fb7067e` — 2026-11-11 — Add historical CHANGELOG.md covering v0.1 through Phase 7
+
+- **Commit:** `fb7067e`
+- **Architectural Summary:**
+  - Added repository-root `CHANGELOG.md` documenting architectural milestones, clean-room provenance, and verified benchmark gates from initial v0.1 scaffold (`01a52e1`) through Phase 7 (`bbfe672`).
+
+---
+
 ## `bbfe672` — 2026-11-11 — Gate CI Clippy on correctness lints across Rust 1.99+ toolchains
 
 - **Commit:** `bbfe672dc41a558930a9abe96cead0f45c8a7059`

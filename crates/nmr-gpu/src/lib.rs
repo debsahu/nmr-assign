@@ -69,6 +69,29 @@ struct AnnealParamsGpu {
     _pad2: [f32; 2],
 }
 
+/// Safely upgrade baseline `wgpu::Limits` with the hardware adapter's buffer and binding
+/// capacities while preserving portable baseline workgroup SRAM (`16 KiB`) and avoiding
+/// optional-feature-gated limits.
+fn bounded_adapter_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    let hw = adapter.limits();
+    let mut lim = wgpu::Limits::default()
+        .using_resolution(hw.clone())
+        .using_alignment(hw.clone());
+    let max_buf_cap: u64 = 2_147_483_648; // 2 GiB
+    let max_bind_cap: u64 = 1_073_741_824; // 1 GiB
+    lim.max_buffer_size = lim.max_buffer_size.max(hw.max_buffer_size.min(max_buf_cap));
+    lim.max_storage_buffer_binding_size = lim
+        .max_storage_buffer_binding_size
+        .max(hw.max_storage_buffer_binding_size.min(max_bind_cap));
+    lim.max_uniform_buffer_binding_size = lim
+        .max_uniform_buffer_binding_size
+        .max(hw.max_uniform_buffer_binding_size.min(65_536));
+    lim.max_compute_workgroups_per_dimension = lim
+        .max_compute_workgroups_per_dimension
+        .max(hw.max_compute_workgroups_per_dimension);
+    lim
+}
+
 pub struct GpuEngine {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -78,12 +101,52 @@ pub struct GpuEngine {
     pair_pipeline: wgpu::ComputePipeline,
     score_bgl: wgpu::BindGroupLayout,
     anneal_pipeline: wgpu::ComputePipeline,
+    anneal_1024_pipeline: wgpu::ComputePipeline,
+    anneal_global_pipeline: wgpu::ComputePipeline,
     anneal_bgl: wgpu::BindGroupLayout,
 }
 
 impl GpuEngine {
-    /// Initialize a standalone high-performance headless WebGPU compute context.
+    /// Initialize a standalone high-performance headless WebGPU compute context
+    /// exposing bounded hardware buffer limits on native Metal / Vulkan / DX12 adapters.
     pub fn new_headless() -> Result<Self, String> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            ..Default::default()
+        }))
+        .map_err(|e| format!("no WebGPU adapter available: {e}"))?;
+
+        let info = adapter.get_info();
+        let adapter_name = info.name.clone();
+        let backend_name = format!("{:?}", info.backend);
+        let required_limits = bounded_adapter_limits(&adapter);
+
+        let (device, queue) =
+            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("nmr-gpu-headless-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits,
+                ..Default::default()
+            })) {
+                Ok(dq) => dq,
+                Err(_) => pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("nmr-gpu-headless-device-default"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                }))
+                .map_err(|e| format!("failed to request WebGPU device: {e}"))?,
+            };
+
+        Ok(Self::from_device(device, queue, adapter_name, backend_name))
+    }
+
+    /// Initialize a headless WebGPU compute context with caller-specified `wgpu::Limits`
+    /// (e.g. strict `wgpu::Limits::default()` to validate baseline browser WebGPU caps).
+    pub fn new_headless_with_limits(required_limits: wgpu::Limits) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -98,12 +161,12 @@ impl GpuEngine {
         let backend_name = format!("{:?}", info.backend);
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("nmr-gpu-headless-device"),
+            label: Some("nmr-gpu-headless-custom-limits"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits,
             ..Default::default()
         }))
-        .map_err(|e| format!("failed to request WebGPU device: {e}"))?;
+        .map_err(|e| format!("failed to request WebGPU device with custom limits: {e}"))?;
 
         Ok(Self::from_device(device, queue, adapter_name, backend_name))
     }
@@ -217,6 +280,24 @@ impl GpuEngine {
             compilation_options: Default::default(),
             cache: None,
         });
+        let anneal_1024_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("nmr-anneal-1024-pipeline"),
+                layout: Some(&anneal_pl),
+                module: &anneal_shader,
+                entry_point: Some("anneal_chunk_1024"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let anneal_global_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("nmr-anneal-global-pipeline"),
+                layout: Some(&anneal_pl),
+                module: &anneal_shader,
+                entry_point: Some("anneal_chunk_global"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             device,
@@ -227,8 +308,15 @@ impl GpuEngine {
             pair_pipeline,
             score_bgl,
             anneal_pipeline,
+            anneal_1024_pipeline,
+            anneal_global_pipeline,
             anneal_bgl,
         }
+    }
+
+    fn max_storage_binding_bytes(&self) -> u64 {
+        let lim = self.device.limits();
+        lim.max_storage_buffer_binding_size.min(lim.max_buffer_size)
     }
 
     fn read_buffer_vec<T: Pod>(&self, src: &wgpu::Buffer, byte_len: u64) -> Result<Vec<T>, String> {
@@ -288,6 +376,35 @@ impl GpuEngine {
             .max()
             .unwrap_or(1)
             .max(1);
+
+        let u_bytes = (s_len as u64) * (k_len as u64) * 4;
+        let p_bytes = (s_len as u64) * (s_len as u64) * 4;
+        let cands_bytes = (s_len as u64) * 6 * (max_cands as u64) * 8;
+        let roots_bytes = (s_len as u64) * 8;
+        let counts_bytes = (s_len as u64) * 6 * 4;
+        let seq_bytes = (k_len as u64) * 4;
+        let max_req = u_bytes
+            .max(p_bytes)
+            .max(cands_bytes)
+            .max(roots_bytes)
+            .max(counts_bytes)
+            .max(seq_bytes);
+        let max_bind = self.max_storage_binding_bytes();
+        if max_req > max_bind {
+            return Err(format!(
+                "GPU scoring matrix buffer ({max_req} B) exceeds device storage binding limit ({max_bind} B) for S={s_len}, K={k_len}"
+            ));
+        }
+        let max_wg_dim = self.device.limits().max_compute_workgroups_per_dimension;
+        let wg_s = (s_len as u64).div_ceil(16);
+        let wg_k = (k_len as u64).div_ceil(16);
+        if wg_s > (max_wg_dim as u64) || wg_k > (max_wg_dim as u64) {
+            return Err(format!(
+                "GPU scoring workgroup count ({}x{}) exceeds device limit ({max_wg_dim}) for S={s_len}, K={k_len}",
+                wg_s,
+                wg_s.max(wg_k)
+            ));
+        }
 
         let params = ScoreParamsGpu {
             s_len: s_len as u32,
@@ -394,8 +511,6 @@ impl GpuEngine {
         let b_cands = mk_ro("cands", bytemuck::cast_slice(&cands_flat));
         let b_counts = mk_ro("counts", bytemuck::cast_slice(&cand_counts));
 
-        let u_bytes = (s_len * k_len * 4) as u64;
-        let p_bytes = (s_len * s_len * 4) as u64;
         let b_out_u = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("out-u"),
             size: u_bytes.max(16),
@@ -498,6 +613,13 @@ impl GpuEngine {
     }
 
     /// Run GPU simulated annealing directly from precomputed `(U, P)` matrices.
+    ///
+    /// Automatically selects:
+    /// - `anneal_chunk` (`8` threads/workgroup, `256` slots in `16 KiB` workgroup SRAM) for `S, K <= 256`,
+    /// - `anneal_chunk_1024` (`2` threads/workgroup, `1024` slots in `16 KiB` workgroup SRAM) for `S, K <= 1024`,
+    /// - `anneal_chunk_global` (`8` threads/workgroup, storage-buffer state) for `S > 1024` or `K > 1024`.
+    ///
+    /// Never silently falls back to CPU execution; returns an explicit `Err` if GPU buffer limits are exceeded.
     pub fn anneal_from_matrices_gpu(
         &self,
         u: &Matrix2D,
@@ -506,8 +628,11 @@ impl GpuEngine {
     ) -> Result<AssignResult, String> {
         let s_len = u.rows;
         let k_len = u.cols;
-        if s_len > 256 || k_len > 256 {
-            return Ok(nmr_core::solver::assign_from_matrices(u, p, cfg));
+        if p.rows != s_len || p.cols != s_len {
+            return Err(format!(
+                "invalid matrix dimensions: U is {s_len}x{k_len}, P is {}x{}",
+                p.rows, p.cols
+            ));
         }
         let replicas = cfg.runs.max(1);
         if s_len == 0 || k_len == 0 {
@@ -518,9 +643,6 @@ impl GpuEngine {
                 run_scores: vec![0.0; replicas],
             });
         }
-
-        let u_f32: Vec<f32> = u.data.iter().map(|&v| v as f32).collect();
-        let p_f32: Vec<f32> = p.data.iter().map(|&v| v as f32).collect();
 
         let mut slots_packed = Vec::with_capacity(s_len + 1 + s_len * k_len / 2);
         let mut slot_indices = Vec::new();
@@ -538,23 +660,47 @@ impl GpuEngine {
         }
         slots_packed.extend_from_slice(&slot_indices);
 
+        let u_bytes = (s_len as u64) * (k_len as u64) * 4;
+        let p_bytes = (s_len as u64) * (s_len as u64) * 4;
+        let slots_bytes = (slots_packed.len() as u64) * 4;
+        let per_rep_at_bytes = 2 * (k_len as u64) * 4;
+        let per_rep_pos_bytes = (s_len as u64) * 4;
+        let per_rep_max_bytes = per_rep_at_bytes.max(per_rep_pos_bytes).max(16);
+        let max_static_req = u_bytes.max(p_bytes).max(slots_bytes).max(per_rep_max_bytes);
+        let max_bind = self.max_storage_binding_bytes();
+        if max_static_req > max_bind {
+            return Err(format!(
+                "GPU annealer buffer ({max_static_req} B) exceeds device storage binding limit ({max_bind} B) for S={s_len}, K={k_len}"
+            ));
+        }
+
+        let (pipeline, wg_threads) = if s_len <= 256 && k_len <= 256 {
+            (&self.anneal_pipeline, 8u32)
+        } else if s_len <= 1024 && k_len <= 1024 {
+            (&self.anneal_1024_pipeline, 2u32)
+        } else {
+            (&self.anneal_global_pipeline, 8u32)
+        };
+        let max_wg_dim = self.device.limits().max_compute_workgroups_per_dimension as usize;
+        let max_reps_by_wg = max_wg_dim.saturating_mul(wg_threads as usize).max(1);
+        let max_reps_by_bind = (max_bind / per_rep_max_bytes) as usize;
+        let max_batch_replicas = max_reps_by_wg.min(max_reps_by_bind).min(replicas).max(1);
+
+        let u_f32: Vec<f32> = u.data.iter().map(|&v| v as f32).collect();
+        let p_f32: Vec<f32> = p.data.iter().map(|&v| v as f32).collect();
+
         let mut seeder = Rng::new(cfg.seed);
-        let mut rng_init = Vec::with_capacity(replicas);
+        let mut rng_init_all = Vec::with_capacity(replicas);
         for _ in 0..replicas {
             let a = seeder.next_u64();
             let b = seeder.next_u64();
-            rng_init.push([
+            rng_init_all.push([
                 (a as u32) | 1,
                 (a >> 32) as u32,
                 (b as u32) | 1,
                 (b >> 32) as u32,
             ]);
         }
-
-        // [0 .. replicas*k_len) = current `at`, [replicas*k_len .. 2*replicas*k_len) = `best_at`
-        let init_at_both = vec![-1i32; 2 * replicas * k_len];
-        let init_pos = vec![-1i32; replicas * s_len];
-        let init_scores = vec![[0.0f32, 0.0f32]; replicas];
 
         let mk_buf = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
             self.device
@@ -565,7 +711,11 @@ impl GpuEngine {
                 })
         };
 
-        let total_steps = (cfg.steps_per_system * s_len).max(1) as u32;
+        let total_steps = cfg
+            .steps_per_system
+            .saturating_mul(s_len)
+            .max(1)
+            .min(u32::MAX as usize) as u32;
         let chunk_steps: u32 = 32_768;
 
         let u_params = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -592,116 +742,128 @@ impl GpuEngine {
         );
 
         let rw = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
-        let b_at = mk_buf("anneal-at-both", bytemuck::cast_slice(&init_at_both), rw);
-        let b_pos = mk_buf("anneal-pos", bytemuck::cast_slice(&init_pos), rw);
-        let b_scores = mk_buf("anneal-scores", bytemuck::cast_slice(&init_scores), rw);
-        let b_rng = mk_buf("anneal-rng", bytemuck::cast_slice(&rng_init), rw);
-
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("anneal-bg"),
-            layout: &self.anneal_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_u.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_p.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: b_slots.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: b_at.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: b_pos.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: b_scores.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: b_rng.as_entire_binding(),
-                },
-            ],
-        });
-
-        let workgroups = (replicas as u32).div_ceil(8);
-        let mut step_offset = 0u32;
-        while step_offset < total_steps {
-            let p_val = AnnealParamsGpu {
-                replicas: replicas as u32,
-                s_len: s_len as u32,
-                k_len: k_len as u32,
-                max_block: cfg.max_block as u32,
-                total_steps,
-                step_offset,
-                chunk_steps,
-                _pad: 0,
-                t_start: cfg.t_start as f32,
-                t_end: cfg.t_end as f32,
-                _pad2: [0.0; 2],
-            };
-            self.queue
-                .write_buffer(&u_params, 0, bytemuck::bytes_of(&p_val));
-            let mut enc = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("anneal-chunk-enc"),
-                });
-            {
-                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("anneal-chunk-pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.anneal_pipeline);
-                cpass.set_bind_group(0, &bg, &[]);
-                cpass.dispatch_workgroups(workgroups, 1, 1);
-            }
-            self.queue.submit(Some(enc.finish()));
-            step_offset = step_offset.saturating_add(chunk_steps);
-        }
-
-        let at_both_out: Vec<i32> =
-            self.read_buffer_vec(&b_at, (2 * replicas * k_len * 4) as u64)?;
-        let best_at_all = &at_both_out[replicas * k_len..2 * replicas * k_len];
-        let scores_out: Vec<[f32; 2]> = self.read_buffer_vec(&b_scores, (replicas * 8) as u64)?;
-
-        // Reconstruct `pos` per replica and re-evaluate exact f64 total score on CPU
         let mut positions: Vec<Vec<i32>> = Vec::with_capacity(replicas);
         let mut exact_scores: Vec<f64> = Vec::with_capacity(replicas);
 
-        for r in 0..replicas {
-            let at_slice = &best_at_all[r * k_len..(r + 1) * k_len];
-            let mut pos = vec![-1i32; s_len];
-            let mut sc = 0.0f64;
-            for (k, &s) in at_slice.iter().enumerate() {
-                if s >= 0 && (s as usize) < s_len {
-                    pos[s as usize] = k as i32;
-                    sc += u.get(s as usize, k);
+        let mut rep_offset = 0usize;
+        while rep_offset < replicas {
+            let batch_reps = (replicas - rep_offset).min(max_batch_replicas);
+            let at_bytes = 2 * (batch_reps as u64) * (k_len as u64) * 4;
+            // [0 .. batch_reps*k_len) = current `at`, [batch_reps*k_len .. 2*batch_reps*k_len) = `best_at`
+            let init_at_both = vec![-1i32; 2 * batch_reps * k_len];
+            let init_pos = vec![-1i32; batch_reps * s_len];
+            let init_scores = vec![[0.0f32, 0.0f32]; batch_reps];
+            let rng_slice = &rng_init_all[rep_offset..rep_offset + batch_reps];
+
+            let b_at = mk_buf("anneal-at-both", bytemuck::cast_slice(&init_at_both), rw);
+            let b_pos = mk_buf("anneal-pos", bytemuck::cast_slice(&init_pos), rw);
+            let b_scores = mk_buf("anneal-scores", bytemuck::cast_slice(&init_scores), rw);
+            let b_rng = mk_buf("anneal-rng", bytemuck::cast_slice(rng_slice), rw);
+
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("anneal-bg"),
+                layout: &self.anneal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: u_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_u.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b_p.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: b_slots.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: b_at.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: b_pos.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: b_scores.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: b_rng.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let workgroups = (batch_reps as u32).div_ceil(wg_threads);
+            let mut step_offset = 0u32;
+            while step_offset < total_steps {
+                let p_val = AnnealParamsGpu {
+                    replicas: batch_reps as u32,
+                    s_len: s_len as u32,
+                    k_len: k_len as u32,
+                    max_block: cfg.max_block as u32,
+                    total_steps,
+                    step_offset,
+                    chunk_steps,
+                    _pad: 0,
+                    t_start: cfg.t_start as f32,
+                    t_end: cfg.t_end as f32,
+                    _pad2: [0.0; 2],
+                };
+                self.queue
+                    .write_buffer(&u_params, 0, bytemuck::bytes_of(&p_val));
+                let mut enc = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("anneal-chunk-enc"),
+                    });
+                {
+                    let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("anneal-chunk-pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(pipeline);
+                    cpass.set_bind_group(0, &bg, &[]);
+                    cpass.dispatch_workgroups(workgroups, 1, 1);
                 }
+                self.queue.submit(Some(enc.finish()));
+                step_offset = step_offset.saturating_add(chunk_steps);
             }
-            for e in 0..k_len.saturating_sub(1) {
-                let a = at_slice[e];
-                let b = at_slice[e + 1];
-                if a >= 0 && b >= 0 {
-                    sc += p.get(a as usize, b as usize);
+
+            let at_both_out: Vec<i32> = self.read_buffer_vec(&b_at, at_bytes)?;
+            let best_at_all = &at_both_out[batch_reps * k_len..2 * batch_reps * k_len];
+            let scores_out: Vec<[f32; 2]> =
+                self.read_buffer_vec(&b_scores, (batch_reps * 8) as u64)?;
+
+            // Reconstruct `pos` per replica and re-evaluate exact f64 total score
+            for r in 0..batch_reps {
+                let at_slice = &best_at_all[r * k_len..(r + 1) * k_len];
+                let mut pos = vec![-1i32; s_len];
+                let mut sc = 0.0f64;
+                for (k, &s) in at_slice.iter().enumerate() {
+                    if s >= 0 && (s as usize) < s_len {
+                        pos[s as usize] = k as i32;
+                        sc += u.get(s as usize, k);
+                    }
                 }
+                for e in 0..k_len.saturating_sub(1) {
+                    let a = at_slice[e];
+                    let b = at_slice[e + 1];
+                    if a >= 0 && b >= 0 {
+                        sc += p.get(a as usize, b as usize);
+                    }
+                }
+                let _gpu_best = scores_out[r][1];
+                positions.push(pos);
+                exact_scores.push(sc);
             }
-            // Fallback to GPU tracked best if identical
-            let _gpu_best = scores_out[r][1];
-            positions.push(pos);
-            exact_scores.push(sc);
+
+            rep_offset += batch_reps;
         }
 
         Ok(consensus_from_runs(&positions, exact_scores))

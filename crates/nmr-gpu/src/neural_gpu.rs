@@ -10,6 +10,7 @@
 //! - Chollet, F. (2017), *CVPR*, 1251–1258 & Yu, F. & Koltun, V. (2016), *ICLR* — multi-scale
 //!   depthwise/separable dilated residual 3D convolutions.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
@@ -26,9 +27,14 @@ pub const CONV3D_GPU_NUM_WEIGHTS: usize = 1030;
 
 const NORM_SIGMA_DIV: f32 = 10.0;
 const NORM_CLAMP: f32 = 8.0;
-/// Maximum voxels per single GPU slab so `n_vox * 16 * 4 <= 64 MiB` (well within WebGPU's 128 MiB default binding limit).
-const MAX_SLAB_VOXELS: usize = 1_048_576;
-const MAX_NMS_PEAKS_PER_SLAB: u32 = 32_768;
+/// Maximum voxels per single GPU 3D tile so `n_vox * 16 * 4 <= 64 MiB` (`67,108,864` bytes),
+/// strictly within `64 MiB` per buffer (half of baseline WebGPU's `128 MiB` storage binding limit).
+pub const MAX_SLAB_VOXELS: usize = 1_048_576;
+/// Hard per-buffer byte ceiling (`64 MiB` = `67,108,864` bytes) enforced across every 3D CNN tile.
+pub const MAX_CONV3D_BUFFER_BYTES: u64 =
+    (MAX_SLAB_VOXELS * CONV3D_GPU_HIDDEN_CH * std::mem::size_of::<f32>()) as u64;
+const MAX_NMS_PEAKS_PER_SLAB: u32 = 65_536;
+const FAST_NMS_STAGING_PEAKS: usize = 1_365; // 16 + 1365 * 48 = 65,536 B (64 KiB)
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -128,21 +134,208 @@ pub fn estimate_thermal_noise_haar_gpu(data: &[f32], nx: usize) -> f32 {
     (1.4826 * 1.014 * median_f32_gpu(&mut bg)).max(1e-6)
 }
 
-/// Normalize 3D spectrum intensities identically to `nmr_core::neural_picker::normalize_spectrum_data_with_nx`.
-pub fn normalize_spectrum_3d_for_gpu(data: &[f32], nx: usize) -> (Vec<f32>, f32, f32) {
+/// Estimate `(median_baseline, thermal_noise_sigma)` identically to `normalize_spectrum_3d_for_gpu`
+/// without materializing a full-cube copy on the CPU.
+pub fn estimate_baseline_and_noise_3d_gpu(data: &[f32], nx: usize) -> (f32, f32) {
     if data.is_empty() {
-        return (Vec::new(), 0.0, 1.0);
+        return (0.0, 1.0);
     }
     let stride = (data.len() / 32_768).max(1);
     let mut sample: Vec<f32> = data.iter().step_by(stride).copied().collect();
     let med = median_f32_gpu(&mut sample);
     let noise = estimate_thermal_noise_haar_gpu(data, nx);
+    (med, noise)
+}
+
+/// Normalize 3D spectrum intensities identically to `nmr_core::neural_picker::normalize_spectrum_data_with_nx`.
+pub fn normalize_spectrum_3d_for_gpu(data: &[f32], nx: usize) -> (Vec<f32>, f32, f32) {
+    if data.is_empty() {
+        return (Vec::new(), 0.0, 1.0);
+    }
+    let (med, noise) = estimate_baseline_and_noise_3d_gpu(data, nx);
     let inv = 1.0 / (NORM_SIGMA_DIV * noise);
     let norm = data
         .iter()
         .map(|&v| ((v - med) * inv).clamp(-NORM_CLAMP, NORM_CLAMP))
         .collect();
     (norm, med, noise)
+}
+
+/// Compute optimal `(max_tile_x, max_tile_y, max_tile_z)` padded tile dimensions for an active
+/// core region `[active_x0..active_x1, active_y0..active_y1, active_z0..active_z1)` inside a full
+/// cube `(full_nx, full_ny, full_nz)` with `halo` voxels on each tiled boundary (`6` for dense
+/// forward CNN, `7` for CNN + 3x3x3 NMS), guaranteeing `tx * ty * tz <= max_voxels`.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_3d_tile_shape(
+    active_x0: usize,
+    active_x1: usize,
+    active_y0: usize,
+    active_y1: usize,
+    active_z0: usize,
+    active_z1: usize,
+    full_nx: usize,
+    full_ny: usize,
+    full_nz: usize,
+    halo: usize,
+    max_voxels: usize,
+) -> (usize, usize, usize) {
+    let cores = [
+        active_x1.saturating_sub(active_x0).max(1),
+        active_y1.saturating_sub(active_y0).max(1),
+        active_z1.saturating_sub(active_z0).max(1),
+    ];
+    let spans = [
+        ((active_x1 + halo).min(full_nx))
+            .saturating_sub(active_x0.saturating_sub(halo))
+            .max(1),
+        ((active_y1 + halo).min(full_ny))
+            .saturating_sub(active_y0.saturating_sub(halo))
+            .max(1),
+        ((active_z1 + halo).min(full_nz))
+            .saturating_sub(active_z0.saturating_sub(halo))
+            .max(1),
+    ];
+
+    let min_tiled = 2 * halo + 2;
+    let eff_max_voxels = max_voxels.max(min_tiled * min_tiled * min_tiled);
+
+    if let Some(prod) = spans[0]
+        .checked_mul(spans[1])
+        .and_then(|v| v.checked_mul(spans[2]))
+    {
+        if prod <= eff_max_voxels {
+            return (spans[0], spans[1], spans[2]);
+        }
+    }
+
+    let mut best_shape = (
+        min_tiled.min(spans[0]),
+        min_tiled.min(spans[1]),
+        min_tiled.min(spans[2]),
+    );
+    let mut best_cost = (usize::MAX, usize::MAX);
+
+    for mask in 1u8..8 {
+        let tiled = [
+            (mask & 1) != 0,
+            ((mask >> 1) & 1) != 0,
+            ((mask >> 2) & 1) != 0,
+        ];
+        let mut t = spans;
+        let mut untiled_prod = 1usize;
+        let mut ok = true;
+        let mut idxs = Vec::with_capacity(3);
+        for d in 0..3 {
+            if tiled[d] {
+                idxs.push(d);
+            } else if let Some(p) = untiled_prod.checked_mul(spans[d]) {
+                untiled_prod = p;
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if !ok || untiled_prod > eff_max_voxels {
+            continue;
+        }
+
+        idxs.sort_by_key(|&d| spans[d]);
+        let rem = eff_max_voxels / untiled_prod.max(1);
+
+        match *idxs.as_slice() {
+            [d0] => {
+                let lo0 = min_tiled.min(spans[d0]);
+                if rem < lo0 {
+                    continue;
+                }
+                t[d0] = rem.min(spans[d0]);
+            }
+            [d0, d1] => {
+                let lo0 = min_tiled.min(spans[d0]);
+                let lo1 = min_tiled.min(spans[d1]);
+                if rem < lo0 * lo1 {
+                    continue;
+                }
+                let mut t0 = ((rem as f64).sqrt().floor() as usize).clamp(lo0, spans[d0]);
+                if rem / t0 < lo1 {
+                    t0 = (rem / lo1).clamp(lo0, spans[d0]);
+                }
+                let t1 = (rem / t0).min(spans[d1]);
+                if t0 < lo0 || t1 < lo1 {
+                    continue;
+                }
+                t[d0] = t0;
+                t[d1] = t1;
+            }
+            [d0, d1, d2] => {
+                let lo0 = min_tiled.min(spans[d0]);
+                let lo1 = min_tiled.min(spans[d1]);
+                let lo2 = min_tiled.min(spans[d2]);
+                if rem < lo0 * lo1 * lo2 {
+                    continue;
+                }
+                let mut t0 = ((rem as f64).cbrt().floor() as usize).clamp(lo0, spans[d0]);
+                if rem / t0 < lo1 * lo2 {
+                    t0 = (rem / (lo1 * lo2)).clamp(lo0, spans[d0]);
+                }
+                let rem1 = rem / t0;
+                let mut t1 = ((rem1 as f64).sqrt().floor() as usize).clamp(lo1, spans[d1]);
+                if rem1 / t1 < lo2 {
+                    t1 = (rem1 / lo2).clamp(lo1, spans[d1]);
+                }
+                let t2 = (rem1 / t1).min(spans[d2]);
+                if t0 < lo0 || t1 < lo1 || t2 < lo2 {
+                    continue;
+                }
+                t[d0] = t0;
+                t[d1] = t1;
+                t[d2] = t2;
+            }
+            _ => continue,
+        }
+
+        let tile_vol = t[0].saturating_mul(t[1]).saturating_mul(t[2]);
+        if tile_vol == 0 || tile_vol > eff_max_voxels {
+            continue;
+        }
+
+        let mut total_tiles = 1usize;
+        let mut step_ok = true;
+        for d in 0..3 {
+            let step = if t[d] >= spans[d] {
+                cores[d]
+            } else {
+                t[d].saturating_sub(2 * halo)
+            };
+            if step == 0 {
+                step_ok = false;
+                break;
+            }
+            total_tiles = total_tiles.saturating_mul(cores[d].div_ceil(step));
+        }
+        if !step_ok {
+            continue;
+        }
+
+        let cost = (total_tiles, total_tiles.saturating_mul(tile_vol));
+        if cost < best_cost {
+            best_cost = cost;
+            best_shape = (t[0], t[1], t[2]);
+        }
+    }
+
+    best_shape
+}
+
+struct Conv3dTileWorkspace {
+    u_params: wgpu::Buffer,
+    b_in: wgpu::Buffer,
+    buf_out: wgpu::Buffer,
+    b_nms: wgpu::Buffer,
+    staging_nms: wgpu::Buffer,
+    staging_nms_bytes: u64,
+    max_peaks: u32,
+    bg: wgpu::BindGroup,
 }
 
 pub struct GpuNeuralPicker {
@@ -160,6 +353,7 @@ pub struct GpuNeuralPicker {
     p_nms_3d: wgpu::ComputePipeline,
     weights_buf: wgpu::Buffer,
     weights: Vec<f32>,
+    last_max_binding_bytes: AtomicU64,
 }
 
 impl GpuNeuralPicker {
@@ -300,11 +494,18 @@ impl GpuNeuralPicker {
             p_nms_3d,
             weights_buf,
             weights: weights.to_vec(),
+            last_max_binding_bytes: AtomicU64::new(0),
         })
     }
 
     pub fn weights(&self) -> &[f32] {
         &self.weights
+    }
+
+    /// Largest single GPU buffer binding (in bytes) allocated by the most recent 3D forward or
+    /// peak-picking invocation. Guaranteed `<= MAX_CONV3D_BUFFER_BYTES` (`64 MiB`).
+    pub fn last_max_binding_bytes(&self) -> u64 {
+        self.last_max_binding_bytes.load(Ordering::Relaxed)
     }
 
     pub fn set_weights(&mut self, weights: &[f32]) -> Result<(), String> {
@@ -363,58 +564,55 @@ impl GpuNeuralPicker {
         Ok(out)
     }
 
-    /// Run a single Z-slab (or full cube) on WebGPU, optionally executing `nms_3d_pass`.
-    #[allow(clippy::too_many_arguments)]
-    fn execute_slab_gpu(
+    /// Allocate a reusable GPU buffer workspace for 3D tiles up to `max_tile_voxels` (`<= MAX_SLAB_VOXELS`),
+    /// enforcing the strict `64 MiB` (`<= 67,108,864` bytes) per-buffer ceiling.
+    fn create_tile_workspace(
         &self,
-        slab_input: &[f32],
-        nx: usize,
-        ny: usize,
-        slab_nz: usize,
-        valid_z0: u32,
-        valid_z1: u32,
-        z_global_offset: u32,
-        prob_thresh: f32,
-        min_snr_norm: f32,
-        allow_neg: bool,
+        max_tile_voxels: usize,
         read_dense_out: bool,
         run_nms: bool,
-    ) -> Result<(Vec<f32>, Vec<GpuRawPeak3D>), String> {
-        let n_vox = nx * ny * slab_nz;
-        if slab_input.len() != n_vox {
+    ) -> Result<Conv3dTileWorkspace, String> {
+        let n_vox = max_tile_voxels.max(1);
+        let in_bytes = ((n_vox * 4) as u64).max(16);
+        let hidden_bytes = ((n_vox * CONV3D_GPU_HIDDEN_CH * 4) as u64).max(16);
+        let out_bytes = ((n_vox * CONV3D_GPU_OUT_CH * 4) as u64).max(16);
+        let max_peaks = if run_nms { MAX_NMS_PEAKS_PER_SLAB } else { 1 };
+        let nms_total_bytes = std::mem::size_of::<NmsHeaderGpu>() as u64
+            + (max_peaks as u64) * (std::mem::size_of::<GpuRawPeak3D>() as u64);
+        let weights_bytes = (CONV3D_GPU_NUM_WEIGHTS * 4) as u64;
+        let params_bytes = std::mem::size_of::<Conv3DParamsGpu>() as u64;
+
+        let max_binding = hidden_bytes
+            .max(out_bytes)
+            .max(in_bytes)
+            .max(nms_total_bytes)
+            .max(weights_bytes)
+            .max(params_bytes);
+        let dev_lim = self.device.limits();
+        let hard_cap = MAX_CONV3D_BUFFER_BYTES
+            .min(dev_lim.max_storage_buffer_binding_size)
+            .min(dev_lim.max_buffer_size);
+        if max_binding > hard_cap {
             return Err(format!(
-                "slab_input length {} != nx*ny*slab_nz ({n_vox})",
-                slab_input.len()
+                "conv3d tile workspace binding ({max_binding} B for {n_vox} voxels) exceeds 64 MiB / device cap ({hard_cap} B)"
             ));
         }
+        self.last_max_binding_bytes
+            .store(max_binding, Ordering::Relaxed);
 
-        let params = Conv3DParamsGpu {
-            nx: nx as u32,
-            ny: ny as u32,
-            nz: slab_nz as u32,
-            allow_neg: u32::from(allow_neg),
-            prob_thresh,
-            min_snr_norm,
-            valid_z0,
-            valid_z1,
-        };
-        let u_params = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("conv3d-params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let b_in = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("conv3d-input"),
-                contents: bytemuck::cast_slice(slab_input),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        let u_params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("conv3d-params"),
+            size: params_bytes,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let b_in = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("conv3d-input"),
+            size: in_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        let hidden_bytes = (n_vox * CONV3D_GPU_HIDDEN_CH * 4).max(16) as u64;
-        let out_bytes = (n_vox * CONV3D_GPU_OUT_CH * 4).max(16) as u64;
         let make_rw = |label: &str, size: u64, copy_src: bool| {
             let mut usage = wgpu::BufferUsages::STORAGE;
             if copy_src {
@@ -432,15 +630,6 @@ impl GpuNeuralPicker {
         let buf_skip = make_rw("conv3d-buf-skip", hidden_bytes, false);
         let buf_out = make_rw("conv3d-buf-out", out_bytes, read_dense_out);
 
-        let max_peaks = if run_nms { MAX_NMS_PEAKS_PER_SLAB } else { 1 };
-        let header = NmsHeaderGpu {
-            count: 0,
-            max_peaks,
-            z_global_offset,
-            pad0: 0,
-        };
-        let nms_total_bytes = std::mem::size_of::<NmsHeaderGpu>() as u64
-            + (max_peaks as u64) * (std::mem::size_of::<GpuRawPeak3D>() as u64);
         let b_nms = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("conv3d-nms-out"),
             size: nms_total_bytes,
@@ -449,8 +638,20 @@ impl GpuNeuralPicker {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        self.queue
-            .write_buffer(&b_nms, 0, bytemuck::bytes_of(&header));
+
+        let fast_nms_bytes = if run_nms {
+            (std::mem::size_of::<NmsHeaderGpu>()
+                + FAST_NMS_STAGING_PEAKS * std::mem::size_of::<GpuRawPeak3D>()) as u64
+        } else {
+            16
+        };
+        let staging_nms_bytes = fast_nms_bytes.min(nms_total_bytes);
+        let staging_nms = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("conv3d-nms-fast-staging"),
+            size: staging_nms_bytes.max(16),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("conv3d-bg"),
@@ -491,9 +692,79 @@ impl GpuNeuralPicker {
             ],
         });
 
+        Ok(Conv3dTileWorkspace {
+            u_params,
+            b_in,
+            buf_out,
+            b_nms,
+            staging_nms,
+            staging_nms_bytes,
+            max_peaks,
+            bg,
+        })
+    }
+
+    /// Execute a single 3D tile `(nx, ny, slab_nz)` using an existing `Conv3dTileWorkspace`.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_slab_in_workspace(
+        &self,
+        ws: &Conv3dTileWorkspace,
+        slab_input: &[f32],
+        nx: usize,
+        ny: usize,
+        slab_nz: usize,
+        valid_z0: u32,
+        valid_z1: u32,
+        z_global_offset: u32,
+        prob_thresh: f32,
+        min_snr_norm: f32,
+        allow_neg: bool,
+        read_dense_out: bool,
+        run_nms: bool,
+    ) -> Result<(Vec<f32>, Vec<GpuRawPeak3D>), String> {
+        let n_vox = nx * ny * slab_nz;
+        if slab_input.len() != n_vox {
+            return Err(format!(
+                "slab_input length {} != nx*ny*slab_nz ({n_vox})",
+                slab_input.len()
+            ));
+        }
+
+        let params = Conv3DParamsGpu {
+            nx: nx as u32,
+            ny: ny as u32,
+            nz: slab_nz as u32,
+            allow_neg: u32::from(allow_neg),
+            prob_thresh,
+            min_snr_norm,
+            valid_z0,
+            valid_z1,
+        };
+        let header = NmsHeaderGpu {
+            count: 0,
+            max_peaks: ws.max_peaks,
+            z_global_offset,
+            pad0: 0,
+        };
+
+        self.queue
+            .write_buffer(&ws.u_params, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&ws.b_in, 0, bytemuck::cast_slice(slab_input));
+        if run_nms {
+            self.queue
+                .write_buffer(&ws.b_nms, 0, bytemuck::bytes_of(&header));
+        }
+
         let wg_x = (nx as u32).div_ceil(8);
         let wg_y = (ny as u32).div_ceil(8);
         let wg_z = (slab_nz as u32).div_ceil(4);
+        let max_wg_dim = self.device.limits().max_compute_workgroups_per_dimension;
+        if wg_x > max_wg_dim || wg_y > max_wg_dim || wg_z > max_wg_dim {
+            return Err(format!(
+                "conv3d tile workgroup dispatch ({wg_x}x{wg_y}x{wg_z}) exceeds device limit ({max_wg_dim})"
+            ));
+        }
 
         let mut encoder = self
             .device
@@ -505,7 +776,7 @@ impl GpuNeuralPicker {
                 label: Some("conv3d-forward-pass"),
                 timestamp_writes: None,
             });
-            cpass.set_bind_group(0, &bg, &[]);
+            cpass.set_bind_group(0, &ws.bg, &[]);
 
             for pipe in [
                 &self.p_stem_x,
@@ -523,6 +794,9 @@ impl GpuNeuralPicker {
                 cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
             }
         }
+        if run_nms {
+            encoder.copy_buffer_to_buffer(&ws.b_nms, 0, &ws.staging_nms, 0, ws.staging_nms_bytes);
+        }
         self.queue.submit(Some(encoder.finish()));
 
         let dense = if read_dense_out {
@@ -530,24 +804,56 @@ impl GpuNeuralPicker {
             let plane_floats = nx * ny * CONV3D_GPU_OUT_CH;
             let byte_off = (valid_z0 as usize * plane_floats * 4) as u64;
             let byte_len = (valid_planes * plane_floats * 4) as u64;
-            let raw_bytes = self.read_buffer_bytes(&buf_out, byte_off, byte_len)?;
+            let raw_bytes = self.read_buffer_bytes(&ws.buf_out, byte_off, byte_len)?;
             bytemuck::cast_slice::<u8, f32>(&raw_bytes).to_vec()
         } else {
             Vec::new()
         };
 
         let raw_peaks = if run_nms {
-            let hdr_bytes =
-                self.read_buffer_bytes(&b_nms, 0, std::mem::size_of::<NmsHeaderGpu>() as u64)?;
-            let hdr: NmsHeaderGpu = *bytemuck::from_bytes(&hdr_bytes);
-            let cnt = hdr.count.min(max_peaks) as usize;
-            if cnt > 0 {
-                let pk_off = std::mem::size_of::<NmsHeaderGpu>() as u64;
-                let pk_bytes = (cnt * std::mem::size_of::<GpuRawPeak3D>()) as u64;
-                let raw_pk_bytes = self.read_buffer_bytes(&b_nms, pk_off, pk_bytes)?;
-                bytemuck::cast_slice::<u8, GpuRawPeak3D>(&raw_pk_bytes).to_vec()
-            } else {
+            let slice = ws.staging_nms.slice(0..ws.staging_nms_bytes);
+            let (tx, rx) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            rx.recv()
+                .map_err(|e| format!("GPU map channel closed: {e}"))?
+                .map_err(|e| format!("GPU buffer map failed: {e}"))?;
+
+            let hdr_sz = std::mem::size_of::<NmsHeaderGpu>();
+            let pk_sz = std::mem::size_of::<GpuRawPeak3D>();
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|e| format!("GPU mapped range failed: {e}"))?;
+            let hdr: NmsHeaderGpu = *bytemuck::from_bytes(&mapped[..hdr_sz]);
+            if hdr.count > ws.max_peaks {
+                let overflow_cnt = hdr.count;
+                drop(mapped);
+                ws.staging_nms.unmap();
+                return Err(format!(
+                    "conv3d tile NMS peak count ({overflow_cnt}) exceeded per-tile buffer capacity ({})",
+                    ws.max_peaks
+                ));
+            }
+            let cnt = hdr.count as usize;
+            let fast_cap = (ws.staging_nms_bytes as usize).saturating_sub(hdr_sz) / pk_sz;
+            if cnt == 0 {
+                drop(mapped);
+                ws.staging_nms.unmap();
                 Vec::new()
+            } else if cnt <= fast_cap {
+                let end_b = hdr_sz + cnt * pk_sz;
+                let pks = bytemuck::cast_slice::<u8, GpuRawPeak3D>(&mapped[hdr_sz..end_b]).to_vec();
+                drop(mapped);
+                ws.staging_nms.unmap();
+                pks
+            } else {
+                drop(mapped);
+                ws.staging_nms.unmap();
+                let raw_pk_bytes =
+                    self.read_buffer_bytes(&ws.b_nms, hdr_sz as u64, (cnt * pk_sz) as u64)?;
+                bytemuck::cast_slice::<u8, GpuRawPeak3D>(&raw_pk_bytes).to_vec()
             }
         } else {
             Vec::new()
@@ -556,14 +862,62 @@ impl GpuNeuralPicker {
         Ok((dense, raw_peaks))
     }
 
+    /// Run a single 3D tile (or full cube) on WebGPU, optionally executing `nms_3d_pass`.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_slab_gpu(
+        &self,
+        slab_input: &[f32],
+        nx: usize,
+        ny: usize,
+        slab_nz: usize,
+        valid_z0: u32,
+        valid_z1: u32,
+        z_global_offset: u32,
+        prob_thresh: f32,
+        min_snr_norm: f32,
+        allow_neg: bool,
+        read_dense_out: bool,
+        run_nms: bool,
+    ) -> Result<(Vec<f32>, Vec<GpuRawPeak3D>), String> {
+        let ws = self.create_tile_workspace(nx * ny * slab_nz, read_dense_out, run_nms)?;
+        self.execute_slab_in_workspace(
+            &ws,
+            slab_input,
+            nx,
+            ny,
+            slab_nz,
+            valid_z0,
+            valid_z1,
+            z_global_offset,
+            prob_thresh,
+            min_snr_norm,
+            allow_neg,
+            read_dense_out,
+            run_nms,
+        )
+    }
+
     /// Execute the 3D separable CNN forward pass on WebGPU (`[nz * ny * nx * 6]`), automatically
-    /// tiling large 3D volumes along Z with exact 6-plane receptive-field halos when needed.
+    /// tiling large 3D volumes across `(X, Y, Z)` with exact `6`-voxel receptive-field halos so no
+    /// GPU buffer ever exceeds `max_tile_voxels * 64` bytes (`<= 64 MiB`).
     pub fn forward_3d_gpu(
         &self,
         input_norm: &[f32],
         nx: usize,
         ny: usize,
         nz: usize,
+    ) -> Result<Vec<f32>, String> {
+        self.forward_3d_gpu_tiled(input_norm, nx, ny, nz, MAX_SLAB_VOXELS)
+    }
+
+    /// Execute `forward_3d_gpu` with an explicit per-tile voxel budget (`<= MAX_SLAB_VOXELS`).
+    pub fn forward_3d_gpu_tiled(
+        &self,
+        input_norm: &[f32],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        max_tile_voxels: usize,
     ) -> Result<Vec<f32>, String> {
         let plane = nx * ny;
         if input_norm.len() != plane * nz {
@@ -577,7 +931,8 @@ impl GpuNeuralPicker {
             return Ok(Vec::new());
         }
 
-        if plane * nz <= MAX_SLAB_VOXELS {
+        let eff_max = max_tile_voxels.clamp(4096, MAX_SLAB_VOXELS);
+        if plane.saturating_mul(nz) <= eff_max {
             let (dense, _) = self.execute_slab_gpu(
                 input_norm, nx, ny, nz, 0, nz as u32, 0, 0.5, 0.0, true, true, false,
             )?;
@@ -585,32 +940,81 @@ impl GpuNeuralPicker {
         }
 
         let halo = 6usize;
-        let max_slab_z = (MAX_SLAB_VOXELS / plane.max(1)).max(halo * 2 + 4);
-        let core_step_z = max_slab_z - 2 * halo;
-        let mut full_out = Vec::with_capacity(plane * nz * CONV3D_GPU_OUT_CH);
+        let (tx, ty, tz) = plan_3d_tile_shape(0, nx, 0, ny, 0, nz, nx, ny, nz, halo, eff_max);
+        let step_x = if tx >= nx { nx } else { tx - 2 * halo };
+        let step_y = if ty >= ny { ny } else { ty - 2 * halo };
+        let step_z = if tz >= nz { nz } else { tz - 2 * halo };
+
+        let ws = self.create_tile_workspace(tx * ty * tz, true, false)?;
+        let mut tile_in = Vec::with_capacity(tx * ty * tz);
+        let mut full_out = vec![0.0f32; plane * nz * CONV3D_GPU_OUT_CH];
 
         let mut z0 = 0usize;
         while z0 < nz {
-            let z1 = (z0 + core_step_z).min(nz);
+            let z1 = (z0 + step_z).min(nz);
             let sub_z0 = z0.saturating_sub(halo);
             let sub_z1 = (z1 + halo).min(nz);
-            let slab_nz = sub_z1 - sub_z0;
-            let slab_slice = &input_norm[sub_z0 * plane..sub_z1 * plane];
-            let (slab_dense, _) = self.execute_slab_gpu(
-                slab_slice,
-                nx,
-                ny,
-                slab_nz,
-                (z0 - sub_z0) as u32,
-                (z1 - sub_z0) as u32,
-                sub_z0 as u32,
-                0.5,
-                0.0,
-                true,
-                true,
-                false,
-            )?;
-            full_out.extend_from_slice(&slab_dense);
+            let tile_nz = sub_z1 - sub_z0;
+
+            let mut y0 = 0usize;
+            while y0 < ny {
+                let y1 = (y0 + step_y).min(ny);
+                let sub_y0 = y0.saturating_sub(halo);
+                let sub_y1 = (y1 + halo).min(ny);
+                let tile_ny = sub_y1 - sub_y0;
+
+                let mut x0 = 0usize;
+                while x0 < nx {
+                    let x1 = (x0 + step_x).min(nx);
+                    let sub_x0 = x0.saturating_sub(halo);
+                    let sub_x1 = (x1 + halo).min(nx);
+                    let tile_nx = sub_x1 - sub_x0;
+
+                    tile_in.clear();
+                    for gz in sub_z0..sub_z1 {
+                        for gy in sub_y0..sub_y1 {
+                            let src = (gz * ny + gy) * nx + sub_x0;
+                            tile_in.extend_from_slice(&input_norm[src..src + tile_nx]);
+                        }
+                    }
+
+                    let (tile_dense, _) = self.execute_slab_in_workspace(
+                        &ws,
+                        &tile_in,
+                        tile_nx,
+                        tile_ny,
+                        tile_nz,
+                        (z0 - sub_z0) as u32,
+                        (z1 - sub_z0) as u32,
+                        sub_z0 as u32,
+                        0.5,
+                        0.0,
+                        true,
+                        true,
+                        false,
+                    )?;
+
+                    let valid_x0 = x0 - sub_x0;
+                    let valid_y0 = y0 - sub_y0;
+                    let core_nx = x1 - x0;
+                    let core_ny = y1 - y0;
+                    let core_nz = z1 - z0;
+                    for lz in 0..core_nz {
+                        for ly in 0..core_ny {
+                            let src_off = ((lz * tile_ny + (valid_y0 + ly)) * tile_nx + valid_x0)
+                                * CONV3D_GPU_OUT_CH;
+                            let dst_off =
+                                (((z0 + lz) * ny + (y0 + ly)) * nx + x0) * CONV3D_GPU_OUT_CH;
+                            let copy_floats = core_nx * CONV3D_GPU_OUT_CH;
+                            full_out[dst_off..dst_off + copy_floats]
+                                .copy_from_slice(&tile_dense[src_off..src_off + copy_floats]);
+                        }
+                    }
+
+                    x0 = x1;
+                }
+                y0 = y1;
+            }
             z0 = z1;
         }
 
@@ -618,13 +1022,27 @@ impl GpuNeuralPicker {
     }
 
     /// Pick 3D triple-resonance peaks (`HNCA`, `HNCOCA`, `HNCACB`, `CBCACONH`, `HNCO`, `HNCACO`)
-    /// entirely on the GPU (separable 3D conv + residual + GELU + 3x3x3 GPU NMS + sub-voxel offset).
+    /// entirely on the GPU (separable 3D conv + residual + GELU + 3x3x3 GPU NMS + sub-voxel offset),
+    /// cropping `1H`/`15N` to the active `hsqc_roots` bounding box when provided and tiling in 3D
+    /// `(X, Y, Z)` with `7`-voxel halos (`6` conv + `1` NMS) so no buffer ever exceeds `64 MiB`.
     pub fn pick_triple_3d_gpu(
         &self,
         spec: &Spectrum3D,
         experiment: &str,
         hsqc_roots: &[Peak],
         cfg: &GpuNeuralPickerConfig,
+    ) -> Result<Vec<Peak>, String> {
+        self.pick_triple_3d_gpu_tiled(spec, experiment, hsqc_roots, cfg, MAX_SLAB_VOXELS)
+    }
+
+    /// Execute `pick_triple_3d_gpu` with an explicit per-tile voxel budget (`<= MAX_SLAB_VOXELS`).
+    pub fn pick_triple_3d_gpu_tiled(
+        &self,
+        spec: &Spectrum3D,
+        experiment: &str,
+        hsqc_roots: &[Peak],
+        cfg: &GpuNeuralPickerConfig,
+        max_tile_voxels: usize,
     ) -> Result<Vec<Peak>, String> {
         let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
         if nx < 3 || ny < 3 || nz < 3 {
@@ -641,76 +1059,215 @@ impl GpuNeuralPicker {
                 && spec.axis_y.min_ppm() < 145.0
                 && !spec.axis_z.label.contains('N'));
 
-        let (norm_in, med, noise) = normalize_spectrum_3d_for_gpu(&spec.data, nx);
-        let eff_prob_thresh = cfg.prob_threshold;
-        let plane = nx * ny;
+        // Precompute exact active (1H, 15N) strip mask & tight active bounding box when HSQC roots exist
+        let n_len = if y_is_n { ny } else { nz };
+        let n_axis = if y_is_n { &spec.axis_y } else { &spec.axis_z };
+        let mut active_x0 = 1usize;
+        let mut active_x1 = nx - 1;
+        let mut active_y0 = 1usize;
+        let mut active_y1 = ny - 1;
+        let mut active_z0 = 1usize;
+        let mut active_z1 = nz - 1;
 
-        let mut all_raw_peaks: Vec<GpuRawPeak3D> = Vec::new();
-        if plane * nz <= MAX_SLAB_VOXELS {
-            let (_, raws) = self.execute_slab_gpu(
-                &norm_in,
-                nx,
-                ny,
-                nz,
-                1,
-                (nz - 1) as u32,
-                0,
-                eff_prob_thresh,
-                cfg.min_snr_norm,
-                allow_neg,
-                false,
-                true,
-            )?;
-            all_raw_peaks = raws;
-        } else {
-            // 7-plane Z-halo (6 conv receptive field + 1 NMS neighbor plane) guarantees exact 3x3x3 NMS
-            let halo = 7usize;
-            let max_slab_z = (MAX_SLAB_VOXELS / plane.max(1)).max(halo * 2 + 4);
-            let core_step_z = max_slab_z - 2 * halo;
-            let mut z0 = 1usize;
-            let z_limit = nz - 1;
-            while z0 < z_limit {
-                let z1 = (z0 + core_step_z).min(z_limit);
-                let sub_z0 = z0.saturating_sub(halo);
-                let sub_z1 = (z1 + halo).min(nz);
-                let slab_nz = sub_z1 - sub_z0;
-                let slab_slice = &norm_in[sub_z0 * plane..sub_z1 * plane];
-                let (_, raws) = self.execute_slab_gpu(
-                    slab_slice,
-                    nx,
-                    ny,
-                    slab_nz,
-                    (z0 - sub_z0) as u32,
-                    (z1 - sub_z0) as u32,
-                    sub_z0 as u32,
-                    eff_prob_thresh,
-                    cfg.min_snr_norm,
-                    allow_neg,
-                    false,
-                    true,
-                )?;
-                all_raw_peaks.extend(raws);
-                z0 = z1;
+        let active_hn_opt: Option<Vec<bool>> = if !hsqc_roots.is_empty() {
+            let h_pts: Vec<f64> = (0..nx)
+                .map(|ix| spec.axis_x.index_to_ppm(ix as f64))
+                .collect();
+            let n_pts: Vec<f64> = (0..n_len).map(|i| n_axis.index_to_ppm(i as f64)).collect();
+            let mut mask = vec![false; n_len * nx];
+            let mut min_ax = usize::MAX;
+            let mut max_ax = 0usize;
+            let mut min_an = usize::MAX;
+            let mut max_an = 0usize;
+
+            for r in hsqc_roots {
+                let xa = spec.axis_x.ppm_to_index(r.h + cfg.strip_tol_h);
+                let xb = spec.axis_x.ppm_to_index(r.h - cfg.strip_tol_h);
+                let wx0 = (xa.min(xb).floor() as isize - 1).clamp(1, nx as isize - 2) as usize;
+                let wx1 = (xa.max(xb).ceil() as isize + 1).clamp(1, nx as isize - 2) as usize;
+
+                let na = n_axis.ppm_to_index(r.n + cfg.strip_tol_n);
+                let nb = n_axis.ppm_to_index(r.n - cfg.strip_tol_n);
+                let wn0 = (na.min(nb).floor() as isize - 1).clamp(1, n_len as isize - 2) as usize;
+                let wn1 = (na.max(nb).ceil() as isize + 1).clamp(1, n_len as isize - 2) as usize;
+
+                for (in_i, &n_ppm) in n_pts.iter().enumerate().take(wn1 + 1).skip(wn0) {
+                    if (r.n - n_ppm).abs() > cfg.strip_tol_n {
+                        continue;
+                    }
+                    let row_base = in_i * nx;
+                    for ix in wx0..=wx1 {
+                        if (r.h - h_pts[ix]).abs() <= cfg.strip_tol_h {
+                            mask[row_base + ix] = true;
+                            min_ax = min_ax.min(ix);
+                            max_ax = max_ax.max(ix);
+                            min_an = min_an.min(in_i);
+                            max_an = max_an.max(in_i);
+                        }
+                    }
+                }
             }
+
+            if min_ax > max_ax || min_an > max_an {
+                return Ok(Vec::new());
+            }
+            active_x0 = min_ax;
+            active_x1 = max_ax + 1;
+            if y_is_n {
+                active_y0 = min_an;
+                active_y1 = max_an + 1;
+            } else {
+                active_z0 = min_an;
+                active_z1 = max_an + 1;
+            }
+            Some(mask)
+        } else {
+            None
+        };
+
+        let (med, noise) = estimate_baseline_and_noise_3d_gpu(&spec.data, nx);
+        let inv = 1.0 / (NORM_SIGMA_DIV * noise);
+        let eff_prob_thresh = cfg.prob_threshold;
+
+        // 7-voxel halo on every tiled axis (6-voxel CNN receptive field + 1-voxel 3x3x3 NMS neighbor)
+        let halo = 7usize;
+        let eff_max = max_tile_voxels.clamp(4096, MAX_SLAB_VOXELS);
+        let (tx, ty, tz) = plan_3d_tile_shape(
+            active_x0, active_x1, active_y0, active_y1, active_z0, active_z1, nx, ny, nz, halo,
+            eff_max,
+        );
+
+        let span_x = ((active_x1 + halo).min(nx))
+            .saturating_sub(active_x0.saturating_sub(halo))
+            .max(1);
+        let span_y = ((active_y1 + halo).min(ny))
+            .saturating_sub(active_y0.saturating_sub(halo))
+            .max(1);
+        let span_z = ((active_z1 + halo).min(nz))
+            .saturating_sub(active_z0.saturating_sub(halo))
+            .max(1);
+        let step_x = if tx >= span_x {
+            active_x1 - active_x0
+        } else {
+            tx - 2 * halo
+        };
+        let step_y = if ty >= span_y {
+            active_y1 - active_y0
+        } else {
+            ty - 2 * halo
+        };
+        let step_z = if tz >= span_z {
+            active_z1 - active_z0
+        } else {
+            tz - 2 * halo
+        };
+
+        let ws = self.create_tile_workspace(tx * ty * tz, false, true)?;
+        let mut tile_in: Vec<f32> = Vec::with_capacity(tx * ty * tz);
+        let mut all_raw_peaks: Vec<GpuRawPeak3D> = Vec::new();
+
+        let mut z0 = active_z0;
+        while z0 < active_z1 {
+            let z1 = (z0 + step_z).min(active_z1);
+            let sub_z0 = z0.saturating_sub(halo);
+            let sub_z1 = (z1 + halo).min(nz);
+            let tile_nz = sub_z1 - sub_z0;
+
+            let mut y0 = active_y0;
+            while y0 < active_y1 {
+                let y1 = (y0 + step_y).min(active_y1);
+                let sub_y0 = y0.saturating_sub(halo);
+                let sub_y1 = (y1 + halo).min(ny);
+                let tile_ny = sub_y1 - sub_y0;
+
+                let mut x0 = active_x0;
+                while x0 < active_x1 {
+                    let x1 = (x0 + step_x).min(active_x1);
+
+                    // Skip 3D tiles whose core (1H, 15N) projection contains zero active HSQC strips
+                    if let Some(mask) = &active_hn_opt {
+                        let (n0, n1) = if y_is_n { (y0, y1) } else { (z0, z1) };
+                        let mut any_active = false;
+                        'chk: for in_i in n0..n1 {
+                            let row = &mask[in_i * nx + x0..in_i * nx + x1];
+                            if row.iter().any(|&b| b) {
+                                any_active = true;
+                                break 'chk;
+                            }
+                        }
+                        if !any_active {
+                            x0 = x1;
+                            continue;
+                        }
+                    }
+
+                    let sub_x0 = x0.saturating_sub(halo);
+                    let sub_x1 = (x1 + halo).min(nx);
+                    let tile_nx = sub_x1 - sub_x0;
+
+                    tile_in.clear();
+                    for gz in sub_z0..sub_z1 {
+                        for gy in sub_y0..sub_y1 {
+                            let src_off = (gz * ny + gy) * nx + sub_x0;
+                            for &v in &spec.data[src_off..src_off + tile_nx] {
+                                tile_in.push(((v - med) * inv).clamp(-NORM_CLAMP, NORM_CLAMP));
+                            }
+                        }
+                    }
+
+                    let valid_x0 = (x0 - sub_x0) as u32;
+                    let valid_x1 = (x1 - sub_x0) as u32;
+                    let valid_y0 = (y0 - sub_y0) as u32;
+                    let valid_y1 = (y1 - sub_y0) as u32;
+                    let valid_z0 = (z0 - sub_z0) as u32;
+                    let valid_z1 = (z1 - sub_z0) as u32;
+
+                    let (_, raws) = self.execute_slab_in_workspace(
+                        &ws,
+                        &tile_in,
+                        tile_nx,
+                        tile_ny,
+                        tile_nz,
+                        valid_z0,
+                        valid_z1,
+                        sub_z0 as u32,
+                        eff_prob_thresh,
+                        cfg.min_snr_norm,
+                        allow_neg,
+                        false,
+                        true,
+                    )?;
+
+                    for mut rp in raws {
+                        if rp.ix < valid_x0
+                            || rp.ix >= valid_x1
+                            || rp.iy < valid_y0
+                            || rp.iy >= valid_y1
+                        {
+                            continue;
+                        }
+                        rp.ix += sub_x0 as u32;
+                        rp.iy += sub_y0 as u32;
+                        // rp.iz already includes z_global_offset (= sub_z0) from conv3d.wgsl
+                        all_raw_peaks.push(rp);
+                    }
+
+                    x0 = x1;
+                }
+                y0 = y1;
+            }
+            z0 = z1;
         }
 
-        // Deterministic sort matching CPU scan order (iz, iy, ix, ch)
+        // Deterministic sort matching CPU scan order (iz, iy, ix, -sign)
         all_raw_peaks.sort_by_key(|a| (a.iz, a.iy, a.ix, -a.sign));
 
         let mut peaks = Vec::with_capacity(all_raw_peaks.len());
         for rp in all_raw_peaks {
             let (ix, iy, iz) = (rp.ix as usize, rp.iy as usize, rp.iz as usize);
-            if !hsqc_roots.is_empty() {
-                let h_grid = spec.axis_x.index_to_ppm(ix as f64);
-                let n_grid = if y_is_n {
-                    spec.axis_y.index_to_ppm(iy as f64)
-                } else {
-                    spec.axis_z.index_to_ppm(iz as f64)
-                };
-                if !hsqc_roots.iter().any(|r| {
-                    (r.h - h_grid).abs() <= cfg.strip_tol_h
-                        && (r.n - n_grid).abs() <= cfg.strip_tol_n
-                }) {
+            if let Some(mask) = &active_hn_opt {
+                let in_i = if y_is_n { iy } else { iz };
+                if !mask[in_i * nx + ix] {
                     continue;
                 }
             }
