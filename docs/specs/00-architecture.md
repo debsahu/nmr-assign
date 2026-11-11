@@ -37,14 +37,14 @@ Feature parity target, mapped to modules:
 1. Python reference first, Julia for speed later, parity-tested (06).
 2. Every module is benchmarked against ground truth before it is trusted (05).
 3. Ambiguity is carried forward as scored candidates, never silently resolved.
-4. Clean-room: implement from papers and open data only (see CLAUDE.md).
+4. Clean-room: implement from papers and open data only (see AGENTS.md).
 5. Interchange formats are open standards (NMR-STAR, NEF, PDB) or the
    documented TSV formats in 01.
 
 ## Repository layout
 
 ```
-CLAUDE.md          agent rules
+AGENTS.md          agent rules (CLAUDE.md, GEMINI.md point here)
 TODO.md            roadmap
 docs/specs/        this folder
 python/nmrassign/  reference implementation (one file per module stage)

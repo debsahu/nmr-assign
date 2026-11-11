@@ -64,7 +64,8 @@ Reading the table:
 ## Repository layout
 
 ```
-CLAUDE.md            rules for AI agents (clean-room, licences, definition of done)
+AGENTS.md            rules for AI agents (clean-room, licences, definition of done)
+CLAUDE.md, GEMINI.md pointers to AGENTS.md for tools that look for them
 TODO.md              roadmap and open tasks, by phase and module
 docs/specs/          one specification per module (start at 00-architecture.md)
 python/nmrassign/    reference implementation

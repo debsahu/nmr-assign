@@ -28,4 +28,4 @@ shift agreement.
 3. Synthetic stress set (noise, overlap, deuteration).
 
 Regression rule: no merged change may lower accuracy or HC precision on the
-suite (CLAUDE.md).
+suite (AGENTS.md).

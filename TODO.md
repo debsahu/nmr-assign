@@ -4,7 +4,7 @@ Target: a complete open equivalent of NMRtist (spectra in, peak lists,
 assignments, and structures out). Parity table: docs/specs/00-architecture.md.
 
 Status key: [x] done, [ ] open. Owner: (M) maintainer, (A) AI agents.
-Specs: docs/specs/. Agent rules: CLAUDE.md.
+Specs: docs/specs/. Agent rules: AGENTS.md.
 
 ## Phase 1: Backbone assignment on real data
 - [x] (A) NMR-STAR reader/writer, peak TSV format
