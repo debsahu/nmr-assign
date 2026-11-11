@@ -1,0 +1,14 @@
+[package]
+name = "nmr-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "WebGPU (wgpu/WGSL) compute engine for NMR scoring matrices and multi-replica simulated annealing"
+
+[dependencies]
+nmr-core = { path = "../nmr-core" }
+bytemuck.workspace = true
+pollster.workspace = true
+wgpu.workspace = true

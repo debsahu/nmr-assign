@@ -1,0 +1,12 @@
+[package]
+name = "nmr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core NMR resonance assignment, spectrum I/O, peak picking, and simulation algorithms"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,6 +1,9 @@
 data/private/
+target/
 __pycache__/
 *.pyc
 .pytest_cache/
 result*.str
 result*.tsv
+ruvector.db
+.DS_Store

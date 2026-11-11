@@ -1,0 +1,16 @@
+[package]
+name = "nmr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Command-line interface for NMR backbone resonance assignment, peak picking, and benchmarking"
+
+[[bin]]
+name = "nmrassign"
+path = "src/main.rs"
+
+[dependencies]
+nmr-core = { path = "../nmr-core" }
+nmr-gpu = { path = "../nmr-gpu" }

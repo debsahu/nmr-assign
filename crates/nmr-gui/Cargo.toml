@@ -1,0 +1,19 @@
+[package]
+name = "nmr-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Interactive WebGPU + egui NMR spectrum & backbone resonance assignment workbench"
+
+[[bin]]
+name = "nmrassign-gui"
+path = "src/main.rs"
+
+[dependencies]
+nmr-core = { path = "../nmr-core" }
+nmr-gpu = { path = "../nmr-gpu" }
+bytemuck.workspace = true
+eframe.workspace = true
+wgpu.workspace = true
