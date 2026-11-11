@@ -4,9 +4,23 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## 2026-11-11 — WebGPU 3D Neural Picker `<= 64 MiB` Multi-Axis Tiling, Multi-Tier `>256`/`>1024` GPU Annealer & Loud Limit Enforcement (`nmr-gpu`)
+## 2026-11-11 — Clean-Room UCSF `.ucsf` v2 Spectrum I/O, Real-Data `pipeline` & `score` CLI, and Loud `--engine gpu` Error Propagation (`nmr-core`, `nmr-cli`)
 
-- **Source Branch / Reviewed Commit:** `swarm/gpu-engine` (`517e364d1f99bedf29a9bfafc9e299f56d97499c`, squashing `7595d64` + `517e364`)
+- **Source Branch / Reviewed Commit:** `swarm/cli-io` (`be27f1407e82028b10f78316ff59f38d4342cd05`, squashing `7140849` + `be27f14`)
+- **Architectural Summary:**
+  - **Clean-Room UCSF Sparky `.ucsf` v2 2D/3D Reader & Writer (`crates/nmr-core/src/spectrum.rs`):** Implemented `is_ucsf_bytes`, `is_ucsf_file`, `read_ucsf_2d`, `write_ucsf_2d`, `write_ucsf_2d_tiled`, `read_ucsf_3d`, `write_ucsf_3d`, and `write_ucsf_3d_tiled` from the public UCSF Sparky v2 file format specification, including exact `xmtr_ppm` carrier-center referencing (`first_ppm = xmtr_ppm + 0.5 * sw_hz / obs_mhz`), zero-padded partial boundary tile handling, and automatic `(1H, 15N, 13C)` axis permutation, wired into CLI auto-detection alongside Bruker `pdata` and NMRPipe.
+  - **Real-Data `nmrassign pipeline` & `nmrassign score` (`crates/nmr-cli/src/main.rs`):** Extended `pipeline` to accept `--seq <fasta_or_1letter>` with either raw spectra (`--hsqc` + repeatable `--triple EXP=path`, `--method classical|neural`, `--snr`, `--prob`) or `--peaks <peaks.tsv>` (emitting `peaks.tsv`, `shifts.str`, `shifts.tsv`, `result.nef`, and `report.html`). Added `nmrassign score` supporting both NMR-STAR and whitespace-delimited backbone shift tables with `-` missing handling and strict exclusion + exact count reporting of `?`-tagged uncertain values (including fused tokens).
+  - **Portable Test Fixtures & Loud `--engine gpu` Enforcement (`crates/nmr-cli/src/main.rs`, `tests/`):** Replaced hardcoded `/Users/` scratch paths in `sidechain_tests.rs` and `structure_tests.rs` with repo-relative `data/benchmark/` lookups (`rg "/Users/" crates/` returns `0` matches), and removed all silent GPU-to-CPU fallbacks across `pipeline`, `pick`, `assign`, `benchmark`, and `benchmark-suite` (including loud error on `--method classical --engine gpu`).
+- **Verified Metrics:**
+  - **UCSF `.ucsf` v2 vs. Bruker `pdata/1` Parity (5 Real Ubiquitin Spectra, 14 Axes):** Axis `first_ppm` agrees with Bruker `procs` `OFFSET` within **`<= 0.00001 ppm`** (`<= 0.000006 ppm` / `0.000` digital points) with bit-identical raw voxels; classical peak picking achieves **`100.0%` top-peak match** across `HSQC` (`700/700`), `HNCACB` (`7,895/7,895`), `CBCACONH` (`4,586/4,585`), `HNCO` (`10,946/10,942`), and `HNCACO` (`694/694`) with median `(|dH|, |dN|, |dC|) = (0.00000, 0.00200, <= 0.00200) ppm`.
+  - **CLI End-to-End Timing & Scoring:** `nmrassign pipeline` completes in **1.56 s** on 5 `.ucsf` spectra, **2.46 s** on 5 Bruker `pdata/1` spectra, and **0.55 s** from `--peaks`; `nmrassign score` parses `76` residues / `359` shifts (`70` assignable spin systems) with `2` uncertain `?` values excluded, and achieves `100.0%` (`72/72`) on synthetic `.str` self-check.
+  - **Synthetic Ubiquitin Gate:** **97.1% accuracy**, **97.1% recall**, **100.0% high-confidence precision (55/55)**.
+
+---
+
+## `ca35643` — 2026-11-11 — WebGPU 3D Neural Picker `<= 64 MiB` Multi-Axis Tiling, Multi-Tier `>256`/`>1024` GPU Annealer & Loud Limit Enforcement (`nmr-gpu`)
+
+- **Commit:** `ca35643` (from `swarm/gpu-engine` `517e364d1f99bedf29a9bfafc9e299f56d97499c`, squashing `7595d64` + `517e364`)
 - **Architectural Summary:**
   - **3D Neural GPU Picker Multi-Axis `(X, Y, Z)` 7-Halo Tiling (`crates/nmr-gpu/src/neural_gpu.rs`, `lib.rs`):** Added active `(1H, 15N)` root bounding-box cropping, empty-tile skipping, on-the-fly per-tile Haar noise normalization (avoiding full-cube CPU copies), and reusable `Conv3dTileWorkspace` `(X, Y, Z)` block tiling (`64x64x64` interior + `7`-voxel NMS / `6`-voxel forward halo = `78^3` padded) capping all GPU storage buffer bindings at `<= 64 MiB` (`MAX_CONV3D_BUFFER_BYTES = 67,108,864 B`) and eliminating the `512 MiB` Bruker `conv3d-bg` binding overflow crash even under baseline `wgpu::Limits::default()` (`128 MiB`).
   - **Multi-Tier WebGPU Simulated Annealing & Replica Batching (`crates/nmr-gpu/src/lib.rs`, `shaders/anneal.wgsl`):** Removed silent CPU fallback for `S > 256 || K > 256`, eliminated WGSL function-scope stack-spilling arrays via register delta helpers, implemented tiered workgroup-SRAM shaders within the `16,384 B` WebGPU baseline (`S, K <= 256` `@workgroup_size(8)`, `257..=512` `@workgroup_size(4)`, `513..=1024` `@workgroup_size(2)`) plus a storage-backed `anneal_chunk_global` tier for `> 1024`, and added automatic multi-dispatch replica batching (`max_batch_replicas`) bounded by `max_compute_workgroups_per_dimension` and `max_storage_buffer_binding_size`.

@@ -19,7 +19,7 @@ use nmr_core::nef::{read_nef_file, write_nef_file, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
 };
-use nmr_core::nmrstar::{read_star, read_star_all_atoms, write_star};
+use nmr_core::nmrstar::{read_star, read_star_all_atoms, read_star_str, write_star, Reference};
 use nmr_core::noesy::{
     compute_chain_torsions, parse_pdb_first_model, simulate_noesy_peaks, summarize_adrs,
     NoesySimConfig,
@@ -54,8 +54,8 @@ use nmr_core::sidechain::{
 use nmr_core::simulate::{render_hsqc_2d, simulate, SimConfig, SpectrumRenderConfig};
 use nmr_core::solver::{assign, AnnealConfig, AssignResult, ScoreConfig};
 use nmr_core::spectrum::{
-    read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d,
-    write_bruker_pdata_2d, write_nmrpipe_2d, Spectrum2D, Spectrum3D,
+    is_ucsf_file, read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d,
+    read_ucsf_2d, read_ucsf_3d, write_bruker_pdata_2d, write_nmrpipe_2d, Spectrum2D, Spectrum3D,
 };
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 use nmr_core::structure::{
@@ -78,6 +78,7 @@ fn usage() -> &'static str {
        nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
        nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json]\n\
+       nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            --hsqc <path> [--triple EXP=path ...] --out <peaks.tsv> [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
@@ -86,7 +87,7 @@ fn usage() -> &'static str {
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--star <entry.str> | --nef <project.nef>) --out-dir <dir> [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}>] [--solvent CDCl3] [--mhz 400]\n"
 }
@@ -504,22 +505,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         let r = read_star(st, None)?;
         (r.sequence, r.seq_ids)
     } else if let Some(sq) = seq_arg {
-        let raw = if Path::new(&sq).exists() {
-            let txt = fs::read_to_string(&sq).map_err(|e| format!("{e}"))?;
-            txt.lines()
-                .filter(|l| !l.trim_start().starts_with('>'))
-                .map(|l| l.trim())
-                .collect::<String>()
-        } else {
-            sq
-        };
-        let seq: Vec<String> = raw
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .map(|c| one_to_three(c).to_string())
-            .collect();
-        let ids: Vec<i32> = (first_seq_id..first_seq_id + (seq.len() as i32)).collect();
-        (seq, ids)
+        parse_sequence_arg(&sq, first_seq_id)?
     } else {
         return Err("assign needs --seq or --star".to_string());
     };
@@ -545,16 +531,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let str_out = out_prefix.with_extension("str");
     let tsv_out = out_prefix.with_extension("tsv");
     write_star(&str_out, &pred, Some(&conf))?;
-
-    let mut tsv_lines = vec!["seq_id\tresidue\tatom\tshift\tconfidence".to_string()];
-    for (&(k, ref atom), &v) in &pred.shifts {
-        let c = conf.get(&k).copied().unwrap_or(0.0);
-        tsv_lines.push(format!(
-            "{}\t{}\t{}\t{:.3}\t{:.2}",
-            seq_ids[k], sequence[k], atom, v, c
-        ));
-    }
-    fs::write(&tsv_out, tsv_lines.join("\n") + "\n").map_err(|e| format!("{e}"))?;
+    write_shifts_tsv(&tsv_out, &pred, &conf)?;
 
     let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
     println!(
@@ -568,11 +545,51 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_sequence_arg(sq: &str, first_seq_id: i32) -> Result<(Vec<String>, Vec<i32>), String> {
+    let raw = if Path::new(sq).exists() {
+        let txt = fs::read_to_string(sq).map_err(|e| format!("{e}"))?;
+        txt.lines()
+            .filter(|l| !l.trim_start().starts_with('>'))
+            .map(|l| l.trim())
+            .collect::<String>()
+    } else {
+        sq.to_string()
+    };
+    let seq: Vec<String> = raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| one_to_three(c).to_string())
+        .collect();
+    if seq.is_empty() {
+        return Err("empty sequence provided to --seq".to_string());
+    }
+    let ids: Vec<i32> = (first_seq_id..first_seq_id + (seq.len() as i32)).collect();
+    Ok((seq, ids))
+}
+
+fn write_shifts_tsv(
+    path: &Path,
+    pred: &Reference,
+    conf: &BTreeMap<usize, f64>,
+) -> Result<(), String> {
+    let mut tsv_lines = vec!["seq_id\tresidue\tatom\tshift\tconfidence".to_string()];
+    for (&(k, ref atom), &v) in &pred.shifts {
+        let c = conf.get(&k).copied().unwrap_or(0.0);
+        tsv_lines.push(format!(
+            "{}\t{}\t{}\t{:.3}\t{:.4}",
+            pred.seq_ids[k], pred.sequence[k], atom, v, c
+        ));
+    }
+    fs::write(path, tsv_lines.join("\n") + "\n").map_err(|e| format!("{e}"))
+}
+
 fn load_2d_auto(path: &Path) -> Result<Spectrum2D, String> {
     if path.is_dir() {
         read_bruker_pdata_2d(path)
     } else if path.file_name().and_then(|s| s.to_str()) == Some("2rr") {
         read_bruker_pdata_2d(path.parent().unwrap_or(path))
+    } else if is_ucsf_file(path) {
+        read_ucsf_2d(path)
     } else {
         read_nmrpipe_2d(path)
     }
@@ -583,8 +600,81 @@ fn load_3d_auto(path: &Path, exp: &str) -> Result<Spectrum3D, String> {
         read_bruker_pdata_3d(path, exp)
     } else if path.file_name().and_then(|s| s.to_str()) == Some("3rrr") {
         read_bruker_pdata_3d(path.parent().unwrap_or(path), exp)
+    } else if is_ucsf_file(path) {
+        read_ucsf_3d(path, exp)
     } else {
         read_nmrpipe_3d(path, exp)
+    }
+}
+
+fn pick_spectra_bundle(
+    hsqc_path: &Path,
+    triples: &[(String, PathBuf)],
+    method: &str,
+    engine: EngineKind,
+    snr: f32,
+    prob: f32,
+) -> Result<(Vec<Peak>, Vec<Peak>, String), String> {
+    let hsqc_spec = load_2d_auto(hsqc_path)?;
+    match method {
+        "classical" => {
+            let cfg = PickerConfig {
+                snr_threshold: snr,
+                ..PickerConfig::default()
+            };
+            let r = pick_hsqc_2d(&hsqc_spec, &cfg);
+            let mut all = r.clone();
+            for (exp, path) in triples {
+                let s3 = load_3d_auto(path, exp)?;
+                all.extend(pick_triple_3d(&s3, &r, &cfg));
+            }
+            Ok((r, all, "classical".to_string()))
+        }
+        "neural" | "cnn" => {
+            let model = NeuralPicker::pretrained();
+            let ncfg = NeuralPickerConfig {
+                prob_threshold: prob,
+                ..NeuralPickerConfig::default()
+            };
+            let r = model.pick_2d(&hsqc_spec, &ncfg);
+            let mut all = r.clone();
+            match engine {
+                EngineKind::Gpu => {
+                    let gpu_picker = GpuNeuralPicker::new_headless(&PRETRAINED_WEIGHTS_3D_GPU)?;
+                    let gcfg = GpuNeuralPickerConfig {
+                        prob_threshold: prob,
+                        ..GpuNeuralPickerConfig::default()
+                    };
+                    for (exp, path) in triples {
+                        let s3 = load_3d_auto(path, exp)?;
+                        all.extend(gpu_picker.pick_triple_3d_gpu(&s3, exp, &r, &gcfg)?);
+                    }
+                    Ok((
+                        r,
+                        all,
+                        format!(
+                            "neural (WebGPU: {}, {})",
+                            gpu_picker.adapter_name, gpu_picker.backend_name
+                        ),
+                    ))
+                }
+                EngineKind::Cpu => {
+                    let cfg_3d = NeuralPickerConfig {
+                        prob_threshold: prob,
+                        hsqc_roots: r.clone(),
+                        ..NeuralPickerConfig::default()
+                    };
+                    for (exp, path) in triples {
+                        let s3 = load_3d_auto(path, exp)?;
+                        all.extend(model.pick_3d(&s3, exp, &cfg_3d));
+                    }
+                    Ok((r, all, "neural (CPU)".to_string()))
+                }
+            }
+        }
+        other => Err(format!(
+            "unknown --method {other:?}; expected classical or neural"
+        )),
     }
 }
 
@@ -595,7 +685,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
     let mut snr = 5.0f32;
     let mut prob = 0.45f32;
     let mut method = "classical".to_string();
-    let mut engine = EngineKind::Cpu;
+    let mut engine_opt: Option<EngineKind> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -644,79 +734,27 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
             }
             "--engine" => {
                 i += 1;
-                engine = parse_engine(args.get(i).ok_or("missing value for --engine")?)?;
+                engine_opt = Some(parse_engine(
+                    args.get(i).ok_or("missing value for --engine")?,
+                )?);
             }
             other => return Err(format!("unknown pick flag {other:?}")),
         }
         i += 1;
     }
 
-    let hsqc_p = hsqc_path.ok_or("pick requires --hsqc <pdata_dir_or_ft2>")?;
-    let out_p = out_path.ok_or("pick requires --out <peaks.tsv>")?;
-    let hsqc_spec = load_2d_auto(&hsqc_p)?;
+    let engine = engine_opt.unwrap_or(EngineKind::Cpu);
+    if method == "classical" && engine_opt == Some(EngineKind::Gpu) {
+        return Err(
+            "classical peak picker has no GPU kernel; pass --method neural --engine gpu or --engine cpu"
+                .to_string(),
+        );
+    }
 
-    let (roots, all_peaks, method_label) = match method.as_str() {
-        "classical" => {
-            let cfg = PickerConfig {
-                snr_threshold: snr,
-                ..PickerConfig::default()
-            };
-            let r = pick_hsqc_2d(&hsqc_spec, &cfg);
-            let mut all = r.clone();
-            for (exp, path) in &triples {
-                let s3 = load_3d_auto(path, exp)?;
-                all.extend(pick_triple_3d(&s3, &r, &cfg));
-            }
-            (r, all, "classical".to_string())
-        }
-        "neural" | "cnn" => {
-            let model = NeuralPicker::pretrained();
-            let ncfg = NeuralPickerConfig {
-                prob_threshold: prob,
-                ..NeuralPickerConfig::default()
-            };
-            let r = model.pick_2d(&hsqc_spec, &ncfg);
-            let mut all = r.clone();
-            match engine {
-                EngineKind::Gpu if !triples.is_empty() => {
-                    let gpu_picker = GpuNeuralPicker::new_headless(&PRETRAINED_WEIGHTS_3D_GPU)?;
-                    let gcfg = GpuNeuralPickerConfig {
-                        prob_threshold: prob,
-                        ..GpuNeuralPickerConfig::default()
-                    };
-                    for (exp, path) in &triples {
-                        let s3 = load_3d_auto(path, exp)?;
-                        all.extend(gpu_picker.pick_triple_3d_gpu(&s3, exp, &r, &gcfg)?);
-                    }
-                    (
-                        r,
-                        all,
-                        format!(
-                            "neural (WebGPU: {}, {})",
-                            gpu_picker.adapter_name, gpu_picker.backend_name
-                        ),
-                    )
-                }
-                _ => {
-                    let cfg_3d = NeuralPickerConfig {
-                        prob_threshold: prob,
-                        hsqc_roots: r.clone(),
-                        ..NeuralPickerConfig::default()
-                    };
-                    for (exp, path) in &triples {
-                        let s3 = load_3d_auto(path, exp)?;
-                        all.extend(model.pick_3d(&s3, exp, &cfg_3d));
-                    }
-                    (r, all, "neural (CPU)".to_string())
-                }
-            }
-        }
-        other => {
-            return Err(format!(
-                "unknown --method {other:?}; expected classical or neural"
-            ))
-        }
-    };
+    let hsqc_p = hsqc_path.ok_or("pick requires --hsqc <pdata_dir_ft2_or_ucsf>")?;
+    let out_p = out_path.ok_or("pick requires --out <peaks.tsv>")?;
+    let (roots, all_peaks, method_label) =
+        pick_spectra_bundle(&hsqc_p, &triples, &method, engine, snr, prob)?;
 
     write_peaks(&out_p, &all_peaks)?;
     println!(
@@ -1517,8 +1555,23 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut star_path: Option<PathBuf> = None;
     let mut nef_path: Option<PathBuf> = None;
+    let mut seq_arg: Option<String> = None;
+    let mut first_seq_id = 1i32;
+    let mut hsqc_path: Option<PathBuf> = None;
+    let mut triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut peaks_path: Option<PathBuf> = None;
+    let mut method = "classical".to_string();
+    let mut snr = 5.0f32;
+    let mut prob = 0.45f32;
+    let mut priors_path: Option<String> = None;
+    let mut runs: Option<usize> = None;
+    let mut steps = 1500usize;
+    let mut assign_cost = 0.0f64;
+    let mut seed = 0u64;
+    let mut name_arg: Option<String> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut pdb_ref_path: Option<PathBuf> = None;
+    let mut noesy_peaks_path: Option<PathBuf> = None;
     let mut engine = EngineKind::Gpu;
     let mut fold = false;
 
@@ -1533,6 +1586,98 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 i += 1;
                 nef_path = args.get(i).map(PathBuf::from);
             }
+            "--seq" => {
+                i += 1;
+                seq_arg = args.get(i).cloned();
+            }
+            "--first-seq-id" => {
+                i += 1;
+                first_seq_id = args
+                    .get(i)
+                    .ok_or("missing --first-seq-id")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--hsqc" => {
+                i += 1;
+                hsqc_path = args.get(i).map(PathBuf::from);
+            }
+            "--triple" => {
+                i += 1;
+                let spec = args.get(i).ok_or("missing EXP=path for --triple")?;
+                let (exp, p) = spec
+                    .split_once('=')
+                    .ok_or("expected EXP=path format for --triple")?;
+                triples.push((
+                    exp.trim().to_ascii_uppercase().replace(['(', ')'], ""),
+                    PathBuf::from(p),
+                ));
+            }
+            "--peaks" => {
+                i += 1;
+                peaks_path = args.get(i).map(PathBuf::from);
+            }
+            "--method" => {
+                i += 1;
+                method = args.get(i).ok_or("missing --method")?.to_ascii_lowercase();
+            }
+            "--snr" => {
+                i += 1;
+                snr = args
+                    .get(i)
+                    .ok_or("missing --snr")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--prob" => {
+                i += 1;
+                prob = args
+                    .get(i)
+                    .ok_or("missing --prob")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--priors" => {
+                i += 1;
+                priors_path = args.get(i).cloned();
+            }
+            "--runs" => {
+                i += 1;
+                runs = Some(
+                    args.get(i)
+                        .ok_or("missing --runs")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
+            }
+            "--steps" => {
+                i += 1;
+                steps = args
+                    .get(i)
+                    .ok_or("missing --steps")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--assign-cost" => {
+                i += 1;
+                assign_cost = args
+                    .get(i)
+                    .ok_or("missing --assign-cost")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--seed" => {
+                i += 1;
+                seed = args
+                    .get(i)
+                    .ok_or("missing --seed")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--name" => {
+                i += 1;
+                name_arg = args.get(i).cloned();
+            }
             "--out-dir" => {
                 i += 1;
                 out_dir = args.get(i).map(PathBuf::from);
@@ -1540,6 +1685,10 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--pdb-ref" => {
                 i += 1;
                 pdb_ref_path = args.get(i).map(PathBuf::from);
+            }
+            "--noesy-peaks" => {
+                i += 1;
+                noesy_peaks_path = args.get(i).map(PathBuf::from);
             }
             "--engine" => {
                 i += 1;
@@ -1554,57 +1703,129 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let dir = out_dir.ok_or("pipeline requires --out-dir <dir>")?;
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
 
+    let t_total = Instant::now();
     let (base_ref, peaks, project_name) = if let Some(np) = &nef_path {
         let doc = read_nef_file(np)?;
         let r = doc.to_reference()?;
-        let pks = doc.to_peaks();
-        let pks = if pks.is_empty() {
-            simulate(&r, &SimConfig::default()).0
+        let pks = if let Some(hp) = &hsqc_path {
+            pick_spectra_bundle(hp, &triples, &method, engine, snr, prob)?.1
+        } else if let Some(pp) = &peaks_path {
+            read_peaks(pp)?
         } else {
-            pks
+            let nef_pks = doc.to_peaks();
+            if nef_pks.is_empty() {
+                simulate(
+                    &r,
+                    &SimConfig {
+                        seed,
+                        ..SimConfig::default()
+                    },
+                )
+                .0
+            } else {
+                nef_pks
+            }
         };
-        (r, pks, doc.project_name)
+        (r, pks, name_arg.unwrap_or(doc.project_name))
+    } else if let Some(hp) = &hsqc_path {
+        let (seq, seq_ids, default_name) = if let Some(sq) = &seq_arg {
+            let (s, ids) = parse_sequence_arg(sq, first_seq_id)?;
+            let nm = Path::new(sq)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|_| Path::new(sq).exists())
+                .unwrap_or("nmr_pipeline")
+                .to_string();
+            (s, ids, nm)
+        } else if let Some(sp) = &star_path {
+            let r = read_star(sp, None)?;
+            let nm = sp
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("nmr_pipeline")
+                .to_string();
+            (r.sequence, r.seq_ids, nm)
+        } else {
+            return Err("pipeline with --hsqc requires --seq <SEQ|fasta> (or --star)".to_string());
+        };
+        let (roots, pks, method_label) =
+            pick_spectra_bundle(hp, &triples, &method, engine, snr, prob)?;
+        println!(
+            "[{method_label}] picked {} HSQC roots and {} total peaks",
+            roots.len(),
+            pks.len()
+        );
+        (
+            Reference::new(seq, seq_ids),
+            pks,
+            name_arg.unwrap_or(default_name),
+        )
+    } else if let Some(pp) = &peaks_path {
+        let (seq, seq_ids, default_name) = if let Some(sq) = &seq_arg {
+            let (s, ids) = parse_sequence_arg(sq, first_seq_id)?;
+            let nm = pp
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("nmr_pipeline")
+                .to_string();
+            (s, ids, nm)
+        } else if let Some(sp) = &star_path {
+            let r = read_star(sp, None)?;
+            let nm = sp
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("nmr_pipeline")
+                .to_string();
+            (r.sequence, r.seq_ids, nm)
+        } else {
+            return Err("pipeline with --peaks requires --seq <SEQ|fasta> (or --star)".to_string());
+        };
+        let pks = read_peaks(pp)?;
+        (
+            Reference::new(seq, seq_ids),
+            pks,
+            name_arg.unwrap_or(default_name),
+        )
     } else if let Some(sp) = &star_path {
         let r = read_star_all_atoms(sp, None)?;
-        let (pks, _) = simulate(&r, &SimConfig::default());
-        let name = sp
+        let (pks, _) = simulate(
+            &r,
+            &SimConfig {
+                seed,
+                ..SimConfig::default()
+            },
+        );
+        let nm = sp
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("pipeline_project")
             .to_string();
-        (r, pks, name)
+        (r, pks, name_arg.unwrap_or(nm))
     } else {
-        return Err("pipeline requires --star <entry.str> or --nef <project.nef>".to_string());
+        return Err(
+            "pipeline requires (--seq <SEQ|fasta> + (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>)), --star <entry.str>, or --nef <project.nef>"
+                .to_string(),
+        );
     };
 
-    let pri = Priors::default();
+    let pri = match priors_path.as_deref() {
+        Some(p) => Priors::from_json(p)?,
+        None => Priors::default(),
+    };
     let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false)?;
     let acfg = AnnealConfig {
-        runs: if engine == EngineKind::Gpu { 64 } else { 32 },
-        steps_per_system: 1500,
-        seed: 0,
+        runs: runs.unwrap_or(if engine == EngineKind::Gpu { 64 } else { 32 }),
+        steps_per_system: steps,
+        seed,
         ..AnnealConfig::default()
     };
-    let t0 = Instant::now();
-    let (res, engine_label) = run_solver(
-        engine,
-        &systems,
-        &base_ref.sequence,
-        &pri,
-        &ScoreConfig::default(),
-        &acfg,
-    )
-    .or_else(|_| {
-        run_solver(
-            EngineKind::Cpu,
-            &systems,
-            &base_ref.sequence,
-            &pri,
-            &ScoreConfig::default(),
-            &acfg,
-        )
-    })?;
-    let dt = t0.elapsed().as_secs_f64();
+    let scfg = ScoreConfig {
+        assign_cost,
+        ..ScoreConfig::default()
+    };
+    let t_solve = Instant::now();
+    let (res, engine_label) = run_solver(engine, &systems, &base_ref.sequence, &pri, &scfg, &acfg)?;
+    let dt_solve = t_solve.elapsed().as_secs_f64();
 
     let (pred_ref, conf) = to_reference(
         &res,
@@ -1614,11 +1835,15 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         0.0,
         Some(&pri),
     );
+    let peaks_out = dir.join("peaks.tsv");
     let star_out = dir.join("shifts.str");
+    let tsv_out = dir.join("shifts.tsv");
     let nef_out = dir.join("result.nef");
     let html_out = dir.join("report.html");
 
+    write_peaks(&peaks_out, &peaks)?;
     write_star(&star_out, &pred_ref, Some(&conf))?;
+    write_shifts_tsv(&tsv_out, &pred_ref, &conf)?;
     let nef_doc =
         NefDocument::from_reference_and_peaks(&project_name, &pred_ref, Some(&conf), &peaks);
     write_nef_file(&nef_out, &nef_doc)?;
@@ -1627,7 +1852,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     rep.n_peaks = Some(peaks.len());
     rep.n_spin_systems = Some(systems.len());
     rep.solver_score = Some(res.score);
-    rep.elapsed_secs = Some(dt);
+    rep.elapsed_secs = Some(dt_solve);
     rep.engine_label = Some(engine_label.clone());
     rep.systems_and_assignment = Some((systems, res));
     rep.dihedrals = predict_csi_dihedrals(&pred_ref);
@@ -1637,9 +1862,15 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             Some(p) => Some(parse_pdb_first_model(p)?),
             None => None,
         };
-        let noesy_pks = match &pdb_ref {
-            Some(rc) => simulate_noesy_peaks(rc, &pred_ref, &NoesySimConfig::default()),
-            None => Vec::new(),
+        let noesy_pks = if let Some(np) = &noesy_peaks_path {
+            read_peaks(np)?
+                .into_iter()
+                .filter(|p| p.exp.starts_with("NOESY"))
+                .collect()
+        } else if let Some(rc) = &pdb_ref {
+            simulate_noesy_peaks(rc, &pred_ref, &NoesySimConfig::default())
+        } else {
+            Vec::new()
         };
         let ens =
             calculate_structure_iterative(&pred_ref, &noesy_pks, &StructureCalcConfig::default());
@@ -1668,14 +1899,570 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     }
 
     write_quality_report_html(&html_out, &rep)?;
+    let dt_total = t_total.elapsed().as_secs_f64();
     println!(
-        "[{engine_label}] Pipeline '{}' completed in {:.2}s -> {}, {}, {}",
+        "[{engine_label}] Pipeline '{}' completed in {:.2}s (solve {:.2}s) -> {}, {}, {}, {}, {}",
         project_name,
-        dt,
+        dt_total,
+        dt_solve,
         star_out.display(),
+        tsv_out.display(),
+        peaks_out.display(),
         nef_out.display(),
         html_out.display()
     );
+    Ok(())
+}
+
+fn normalize_backbone_atom_name(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "H" | "HN" => Some("H"),
+        "N" => Some("N"),
+        "CA" => Some("CA"),
+        "CB" => Some("CB"),
+        "C" | "CO" => Some("C"),
+        _ => None,
+    }
+}
+
+fn normalize_residue_code(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() == 1 {
+        one_to_three(trimmed.chars().next().unwrap()).to_string()
+    } else {
+        trimmed.to_ascii_uppercase()
+    }
+}
+
+/// Auto-detect and parse ground-truth assignments from either NMR-STAR v3/v2.1 or a
+/// whitespace/CcpNmr backbone shift table (`seq# residue H N C CA ... xx.xx:Cb`),
+/// handling `-`/`.` missing entries and excluding any `?`-uncertain tokens.
+/// Returns `(Reference, excluded_uncertain_count, format_label)`.
+fn parse_truth_auto(path: &Path) -> Result<(Reference, usize, &'static str), String> {
+    let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+
+    let looks_like_star = text.contains("loop_")
+        && (text.contains("_Atom_chem_shift") || text.contains("_Chem_shift_value"));
+    if looks_like_star {
+        // Count any '?' uncertain values inside the chemical shift loop before parsing valid floats.
+        let mut excluded_q = 0usize;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('_')
+                || trimmed.starts_with("save_")
+                || trimmed.starts_with("data_")
+                || trimmed.eq_ignore_ascii_case("loop_")
+                || trimmed.eq_ignore_ascii_case("stop_")
+            {
+                continue;
+            }
+            for tok in trimmed.split_whitespace() {
+                if tok.contains('?') && tok.chars().any(|c| c.is_ascii_digit()) {
+                    excluded_q += 1;
+                }
+            }
+        }
+        let r = read_star_str(&text, None).map_err(|e| format!("{e} in {}", path.display()))?;
+        return Ok((r, excluded_q, "NMR-STAR"));
+    }
+
+    // Whitespace / CcpNmr backbone shift table parser
+    let mut col_atoms: Vec<&'static str> = vec!["H", "N", "C", "CA"];
+    let mut raw_residues: BTreeMap<i32, String> = BTreeMap::new();
+    let mut raw_shifts: BTreeMap<(i32, &'static str), f64> = BTreeMap::new();
+    let mut excluded_q = 0usize;
+
+    for (line_no, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('!') || line.starts_with('#') {
+            let hdr_body = line.trim_start_matches(['!', '#']);
+            let mapped: Vec<&'static str> = hdr_body
+                .split_whitespace()
+                .filter_map(normalize_backbone_atom_name)
+                .collect();
+            if mapped.len() >= 2 {
+                col_atoms = mapped;
+            }
+            continue;
+        }
+
+        let ws: Vec<&str> = line.split_whitespace().collect();
+        if ws.len() < 2 {
+            continue;
+        }
+        let Ok(seq_id) = ws[0].parse::<i32>() else {
+            // Skip non-numeric header rows (e.g. TSV header "seq_id residue ...")
+            if line_no == 0 {
+                continue;
+            }
+            return Err(format!(
+                "invalid sequence number {:?} on line {} of {}",
+                ws[0],
+                line_no + 1,
+                path.display()
+            ));
+        };
+        let res_code = normalize_residue_code(ws[1]);
+        raw_residues.insert(seq_id, res_code);
+
+        // 1. Split malformed concatenated '?' tokens such as `119.24?170.15` -> `["119.24?", "170.15"]`.
+        let mut split_toks: Vec<String> = Vec::new();
+        for &raw_tok in &ws[2..] {
+            let mut rem = raw_tok;
+            while let Some(qpos) = rem.find('?') {
+                if qpos + 1 < rem.len() {
+                    split_toks.push(rem[..=qpos].to_string());
+                    rem = &rem[qpos + 1..];
+                } else {
+                    break;
+                }
+            }
+            if !rem.is_empty() {
+                split_toks.push(rem.to_string());
+            }
+        }
+
+        // 2. Merge trailing standalone `?` uncertainty flags onto preceding tagged values (e.g. `9.19:H* ?`).
+        let mut toks: Vec<String> = Vec::with_capacity(split_toks.len());
+        for tok in split_toks {
+            if tok == "?"
+                && toks
+                    .last()
+                    .is_some_and(|prev| prev.contains(':') && !prev.contains('?'))
+            {
+                toks.last_mut().unwrap().push('?');
+            } else {
+                toks.push(tok);
+            }
+        }
+
+        // 3. Parse positional backbone columns up to `col_atoms.len()` (or until a `val:Atom` tag appears).
+        let mut pos_end = col_atoms.len().min(toks.len());
+        for c_idx in 0..pos_end {
+            let tok = toks[c_idx].as_str();
+            if tok.contains(':') {
+                pos_end = c_idx;
+                break;
+            }
+            if tok == "-" || tok == "." || tok.eq_ignore_ascii_case("na") {
+                continue;
+            }
+            if tok.contains('?') {
+                excluded_q += 1;
+                continue;
+            }
+            let val: f64 = tok.parse().map_err(|e| {
+                format!(
+                    "invalid shift {tok:?} at residue {seq_id} line {} of {}: {e}",
+                    line_no + 1,
+                    path.display()
+                )
+            })?;
+            raw_shifts.insert((seq_id, col_atoms[c_idx]), val);
+        }
+
+        // 4. Parse remaining tagged columns such as `32.19:Cb`, counting and excluding any `?` tokens.
+        for tok in &toks[pos_end..] {
+            let s = tok.as_str();
+            if s == "-" || s == "." || s.eq_ignore_ascii_case("na") {
+                continue;
+            }
+            if s.contains('?') {
+                excluded_q += 1;
+                continue;
+            }
+            if let Some((val_str, atom_str)) = s.split_once(':') {
+                if let Some(atom_canon) = normalize_backbone_atom_name(atom_str) {
+                    let val: f64 = val_str.parse().map_err(|e| {
+                        format!(
+                            "invalid tagged shift {s:?} at residue {seq_id} line {} of {}: {e}",
+                            line_no + 1,
+                            path.display()
+                        )
+                    })?;
+                    raw_shifts.insert((seq_id, atom_canon), val);
+                }
+            }
+        }
+    }
+
+    if raw_residues.is_empty() {
+        return Err(format!("no residue shift rows found in {}", path.display()));
+    }
+
+    let (&lo, &hi) = (
+        raw_residues.keys().next().unwrap(),
+        raw_residues.keys().next_back().unwrap(),
+    );
+    let seq_ids: Vec<i32> = (lo..=hi).collect();
+    let sequence: Vec<String> = seq_ids
+        .iter()
+        .map(|sid| {
+            raw_residues
+                .get(sid)
+                .cloned()
+                .unwrap_or_else(|| "UNK".to_string())
+        })
+        .collect();
+    let mut truth_ref = Reference::new(sequence, seq_ids);
+    for ((sid, atom), val) in raw_shifts {
+        if sid >= lo && sid <= hi {
+            truth_ref
+                .shifts
+                .insert(((sid - lo) as usize, atom.to_string()), val);
+        }
+    }
+    Ok((truth_ref, excluded_q, "CcpNmr/table"))
+}
+
+fn parse_star_confidences_by_seq_id(path: &Path) -> BTreeMap<i32, f64> {
+    let mut out = BTreeMap::new();
+    let Ok(text) = fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('_') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        // write_star emits: ID Entity_ID Seq_ID Comp_ID Atom_ID Atom_type Val Ambiguity_code Details(conf=0.xx)
+        if cols.len() >= 9 {
+            if let (Ok(seq_id), Some(conf_s)) =
+                (cols[2].parse::<i32>(), cols[8].strip_prefix("conf="))
+            {
+                if let Ok(c) = conf_s.parse::<f64>() {
+                    if matches!(cols[4], "H" | "HN" | "N") {
+                        out.insert(seq_id, c);
+                    } else {
+                        out.entry(seq_id).or_insert(c);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_assign_tsv_confidences(path: &Path) -> Result<BTreeMap<i32, f64>, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || (line_idx == 0 && line.starts_with("seq_id"))
+        {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 5 {
+            if let (Ok(seq_id), Ok(c)) =
+                (cols[0].trim().parse::<i32>(), cols[4].trim().parse::<f64>())
+            {
+                let atom = cols[2].trim();
+                if matches!(atom, "H" | "HN" | "N") {
+                    out.insert(seq_id, c);
+                } else {
+                    out.entry(seq_id).or_insert(c);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn cmd_score(args: &[String]) -> Result<(), String> {
+    let mut pred_path: Option<PathBuf> = None;
+    let mut truth_path: Option<PathBuf> = None;
+    let mut peaks_path: Option<PathBuf> = None;
+    let mut assign_tsv_path: Option<PathBuf> = None;
+    let mut hc_threshold = 0.8f64;
+    let mut verbose = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pred" => {
+                i += 1;
+                pred_path = args.get(i).map(PathBuf::from);
+            }
+            "--truth" => {
+                i += 1;
+                truth_path = args.get(i).map(PathBuf::from);
+            }
+            "--peaks" => {
+                i += 1;
+                peaks_path = args.get(i).map(PathBuf::from);
+            }
+            "--assign-tsv" => {
+                i += 1;
+                assign_tsv_path = args.get(i).map(PathBuf::from);
+            }
+            "--hc" => {
+                i += 1;
+                hc_threshold = args
+                    .get(i)
+                    .ok_or("missing --hc")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "-v" | "--verbose" => verbose = true,
+            other => return Err(format!("unknown score flag {other:?}")),
+        }
+        i += 1;
+    }
+
+    let pred_p = pred_path.ok_or("score requires --pred <pred.str>")?;
+    let truth_p = truth_path.ok_or("score requires --truth <truth.str|table.txt>")?;
+
+    let pred_raw = read_star(&pred_p, None)?;
+    let (truth_ref, excluded_q, truth_fmt) = parse_truth_auto(&truth_p)?;
+
+    let mut conf_by_seq_id = parse_star_confidences_by_seq_id(&pred_p);
+    if let Some(tsv_p) = &assign_tsv_path {
+        for (sid, c) in parse_assign_tsv_confidences(tsv_p)? {
+            conf_by_seq_id.insert(sid, c);
+        }
+    }
+
+    // Map Seq_ID -> residue index `k` in `truth_ref`
+    let mut truth_idx_by_seq_id = BTreeMap::new();
+    for (k, &sid) in truth_ref.seq_ids.iter().enumerate() {
+        truth_idx_by_seq_id.insert(sid, k);
+    }
+
+    // Align `pred_raw` onto `truth_ref` residue indices for exact shift comparison & spin-system scoring
+    let mut pred_aligned = Reference::new(truth_ref.sequence.clone(), truth_ref.seq_ids.clone());
+    for (&(pk, ref atom), &val) in &pred_raw.shifts {
+        let sid = pred_raw.seq_ids[pk];
+        if let Some(&tk) = truth_idx_by_seq_id.get(&sid) {
+            pred_aligned.shifts.insert((tk, atom.clone()), val);
+        }
+    }
+
+    // Ground-truth assignable backbone spin systems: non-N-terminal, non-Pro residues with both H and N shifts
+    let mut true_roots: Vec<(usize, f64, f64)> = Vec::new();
+    for (k, res) in truth_ref.sequence.iter().enumerate() {
+        if k == 0 || res == "PRO" {
+            continue;
+        }
+        if let (Some(&th), Some(&tn)) = (
+            truth_ref.shifts.get(&(k, "H".to_string())),
+            truth_ref.shifts.get(&(k, "N".to_string())),
+        ) {
+            true_roots.push((k, th, tn));
+        }
+    }
+    let assignable = true_roots.len();
+
+    // Placed spin systems in `pred_aligned`: residues `k` carrying both H and N shifts
+    let mut placed_roots: Vec<(usize, f64, f64, f64)> = Vec::new();
+    for k in 0..truth_ref.sequence.len() {
+        if let (Some(&ph), Some(&pn)) = (
+            pred_aligned.shifts.get(&(k, "H".to_string())),
+            pred_aligned.shifts.get(&(k, "N".to_string())),
+        ) {
+            let sid = truth_ref.seq_ids[k];
+            let conf = conf_by_seq_id.get(&sid).copied().unwrap_or(0.0);
+            placed_roots.push((k, ph, pn, conf));
+        }
+    }
+
+    let tol_h = 0.045f64;
+    let tol_n = 0.45f64;
+
+    // Determine true residue `true_k: i32` (`-1` if spurious) for each placed root.
+    // When `--peaks` is provided, match ALL spin-system HSQC roots 1-to-1 against `true_roots`
+    // first so a spurious ripple adjacent to an unassigned/displaced true root cannot steal its identity.
+    let placed_true_k: Vec<(Option<usize>, i32)> = if let Some(pp) = &peaks_path {
+        let pks = read_peaks(pp)?;
+        let systems = build_spin_systems(&pks, &Tolerances::default(), 3, false)?;
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+        for (si, ss) in systems.iter().enumerate() {
+            for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
+                let dh = (ss.h - th).abs();
+                let dn = (ss.n - tn).abs();
+                if dh <= tol_h && dn <= tol_n {
+                    let d2 = (dh / tol_h).powi(2) + (dn / tol_n).powi(2);
+                    pairs.push((d2, si, ti));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut used_s = vec![false; systems.len()];
+        let mut used_t = vec![false; true_roots.len()];
+        let mut ss_truth = vec![-1i32; systems.len()];
+        for &(_, si, ti) in &pairs {
+            if !used_s[si] && !used_t[ti] {
+                used_s[si] = true;
+                used_t[ti] = true;
+                ss_truth[si] = true_roots[ti].0 as i32;
+            }
+        }
+
+        // Match placed (ph, pn) 1-to-1 to spin systems by exact/closest coordinates
+        let mut p_to_ss: Vec<(f64, usize, usize)> = Vec::new();
+        for (pi, &(_, ph, pn, _)) in placed_roots.iter().enumerate() {
+            for (si, ss) in systems.iter().enumerate() {
+                let dh = (ph - ss.h).abs();
+                let dn = (pn - ss.n).abs();
+                if dh <= 0.02 && dn <= 0.20 {
+                    p_to_ss.push(((dh / 0.01).powi(2) + (dn / 0.10).powi(2), pi, si));
+                }
+            }
+        }
+        p_to_ss.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut used_p = vec![false; placed_roots.len()];
+        let mut used_ss_for_p = vec![false; systems.len()];
+        let mut out = vec![(None, -1i32); placed_roots.len()];
+        for &(_, pi, si) in &p_to_ss {
+            if !used_p[pi] && !used_ss_for_p[si] {
+                used_p[pi] = true;
+                used_ss_for_p[si] = true;
+                out[pi] = (Some(si), ss_truth[si]);
+            }
+        }
+        out
+    } else {
+        let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+        for (pi, &(_, ph, pn, _)) in placed_roots.iter().enumerate() {
+            for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
+                let dh = (ph - th).abs();
+                let dn = (pn - tn).abs();
+                if dh <= tol_h && dn <= tol_n {
+                    let d2 = (dh / tol_h).powi(2) + (dn / tol_n).powi(2);
+                    pairs.push((d2, pi, ti));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut used_p = vec![false; placed_roots.len()];
+        let mut used_t = vec![false; true_roots.len()];
+        let mut out = vec![(None, -1i32); placed_roots.len()];
+        for &(_, pi, ti) in &pairs {
+            if !used_p[pi] && !used_t[ti] {
+                used_p[pi] = true;
+                used_t[ti] = true;
+                out[pi] = (None, true_roots[ti].0 as i32);
+            }
+        }
+        out
+    };
+
+    let assigned = placed_roots.len();
+    let mut correct = 0usize;
+    let mut hc_assigned = 0usize;
+    let mut hc_correct = 0usize;
+    let mut misassigned: Vec<(Option<usize>, usize, i32, f64, f64, f64)> = Vec::new();
+
+    for (pi, &(placed_k, ph, pn, conf)) in placed_roots.iter().enumerate() {
+        let (ss_opt, true_k) = placed_true_k[pi];
+        let is_ok = true_k >= 0 && (true_k as usize) == placed_k;
+        if is_ok {
+            correct += 1;
+        } else {
+            misassigned.push((ss_opt, placed_k, true_k, ph, pn, conf));
+        }
+        if conf >= hc_threshold {
+            hc_assigned += 1;
+            if is_ok {
+                hc_correct += 1;
+            }
+        }
+    }
+
+    let acc = if assigned > 0 {
+        (correct as f64) / (assigned as f64)
+    } else {
+        0.0
+    };
+    let rec = if assignable > 0 {
+        (correct as f64) / (assignable as f64)
+    } else {
+        0.0
+    };
+    let hc_prec = if hc_assigned > 0 {
+        (hc_correct as f64) / (hc_assigned as f64)
+    } else {
+        0.0
+    };
+    let hc_rec = if assignable > 0 {
+        (hc_correct as f64) / (assignable as f64)
+    } else {
+        0.0
+    };
+
+    println!(
+        "truth format            : {} ({} residues, {} backbone shifts, {} uncertain '?' values excluded)",
+        truth_fmt,
+        truth_ref.sequence.len(),
+        truth_ref.shifts.len(),
+        excluded_q
+    );
+    println!("assignable spin systems : {assignable}");
+    println!("assigned                : {assigned}");
+    println!(
+        "accuracy (correct/assigned)   : {:.1}% ({correct}/{assigned})",
+        acc * 100.0
+    );
+    println!(
+        "recall   (correct/assignable) : {:.1}% ({correct}/{assignable})",
+        rec * 100.0
+    );
+    println!(
+        "high-confidence (>={:.1}) precision : {:.1}% ({hc_correct}/{hc_assigned})",
+        hc_threshold,
+        hc_prec * 100.0
+    );
+    println!(
+        "high-confidence recall            : {:.1}% ({hc_correct}/{assignable})",
+        hc_rec * 100.0
+    );
+    println!("shift agreement with reference (within tolerance / predicted):");
+    let cmp = compare_shifts(&pred_aligned, &truth_ref);
+    for atom in ["H", "N", "CA", "CB", "C"] {
+        if let Some(&(ok, n)) = cmp.get(atom) {
+            let pct = if n > 0 {
+                (ok as f64) * 100.0 / (n as f64)
+            } else {
+                0.0
+            };
+            println!("  {atom:2} {ok}/{n} ({pct:.1}%)");
+        }
+    }
+
+    if verbose && !misassigned.is_empty() {
+        println!("misassigned spin systems (placed, true, H, N, confidence):");
+        for (ss_opt, placed_k, true_k, ph, pn, conf) in misassigned {
+            let placed_lbl = format!(
+                "{}{}",
+                truth_ref.sequence[placed_k], truth_ref.seq_ids[placed_k]
+            );
+            let true_lbl = if true_k >= 0 {
+                let tk = true_k as usize;
+                format!("{}{}", truth_ref.sequence[tk], truth_ref.seq_ids[tk])
+            } else {
+                "none(spurious)".to_string()
+            };
+            if let Some(ss_i) = ss_opt {
+                println!(
+                    "  ss#{:<4} {:<8} {:<15} {:6.3} {:7.2} {:.2}",
+                    ss_i, placed_lbl, true_lbl, ph, pn, conf
+                );
+            } else {
+                println!(
+                    "  {:<8} {:<15} {:6.3} {:7.2} {:.2}",
+                    placed_lbl, true_lbl, ph, pn, conf
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1989,6 +2776,7 @@ fn main() {
         "e2e-benchmark" => cmd_e2e_benchmark(&args[1..]),
         "simulate" => cmd_simulate(&args[1..]),
         "assign" => cmd_assign(&args[1..]),
+        "score" => cmd_score(&args[1..]),
         "pick" => cmd_pick(&args[1..]),
         "priors" => cmd_priors(&args[1..]),
         "sidechain" => cmd_sidechain(&args[1..]),
@@ -2004,5 +2792,202 @@ fn main() {
     if let Err(err) = res {
         eprintln!("error: {err}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nmr_core::simulate::render_triple_3d;
+    use nmr_core::spectrum::{write_ucsf_2d_tiled, write_ucsf_3d_tiled};
+
+    fn fixture_star_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/fixtures/synthetic_ubiquitin.str")
+    }
+
+    #[test]
+    fn test_parse_truth_auto_ccpnmr_excludes_uncertain_tokens() {
+        let dir = env::temp_dir().join(format!("nmr_cli_truth_test_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let table = "\
+seq#\tresidue\tH\tN\tC\tCA\tsidechains
+1\tMet\t-\t-\t170.54\t54.45\t33.27:Cb 17.07:Ce
+2\tGln\t8.96\t122.86\t175.92\t55.10\t30.76:Cb 32.16:Cg
+19\tPro\t-\t-\t175.42\t65.12\t32.00:Cb
+24\tGlu\t-\t119.24?170.15\t59.10\t-\t9.19:H* ?
+43\tLeu\t8.83\t124.22\t174.11\t52.66\t42.20:Cb 24.50:Cg?
+";
+        let tpath = dir.join("truth_table.txt");
+        fs::write(&tpath, table).unwrap();
+
+        let (r, excluded_q, fmt) = parse_truth_auto(&tpath).unwrap();
+        assert_eq!(fmt, "CcpNmr/table");
+        // 3 uncertain '?' tokens: `119.24?`, `9.19:H*?`, and `24.50:Cg?`
+        assert_eq!(excluded_q, 3);
+        assert_eq!(r.sequence.len(), 43);
+        assert_eq!(r.sequence[0], "MET");
+        assert_eq!(r.sequence[1], "GLN");
+        assert_eq!(r.sequence[18], "PRO");
+        assert_eq!(r.sequence[23], "GLU");
+        assert_eq!(r.sequence[42], "LEU");
+
+        // Glu24 (k = 23): 119.24? excluded for N, 170.15 retained for C, 59.10 retained for CA
+        assert!(!r.shifts.contains_key(&(23, "N".to_string())));
+        assert!(!r.shifts.contains_key(&(23, "H".to_string())));
+        assert!((r.shifts[&(23, "C".to_string())] - 170.15).abs() < 1e-6);
+        assert!((r.shifts[&(23, "CA".to_string())] - 59.10).abs() < 1e-6);
+        // Gln2 (k = 1) and Leu43 (k = 42) retain CB, while 24.50:Cg? is excluded
+        assert!((r.shifts[&(1, "CB".to_string())] - 30.76).abs() < 1e-6);
+        assert!((r.shifts[&(42, "CB".to_string())] - 42.20).abs() < 1e-6);
+
+        // NMR-STAR auto-detection
+        let (r_star, ex_star, fmt_star) = parse_truth_auto(&fixture_star_path()).unwrap();
+        assert_eq!(fmt_star, "NMR-STAR");
+        assert_eq!(ex_star, 0);
+        assert_eq!(r_star.sequence.len(), 76);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_real_data_pipeline_ucsf_and_score_cli() {
+        let dir = env::temp_dir().join(format!("nmr_cli_pipe_ucsf_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let star = fixture_star_path();
+        let ref_data = read_star(&star, None).unwrap();
+        let (sim_peaks, _) = simulate(
+            &ref_data,
+            &SimConfig {
+                p_missing_peak: 0.0,
+                spurious_rate: 0.0,
+                seed: 7,
+                ..SimConfig::default()
+            },
+        );
+
+        let rcfg = SpectrumRenderConfig {
+            nx_h: 256,
+            ny_n: 128,
+            nz_c: 96,
+            ..SpectrumRenderConfig::default()
+        };
+        let hsqc = render_hsqc_2d(&sim_peaks, &rcfg);
+        let hncacb = render_triple_3d("HNCACB", &sim_peaks, &rcfg);
+        let cbcaconh = render_triple_3d("CBCACONH", &sim_peaks, &rcfg);
+
+        let hsqc_ucsf = dir.join("hsqc.ucsf");
+        let hncacb_ucsf = dir.join("hncacb.ucsf");
+        let cbcaconh_ucsf = dir.join("cbcaconh.ucsf");
+        write_ucsf_2d_tiled(&hsqc_ucsf, &hsqc, 30, 70).unwrap();
+        write_ucsf_3d_tiled(&hncacb_ucsf, &hncacb, 25, 19, 60).unwrap();
+        write_ucsf_3d_tiled(&cbcaconh_ucsf, &cbcaconh, 25, 19, 60).unwrap();
+
+        let fasta_path = dir.join("ubq.fasta");
+        let seq_1letter: String = ref_data
+            .sequence
+            .iter()
+            .map(|r| match r.as_str() {
+                "ALA" => 'A',
+                "ARG" => 'R',
+                "ASN" => 'N',
+                "ASP" => 'D',
+                "CYS" => 'C',
+                "GLN" => 'Q',
+                "GLU" => 'E',
+                "GLY" => 'G',
+                "HIS" => 'H',
+                "ILE" => 'I',
+                "LEU" => 'L',
+                "LYS" => 'K',
+                "MET" => 'M',
+                "PHE" => 'F',
+                "PRO" => 'P',
+                "SER" => 'S',
+                "THR" => 'T',
+                "TRP" => 'W',
+                "TYR" => 'Y',
+                "VAL" => 'V',
+                _ => 'X',
+            })
+            .collect();
+        fs::write(&fasta_path, format!(">ubq\n{seq_1letter}\n")).unwrap();
+
+        let out_dir = dir.join("out_real");
+        let pipe_args: Vec<String> = vec![
+            "--seq".into(),
+            fasta_path.to_string_lossy().into_owned(),
+            "--hsqc".into(),
+            hsqc_ucsf.to_string_lossy().into_owned(),
+            "--triple".into(),
+            format!("HNCACB={}", hncacb_ucsf.display()),
+            "--triple".into(),
+            format!("CBCACONH={}", cbcaconh_ucsf.display()),
+            "--method".into(),
+            "classical".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "500".into(),
+            "--out-dir".into(),
+            out_dir.to_string_lossy().into_owned(),
+        ];
+        cmd_pipeline(&pipe_args).unwrap();
+
+        for fname in [
+            "shifts.str",
+            "shifts.tsv",
+            "peaks.tsv",
+            "result.nef",
+            "report.html",
+        ] {
+            assert!(out_dir.join(fname).exists(), "missing output {fname}");
+        }
+
+        let score_args: Vec<String> = vec![
+            "--pred".into(),
+            out_dir.join("shifts.str").to_string_lossy().into_owned(),
+            "--assign-tsv".into(),
+            out_dir.join("shifts.tsv").to_string_lossy().into_owned(),
+            "--peaks".into(),
+            out_dir.join("peaks.tsv").to_string_lossy().into_owned(),
+            "--truth".into(),
+            star.to_string_lossy().into_owned(),
+            "-v".into(),
+        ];
+        cmd_score(&score_args).unwrap();
+
+        // Loud GPU failure checks: classical picker must reject `--engine gpu` rather than silently running CPU,
+        // and neural `--engine gpu` with 0 triples must still initialize WebGPU rather than falling back to CPU.
+        let bad_pick_args: Vec<String> = vec![
+            "--hsqc".into(),
+            hsqc_ucsf.to_string_lossy().into_owned(),
+            "--out".into(),
+            dir.join("bad_peaks.tsv").to_string_lossy().into_owned(),
+            "--method".into(),
+            "classical".into(),
+            "--engine".into(),
+            "gpu".into(),
+        ];
+        let err_msg = cmd_pick(&bad_pick_args).unwrap_err();
+        assert!(
+            err_msg.contains("no GPU kernel"),
+            "unexpected err: {err_msg}"
+        );
+
+        let (_, _, lbl_gpu_2d) =
+            pick_spectra_bundle(&hsqc_ucsf, &[], "neural", EngineKind::Gpu, 5.0, 0.45).unwrap();
+        assert!(
+            lbl_gpu_2d.starts_with("neural (WebGPU:"),
+            "expected WebGPU label, got {lbl_gpu_2d}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

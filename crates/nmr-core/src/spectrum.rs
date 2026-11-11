@@ -1,12 +1,16 @@
-//! Processed 2D and 3D NMR spectrum representation and Bruker `pdata` / NMRPipe I/O.
+//! Processed 2D and 3D NMR spectrum representation and Bruker `pdata`, NMRPipe, and UCSF Sparky I/O.
 //!
 //! Provenance: Original clean-room implementation of `docs/specs/01-data-io.md` from public
 //! format specifications:
 //! - NMRPipe 512-float header specification (Delaglio et al., *J. Biomol. NMR* 6, 277-293, 1995).
 //! - Bruker TopSpin JCAMP-DX `procs`/`proc2s`/`proc3s` and submatrix `2rr`/`3rrr` binary layout.
+//! - UCSF Sparky v2 `.ucsf` binary format specification (Goddard & Kneller, *SPARKY 3 Manual —
+//!   UCSF NMR Data Format*, University of California, San Francisco: 180-byte global header,
+//!   128-byte big-endian axis headers, and zero-padded big-endian IEEE 754 `f32` data tiles).
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -744,4 +748,673 @@ pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, 
         axis_z,
         data,
     })
+}
+
+// ============================================================================
+// UCSF Sparky v2 .ucsf reader & writer (180-byte header + N*128-byte axis headers + BE f32 tiles)
+// ============================================================================
+
+const UCSF_FILE_HEADER_BYTES: usize = 180;
+const UCSF_AXIS_HEADER_BYTES: usize = 128;
+const UCSF_MAGIC_PREFIX: &[u8; 8] = b"UCSF NMR";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UcsfNuc {
+    H,
+    N,
+    C,
+}
+
+/// Check whether an in-memory buffer starts with the UCSF NMR magic signature (`"UCSF NMR\0\0"`).
+pub fn is_ucsf_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 10 && &bytes[..8] == UCSF_MAGIC_PREFIX && bytes[8] == 0
+}
+
+/// Check whether `path` is a UCSF Sparky spectrum file by sniffing its 10-byte magic header
+/// (or `.ucsf` extension if unreadable).
+pub fn is_ucsf_file(path: impl AsRef<Path>) -> bool {
+    let p = path.as_ref();
+    if p.is_dir() {
+        return false;
+    }
+    if let Ok(mut f) = File::open(p) {
+        let mut magic = [0u8; 10];
+        if f.read_exact(&mut magic).is_ok() {
+            return is_ucsf_bytes(&magic);
+        }
+    }
+    p.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ucsf"))
+}
+
+fn classify_ucsf_nucleus(ax: &AxisPpm) -> UcsfNuc {
+    let up = ax.label.to_ascii_uppercase();
+    if up.contains('N') {
+        UcsfNuc::N
+    } else if up.contains('C') {
+        UcsfNuc::C
+    } else if up.contains('H') || (ax.max_ppm() <= 20.0 && ax.min_ppm() >= -5.0) {
+        UcsfNuc::H
+    } else if ax.min_ppm() >= 90.0 && ax.max_ppm() <= 150.0 && ax.sw_ppm() < 60.0 {
+        UcsfNuc::N
+    } else {
+        UcsfNuc::C
+    }
+}
+
+fn parse_ucsf_file_header(hdr: &[u8], expected_ndim: u8) -> Result<(), String> {
+    if hdr.len() < UCSF_FILE_HEADER_BYTES {
+        return Err(format!(
+            "UCSF file shorter than {UCSF_FILE_HEADER_BYTES}-byte global header ({} bytes)",
+            hdr.len()
+        ));
+    }
+    if !is_ucsf_bytes(hdr) {
+        return Err("unrecognized UCSF magic header (expected 'UCSF NMR\\0\\0')".to_string());
+    }
+    let ndim = hdr[10];
+    if ndim != expected_ndim {
+        return Err(format!(
+            "UCSF dimension mismatch: file has ndim={ndim}, expected {expected_ndim}"
+        ));
+    }
+    let ncomp = hdr[11];
+    if ncomp != 1 {
+        return Err(format!(
+            "unsupported UCSF ncomponents={ncomp} (expected 1 for real spectrum)"
+        ));
+    }
+    let encoding = hdr[12];
+    if encoding != 0 {
+        return Err(format!(
+            "unsupported UCSF encoding={encoding} (expected 0 for IEEE 754 float32)"
+        ));
+    }
+    let version = hdr[13];
+    if version != 2 {
+        return Err(format!(
+            "unsupported UCSF format version={version} (expected 2)"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_ucsf_axis_header(ax_hdr: &[u8], axis_idx: usize) -> Result<(AxisPpm, usize), String> {
+    if ax_hdr.len() < UCSF_AXIS_HEADER_BYTES {
+        return Err(format!(
+            "UCSF axis[{axis_idx}] header shorter than {UCSF_AXIS_HEADER_BYTES} bytes"
+        ));
+    }
+    let nuc_slice = &ax_hdr[0..6];
+    let nuc_end = nuc_slice.iter().position(|&b| b == 0).unwrap_or(6);
+    let raw_label = String::from_utf8_lossy(&nuc_slice[..nuc_end])
+        .trim()
+        .to_string();
+    let label = if raw_label.is_empty() {
+        format!("W{}", axis_idx + 1)
+    } else {
+        raw_label
+    };
+
+    let npoints_i32 = i32::from_be_bytes(ax_hdr[8..12].try_into().unwrap());
+    if npoints_i32 <= 0 {
+        return Err(format!(
+            "invalid UCSF axis[{axis_idx}] npoints={npoints_i32}"
+        ));
+    }
+    let npoints = npoints_i32 as usize;
+
+    let tile_i32 = i32::from_be_bytes(ax_hdr[16..20].try_into().unwrap());
+    if tile_i32 <= 0 {
+        return Err(format!(
+            "invalid UCSF axis[{axis_idx}] tile_size={tile_i32}"
+        ));
+    }
+    let tile_size = tile_i32 as usize;
+
+    let obs_mhz = f32::from_be_bytes(ax_hdr[20..24].try_into().unwrap()) as f64;
+    let sw_hz = f32::from_be_bytes(ax_hdr[24..28].try_into().unwrap()) as f64;
+    let xmtr_ppm = f32::from_be_bytes(ax_hdr[28..32].try_into().unwrap()) as f64;
+
+    if !obs_mhz.is_finite() || obs_mhz <= 0.0 {
+        return Err(format!(
+            "invalid UCSF axis[{axis_idx}] spectrometer_mhz={obs_mhz}"
+        ));
+    }
+    if !sw_hz.is_finite() || sw_hz <= 0.0 {
+        return Err(format!(
+            "invalid UCSF axis[{axis_idx}] spectral_width_hz={sw_hz}"
+        ));
+    }
+    if !xmtr_ppm.is_finite() {
+        return Err(format!("invalid UCSF axis[{axis_idx}] xmtr_ppm={xmtr_ppm}"));
+    }
+
+    // In UCSF v2, byte offset 28..32 stores the carrier/center chemical shift (xmtr_ppm),
+    // so index 0 (high-ppm edge) sits at xmtr_ppm + 0.5 * (sw_hz / obs_mhz) with step -(sw_hz / obs_mhz) / npoints.
+    let sw_ppm = sw_hz / obs_mhz;
+    let first_ppm = xmtr_ppm + 0.5 * sw_ppm;
+    let step_ppm = -sw_ppm / (npoints as f64);
+
+    Ok((
+        AxisPpm {
+            label,
+            size: npoints,
+            first_ppm,
+            step_ppm,
+            obs_mhz,
+        },
+        tile_size,
+    ))
+}
+
+fn encode_ucsf_file_header(ndim: u8) -> [u8; UCSF_FILE_HEADER_BYTES] {
+    let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES];
+    hdr[..8].copy_from_slice(UCSF_MAGIC_PREFIX);
+    hdr[8] = 0;
+    hdr[9] = 0;
+    hdr[10] = ndim;
+    hdr[11] = 1; // ncomponents = 1 (real)
+    hdr[12] = 0; // encoding = 0 (IEEE 754 float32)
+    hdr[13] = 2; // format version = 2
+    let comment = b"nmrassign UCSF v2 spectrum";
+    hdr[46..46 + comment.len()].copy_from_slice(comment);
+    hdr
+}
+
+fn encode_ucsf_axis_header(ax: &AxisPpm, tile_size: usize) -> [u8; UCSF_AXIS_HEADER_BYTES] {
+    let mut buf = [0u8; UCSF_AXIS_HEADER_BYTES];
+    let lbl_bytes = ax.label.as_bytes();
+    let copy_len = lbl_bytes.len().min(5);
+    buf[..copy_len].copy_from_slice(&lbl_bytes[..copy_len]);
+
+    let npts = (ax.size.max(1)) as i32;
+    let tsize = (tile_size.max(1)) as i32;
+    let obs_mhz = (ax.obs_mhz.max(1e-3)) as f32;
+    let sw_ppm = ax.sw_ppm();
+    let sw_hz = (sw_ppm * ax.obs_mhz.max(1e-3)) as f32;
+    let xmtr_ppm = (ax.first_ppm - 0.5 * sw_ppm) as f32;
+
+    buf[8..12].copy_from_slice(&npts.to_be_bytes());
+    buf[12..16].copy_from_slice(&npts.to_be_bytes());
+    buf[16..20].copy_from_slice(&tsize.to_be_bytes());
+    buf[20..24].copy_from_slice(&obs_mhz.to_be_bytes());
+    buf[24..28].copy_from_slice(&sw_hz.to_be_bytes());
+    buf[28..32].copy_from_slice(&xmtr_ppm.to_be_bytes());
+    buf
+}
+
+/// Read a 2D UCSF Sparky spectrum (`.ucsf`), mapping `1H` to `axis_x` and the indirect
+/// heteronucleus (`15N` / `13C`) to `axis_y`.
+pub fn read_ucsf_2d(path: impl AsRef<Path>) -> Result<Spectrum2D, String> {
+    let p = path.as_ref();
+    let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+
+    let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES + 2 * UCSF_AXIS_HEADER_BYTES];
+    reader
+        .read_exact(&mut hdr)
+        .map_err(|e| format!("failed to read UCSF 2D header from {}: {e}", p.display()))?;
+    parse_ucsf_file_header(&hdr[..UCSF_FILE_HEADER_BYTES], 2)?;
+
+    let (ax0, t0) = parse_ucsf_axis_header(
+        &hdr[UCSF_FILE_HEADER_BYTES..UCSF_FILE_HEADER_BYTES + UCSF_AXIS_HEADER_BYTES],
+        0,
+    )?;
+    let (ax1, t1) =
+        parse_ucsf_axis_header(&hdr[UCSF_FILE_HEADER_BYTES + UCSF_AXIS_HEADER_BYTES..], 1)?;
+
+    let n0 = ax0.size;
+    let n1 = ax1.size;
+    let nt0 = n0.div_ceil(t0);
+    let nt1 = n1.div_ceil(t1);
+
+    // Standard Sparky 2D layout has axis[0] = indirect (15N/13C) and axis[1] = direct (1H).
+    // Transpose into Spectrum2D(X=1H, Y=indirect) if axis[0] is 1H and axis[1] is heteronuclear.
+    let transpose =
+        classify_ucsf_nucleus(&ax0) == UcsfNuc::H && classify_ucsf_nucleus(&ax1) != UcsfNuc::H;
+    let (axis_x, axis_y) = if transpose { (ax0, ax1) } else { (ax1, ax0) };
+    let nx = axis_x.size;
+    let ny = axis_y.size;
+
+    let mut data = vec![0.0f32; ny * nx];
+    let mut tile_bytes = vec![0u8; t0 * t1 * 4];
+
+    for bt0 in 0..nt0 {
+        let base0 = bt0 * t0;
+        let valid0 = (n0 - base0).min(t0);
+        for bt1 in 0..nt1 {
+            let base1 = bt1 * t1;
+            let valid1 = (n1 - base1).min(t1);
+            reader.read_exact(&mut tile_bytes).map_err(|e| {
+                format!(
+                    "UCSF 2D tile ({bt0},{bt1}) truncated in {}: {e}",
+                    p.display()
+                )
+            })?;
+            if !transpose {
+                for l0 in 0..valid0 {
+                    let gy = base0 + l0;
+                    let dst_row = &mut data[gy * nx + base1..gy * nx + base1 + valid1];
+                    let src_off = l0 * t1 * 4;
+                    let src_slice = &tile_bytes[src_off..src_off + valid1 * 4];
+                    for (dst, chunk) in dst_row.iter_mut().zip(src_slice.chunks_exact(4)) {
+                        *dst = f32::from_be_bytes(chunk.try_into().unwrap());
+                    }
+                }
+            } else {
+                for l0 in 0..valid0 {
+                    let gx = base0 + l0;
+                    let src_off = l0 * t1 * 4;
+                    let src_slice = &tile_bytes[src_off..src_off + valid1 * 4];
+                    for (l1, chunk) in src_slice.chunks_exact(4).enumerate() {
+                        let gy = base1 + l1;
+                        data[gy * nx + gx] = f32::from_be_bytes(chunk.try_into().unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Spectrum2D {
+        name: p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("spectrum.ucsf")
+            .to_string(),
+        axis_x,
+        axis_y,
+        data,
+    })
+}
+
+/// Write a 2D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`64 x 256` capped to axis size).
+pub fn write_ucsf_2d(path: impl AsRef<Path>, spec: &Spectrum2D) -> Result<(), String> {
+    let ty = spec.ny().clamp(1, 64);
+    let tx = spec.nx().clamp(1, 256);
+    write_ucsf_2d_tiled(path, spec, ty, tx)
+}
+
+/// Write a 2D UCSF Sparky spectrum (`.ucsf`) with explicit `(tile_y, tile_x)` dimensions,
+/// zero-padding partial boundary tiles per the UCSF v2 format specification.
+pub fn write_ucsf_2d_tiled(
+    path: impl AsRef<Path>,
+    spec: &Spectrum2D,
+    tile_y: usize,
+    tile_x: usize,
+) -> Result<(), String> {
+    let p = path.as_ref();
+    let file = File::create(p).map_err(|e| format!("failed to create {}: {e}", p.display()))?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+
+    let t0 = tile_y.max(1);
+    let t1 = tile_x.max(1);
+    writer
+        .write_all(&encode_ucsf_file_header(2))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+    // UCSF convention: axis[0] = indirect (axis_y), axis[1] = direct (axis_x)
+    writer
+        .write_all(&encode_ucsf_axis_header(&spec.axis_y, t0))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+    writer
+        .write_all(&encode_ucsf_axis_header(&spec.axis_x, t1))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+
+    let ny = spec.ny();
+    let nx = spec.nx();
+    let nt0 = ny.div_ceil(t0);
+    let nt1 = nx.div_ceil(t1);
+    let mut tile_bytes = vec![0u8; t0 * t1 * 4];
+
+    for bt0 in 0..nt0 {
+        let base0 = bt0 * t0;
+        for bt1 in 0..nt1 {
+            let base1 = bt1 * t1;
+            tile_bytes.fill(0);
+            let valid0 = (ny.saturating_sub(base0)).min(t0);
+            let valid1 = (nx.saturating_sub(base1)).min(t1);
+            for l0 in 0..valid0 {
+                let gy = base0 + l0;
+                let row_off = l0 * t1 * 4;
+                for l1 in 0..valid1 {
+                    let gx = base1 + l1;
+                    let val = spec.data[gy * nx + gx];
+                    let dst = row_off + l1 * 4;
+                    tile_bytes[dst..dst + 4].copy_from_slice(&val.to_be_bytes());
+                }
+            }
+            writer
+                .write_all(&tile_bytes)
+                .map_err(|e| format!("write error {}: {e}", p.display()))?;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("flush error {}: {e}", p.display()))
+}
+
+fn choose_ucsf_3d_axis_perm(axes: &[AxisPpm; 3]) -> (usize, usize, usize) {
+    let nucs = [
+        classify_ucsf_nucleus(&axes[0]),
+        classify_ucsf_nucleus(&axes[1]),
+        classify_ucsf_nucleus(&axes[2]),
+    ];
+    let h_dims: Vec<usize> = (0..3).filter(|&i| nucs[i] == UcsfNuc::H).collect();
+    let n_dims: Vec<usize> = (0..3).filter(|&i| nucs[i] == UcsfNuc::N).collect();
+    let c_dims: Vec<usize> = (0..3).filter(|&i| nucs[i] == UcsfNuc::C).collect();
+
+    if h_dims.len() == 1 && n_dims.len() == 1 && c_dims.len() == 1 {
+        // Triple-resonance (1H, 15N, 13C) -> Spectrum3D(X=1H, Y=15N, Z=13C)
+        (h_dims[0], n_dims[0], c_dims[0])
+    } else if h_dims.len() == 2 && (n_dims.len() == 1 || c_dims.len() == 1) {
+        // 3D NOESY / HCCCONH / HCCH-TOCSY -> X = direct 1H (highest axis index), Y = heavy (15N/13C), Z = indirect 1H
+        let heavy = if n_dims.len() == 1 {
+            n_dims[0]
+        } else {
+            c_dims[0]
+        };
+        let x_dim = *h_dims.iter().max().unwrap();
+        let z_dim = *h_dims.iter().min().unwrap();
+        (x_dim, heavy, z_dim)
+    } else if h_dims.len() == 1 {
+        // One 1H axis + two heavy axes (e.g. CCCONH or custom 3D) -> X = 1H, Y/Z preserve indirect order
+        let x_dim = h_dims[0];
+        let others: Vec<usize> = (0..3).filter(|&i| i != x_dim).collect();
+        (x_dim, others[1], others[0])
+    } else {
+        (2, 1, 0)
+    }
+}
+
+/// Read a 3D UCSF Sparky spectrum (`.ucsf`), assembling big-endian `f32` tiles (including
+/// zero-padded partial boundary tiles) and ordering dimensions into `Spectrum3D(X=1H, Y=15N, Z=13C)`.
+pub fn read_ucsf_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, String> {
+    let p = path.as_ref();
+    let file = File::open(p).map_err(|e| format!("failed to open {}: {e}", p.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+
+    let mut hdr = [0u8; UCSF_FILE_HEADER_BYTES + 3 * UCSF_AXIS_HEADER_BYTES];
+    reader
+        .read_exact(&mut hdr)
+        .map_err(|e| format!("failed to read UCSF 3D header from {}: {e}", p.display()))?;
+    parse_ucsf_file_header(&hdr[..UCSF_FILE_HEADER_BYTES], 3)?;
+
+    let (ax0, t0) = parse_ucsf_axis_header(
+        &hdr[UCSF_FILE_HEADER_BYTES..UCSF_FILE_HEADER_BYTES + UCSF_AXIS_HEADER_BYTES],
+        0,
+    )?;
+    let (ax1, t1) = parse_ucsf_axis_header(
+        &hdr[UCSF_FILE_HEADER_BYTES + UCSF_AXIS_HEADER_BYTES
+            ..UCSF_FILE_HEADER_BYTES + 2 * UCSF_AXIS_HEADER_BYTES],
+        1,
+    )?;
+    let (ax2, t2) = parse_ucsf_axis_header(
+        &hdr[UCSF_FILE_HEADER_BYTES + 2 * UCSF_AXIS_HEADER_BYTES..],
+        2,
+    )?;
+
+    let raw_axes = [ax0, ax1, ax2];
+    let (x_dim, y_dim, z_dim) = choose_ucsf_3d_axis_perm(&raw_axes);
+    let axis_x = raw_axes[x_dim].clone();
+    let axis_y = raw_axes[y_dim].clone();
+    let axis_z = raw_axes[z_dim].clone();
+
+    let (n0, n1, n2) = (raw_axes[0].size, raw_axes[1].size, raw_axes[2].size);
+    let (nt0, nt1, nt2) = (n0.div_ceil(t0), n1.div_ceil(t1), n2.div_ceil(t2));
+    let (nx, ny, nz) = (axis_x.size, axis_y.size, axis_z.size);
+
+    let mut data = vec![0.0f32; nz * ny * nx];
+    let mut tile_bytes = vec![0u8; t0 * t1 * t2 * 4];
+    let direct_zyx = (x_dim, y_dim, z_dim) == (2, 1, 0);
+
+    for bt0 in 0..nt0 {
+        let base0 = bt0 * t0;
+        let valid0 = (n0 - base0).min(t0);
+        for bt1 in 0..nt1 {
+            let base1 = bt1 * t1;
+            let valid1 = (n1 - base1).min(t1);
+            for bt2 in 0..nt2 {
+                let base2 = bt2 * t2;
+                let valid2 = (n2 - base2).min(t2);
+                reader.read_exact(&mut tile_bytes).map_err(|e| {
+                    format!(
+                        "UCSF 3D tile ({bt0},{bt1},{bt2}) truncated in {}: {e}",
+                        p.display()
+                    )
+                })?;
+
+                if direct_zyx {
+                    for l0 in 0..valid0 {
+                        let gz = base0 + l0;
+                        for l1 in 0..valid1 {
+                            let gy = base1 + l1;
+                            let dst_start = (gz * ny + gy) * nx + base2;
+                            let dst_row = &mut data[dst_start..dst_start + valid2];
+                            let src_off = (l0 * t1 + l1) * t2 * 4;
+                            let src_slice = &tile_bytes[src_off..src_off + valid2 * 4];
+                            for (dst, chunk) in dst_row.iter_mut().zip(src_slice.chunks_exact(4)) {
+                                *dst = f32::from_be_bytes(chunk.try_into().unwrap());
+                            }
+                        }
+                    }
+                } else {
+                    for l0 in 0..valid0 {
+                        let g0 = base0 + l0;
+                        for l1 in 0..valid1 {
+                            let g1 = base1 + l1;
+                            let src_off = (l0 * t1 + l1) * t2 * 4;
+                            let src_slice = &tile_bytes[src_off..src_off + valid2 * 4];
+                            for (l2, chunk) in src_slice.chunks_exact(4).enumerate() {
+                                let coords = [g0, g1, base2 + l2];
+                                let gx = coords[x_dim];
+                                let gy = coords[y_dim];
+                                let gz = coords[z_dim];
+                                data[(gz * ny + gy) * nx + gx] =
+                                    f32::from_be_bytes(chunk.try_into().unwrap());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Spectrum3D {
+        name: p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("spectrum3d.ucsf")
+            .to_string(),
+        exp: exp.to_string(),
+        axis_x,
+        axis_y,
+        axis_z,
+        data,
+    })
+}
+
+/// Write a 3D UCSF Sparky spectrum (`.ucsf`) using standard tile sizes (`32 x 8 x 128` capped to axis size).
+pub fn write_ucsf_3d(path: impl AsRef<Path>, spec: &Spectrum3D) -> Result<(), String> {
+    let tz = spec.nz().clamp(1, 32);
+    let ty = spec.ny().clamp(1, 8);
+    let tx = spec.nx().clamp(1, 128);
+    write_ucsf_3d_tiled(path, spec, tz, ty, tx)
+}
+
+/// Write a 3D UCSF Sparky spectrum (`.ucsf`) with explicit `(tile_z, tile_y, tile_x)` dimensions,
+/// zero-padding partial boundary tiles per the UCSF v2 format specification.
+pub fn write_ucsf_3d_tiled(
+    path: impl AsRef<Path>,
+    spec: &Spectrum3D,
+    tile_z: usize,
+    tile_y: usize,
+    tile_x: usize,
+) -> Result<(), String> {
+    let p = path.as_ref();
+    let file = File::create(p).map_err(|e| format!("failed to create {}: {e}", p.display()))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
+    let (t0, t1, t2) = (tile_z.max(1), tile_y.max(1), tile_x.max(1));
+    writer
+        .write_all(&encode_ucsf_file_header(3))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+    // UCSF convention: axis[0] = Z (13C), axis[1] = Y (15N), axis[2] = X (1H)
+    writer
+        .write_all(&encode_ucsf_axis_header(&spec.axis_z, t0))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+    writer
+        .write_all(&encode_ucsf_axis_header(&spec.axis_y, t1))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+    writer
+        .write_all(&encode_ucsf_axis_header(&spec.axis_x, t2))
+        .map_err(|e| format!("write error {}: {e}", p.display()))?;
+
+    let (nz, ny, nx) = (spec.nz(), spec.ny(), spec.nx());
+    let (nt0, nt1, nt2) = (nz.div_ceil(t0), ny.div_ceil(t1), nx.div_ceil(t2));
+    let mut tile_bytes = vec![0u8; t0 * t1 * t2 * 4];
+
+    for bt0 in 0..nt0 {
+        let base0 = bt0 * t0;
+        let valid0 = (nz.saturating_sub(base0)).min(t0);
+        for bt1 in 0..nt1 {
+            let base1 = bt1 * t1;
+            let valid1 = (ny.saturating_sub(base1)).min(t1);
+            for bt2 in 0..nt2 {
+                let base2 = bt2 * t2;
+                let valid2 = (nx.saturating_sub(base2)).min(t2);
+                tile_bytes.fill(0);
+                for l0 in 0..valid0 {
+                    let gz = base0 + l0;
+                    for l1 in 0..valid1 {
+                        let gy = base1 + l1;
+                        let dst_row_off = (l0 * t1 + l1) * t2 * 4;
+                        let src_row_off = (gz * ny + gy) * nx + base2;
+                        for l2 in 0..valid2 {
+                            let val = spec.data[src_row_off + l2];
+                            let dst = dst_row_off + l2 * 4;
+                            tile_bytes[dst..dst + 4].copy_from_slice(&val.to_be_bytes());
+                        }
+                    }
+                }
+                writer
+                    .write_all(&tile_bytes)
+                    .map_err(|e| format!("write error {}: {e}", p.display()))?;
+            }
+        }
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("flush error {}: {e}", p.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::process;
+
+    #[test]
+    fn test_ucsf_permuted_axis_orders_and_partial_tiles() {
+        let dir = env::temp_dir().join(format!("nmr_ucsf_perm_test_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 1. 2D UCSF stored in transposed order: axis[0] = 1H (nx=13, t0=5), axis[1] = 15N (ny=9, t1=4)
+        let ax_h = AxisPpm::from_bounds("1H", 13, 10.2, 6.0, 600.13);
+        let ax_n = AxisPpm::from_bounds("15N", 9, 130.0, 106.0, 60.81);
+        let (t0, t1) = (5usize, 4usize);
+        let p2 = dir.join("transposed_2d.ucsf");
+        {
+            let mut f = File::create(&p2).unwrap();
+            f.write_all(&encode_ucsf_file_header(2)).unwrap();
+            f.write_all(&encode_ucsf_axis_header(&ax_h, t0)).unwrap();
+            f.write_all(&encode_ucsf_axis_header(&ax_n, t1)).unwrap();
+            let nt0 = ax_h.size.div_ceil(t0);
+            let nt1 = ax_n.size.div_ceil(t1);
+            for bt0 in 0..nt0 {
+                for bt1 in 0..nt1 {
+                    let mut tile = vec![0u8; t0 * t1 * 4];
+                    for l0 in 0..t0 {
+                        let gx = bt0 * t0 + l0;
+                        for l1 in 0..t1 {
+                            let gy = bt1 * t1 + l1;
+                            let val = if gx < ax_h.size && gy < ax_n.size {
+                                (gy * 100 + gx + 1) as f32
+                            } else {
+                                -999.0 // boundary padding sentinel must be ignored by reader
+                            };
+                            let off = (l0 * t1 + l1) * 4;
+                            tile[off..off + 4].copy_from_slice(&val.to_be_bytes());
+                        }
+                    }
+                    f.write_all(&tile).unwrap();
+                }
+            }
+        }
+        assert!(is_ucsf_file(&p2));
+        let s2 = read_ucsf_2d(&p2).unwrap();
+        assert_eq!(s2.nx(), 13);
+        assert_eq!(s2.ny(), 9);
+        assert_eq!(s2.axis_x.label, "1H");
+        assert_eq!(s2.axis_y.label, "15N");
+        for gy in 0..9 {
+            for gx in 0..13 {
+                assert_eq!(s2.get(gx, gy), (gy * 100 + gx + 1) as f32);
+            }
+        }
+
+        // 2. 3D UCSF stored in non-standard order: axis[0] = 1H (nx=7, t0=3), axis[1] = 13C (nz=6, t1=4), axis[2] = 15N (ny=5, t2=2)
+        let ax3_h = AxisPpm::from_bounds("1H", 7, 9.8, 7.0, 500.13);
+        let ax3_c = AxisPpm::from_bounds("13C", 6, 70.0, 20.0, 125.76);
+        let ax3_n = AxisPpm::from_bounds("15N", 5, 128.0, 108.0, 50.68);
+        let (u0, u1, u2) = (3usize, 4usize, 2usize);
+        let p3 = dir.join("permuted_3d.ucsf");
+        {
+            let mut f = File::create(&p3).unwrap();
+            f.write_all(&encode_ucsf_file_header(3)).unwrap();
+            f.write_all(&encode_ucsf_axis_header(&ax3_h, u0)).unwrap();
+            f.write_all(&encode_ucsf_axis_header(&ax3_c, u1)).unwrap();
+            f.write_all(&encode_ucsf_axis_header(&ax3_n, u2)).unwrap();
+            for bt0 in 0..ax3_h.size.div_ceil(u0) {
+                for bt1 in 0..ax3_c.size.div_ceil(u1) {
+                    for bt2 in 0..ax3_n.size.div_ceil(u2) {
+                        let mut tile = vec![0u8; u0 * u1 * u2 * 4];
+                        for l0 in 0..u0 {
+                            let gx = bt0 * u0 + l0;
+                            for l1 in 0..u1 {
+                                let gz = bt1 * u1 + l1;
+                                for l2 in 0..u2 {
+                                    let gy = bt2 * u2 + l2;
+                                    let val =
+                                        if gx < ax3_h.size && gz < ax3_c.size && gy < ax3_n.size {
+                                            (gz * 1000 + gy * 10 + gx + 1) as f32
+                                        } else {
+                                            -777.0
+                                        };
+                                    let off = ((l0 * u1 + l1) * u2 + l2) * 4;
+                                    tile[off..off + 4].copy_from_slice(&val.to_be_bytes());
+                                }
+                            }
+                        }
+                        f.write_all(&tile).unwrap();
+                    }
+                }
+            }
+        }
+        let s3 = read_ucsf_3d(&p3, "HNCA").unwrap();
+        assert_eq!((s3.nx(), s3.ny(), s3.nz()), (7, 5, 6));
+        assert_eq!(s3.axis_x.label, "1H");
+        assert_eq!(s3.axis_y.label, "15N");
+        assert_eq!(s3.axis_z.label, "13C");
+        for gz in 0..6 {
+            for gy in 0..5 {
+                for gx in 0..7 {
+                    assert_eq!(s3.get(gx, gy, gz), (gz * 1000 + gy * 10 + gx + 1) as f32);
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

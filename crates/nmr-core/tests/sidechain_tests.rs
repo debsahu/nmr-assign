@@ -336,21 +336,19 @@ fn test_volumetric_2d_and_3d_sidechain_simulators_and_pickers() {
 
 #[test]
 fn test_ubiquitin_bmr17769_blind_sidechain_assignment_benchmark() {
-    let raw_bmr17769 = Path::new(
-        "/Users/debsahu/.gemini/antigravity/brain/abeb5c50-57b8-474f-bd50-46bb84550078/scratch/bmrb_raw/bmr17769.str",
-    );
     let sc_priors = SidechainPriors::empirical_bmrb();
     let bb_priors = Priors::default();
 
-    let truth_all = if raw_bmr17769.exists() {
-        read_star_all_atoms(raw_bmr17769, None).expect("parse all-atom bmr17769.str")
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let base = read_star_all_atoms(workspace.join("data/benchmark/bmr17769.str"), None)
+        .expect("read data/benchmark/bmr17769.str");
+    let has_sidechains = base
+        .shifts
+        .keys()
+        .any(|(_, a)| !["H", "N", "CA", "CB", "C"].contains(&a.as_str()));
+    let truth_all = if has_sidechains {
+        base
     } else {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let base = read_star(
-            workspace.join("data/fixtures/synthetic_ubiquitin.str"),
-            None,
-        )
-        .expect("read synthetic_ubiquitin.str");
         synthesize_all_atom_reference(&base, &sc_priors, 17769)
     };
     assert_eq!(truth_all.sequence.len(), 76);

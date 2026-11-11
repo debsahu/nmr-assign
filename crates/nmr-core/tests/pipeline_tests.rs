@@ -1,5 +1,5 @@
 //! Comprehensive regression tests for `nmr-core` (I/O, spin systems, scoring,
-//! Bruker `pdata` & NMRPipe spectra, classical peak picking, and assignment benchmark).
+//! Bruker `pdata`, NMRPipe, & UCSF Sparky spectra, classical peak picking, and assignment benchmark).
 
 use std::fs;
 use std::path::PathBuf;
@@ -14,7 +14,8 @@ use nmr_core::simulate::{
 };
 use nmr_core::solver::{assign, AnnealConfig, ScoreConfig};
 use nmr_core::spectrum::{
-    read_bruker_pdata_2d, read_nmrpipe_2d, write_bruker_pdata_2d, write_nmrpipe_2d,
+    is_ucsf_file, read_bruker_pdata_2d, read_nmrpipe_2d, read_ucsf_2d, read_ucsf_3d,
+    write_bruker_pdata_2d, write_nmrpipe_2d, write_ucsf_2d_tiled, write_ucsf_3d_tiled,
 };
 use nmr_core::spinsystems::{build_spin_systems, Tolerances};
 
@@ -171,9 +172,42 @@ fn test_spectrum_io_and_classical_picker_roundtrip() {
         assert!((pa.n - pb.n).abs() < 0.25 * step_n);
     }
 
-    // 3. 3D HNCACB picking restricted under HSQC roots preserves +CA / -CB phase signs
+    // 3. UCSF Sparky .ucsf 2D round-trip with non-divisor tile sizes (partial boundary tiles)
+    let ucsf_2d_path = dir.join("test_hsqc.ucsf");
+    write_ucsf_2d_tiled(&ucsf_2d_path, &hsqc, 37, 97).unwrap();
+    assert!(is_ucsf_file(&ucsf_2d_path));
+    assert!(!is_ucsf_file(&pipe_path));
+    let hsqc_ucsf = read_ucsf_2d(&ucsf_2d_path).unwrap();
+    assert_eq!(hsqc_ucsf.nx(), hsqc.nx());
+    assert_eq!(hsqc_ucsf.ny(), hsqc.ny());
+    assert_eq!(hsqc_ucsf.data, hsqc.data);
+    let picked_ucsf = pick_hsqc_2d(&hsqc_ucsf, &pcfg);
+    assert_eq!(picked_ucsf.len(), picked_pipe.len());
+    for (pa, pu) in picked_pipe.iter().zip(picked_ucsf.iter()) {
+        assert!((pa.h - pu.h).abs() < 0.05 * step_h);
+        assert!((pa.n - pu.n).abs() < 0.05 * step_n);
+    }
+
+    // 4. 3D HNCACB picking restricted under HSQC roots preserves +CA / -CB phase signs
+    //    and round-trips identically through 3D UCSF with partial boundary tiles
     let hncacb_3d = render_triple_3d("HNCACB", &peaks, &rcfg);
+    let ucsf_3d_path = dir.join("test_hncacb.ucsf");
+    write_ucsf_3d_tiled(&ucsf_3d_path, &hncacb_3d, 19, 11, 61).unwrap();
+    assert!(is_ucsf_file(&ucsf_3d_path));
+    let hncacb_ucsf = read_ucsf_3d(&ucsf_3d_path, "HNCACB").unwrap();
+    assert_eq!(hncacb_ucsf.nx(), hncacb_3d.nx());
+    assert_eq!(hncacb_ucsf.ny(), hncacb_3d.ny());
+    assert_eq!(hncacb_ucsf.nz(), hncacb_3d.nz());
+    assert_eq!(hncacb_ucsf.data, hncacb_3d.data);
+
     let picked_3d = pick_triple_3d(&hncacb_3d, &picked_pipe, &pcfg);
+    let picked_3d_ucsf = pick_triple_3d(&hncacb_ucsf, &picked_ucsf, &pcfg);
+    assert_eq!(picked_3d.len(), picked_3d_ucsf.len());
+    let step_c = hncacb_3d.axis_z.step_ppm.abs();
+    for (pa, pu) in picked_3d.iter().zip(picked_3d_ucsf.iter()) {
+        assert_eq!(pa.sign, pu.sign);
+        assert!((pa.c.unwrap() - pu.c.unwrap()).abs() < 0.05 * step_c);
+    }
     let n_pos = picked_3d.iter().filter(|p| p.sign > 0).count();
     let n_neg = picked_3d.iter().filter(|p| p.sign < 0).count();
     assert!(n_pos > 50 && n_neg > 40, "n_pos={n_pos}, n_neg={n_neg}");

@@ -30,16 +30,8 @@ fn workspace_root() -> PathBuf {
 }
 
 fn load_bmrb_reference(bmrb_file: &str) -> nmr_core::nmrstar::Reference {
-    let scratch = Path::new(
-        "/Users/debsahu/.gemini/antigravity/brain/abeb5c50-57b8-474f-bd50-46bb84550078/scratch/bmrb_raw",
-    )
-    .join(bmrb_file);
-    if scratch.exists() {
-        read_star_all_atoms(&scratch, None).expect("failed to parse raw BMRB file")
-    } else {
-        let bench = workspace_root().join("data/benchmark").join(bmrb_file);
-        read_star_all_atoms(&bench, None).expect("failed to parse benchmark BMRB file")
-    }
+    let bench = workspace_root().join("data/benchmark").join(bmrb_file);
+    read_star_all_atoms(&bench, None).expect("failed to parse benchmark BMRB file")
 }
 
 #[test]
