@@ -1,12 +1,13 @@
 //! Score spin system placements and optimize the backbone assignment.
 //!
 //! Provenance: Original implementation of `docs/specs/03-assignment.md` section 3:
-//! log-likelihood-ratio typing scores, Gaussian sequential connectivity scores,
-//! simulated annealing with single, swap, and block moves, and multi-run consensus.
+//! log-likelihood-ratio typing scores with automatic marginal reference offset alignment,
+//! excess-root zero-`CA` / 1-peak noise placement protection, Gaussian sequential connectivity
+//! scores, simulated annealing with single, swap, and block moves, and multi-run consensus.
 
 use std::f64::consts::TAU;
 
-use crate::priors::Priors;
+pub use crate::priors::{estimate_reference_offsets, Priors, ShiftOffsets};
 use crate::rng::Rng;
 use crate::spinsystems::SpinSystem;
 
@@ -23,6 +24,12 @@ pub struct ScoreConfig {
     pub assign_cost: f64,
     pub forbid_zero_carbons: bool,
     pub use_hn: bool,
+    /// Automatically estimate and apply global chemical-shift reference offsets to `Priors`
+    /// during unary scoring while keeping output shifts in the experimental ppm frame.
+    pub auto_reference: bool,
+    /// Protect exchange-broadened sequence slots against spurious roots lacking `CA(i)`/`CA(i-1)`
+    /// or having only a single uncorroborated carbon peak when `systems.len() > assignable`.
+    pub forbid_ca_less_excess_roots: bool,
 }
 
 impl Default for ScoreConfig {
@@ -37,6 +44,8 @@ impl Default for ScoreConfig {
             assign_cost: 0.0,
             forbid_zero_carbons: true,
             use_hn: true,
+            auto_reference: true,
+            forbid_ca_less_excess_roots: true,
         }
     }
 }
@@ -129,6 +138,25 @@ pub fn candidate_llr(
     (best - (cands.len() as f64).ln(), best_i)
 }
 
+/// Prepare effective scoring `Priors` (applying `estimate_reference_offsets` when
+/// `cfg.auto_reference` is enabled) and return `(effective_priors, applied_offsets)`.
+///
+/// Exposed publicly so GPU (`nmr-gpu`) and CLI (`nmr-cli`) engines share identical reference
+/// alignment while `SpinSystem` candidates and output shifts remain in the experimental ppm frame.
+pub fn prepare_scoring_priors(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    cfg: &ScoreConfig,
+) -> (Priors, ShiftOffsets) {
+    if cfg.auto_reference {
+        let offsets = estimate_reference_offsets(systems, sequence, priors);
+        (priors.with_offsets(&offsets), offsets)
+    } else {
+        (priors.clone(), ShiftOffsets::default())
+    }
+}
+
 pub fn unary_matrix(
     systems: &[SpinSystem],
     sequence: &[String],
@@ -138,6 +166,56 @@ pub fn unary_matrix(
     let s_len = systems.len();
     let k_len = sequence.len();
     let mut u = Matrix2D::filled(s_len, k_len, FORBID);
+    if s_len == 0 || k_len == 0 {
+        return u;
+    }
+
+    let (eff_priors, _) = prepare_scoring_priors(systems, sequence, priors, cfg);
+    let assignable = sequence
+        .iter()
+        .enumerate()
+        .filter(|&(k, r)| k > 0 && r != "PRO")
+        .count();
+    let has_excess_roots = cfg.forbid_ca_less_excess_roots && s_len > assignable;
+
+    let mut has_obs_ca = vec![true; s_len];
+    let mut obs_slots = vec![0usize; s_len];
+    let mut max_sup = vec![0usize; s_len];
+    let mut multi_slot_count = 0usize;
+    if has_excess_roots {
+        for (s, ss) in systems.iter().enumerate() {
+            let ca0 = ss
+                .cands
+                .get(&("CA".to_string(), 0))
+                .is_some_and(|l| l.iter().any(|&(_, sup)| sup > 0));
+            let cam1 = ss
+                .cands
+                .get(&("CA".to_string(), -1))
+                .is_some_and(|l| l.iter().any(|&(_, sup)| sup > 0));
+            has_obs_ca[s] = ca0 || cam1;
+            let mut n_slots = 0usize;
+            let mut m_sup = 0usize;
+            for raw in ss.cands.values() {
+                let mut slot_pos = false;
+                for &(_, sup) in raw {
+                    if sup > 0 {
+                        slot_pos = true;
+                        m_sup = m_sup.max(sup);
+                    }
+                }
+                if slot_pos {
+                    n_slots += 1;
+                }
+            }
+            obs_slots[s] = n_slots;
+            max_sup[s] = m_sup;
+            if n_slots >= 3 {
+                multi_slot_count += 1;
+            }
+        }
+    }
+    let multi_slot_dataset = multi_slot_count >= 8;
+
     for k in 1..k_len {
         let res = &sequence[k];
         let prev = &sequence[k - 1];
@@ -148,6 +226,9 @@ pub fn unary_matrix(
             if cfg.forbid_zero_carbons && !ss.has_observed_carbons() {
                 continue;
             }
+            if has_excess_roots && !has_obs_ca[s] && res != "GLY" && prev != "PRO" {
+                continue;
+            }
             let mut sc = 0.0;
             for ((atom, off), raw_cands) in &ss.cands {
                 let cands: Vec<(f64, usize)> =
@@ -156,10 +237,16 @@ pub fn unary_matrix(
                     continue;
                 }
                 let target_res = if *off == 0 { res } else { prev };
-                sc += candidate_llr(priors, target_res, atom, &cands, cfg.support_bonus).0;
+                sc += candidate_llr(&eff_priors, target_res, atom, &cands, cfg.support_bonus).0;
             }
             if cfg.use_hn {
-                sc += priors.llr(res, "N", ss.n) + priors.llr(res, "H", ss.h);
+                sc += eff_priors.llr(res, "N", ss.n) + eff_priors.llr(res, "H", ss.h);
+            }
+            if has_excess_roots
+                && multi_slot_dataset
+                && (!has_obs_ca[s] || (obs_slots[s] <= 1 && max_sup[s] <= 1))
+            {
+                sc -= 4.5;
             }
             sc -= cfg.assign_cost;
             u.set(s, k, sc);

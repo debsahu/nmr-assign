@@ -1,4 +1,4 @@
-# 03. Backbone assignment (v0.1 working)
+# 03. Backbone assignment (v0.2 working)
 
 Status: draft for maintainer review. Sections 3 and 4 are owned by the
 maintainer; numbers marked PROVISIONAL are placeholders.
@@ -10,18 +10,20 @@ Inputs
 - Peak lists: TSV, one peak per row:
 
   ```
-  experiment  H      N       C       sign
-  HSQC        8.312  121.45
-  HNCA        8.309  121.47  56.21   1
-  HNCACB      8.311  121.44  30.05   -1
+  experiment  H      N       C       sign  height   volume
+  HSQC        8.312  121.45          1     540000   2100000
+  HNCA        8.309  121.47  56.21   1     320000   1600000
+  HNCACB      8.311  121.44  30.05   -1    210000   1100000
   ```
 
   `experiment` is one of HSQC, HNCA, HNCOCA, HNCACB, CBCACONH, HNCO, HNCACO.
   `C` is blank for HSQC. `sign` is the peak phase (required for HNCACB,
-  where CA is positive and CB negative; optional elsewhere).
+  where CA is positive and CB negative; optional elsewhere). `height` and
+  `volume` are optional (5-column TSVs without intensities remain supported).
 
 Outputs
-- Per residue: H, N, CA, CB, C shifts with a confidence in [0, 1].
+- Per residue: H, N, CA, CB, C shifts with a confidence in [0, 1] (reported in
+  the experimental spectrum's chemical-shift referencing frame).
 - TSV and an NMR-STAR v3 `_Atom_chem_shift` loop.
 
 ## 2. Pipeline
@@ -30,14 +32,29 @@ Outputs
    to all roots within the H/N tolerance ellipse (`d <= 1`), so tightly
    overlapped HSQC roots both retain their candidate carbon peaks.
 2. Offset resolution: within a root, carbon peaks are labelled as residue i or
-   i-1 by matching against experiments that report only i-1.
-3. Scoring: unary typing score per (spin system, residue) and pairwise
-   connectivity score per (spin system, spin system).
+   i-1 by matching against experiments that report only i-1 (or via `1J`/`2J`
+   intensity-ratio tie-breaking when no i-1-only experiment is present).
+3. Scoring: automatic marginal reference offset alignment on `Priors`, unary
+   typing score per (spin system, residue), and pairwise connectivity score per
+   (spin system, spin system).
 4. Optimization: simulated annealing over the injective map
    spin system -> residue (with an unassigned state), repeated R times.
 5. Consensus: confidence = fraction of runs agreeing with the best run.
 
 ## 3. Scoring (maintainer owned)
+
+Automatic chemical-shift reference alignment (`auto_reference = true` by
+default in `ScoreConfig`): before computing `U(s, k)`,
+`estimate_reference_offsets(systems, sequence, priors)` estimates global
+per-nucleus offsets `(dH, dN, dCA, dCB, dC)` (`experimental_ppm - dss_prior_ppm`)
+maximizing the outlier-robust marginal mixture log-likelihood of observed
+multi-slot spin-system shifts against sequence-weighted `Priors`, with a joint
+aliphatic carrier tether `dCA ≈ dCB` (which cancels opposite-sign secondary
+structure shifts while capturing TMS vs DSS or carrier offsets) and a deadband +
+log-likelihood-ratio gate so DSS-referenced spectra remain at exact `0.0 ppm`.
+The offset is applied via `priors.with_offsets(&offsets)` (`prepare_scoring_priors`)
+inside unary scoring only; `SpinSystem` candidates and output chemical shifts stay
+in the experimental spectrum's ppm frame.
 
 Typing score of spin system s at residue k, summed over observed atoms:
 
@@ -46,7 +63,7 @@ Typing score of spin system s at residue k, summed over observed atoms:
            + LLR(type(k), N, root_N) + LLR(type(k), H, root_H)
            - assign_cost
 
-    LLR(t, X, v) = max( log N(v | mu_tX, sd_tX) - log B_X(v), floor )
+    LLR(t, X, v) = max( log N(v | mu_tX + d_X, sd_tX) - log B_X(v), floor )
 
 where B_X is the residue-averaged background density, so an atom that does
 not discriminate contributes about zero. floor = -12 (PROVISIONAL).
@@ -56,6 +73,11 @@ A CB observed for a glycine position contributes log(0.02) (PROVISIONAL).
 Residue k is forbidden if it is proline or the N-terminal residue. Spin
 systems with zero observed carbon candidates (for example Asn/Gln sidechain
 NH2 roots or 2D HSQC noise peaks) are forbidden from all backbone positions.
+When `systems.len() > assignable` (`forbid_ca_less_excess_roots = true`),
+spin systems with zero observed `CA(i)` and `CA(i-1)` candidates are forbidden
+from non-Gly / non-post-Pro sequence slots, and sparse uncorroborated 1-peak
+roots receive an excess-root placement penalty (`4.5` nats) so noise roots do
+not hijack exchange-broadened sequence slots.
 
 Connectivity score for s at k and t at k+1:
 
@@ -69,48 +91,60 @@ resolution). R: 30 ppm (PROVISIONAL).
 Total score = sum of U over assigned spin systems + sum of P over adjacent
 assigned pairs. Unassigned spin systems contribute 0.
 
-Priors: mu and sd per residue type and atom. v1 ships PROVISIONAL values;
+Priors: empirical `(mu, sd)` per residue type and atom shipped in
+`data/priors/bmrb_priors.json` (trained on 21 DSS-referenced BMRB entries
+strictly disjoint from `data/benchmark/manifest.tsv`).
 `cargo run --release -p nmr-cli -- priors` recomputes them from a directory of
-NMR-STAR files (BMRB) and should replace them before release.
+NMR-STAR files (BMRB).
 
 ## 4. Experiment rules (maintainer owned)
 
-| Experiment | Peaks per root                 | Offset      |
-|------------|--------------------------------|-------------|
-| HNCA       | CA                             | i and i-1   |
-| HNCOCA     | CA                             | i-1 only    |
-| HNCACB     | CA (+), CB (-)                 | i and i-1   |
-| CBCACONH   | CA, CB                         | i-1 only    |
-| HNCO       | C                              | i-1 only    |
-| HNCACO     | C                              | i and i-1   |
+| Experiment | Peaks per root | Top-`M_exp` cap | Offset      |
+|------------|----------------|-----------------|-------------|
+| HNCA       | CA             | 4               | i and i-1   |
+| HNCOCA     | CA             | 2               | i-1 only    |
+| HNCACB     | CA (+), CB (-) | 4 (+), 4 (-)    | i and i-1   |
+| CBCACONH   | CA, CB         | 4               | i-1 only    |
+| HNCO       | C              | 2               | i-1 only    |
+| HNCACO     | C              | 4               | i and i-1   |
 
 CBCACONH peaks take their atom type from the HNCACB peak they match.
 A carbon in an "i and i-1" experiment that matches an i-1 reference within
 tolerance (CA 0.25, CB 0.35, C 0.25 ppm, PROVISIONAL) is i-1; otherwise i.
+When no i-1-only reference exists for an atom, two well-centered peaks
+(`hn_dist <= 0.72`) in `HNCA`, `HNCACB`, or `HNCACO` with height ratio `>= 1.60`
+resolve the stronger (`1J`) peak as `i` and the weaker (`2J`) peak as `i-1`.
 
-Candidates. Peaks are never discarded by the builder. Per (atom, offset)
-the builder clusters values within tolerance and keeps up to 3 clusters as
-competing candidates (value, support), ranked by descending support and then
-closest mean H/N distance to the root. Typing uses the best candidate minus
-log(n candidates) plus 0.7 x (support - 1); connectivity uses the best
-candidate pair minus log(n_s x n_t). A carbon from an "i and i-1"
-experiment with no i-1 reference at all is a candidate for both offsets.
-Measured effect: HNCACB/CBCA(CO)NH-only accuracy rose from 88.6% to 98.5%.
+Candidates and distinct-experiment support. When peak heights are present,
+attached peaks per `(root, experiment, sign_class)` are capped to the top
+`M_exp` peaks ranked by `norm_height * exp(-0.5 * hn_dist^2)`, where
+`norm_height = height / median_height(experiment, sign_class)`. Per
+`(atom, offset)` the builder clusters values within tolerance and defines
+cluster `support` as the count of **distinct experiments** in the cluster
+(preventing multiple sinc ripples from a single experiment from inflating
+`support`). Up to `max_cands` (default 3) clusters are kept as competing
+candidates `(value, support)`, ranked by `(distinct_support DESC,
+max_norm_height DESC, mean_hn_dist ASC)` when heights exist, or
+`(distinct_support DESC, mean_hn_dist ASC)` when heights are absent. Typing
+uses the best candidate minus `log(n candidates)` plus `0.7 * (support - 1)`;
+connectivity uses the best candidate pair minus `log(n_s * n_t)`. A carbon from
+an "i and i-1" experiment with no i-1 reference at all is a candidate for both
+offsets.
 
-Degenerate i / i-1 shifts (option `degenerate=True`, default off). When an
-"i and i-1" experiment shows only the peak matching i-1, the value is also
-offered as residue i, with support 0 (connectivity only, never typing).
-Measured over three seeds it lowered recall and high-confidence recall, so it
-is disabled until peak intensities can discriminate a missing peak from
-coincident peaks.
+Asn/Gln sidechain `NH2` doublet rejection. Paired HSQC roots sharing a common
+`15N` shift (`|dN| <= 0.12 ppm`) with `0.30 <= |dH| <= 1.20 ppm` that both lack
+credible intra-residue `CA(i)` support have their candidate lists cleared so
+spurious 3D noise attachments on `NH2` prongs cannot enter backbone assignment.
+
+Degenerate `i == i-1` shifts (automatic when peak heights exist; optional
+`degenerate=true` otherwise). When an "i and i-1" experiment (`HNCA`, `HNCACB`,
+`HNCACO`) shows only the peak matching `i-1` and its summed amplitude at that
+shift is `>= 1.65 * median_height(experiment, sign_class)`, the value is also
+offered as residue `i` with `support = 0` (connectivity only, never typing),
+discriminating coincident `i + i-1` peaks from missing `i` peaks.
 
 Open questions for the maintainer
-- Intensity ratio (i stronger than i-1 in HNCA) as a tiebreaker when no
-  i-1-only experiment exists? Also the key to enabling degenerate handling.
 - Secondary-structure-dependent priors (helix vs strand CA/CB offsets)?
-- Handling of Asn/Gln sidechain NH2 roots: 0-carbon roots are excluded by
-  default; also detect paired H doublets at shared N to reject NH2 roots that
-  pick up a spurious 3D peak?
 - Deuteration isotope shift corrections for CA/CB?
 
 ## 5. Evaluation

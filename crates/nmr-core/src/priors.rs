@@ -1,20 +1,23 @@
-//! Empirical BMRB chemical shift priors per residue type and atom.
+//! Empirical BMRB chemical shift priors per residue type and atom, plus automatic reference alignment.
 //!
 //! Provenance: Clean-room original implementation of `docs/specs/03-assignment.md` section 3,
 //! shipping empirical `(mean, sd)` priors in ppm computed from 21 DSS-referenced public
 //! BioMagResBank (BMRB) NMR-STAR depositions (`data/priors/bmrb_priors.json` &
 //! `data/priors/PROVENANCE.md`; Ulrich et al., *Nucleic Acids Res.* 2008, 36, D402–D408;
-//! referencing QC per Zhang, Neal & Wishart, *J. Biomol. NMR* 2003, 25, 173–195), strictly
-//! disjoint from the benchmark suite (`data/benchmark/manifest.tsv`), with literature fallback
-//! strictly when `N < 5` (Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81).
+//! referencing QC and marginal chemical-shift offset alignment per Zhang, Neal & Wishart,
+//! *J. Biomol. NMR* 2003, 25, 173–195; Wang, Wishart et al., *J. Biomol. NMR* 2005, 31, 143–148),
+//! strictly disjoint from the benchmark suite (`data/benchmark/manifest.tsv`), with literature
+//! fallback strictly when `N < 5` (Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81).
 
 use std::collections::BTreeMap;
 use std::f64::consts::TAU;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::nmrstar::{read_star, read_star_all_atoms};
+use crate::spinsystems::SpinSystem;
 
 pub const ATOMS: [&str; 5] = ["H", "N", "CA", "CB", "C"];
 
@@ -450,6 +453,400 @@ impl Priors {
         }
         (self.logpdf(res, atom, v) - self.background(atom, v)).max(floor)
     }
+
+    /// Return a copy of `self` with backbone prior means shifted by `offsets` (`mu_shifted = mu + offset`),
+    /// leaving standard deviations untouched so scoring matches the experimental spectrum's referencing frame.
+    pub fn with_offsets(&self, offsets: &ShiftOffsets) -> Self {
+        if offsets.is_zero() {
+            return self.clone();
+        }
+        let mut table = self.table.clone();
+        for atoms in table.values_mut() {
+            for &atom in &ATOMS {
+                let d = offsets.get(atom);
+                if d.abs() > 1e-12 {
+                    if let Some(entry) = atoms.get_mut(atom) {
+                        entry.0 += d;
+                    }
+                }
+            }
+        }
+        Self { table }
+    }
+}
+
+/// Global chemical-shift referencing offsets `(experimental_ppm - dss_prior_ppm)` per backbone nucleus.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShiftOffsets {
+    pub h: f64,
+    pub n: f64,
+    pub ca: f64,
+    pub cb: f64,
+    pub c: f64,
+}
+
+impl ShiftOffsets {
+    #[inline]
+    pub fn get(&self, atom: &str) -> f64 {
+        match atom {
+            "H" => self.h,
+            "N" => self.n,
+            "CA" => self.ca,
+            "CB" => self.cb,
+            "C" => self.c,
+            _ => 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.h.abs() < 1e-9
+            && self.n.abs() < 1e-9
+            && self.ca.abs() < 1e-9
+            && self.cb.abs() < 1e-9
+            && self.c.abs() < 1e-9
+    }
+}
+
+impl fmt::Display for ShiftOffsets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "dH={:+.3}, dN={:+.2}, dCA={:+.2}, dCB={:+.2}, dC={:+.2} ppm",
+            self.h, self.n, self.ca, self.cb, self.c
+        )
+    }
+}
+
+fn build_sequence_mixture(
+    sequence: &[String],
+    priors: &Priors,
+    atom: &str,
+    is_im1: bool,
+) -> Vec<(f64, f64, f64)> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for k in 1..sequence.len() {
+        if sequence[k] == "PRO" {
+            continue;
+        }
+        let target = if is_im1 {
+            &sequence[k - 1]
+        } else {
+            &sequence[k]
+        };
+        if priors.has(target, atom) {
+            *counts.entry(target.as_str()).or_insert(0) += 1;
+        }
+    }
+    if counts.is_empty() {
+        for &(res, _) in &STANDARD_RESIDUES {
+            if priors.has(res, atom) {
+                counts.insert(res, 1);
+            }
+        }
+    }
+    let total = counts.values().sum::<usize>().max(1) as f64;
+    counts
+        .into_iter()
+        .filter_map(|(res, cnt)| {
+            priors
+                .get(res, atom)
+                .map(|(mu, sd)| (mu, sd, (cnt as f64) / total))
+        })
+        .collect()
+}
+
+fn outlier_robust_mixture_ll(
+    obs: &[(f64, bool)],
+    mix0: &[(f64, f64, f64)],
+    mixm1: &[(f64, f64, f64)],
+    range_ppm: f64,
+    offset: f64,
+) -> f64 {
+    const EPS: f64 = 0.05;
+    let bg = EPS / range_ppm;
+    let fg = 1.0 - EPS;
+    let mut total = 0.0;
+    for &(v, is_im1) in obs {
+        let mix = if is_im1 { mixm1 } else { mix0 };
+        let mut sum = 0.0;
+        for &(mu, sd, w) in mix {
+            let z = (v - (mu + offset)) / sd;
+            sum += w * (-0.5 * z * z).exp() / (sd * TAU.sqrt());
+        }
+        total += (fg * sum + bg).max(1e-30).ln();
+    }
+    total
+}
+
+#[inline]
+fn refine_grid_peak(scores: &[f64], best_idx: usize, min_d: f64, step: f64) -> f64 {
+    let d0 = min_d + (best_idx as f64) * step;
+    if best_idx == 0 || best_idx + 1 >= scores.len() {
+        return d0;
+    }
+    let ym1 = scores[best_idx - 1];
+    let y0 = scores[best_idx];
+    let yp1 = scores[best_idx + 1];
+    let denom = ym1 - 2.0 * y0 + yp1;
+    if denom < -1e-12 {
+        let delta = (0.5 * (ym1 - yp1) / denom).clamp(-0.5, 0.5);
+        d0 + delta * step
+    } else {
+        d0
+    }
+}
+
+/// Estimate global chemical-shift reference offsets `(dH, dN, dCA, dCB, dC)` maximizing the
+/// outlier-robust marginal mixture log-likelihood of observed spin-system shifts against
+/// sequence-weighted `Priors` (with joint aliphatic `dCA ≈ dCB` regularization and a deadband/BIC
+/// gate so DSS-referenced spectra remain at exact `0.0 ppm`).
+pub fn estimate_reference_offsets(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+) -> ShiftOffsets {
+    if systems.is_empty() {
+        return ShiftOffsets::default();
+    }
+
+    let slot_count = |ss: &SpinSystem| -> usize {
+        ss.cands
+            .values()
+            .filter(|cands| cands.iter().any(|&(_, sup)| sup > 0))
+            .count()
+    };
+    let multi_slot: Vec<&SpinSystem> = systems.iter().filter(|ss| slot_count(ss) >= 2).collect();
+    let selected: Vec<&SpinSystem> = if multi_slot.len() >= 8 {
+        multi_slot
+    } else {
+        systems
+            .iter()
+            .filter(|ss| ss.has_observed_carbons())
+            .collect()
+    };
+    if selected.len() < 6 {
+        return ShiftOffsets::default();
+    }
+
+    let collect_carbon = |atom: &str, lo: f64, hi: f64| -> (Vec<(f64, bool)>, f64) {
+        let mut obs = Vec::new();
+        let mut n0 = 0usize;
+        let mut nm1 = 0usize;
+        for ss in &selected {
+            for (off, is_im1) in [(0, false), (-1, true)] {
+                if let Some(list) = ss.cands.get(&(atom.to_string(), off)) {
+                    if let Some(&(v, _)) = list.iter().find(|&&(_, sup)| sup > 0) {
+                        if (lo..=hi).contains(&v) {
+                            obs.push((v, is_im1));
+                            if is_im1 {
+                                nm1 += 1;
+                            } else {
+                                n0 += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let scale = if obs.is_empty() {
+            1.0
+        } else {
+            (n0.max(nm1).max(1) as f64) / (obs.len() as f64)
+        };
+        (obs, scale)
+    };
+
+    let (obs_ca, scale_ca) = collect_carbon("CA", 34.0, 76.0);
+    let (obs_cb, scale_cb) = collect_carbon("CB", 8.0, 78.0);
+    let (obs_c, scale_c) = collect_carbon("C", 162.0, 188.0);
+
+    let obs_h: Vec<(f64, bool)> = selected
+        .iter()
+        .filter(|ss| (5.0..=12.5).contains(&ss.h))
+        .map(|ss| (ss.h, false))
+        .collect();
+    let obs_n: Vec<(f64, bool)> = selected
+        .iter()
+        .filter(|ss| (95.0..=145.0).contains(&ss.n))
+        .map(|ss| (ss.n, false))
+        .collect();
+
+    // 13C grid: [-6.0, +6.0] ppm in 0.05 ppm steps (index 120 == 0.0 ppm)
+    const N_GRID_C: usize = 241;
+    const ZERO_C: usize = 120;
+    const MIN_C: f64 = -6.0;
+    const STEP_C: f64 = 0.05;
+
+    let eval_c_curve = |atom: &str, obs: &[(f64, bool)], scale: f64, range_ppm: f64| -> Vec<f64> {
+        let mix0 = build_sequence_mixture(sequence, priors, atom, false);
+        let mixm1 = build_sequence_mixture(sequence, priors, atom, true);
+        (0..N_GRID_C)
+            .map(|i| {
+                let d = MIN_C + (i as f64) * STEP_C;
+                scale * outlier_robust_mixture_ll(obs, &mix0, &mixm1, range_ppm, d)
+                    - 0.5 * (d / 4.5).powi(2)
+            })
+            .collect()
+    };
+
+    let round3 = |x: f64| (x * 1000.0).round() / 1000.0;
+
+    // 1. Joint aliphatic (dCA, dCB) estimation with carrier-tether regularization dCA ≈ dCB.
+    // Because alpha-helix vs beta-sheet secondary structure shifts CA and CB in OPPOSITE directions
+    // whereas chemical-shift referencing shifts CA and CB in the SAME direction, coupling dCA ≈ dCB
+    // cancels secondary-structure bias on DSS-referenced proteins while capturing TMS/carrier offsets.
+    let (ca_off, cb_off) = if obs_ca.len() >= 8 && obs_cb.len() >= 8 {
+        let l_ca = eval_c_curve("CA", &obs_ca, scale_ca, 45.0);
+        let l_cb = eval_c_curve("CB", &obs_cb, scale_cb, 65.0);
+        let null_score = l_ca[ZERO_C] + l_cb[ZERO_C];
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_i = ZERO_C;
+        let mut best_j = ZERO_C;
+        for (i, &sca) in l_ca.iter().enumerate() {
+            let di = MIN_C + (i as f64) * STEP_C;
+            for (j, &scb) in l_cb.iter().enumerate() {
+                let dj = MIN_C + (j as f64) * STEP_C;
+                let tether = -0.5 * ((di - dj) / 0.25).powi(2);
+                let sc = sca + scb + tether;
+                if sc > best_score {
+                    best_score = sc;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+        // Refine 1D slices along best_j / best_i
+        let slice_ca: Vec<f64> = (0..N_GRID_C)
+            .map(|i| {
+                let di = MIN_C + (i as f64) * STEP_C;
+                let dj = MIN_C + (best_j as f64) * STEP_C;
+                l_ca[i] + l_cb[best_j] - 0.5 * ((di - dj) / 0.25).powi(2)
+            })
+            .collect();
+        let slice_cb: Vec<f64> = (0..N_GRID_C)
+            .map(|j| {
+                let di = MIN_C + (best_i as f64) * STEP_C;
+                let dj = MIN_C + (j as f64) * STEP_C;
+                l_ca[best_i] + l_cb[j] - 0.5 * ((di - dj) / 0.25).powi(2)
+            })
+            .collect();
+        let d_ca = refine_grid_peak(&slice_ca, best_i, MIN_C, STEP_C);
+        let d_cb = refine_grid_peak(&slice_cb, best_j, MIN_C, STEP_C);
+        if d_ca.abs().max(d_cb.abs()) >= 0.85 && (best_score - null_score) >= 12.0 {
+            (round3(d_ca), round3(d_cb))
+        } else {
+            (0.0, 0.0)
+        }
+    } else if obs_ca.len() >= 8 {
+        let l_ca = eval_c_curve("CA", &obs_ca, scale_ca, 45.0);
+        let (best_i, &best_sc) = l_ca
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_C, &0.0));
+        let d_ca = refine_grid_peak(&l_ca, best_i, MIN_C, STEP_C);
+        // Without CB to cancel secondary-structure shift propensities, require a clear offset
+        if d_ca.abs() >= 1.15 && (best_sc - l_ca[ZERO_C]) >= 12.0 {
+            let r = round3(d_ca);
+            (r, r)
+        } else {
+            (0.0, 0.0)
+        }
+    } else if obs_cb.len() >= 8 {
+        let l_cb = eval_c_curve("CB", &obs_cb, scale_cb, 65.0);
+        let (best_j, &best_sc) = l_cb
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_C, &0.0));
+        let d_cb = refine_grid_peak(&l_cb, best_j, MIN_C, STEP_C);
+        if d_cb.abs() >= 0.85 && (best_sc - l_cb[ZERO_C]) >= 12.0 {
+            let r = round3(d_cb);
+            (r, r)
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0)
+    };
+
+    // 2. Carbonyl dC estimation
+    let c_off = if obs_c.len() >= 8 {
+        let l_c = eval_c_curve("C", &obs_c, scale_c, 25.0);
+        let (best_i, &best_sc) = l_c
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_C, &0.0));
+        let d_c = refine_grid_peak(&l_c, best_i, MIN_C, STEP_C);
+        if d_c.abs() >= 0.45 && (best_sc - l_c[ZERO_C]) >= 5.0 {
+            round3(d_c)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    // 3. Amide dH and dN estimation (conservative deadband so fold-dependent dispersion stays 0.0)
+    let h_off = if obs_h.len() >= 12 {
+        const N_GRID_H: usize = 301;
+        const ZERO_H: usize = 150;
+        const MIN_H: f64 = -1.5;
+        const STEP_H: f64 = 0.01;
+        let mix_h = build_sequence_mixture(sequence, priors, "H", false);
+        let l_h: Vec<f64> = (0..N_GRID_H)
+            .map(|i| {
+                let d = MIN_H + (i as f64) * STEP_H;
+                outlier_robust_mixture_ll(&obs_h, &mix_h, &mix_h, 6.0, d) - 0.5 * (d / 0.8).powi(2)
+            })
+            .collect();
+        let (best_i, &best_sc) = l_h
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_H, &0.0));
+        let d_h = refine_grid_peak(&l_h, best_i, MIN_H, STEP_H);
+        if d_h.abs() >= 0.22 && (best_sc - l_h[ZERO_H]) >= 6.0 {
+            round3(d_h)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    let n_off = if obs_n.len() >= 12 {
+        let mix_n = build_sequence_mixture(sequence, priors, "N", false);
+        let l_n: Vec<f64> = (0..N_GRID_C)
+            .map(|i| {
+                let d = MIN_C + (i as f64) * STEP_C;
+                outlier_robust_mixture_ll(&obs_n, &mix_n, &mix_n, 40.0, d) - 0.5 * (d / 4.0).powi(2)
+            })
+            .collect();
+        let (best_i, &best_sc) = l_n
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_C, &0.0));
+        let d_n = refine_grid_peak(&l_n, best_i, MIN_C, STEP_C);
+        if d_n.abs() >= 1.25 && (best_sc - l_n[ZERO_C]) >= 6.0 {
+            round3(d_n)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    ShiftOffsets {
+        h: h_off,
+        n: n_off,
+        ca: ca_off,
+        cb: cb_off,
+        c: c_off,
+    }
 }
 
 fn bio_plausible_bounds(atom: &str) -> Option<(f64, f64)> {
@@ -567,4 +964,43 @@ pub fn compute_all_atom_priors<P: AsRef<Path>>(star_paths: &[P], min_count: usiz
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulate::{simulate, SimConfig};
+    use crate::spinsystems::{build_spin_systems, Tolerances};
+
+    #[test]
+    fn test_reference_offsets_dss_and_shifted() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let priors = Priors::bmrb();
+        let rd = read_star(root.join("data/fixtures/synthetic_ubiquitin.str"), None).unwrap();
+        let (pks, _) = simulate(
+            &rd,
+            &SimConfig {
+                seed: 0,
+                ..SimConfig::default()
+            },
+        );
+        let sys = build_spin_systems(&pks, &Tolerances::default(), 3, true).unwrap();
+        let off_dss = estimate_reference_offsets(&sys, &rd.sequence, &priors);
+        assert!(
+            off_dss.is_zero(),
+            "expected 0.0 ppm on DSS ubiquitin, got {off_dss}"
+        );
+
+        let mut shifted_pks = pks;
+        for p in &mut shifted_pks {
+            if let Some(c) = p.c.as_mut() {
+                *c -= 2.75;
+            }
+        }
+        let sys_tms = build_spin_systems(&shifted_pks, &Tolerances::default(), 3, true).unwrap();
+        let off_tms = estimate_reference_offsets(&sys_tms, &rd.sequence, &priors);
+        assert!((off_tms.ca - (-2.75)).abs() <= 0.55, "dCA={}", off_tms.ca);
+        assert!((off_tms.cb - (-2.75)).abs() <= 0.55, "dCB={}", off_tms.cb);
+        assert!((off_tms.c - (-2.75)).abs() <= 0.55, "dC={}", off_tms.c);
+    }
 }
