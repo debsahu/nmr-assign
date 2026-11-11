@@ -217,6 +217,62 @@ fn test_gpu_scoring_and_annealing_parity() {
     let m = score(&res_gpu, &truth, 0.8);
     assert!(m.recall() >= 0.90, "{}", m.report());
     assert!(m.hc_precision() >= 0.95, "{}", m.report());
+
+    // Verify automatic 13C TMS-vs-DSS reference alignment + CA-less excess-root gating parity on GPU
+    let mut tms_systems: Vec<SpinSystem> = systems
+        .iter()
+        .cloned()
+        .map(|mut ss| {
+            for list in ss.cands.values_mut() {
+                for cand in list.iter_mut() {
+                    cand.0 -= 2.75;
+                }
+            }
+            ss
+        })
+        .collect();
+    let mut tms_truth = truth.clone();
+    // Append a CA-less 1-peak noise root to exercise excess-root protection in WGSL
+    let mut ca_less = SpinSystem::new(8.15, 119.5);
+    ca_less
+        .cands
+        .insert(("C".to_string(), -1), vec![(173.4, 1)]);
+    tms_systems.push(ca_less);
+    tms_truth.push(-1);
+
+    let u_tms_cpu = unary_matrix(&tms_systems, &ref_data.sequence, &priors, &scfg);
+    let (u_tms_gpu, _) = gpu
+        .score_matrices_gpu(&tms_systems, &ref_data.sequence, &priors, &scfg)
+        .expect("GPU TMS scoring matrices");
+    for i in 0..u_tms_cpu.data.len() {
+        let a = u_tms_cpu.data[i];
+        let b = u_tms_gpu.data[i];
+        if a < -1e8 {
+            assert!(b < -1e8, "TMS FORBID mismatch at {i}: cpu={a}, gpu={b}");
+        } else {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "TMS U mismatch at {i}: cpu={a}, gpu={b}"
+            );
+        }
+    }
+    let res_tms_gpu = gpu
+        .assign_gpu(
+            &tms_systems,
+            &ref_data.sequence,
+            &priors,
+            &scfg,
+            &AnnealConfig {
+                runs: 32,
+                steps_per_system: 1200,
+                seed: 0,
+                ..AnnealConfig::default()
+            },
+        )
+        .expect("GPU TMS annealing");
+    let m_tms = score(&res_tms_gpu, &tms_truth, 0.8);
+    assert!(m_tms.accuracy() >= 0.95, "{}", m_tms.report());
+    assert!(m_tms.hc_precision() >= 0.95, "{}", m_tms.report());
 }
 
 #[test]

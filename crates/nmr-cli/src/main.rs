@@ -14,12 +14,15 @@ use std::process;
 use std::time::Instant;
 
 use nmr_core::dihedrals::{predict_dihedrals, validate_dihedrals_against_torsions};
-use nmr_core::evaluate::{compare_shifts, score, to_reference};
+use nmr_core::evaluate::{compare_shifts, score, to_reference, Metrics};
+use nmr_core::evo_graph::{assign_evo_graph_from_peaks, torsions_from_pdb_path, EvoGraphConfig};
 use nmr_core::nef::{read_nef_file, write_nef_file, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
 };
-use nmr_core::nmrstar::{read_star, read_star_all_atoms, read_star_str, write_star, Reference};
+use nmr_core::nmrstar::{
+    read_star, read_star_all_atoms, read_star_str, write_star, write_star_with_header, Reference,
+};
 use nmr_core::noesy::{
     compute_chain_torsions, parse_pdb_first_model, simulate_noesy_peaks, summarize_adrs,
     NoesySimConfig,
@@ -42,7 +45,7 @@ use nmr_core::octet_render::{
 };
 use nmr_core::peaks::{read_peaks, write_peaks, Peak, EXPERIMENT_NAMES};
 use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
-use nmr_core::priors::{compute_priors, one_to_three, Priors};
+use nmr_core::priors::{compute_priors, one_to_three, Priors, ShiftOffsets};
 use nmr_core::report::{
     predict_csi_dihedrals, write_quality_report_html, ReportInput, StructureReportSummary,
 };
@@ -52,7 +55,7 @@ use nmr_core::sidechain::{
     synthesize_all_atom_reference, SidechainSimConfig, SidechainSolverConfig,
 };
 use nmr_core::simulate::{render_hsqc_2d, simulate, SimConfig, SpectrumRenderConfig};
-use nmr_core::solver::{assign, AnnealConfig, AssignResult, ScoreConfig};
+use nmr_core::solver::{assign, prepare_scoring_priors, AnnealConfig, AssignResult, ScoreConfig};
 use nmr_core::spectrum::{
     is_ucsf_file, read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d,
     read_ucsf_2d, read_ucsf_3d, write_bruker_pdata_2d, write_nmrpipe_2d, Spectrum2D, Spectrum3D,
@@ -62,22 +65,40 @@ use nmr_core::structure::{
     calculate_structure_iterative, validate_ensemble, write_pdb_ensemble, StructureCalcConfig,
 };
 use nmr_core::topology::SidechainPriors;
+use nmr_core::tripeptide::{assign_tripeptide, TripeptideConfig};
 use nmr_gpu::neural_gpu::{GpuNeuralPicker, GpuNeuralPickerConfig, PRETRAINED_WEIGHTS_3D_GPU};
 use nmr_gpu::GpuEngine;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EngineKind {
     Gpu,
     Cpu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolverKind {
+    Standard,
+    Tripeptide,
+    EvoGraph,
+}
+
+impl SolverKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SolverKind::Standard => "standard",
+            SolverKind::Tripeptide => "tripeptide",
+            SolverKind::EvoGraph => "evo-graph",
+        }
+    }
+}
+
 fn usage() -> &'static str {
     "nmrassign (Rust + WebGPU)\n\
      Usage:\n\
-       nmrassign benchmark       --star <ref.str> [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
-       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
+       nmrassign benchmark       --star <ref.str> [--solver standard|tripeptide|evo-graph] [--pdb <ref.pdb>] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
+       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|tripeptide|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json]\n\
+       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|tripeptide|evo-graph] [--pdb <ref.pdb>] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            --hsqc <path> [--triple EXP=path ...] --out <peaks.tsv> [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
@@ -87,7 +108,7 @@ fn usage() -> &'static str {
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--solver standard|tripeptide|evo-graph] [--pdb <ref.pdb>] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}>] [--solvent CDCl3] [--mhz 400]\n"
 }
@@ -122,6 +143,202 @@ fn parse_engine(val: &str) -> Result<EngineKind, String> {
     }
 }
 
+fn parse_solver(val: &str) -> Result<SolverKind, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "standard" => Ok(SolverKind::Standard),
+        "tripeptide" => Ok(SolverKind::Tripeptide),
+        "evo-graph" | "evograph" | "evo_graph" => Ok(SolverKind::EvoGraph),
+        other => Err(format!(
+            "unknown --solver {other:?}; expected standard, tripeptide, or evo-graph"
+        )),
+    }
+}
+
+fn resolve_solver_engine(
+    solver: SolverKind,
+    engine_opt: Option<EngineKind>,
+) -> Result<EngineKind, String> {
+    match (solver, engine_opt) {
+        (SolverKind::Standard, Some(e)) => Ok(e),
+        (SolverKind::Standard, None) => Ok(EngineKind::Gpu),
+        (SolverKind::Tripeptide, Some(EngineKind::Gpu)) => Err(
+            "--engine gpu is not supported with --solver tripeptide (CPU-only); use --engine cpu (or omit --engine) or --solver standard"
+                .to_string(),
+        ),
+        (SolverKind::EvoGraph, Some(EngineKind::Gpu)) => Err(
+            "--engine gpu is not supported with --solver evo-graph (CPU-only); use --engine cpu (or omit --engine) or --solver standard"
+                .to_string(),
+        ),
+        (SolverKind::Tripeptide | SolverKind::EvoGraph, _) => Ok(EngineKind::Cpu),
+    }
+}
+
+struct SolverWorkflowOutput {
+    systems: Vec<SpinSystem>,
+    kept_hsqc_indices: Option<Vec<usize>>,
+    result: AssignResult,
+    effective_priors: Priors,
+    offsets: ShiftOffsets,
+    engine_label: String,
+    replicas: usize,
+    steps_per_system: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_assignment_workflow(
+    solver: SolverKind,
+    engine_opt: Option<EngineKind>,
+    peaks: &[Peak],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    runs_opt: Option<usize>,
+    steps_opt: Option<usize>,
+    default_cpu_runs: usize,
+    seed: u64,
+    pdb_path: Option<&Path>,
+) -> Result<SolverWorkflowOutput, String> {
+    if pdb_path.is_some() && solver != SolverKind::EvoGraph {
+        return Err(format!(
+            "--pdb torsion conditioning is only supported with --solver evo-graph (got --solver {})",
+            solver.as_str()
+        ));
+    }
+    let engine = resolve_solver_engine(solver, engine_opt)?;
+
+    match solver {
+        SolverKind::Standard => {
+            let systems = build_spin_systems(peaks, &Tolerances::default(), 3, false)?;
+            let (effective_priors, offsets) =
+                prepare_scoring_priors(&systems, sequence, priors, score_cfg);
+            let default_runs = if engine == EngineKind::Gpu {
+                64
+            } else {
+                default_cpu_runs
+            };
+            let anneal_cfg = AnnealConfig {
+                runs: runs_opt.unwrap_or(default_runs),
+                steps_per_system: steps_opt.unwrap_or(1500),
+                seed,
+                ..AnnealConfig::default()
+            };
+            let (result, engine_label) =
+                run_solver(engine, &systems, sequence, priors, score_cfg, &anneal_cfg)?;
+            Ok(SolverWorkflowOutput {
+                systems,
+                kept_hsqc_indices: None,
+                result,
+                effective_priors,
+                offsets,
+                engine_label,
+                replicas: anneal_cfg.runs,
+                steps_per_system: anneal_cfg.steps_per_system,
+            })
+        }
+        SolverKind::Tripeptide => {
+            let systems = build_spin_systems(peaks, &Tolerances::default(), 3, false)?;
+            let mut tri_cfg = TripeptideConfig {
+                score: score_cfg.clone(),
+                auto_reference: score_cfg.auto_reference,
+                ..TripeptideConfig::default()
+            };
+            if let Some(r) = runs_opt {
+                tri_cfg.anneal.runs = r.max(1);
+            }
+            if let Some(st) = steps_opt {
+                tri_cfg.anneal.steps_per_system = st.max(1);
+            }
+            tri_cfg.anneal.seed = seed;
+            let offsets = if tri_cfg.auto_reference {
+                let o =
+                    nmr_core::tripeptide::estimate_reference_offsets(&systems, sequence, priors);
+                ShiftOffsets {
+                    h: o.dh,
+                    n: o.dn,
+                    ca: o.dca,
+                    cb: o.dcb,
+                    c: o.dc,
+                }
+            } else {
+                ShiftOffsets::default()
+            };
+            let effective_priors = priors.with_offsets(&offsets);
+            let result = assign_tripeptide(&systems, sequence, priors, &tri_cfg);
+            Ok(SolverWorkflowOutput {
+                systems,
+                kept_hsqc_indices: None,
+                result,
+                effective_priors,
+                offsets,
+                engine_label: "CPU (f64, tripeptide)".to_string(),
+                replicas: tri_cfg.anneal.runs,
+                steps_per_system: tri_cfg.anneal.steps_per_system,
+            })
+        }
+        SolverKind::EvoGraph => {
+            let torsions_vec = match pdb_path {
+                Some(p) => Some(torsions_from_pdb_path(p, sequence)?),
+                None => None,
+            };
+            let mut evo_cfg = EvoGraphConfig {
+                score_cfg: score_cfg.clone(),
+                auto_reference: score_cfg.auto_reference,
+                structure_torsions: torsions_vec.as_deref(),
+                seed,
+                ..EvoGraphConfig::default()
+            };
+            if let Some(r) = runs_opt {
+                evo_cfg.population_size = r.max(4);
+                evo_cfg.num_islands = evo_cfg.num_islands.min(evo_cfg.population_size).max(1);
+            }
+            if let Some(st) = steps_opt {
+                evo_cfg.steps_per_system_per_gen = st.max(1);
+            }
+            let (systems, result, rep) =
+                assign_evo_graph_from_peaks(peaks, sequence, priors, &evo_cfg);
+            let offsets = ShiftOffsets {
+                h: rep.final_offsets.d_h,
+                n: rep.final_offsets.d_n,
+                ca: rep.final_offsets.d_ca,
+                cb: rep.final_offsets.d_cb,
+                c: rep.final_offsets.d_c,
+            };
+            let effective_priors = rep.shifted_priors(priors);
+            let engine_label = if pdb_path.is_some() {
+                "CPU (f64, evo-graph+pdb)".to_string()
+            } else {
+                "CPU (f64, evo-graph)".to_string()
+            };
+            Ok(SolverWorkflowOutput {
+                systems,
+                kept_hsqc_indices: Some(rep.kept_hsqc_indices),
+                result,
+                effective_priors,
+                offsets,
+                engine_label,
+                replicas: evo_cfg.population_size,
+                steps_per_system: evo_cfg.generations * evo_cfg.steps_per_system_per_gen,
+            })
+        }
+    }
+}
+
+fn format_star_offset_header(solver_label: &str, offsets: &ShiftOffsets) -> Option<String> {
+    (!offsets.is_zero()).then(|| {
+        format!(
+            "nmrassign solver={solver_label} | fitted_prior_reference_offsets (experimental - DSS prior): {offsets} | emitted chemical shifts remain in experimental spectrum ppm frame"
+        )
+    })
+}
+
+fn log_nonzero_offsets(solver_label: &str, offsets: &ShiftOffsets, verbose: bool) {
+    if !offsets.is_zero() || verbose {
+        eprintln!(
+            "[{solver_label}] fitted prior reference offsets (experimental - DSS prior; output kept in experimental ppm): {offsets}"
+        );
+    }
+}
+
 fn load_priors(path: Option<&str>) -> Result<Priors, String> {
     match path {
         Some(p) => Priors::from_json(p),
@@ -135,9 +352,11 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     let mut priors_path: Option<String> = None;
     let mut missing = 0.06f64;
     let mut spurious = 0.04f64;
-    let mut engine = EngineKind::Gpu;
+    let mut solver = SolverKind::Standard;
+    let mut pdb_path: Option<PathBuf> = None;
+    let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
-    let mut steps = 1500usize;
+    let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
     let mut seed = 0u64;
     let mut verbose = false;
@@ -157,6 +376,14 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
                 i += 1;
                 priors_path = args.get(i).cloned();
             }
+            "--solver" => {
+                i += 1;
+                solver = parse_solver(args.get(i).ok_or("missing value for --solver")?)?;
+            }
+            "--pdb" => {
+                i += 1;
+                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing value for --pdb")?));
+            }
             "--missing" => {
                 i += 1;
                 missing = args
@@ -175,7 +402,9 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
             }
             "--engine" => {
                 i += 1;
-                engine = parse_engine(args.get(i).ok_or("missing value for --engine")?)?;
+                engine_opt = Some(parse_engine(
+                    args.get(i).ok_or("missing value for --engine")?,
+                )?);
             }
             "--runs" => {
                 i += 1;
@@ -188,11 +417,12 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
             }
             "--steps" => {
                 i += 1;
-                steps = args
-                    .get(i)
-                    .ok_or("missing value for --steps")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                steps = Some(
+                    args.get(i)
+                        .ok_or("missing value for --steps")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
             }
             "--assign-cost" => {
                 i += 1;
@@ -238,51 +468,59 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     );
 
     let pri = load_priors(priors_path.as_deref())?;
-    let default_runs = if engine == EngineKind::Gpu { 64 } else { 12 };
-    let anneal_cfg = AnnealConfig {
-        runs: runs.unwrap_or(default_runs),
-        steps_per_system: steps,
-        seed,
-        ..AnnealConfig::default()
-    };
-
     let score_cfg = ScoreConfig {
         assign_cost,
         ..ScoreConfig::default()
     };
     let t0 = Instant::now();
-    let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false)?;
-    let (res, engine_label) = run_solver(
-        engine,
-        &systems,
+    let wf = execute_assignment_workflow(
+        solver,
+        engine_opt,
+        &peaks,
         &ref_data.sequence,
         &pri,
         &score_cfg,
-        &anneal_cfg,
+        runs,
+        steps,
+        12,
+        seed,
+        pdb_path.as_deref(),
     )?;
     let elapsed = t0.elapsed().as_secs_f64();
 
-    let m = score(&res, &truth, 0.8);
+    log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+
+    let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
+        Some(kept) => kept
+            .iter()
+            .map(|&idx| truth.get(idx).copied().unwrap_or(-1))
+            .collect(),
+        None => truth.clone(),
+    };
+    let m = Metrics {
+        assignable: truth.iter().filter(|&&t| t >= 0).count(),
+        ..score(&wf.result, &eval_truth, 0.8)
+    };
     println!(
         "protein: {} residues, {} peaks, {} spin systems",
         ref_data.sequence.len(),
         peaks.len(),
-        systems.len()
+        wf.systems.len()
     );
     println!(
         "engine: {} ({} replicas, {} steps/system)",
-        engine_label, anneal_cfg.runs, anneal_cfg.steps_per_system
+        wf.engine_label, wf.replicas, wf.steps_per_system
     );
     println!("experiments: {}", exps.join(", "));
     println!("{}", m.report());
 
     let (pred, _) = to_reference(
-        &res,
-        &systems,
+        &wf.result,
+        &wf.systems,
         &ref_data.sequence,
         &ref_data.seq_ids,
         0.0,
-        Some(&pri),
+        Some(&wf.effective_priors),
     );
     println!("shift agreement with reference (within tolerance / predicted):");
     for atom in ["H", "N", "CA", "CB", "C"] {
@@ -296,9 +534,9 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
 
     if verbose {
         let mut wrong = Vec::new();
-        for (s, &k) in res.position.iter().enumerate() {
-            if k >= 0 && k != truth[s] {
-                wrong.push((s, k as usize, truth[s]));
+        for (s, &k) in wf.result.position.iter().enumerate() {
+            if k >= 0 && k != eval_truth[s] {
+                wrong.push((s, k as usize, eval_truth[s]));
             }
         }
         if !wrong.is_empty() {
@@ -314,7 +552,7 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
                 };
                 println!(
                     "  {}{:<5} {:<8} {:.2}",
-                    ref_data.sequence[k], ref_data.seq_ids[k], tl, res.confidence[s]
+                    ref_data.sequence[k], ref_data.seq_ids[k], tl, wf.result.confidence[s]
                 );
             }
         }
@@ -420,11 +658,14 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut out_arg: Option<String> = None;
     let mut priors_path: Option<String> = None;
     let mut first_seq_id = 1i32;
-    let mut engine = EngineKind::Gpu;
+    let mut solver = SolverKind::Standard;
+    let mut pdb_path: Option<PathBuf> = None;
+    let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
-    let mut steps = 1500usize;
+    let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
     let mut seed = 0u64;
+    let mut verbose = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -449,6 +690,14 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 i += 1;
                 priors_path = args.get(i).cloned();
             }
+            "--solver" => {
+                i += 1;
+                solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
+            }
+            "--pdb" => {
+                i += 1;
+                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing --pdb")?));
+            }
             "--first-seq-id" => {
                 i += 1;
                 first_seq_id = args
@@ -459,7 +708,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             }
             "--engine" => {
                 i += 1;
-                engine = parse_engine(args.get(i).ok_or("missing --engine")?)?;
+                engine_opt = Some(parse_engine(args.get(i).ok_or("missing --engine")?)?);
             }
             "--runs" => {
                 i += 1;
@@ -472,11 +721,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             }
             "--steps" => {
                 i += 1;
-                steps = args
-                    .get(i)
-                    .ok_or("missing --steps")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                steps = Some(
+                    args.get(i)
+                        .ok_or("missing --steps")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
             }
             "--assign-cost" => {
                 i += 1;
@@ -494,6 +744,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?;
             }
+            "-v" | "--verbose" => verbose = true,
             other => return Err(format!("unknown assign flag {other:?}")),
         }
         i += 1;
@@ -511,33 +762,46 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     };
 
     let peaks = read_peaks(p_path)?;
-    let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false)?;
     let pri = load_priors(priors_path.as_deref())?;
-    let default_runs = if engine == EngineKind::Gpu { 64 } else { 12 };
-    let cfg = AnnealConfig {
-        runs: runs.unwrap_or(default_runs),
-        steps_per_system: steps,
-        seed,
-        ..AnnealConfig::default()
-    };
-
     let score_cfg = ScoreConfig {
         assign_cost,
         ..ScoreConfig::default()
     };
-    let (res, engine_label) = run_solver(engine, &systems, &sequence, &pri, &score_cfg, &cfg)?;
-    let (pred, conf) = to_reference(&res, &systems, &sequence, &seq_ids, 0.0, Some(&pri));
+    let wf = execute_assignment_workflow(
+        solver,
+        engine_opt,
+        &peaks,
+        &sequence,
+        &pri,
+        &score_cfg,
+        runs,
+        steps,
+        12,
+        seed,
+        pdb_path.as_deref(),
+    )?;
+    log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+
+    let (pred, conf) = to_reference(
+        &wf.result,
+        &wf.systems,
+        &sequence,
+        &seq_ids,
+        0.0,
+        Some(&wf.effective_priors),
+    );
 
     let str_out = out_prefix.with_extension("str");
     let tsv_out = out_prefix.with_extension("tsv");
-    write_star(&str_out, &pred, Some(&conf))?;
+    let star_hdr = format_star_offset_header(&wf.engine_label, &wf.offsets);
+    write_star_with_header(&str_out, &pred, Some(&conf), star_hdr.as_deref())?;
     write_shifts_tsv(&tsv_out, &pred, &conf)?;
 
     let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
     println!(
         "[{}] {} spin systems; {} residues assigned, {} with confidence >= 0.8",
-        engine_label,
-        systems.len(),
+        wf.engine_label,
+        wf.systems.len(),
         conf.len(),
         n_hc
     );
@@ -815,9 +1079,10 @@ fn cmd_priors(args: &[String]) -> Result<(), String> {
 
 fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
     let mut manifest = PathBuf::from("data/benchmark/manifest.tsv");
-    let mut engine = EngineKind::Gpu;
+    let mut solver = SolverKind::Standard;
+    let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
-    let mut steps = 1500usize;
+    let mut steps: Option<usize> = None;
     let mut missing = 0.06f64;
     let mut spurious = 0.04f64;
     let mut seed = 0u64;
@@ -830,9 +1095,13 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
                 i += 1;
                 manifest = PathBuf::from(args.get(i).ok_or("missing --manifest")?);
             }
+            "--solver" => {
+                i += 1;
+                solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
+            }
             "--engine" => {
                 i += 1;
-                engine = parse_engine(args.get(i).ok_or("missing --engine")?)?;
+                engine_opt = Some(parse_engine(args.get(i).ok_or("missing --engine")?)?);
             }
             "--runs" => {
                 i += 1;
@@ -845,11 +1114,12 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
             }
             "--steps" => {
                 i += 1;
-                steps = args
-                    .get(i)
-                    .ok_or("missing --steps")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                steps = Some(
+                    args.get(i)
+                        .ok_or("missing --steps")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
             }
             "--missing" => {
                 i += 1;
@@ -884,22 +1154,22 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
+    let engine = resolve_solver_engine(solver, engine_opt)?;
     let text = fs::read_to_string(&manifest)
         .map_err(|e| format!("failed to read {}: {e}", manifest.display()))?;
     let pri = load_priors(priors_path.as_deref())?;
-    let default_runs = match engine {
-        EngineKind::Gpu => 64,
-        EngineKind::Cpu => 32,
-    };
-    let n_runs = runs.unwrap_or(default_runs);
     let maybe_gpu = if engine == EngineKind::Gpu {
         Some(GpuEngine::new_headless()?)
     } else {
         None
     };
-    let engine_banner = match &maybe_gpu {
-        Some(g) => format!("WebGPU ({}, {})", g.adapter_name, g.backend_name),
-        None => "CPU (f64)".to_string(),
+    let engine_banner = match (solver, &maybe_gpu) {
+        (SolverKind::Standard, Some(g)) => {
+            format!("WebGPU ({}, {})", g.adapter_name, g.backend_name)
+        }
+        (SolverKind::Standard, None) => "CPU (f64)".to_string(),
+        (SolverKind::Tripeptide, _) => "CPU (f64, tripeptide)".to_string(),
+        (SolverKind::EvoGraph, _) => "CPU (f64, evo-graph)".to_string(),
     };
 
     println!(
@@ -940,22 +1210,49 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
             ..SimConfig::default()
         };
         let (peaks, truth) = simulate(&ref_data, &sim_cfg);
-        let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false)?;
-        let acfg = AnnealConfig {
-            runs: n_runs,
-            steps_per_system: steps,
-            seed,
-            ..AnnealConfig::default()
-        };
         let scfg = ScoreConfig::default();
 
         let t0 = Instant::now();
-        let res = match &maybe_gpu {
-            Some(g) => g.assign_gpu(&systems, &ref_data.sequence, &pri, &scfg, &acfg)?,
-            None => assign(&systems, &ref_data.sequence, &pri, &scfg, &acfg),
+        let m = match (solver, &maybe_gpu) {
+            (SolverKind::Standard, Some(g)) => {
+                let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false)?;
+                let acfg = AnnealConfig {
+                    runs: runs.unwrap_or(64),
+                    steps_per_system: steps.unwrap_or(1500),
+                    seed,
+                    ..AnnealConfig::default()
+                };
+                let res = g.assign_gpu(&systems, &ref_data.sequence, &pri, &scfg, &acfg)?;
+                score(&res, &truth, 0.8)
+            }
+            _ => {
+                let wf = execute_assignment_workflow(
+                    solver,
+                    engine_opt,
+                    &peaks,
+                    &ref_data.sequence,
+                    &pri,
+                    &scfg,
+                    runs,
+                    steps,
+                    32,
+                    seed,
+                    None,
+                )?;
+                let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
+                    Some(kept) => kept
+                        .iter()
+                        .map(|&idx| truth.get(idx).copied().unwrap_or(-1))
+                        .collect(),
+                    None => truth.clone(),
+                };
+                Metrics {
+                    assignable: truth.iter().filter(|&&t| t >= 0).count(),
+                    ..score(&wf.result, &eval_truth, 0.8)
+                }
+            }
         };
         let dt = t0.elapsed().as_secs_f64();
-        let m = score(&res, &truth, 0.8);
 
         println!(
             "{:<10} {:<6} {:<10} {:>5} | {:>7.1}% {:>7.1}% {:>9.1}% {:>7.2}s",
@@ -1564,16 +1861,19 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut snr = 5.0f32;
     let mut prob = 0.45f32;
     let mut priors_path: Option<String> = None;
+    let mut solver = SolverKind::Standard;
+    let mut pdb_path: Option<PathBuf> = None;
     let mut runs: Option<usize> = None;
-    let mut steps = 1500usize;
+    let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
     let mut seed = 0u64;
     let mut name_arg: Option<String> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut pdb_ref_path: Option<PathBuf> = None;
     let mut noesy_peaks_path: Option<PathBuf> = None;
-    let mut engine = EngineKind::Gpu;
+    let mut engine_opt: Option<EngineKind> = None;
     let mut fold = false;
+    let mut verbose = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1641,6 +1941,14 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 i += 1;
                 priors_path = args.get(i).cloned();
             }
+            "--solver" => {
+                i += 1;
+                solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
+            }
+            "--pdb" => {
+                i += 1;
+                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing --pdb")?));
+            }
             "--runs" => {
                 i += 1;
                 runs = Some(
@@ -1652,11 +1960,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
             "--steps" => {
                 i += 1;
-                steps = args
-                    .get(i)
-                    .ok_or("missing --steps")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                steps = Some(
+                    args.get(i)
+                        .ok_or("missing --steps")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
             }
             "--assign-cost" => {
                 i += 1;
@@ -1692,13 +2001,23 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
             "--engine" => {
                 i += 1;
-                engine = parse_engine(args.get(i).ok_or("missing --engine")?)?;
+                engine_opt = Some(parse_engine(args.get(i).ok_or("missing --engine")?)?);
             }
             "--fold" => fold = true,
+            "-v" | "--verbose" => verbose = true,
             other => return Err(format!("unknown pipeline flag {other:?}")),
         }
         i += 1;
     }
+
+    if pdb_path.is_some() && solver != SolverKind::EvoGraph {
+        return Err(format!(
+            "--pdb torsion conditioning is only supported with --solver evo-graph (got --solver {})",
+            solver.as_str()
+        ));
+    }
+    let _validated_solver_engine = resolve_solver_engine(solver, engine_opt)?;
+    let picker_engine = engine_opt.unwrap_or(EngineKind::Gpu);
 
     let dir = out_dir.ok_or("pipeline requires --out-dir <dir>")?;
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
@@ -1708,7 +2027,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         let doc = read_nef_file(np)?;
         let r = doc.to_reference()?;
         let pks = if let Some(hp) = &hsqc_path {
-            pick_spectra_bundle(hp, &triples, &method, engine, snr, prob)?.1
+            pick_spectra_bundle(hp, &triples, &method, picker_engine, snr, prob)?.1
         } else if let Some(pp) = &peaks_path {
             read_peaks(pp)?
         } else {
@@ -1749,7 +2068,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             return Err("pipeline with --hsqc requires --seq <SEQ|fasta> (or --star)".to_string());
         };
         let (roots, pks, method_label) =
-            pick_spectra_bundle(hp, &triples, &method, engine, snr, prob)?;
+            pick_spectra_bundle(hp, &triples, &method, picker_engine, snr, prob)?;
         println!(
             "[{method_label}] picked {} HSQC roots and {} total peaks",
             roots.len(),
@@ -1812,28 +2131,34 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         Some(p) => Priors::from_json(p)?,
         None => Priors::default(),
     };
-    let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false)?;
-    let acfg = AnnealConfig {
-        runs: runs.unwrap_or(if engine == EngineKind::Gpu { 64 } else { 32 }),
-        steps_per_system: steps,
-        seed,
-        ..AnnealConfig::default()
-    };
     let scfg = ScoreConfig {
         assign_cost,
         ..ScoreConfig::default()
     };
     let t_solve = Instant::now();
-    let (res, engine_label) = run_solver(engine, &systems, &base_ref.sequence, &pri, &scfg, &acfg)?;
+    let wf = execute_assignment_workflow(
+        solver,
+        engine_opt,
+        &peaks,
+        &base_ref.sequence,
+        &pri,
+        &scfg,
+        runs,
+        steps,
+        32,
+        seed,
+        pdb_path.as_deref(),
+    )?;
     let dt_solve = t_solve.elapsed().as_secs_f64();
+    log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
 
     let (pred_ref, conf) = to_reference(
-        &res,
-        &systems,
+        &wf.result,
+        &wf.systems,
         &base_ref.sequence,
         &base_ref.seq_ids,
         0.0,
-        Some(&pri),
+        Some(&wf.effective_priors),
     );
     let peaks_out = dir.join("peaks.tsv");
     let star_out = dir.join("shifts.str");
@@ -1842,19 +2167,21 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let html_out = dir.join("report.html");
 
     write_peaks(&peaks_out, &peaks)?;
-    write_star(&star_out, &pred_ref, Some(&conf))?;
+    let star_hdr = format_star_offset_header(&wf.engine_label, &wf.offsets);
+    write_star_with_header(&star_out, &pred_ref, Some(&conf), star_hdr.as_deref())?;
     write_shifts_tsv(&tsv_out, &pred_ref, &conf)?;
     let nef_doc =
         NefDocument::from_reference_and_peaks(&project_name, &pred_ref, Some(&conf), &peaks);
     write_nef_file(&nef_out, &nef_doc)?;
 
+    let engine_label = wf.engine_label;
     let mut rep = ReportInput::new(&project_name, pred_ref.clone(), conf.clone());
     rep.n_peaks = Some(peaks.len());
-    rep.n_spin_systems = Some(systems.len());
-    rep.solver_score = Some(res.score);
+    rep.n_spin_systems = Some(wf.systems.len());
+    rep.solver_score = Some(wf.result.score);
     rep.elapsed_secs = Some(dt_solve);
     rep.engine_label = Some(engine_label.clone());
-    rep.systems_and_assignment = Some((systems, res));
+    rep.systems_and_assignment = Some((wf.systems, wf.result));
     rep.dihedrals = predict_csi_dihedrals(&pred_ref);
 
     if fold {
@@ -2987,6 +3314,162 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             lbl_gpu_2d.starts_with("neural (WebGPU:"),
             "expected WebGPU label, got {lbl_gpu_2d}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cli_solver_flags_loud_gpu_reject_and_star_offset_header() {
+        let dir = env::temp_dir().join(format!("nmr_cli_solvers_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let star = fixture_star_path();
+        let pdb_ref =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/pdb_refs/1d3z.pdb");
+        let ref_data = read_star(&star, None).unwrap();
+        let seq_1letter: String = ref_data
+            .sequence
+            .iter()
+            .map(|r| match r.as_str() {
+                "ALA" => 'A',
+                "ARG" => 'R',
+                "ASN" => 'N',
+                "ASP" => 'D',
+                "CYS" => 'C',
+                "GLN" => 'Q',
+                "GLU" => 'E',
+                "GLY" => 'G',
+                "HIS" => 'H',
+                "ILE" => 'I',
+                "LEU" => 'L',
+                "LYS" => 'K',
+                "MET" => 'M',
+                "PHE" => 'F',
+                "PRO" => 'P',
+                "SER" => 'S',
+                "THR" => 'T',
+                "TRP" => 'W',
+                "TYR" => 'Y',
+                "VAL" => 'V',
+                _ => 'X',
+            })
+            .collect();
+        let fasta_path = dir.join("ubq.fasta");
+        fs::write(&fasta_path, format!(">ubq\n{seq_1letter}\n")).unwrap();
+
+        let (mut sim_peaks, _) = simulate(
+            &ref_data,
+            &SimConfig {
+                p_missing_peak: 0.0,
+                spurious_rate: 0.0,
+                seed: 11,
+                ..SimConfig::default()
+            },
+        );
+        // Apply -2.75 ppm TMS-vs-DSS 13C offset to exercise automatic prior offset header emission
+        for p in &mut sim_peaks {
+            if let Some(c) = &mut p.c {
+                *c -= 2.75;
+            }
+        }
+        let peaks_path = dir.join("tms_peaks.tsv");
+        write_peaks(&peaks_path, &sim_peaks).unwrap();
+
+        // 1. Loud GPU rejection for CPU-only solvers (`tripeptide` and `evo-graph`)
+        for solver_name in ["tripeptide", "evo-graph"] {
+            let err = cmd_assign(&[
+                "--peaks".into(),
+                peaks_path.to_string_lossy().into_owned(),
+                "--seq".into(),
+                fasta_path.to_string_lossy().into_owned(),
+                "--out".into(),
+                dir.join("bad.str").to_string_lossy().into_owned(),
+                "--solver".into(),
+                solver_name.into(),
+                "--engine".into(),
+                "gpu".into(),
+            ])
+            .unwrap_err();
+            assert!(
+                err.contains("CPU-only") && err.contains("--engine gpu"),
+                "expected loud CPU-only GPU rejection for {solver_name}, got: {err}"
+            );
+        }
+
+        // 2. Loud rejection when --pdb is passed to non-evo-graph solver
+        let pdb_err = cmd_assign(&[
+            "--peaks".into(),
+            peaks_path.to_string_lossy().into_owned(),
+            "--seq".into(),
+            fasta_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            dir.join("bad_pdb.str").to_string_lossy().into_owned(),
+            "--solver".into(),
+            "standard".into(),
+            "--pdb".into(),
+            pdb_ref.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err();
+        assert!(
+            pdb_err.contains("only supported with --solver evo-graph"),
+            "unexpected pdb error: {pdb_err}"
+        );
+
+        // 3. Default engine omission works cleanly for standard (GPU), tripeptide (CPU), and evo-graph (+ --pdb),
+        //    and emits '#' offset header while preserving experimental TMS ppm shifts.
+        for (tag, solver_name, with_pdb) in [
+            ("standard", "standard", false),
+            ("tripeptide", "tripeptide", false),
+            ("evo_graph", "evo-graph", false),
+            ("evo_graph_pdb", "evo-graph", true),
+        ] {
+            let out_str = dir.join(format!("out_{tag}.str"));
+            let mut args: Vec<String> = vec![
+                "--peaks".into(),
+                peaks_path.to_string_lossy().into_owned(),
+                "--seq".into(),
+                fasta_path.to_string_lossy().into_owned(),
+                "--out".into(),
+                out_str.to_string_lossy().into_owned(),
+                "--solver".into(),
+                solver_name.into(),
+                "--runs".into(),
+                "4".into(),
+                "--steps".into(),
+                "400".into(),
+            ];
+            if with_pdb {
+                args.push("--pdb".into());
+                args.push(pdb_ref.to_string_lossy().into_owned());
+            }
+            cmd_assign(&args).unwrap();
+            let content = fs::read_to_string(&out_str).unwrap();
+            assert!(
+                content.starts_with("# nmrassign ")
+                    && content.contains("fitted_prior_reference_offsets"),
+                "expected # fitted_prior_reference_offsets header for {tag}, got:\n{}",
+                content.lines().next().unwrap_or("")
+            );
+            // Round-trip read_star verifies '#' header compatibility and experimental TMS ppm frame preservation
+            let parsed = read_star(&out_str, None).unwrap();
+            assert_eq!(parsed.sequence.len(), 76);
+            let mut ca_diffs = Vec::new();
+            for (&(k, ref atom), &val) in &parsed.shifts {
+                if atom == "CA" {
+                    if let Some(&t_val) = ref_data.shifts.get(&(k, "CA".to_string())) {
+                        ca_diffs.push(val - t_val);
+                    }
+                }
+            }
+            assert!(!ca_diffs.is_empty());
+            ca_diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med_diff = ca_diffs[ca_diffs.len() / 2];
+            assert!(
+                (med_diff + 2.75).abs() < 0.25,
+                "expected experimental TMS frame (~ -2.75 ppm) for {tag}, median diff={med_diff:.3}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

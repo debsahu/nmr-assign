@@ -524,6 +524,44 @@ fn filter_peaks_with_report(
         }
     }
 
+    // 2c. Reject uncorroborated noise-only HNCACO channel when HNCO is present:
+    // a genuine HN(CA)CO acquisition observes C'(i-1) alongside C'(i), whereas an empty/failed
+    // cube picked near k*MAD exhibits a flat truncated-Gaussian tail (top/p80 < 1.80) and near-zero
+    // (< 8%) strip-level C'(i-1) overlap with HNCO.
+    if let (Some(hncaco_list), Some(hnco_list)) = (
+        gated_3d.get(&("HNCACO", 1)).cloned(),
+        gated_3d.get(&("HNCO", 1)),
+    ) {
+        if hncaco_list.len() >= 16 && hnco_list.len() >= 20 {
+            let mut hs: Vec<f64> = hncaco_list
+                .iter()
+                .filter_map(|p| p.height.map(f64::abs))
+                .collect();
+            hs.sort_by(|a, b| b.total_cmp(a));
+            if hs.len() >= 16 {
+                let top_h = hs[0];
+                let p80_h = hs[hs.len() * 4 / 5].max(1e-9);
+                if top_h / p80_h < 1.80 {
+                    let matched = hncaco_list
+                        .iter()
+                        .filter(|p| {
+                            let pc = p.c.unwrap_or(0.0);
+                            hnco_list.iter().any(|q| {
+                                let qc = q.c.unwrap_or(0.0);
+                                (p.h - q.h).abs() <= 0.045
+                                    && (p.n - q.n).abs() <= 0.45
+                                    && (pc - qc).abs() <= 0.30
+                            })
+                        })
+                        .count();
+                    if (matched as f64) < 0.08 * (hncaco_list.len() as f64) {
+                        gated_3d.remove(&("HNCACO", 1));
+                    }
+                }
+            }
+        }
+    }
+
     // 3. Cross-sign F1 sinc sidelobe suppression in phase-sensitive HNCACB
     if let (Some(pos_list), Some(neg_list)) = (
         gated_3d.get(&("HNCACB", 1)).cloned(),
@@ -1666,6 +1704,26 @@ pub fn refine_anchor_reference_offsets(
     min_consensus: f64,
     init_offsets: ReferenceOffsets,
 ) -> (ReferenceOffsets, usize) {
+    refine_anchor_reference_offsets_with_torsions(
+        systems,
+        sequence,
+        priors,
+        pass1,
+        min_consensus,
+        init_offsets,
+        None,
+    )
+}
+
+fn refine_anchor_reference_offsets_with_torsions(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    pass1: &AssignResult,
+    min_consensus: f64,
+    init_offsets: ReferenceOffsets,
+    structure_torsions: Option<&[ResidueTorsion]>,
+) -> (ReferenceOffsets, usize) {
     let norm_seq = normalize_sequence(sequence);
     let init_priors = apply_offsets_to_priors(priors, &init_offsets);
 
@@ -1688,19 +1746,55 @@ pub fn refine_anchor_reference_offsets(
         let ss = &systems[s];
         let rname = &norm_seq[k];
         let prev_name = &norm_seq[k - 1];
+        let next_pro_k = k + 1 < norm_seq.len() && norm_seq[k + 1] == "PRO";
+        let next_pro_km1 = rname == "PRO";
+        let (phi_k, psi_k) = structure_torsions
+            .and_then(|t| t.get(k).copied())
+            .unwrap_or((None, None));
+        let (phi_km1, psi_km1) = structure_torsions
+            .and_then(|t| t.get(k - 1).copied())
+            .unwrap_or((None, None));
+        let has_tors = structure_torsions.is_some();
 
         if let Some((mu_h, _)) = priors.get(rname, "H") {
-            res_h.push(ss.h - mu_h);
+            let d_mu = if has_tors {
+                torsion_shift_adjustment(rname, "H", phi_k, psi_k, next_pro_k).0
+            } else {
+                0.0
+            };
+            res_h.push(ss.h - (mu_h + d_mu));
         }
         if let Some((mu_n, _)) = priors.get(rname, "N") {
-            res_n.push(ss.n - mu_n);
+            let d_mu = if has_tors {
+                torsion_shift_adjustment(rname, "N", phi_k, psi_k, next_pro_k).0
+            } else {
+                0.0
+            };
+            res_n.push(ss.n - (mu_n + d_mu));
         }
         if let Some(cands) = ss.cands.get(&("CA".to_string(), 0)) {
             let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
             if !obs.is_empty() {
                 if let Some((mu_ca, _)) = priors.get(rname, "CA") {
-                    let (_, idx) = candidate_llr(&init_priors, rname, "CA", &obs, 0.7);
-                    res_ca.push(obs[idx].0 - mu_ca);
+                    let (_, idx) = if has_tors {
+                        conditioned_candidate_llr(
+                            &init_priors,
+                            rname,
+                            "CA",
+                            &obs,
+                            0.7,
+                            (phi_k, psi_k),
+                            next_pro_k,
+                        )
+                    } else {
+                        candidate_llr(&init_priors, rname, "CA", &obs, 0.7)
+                    };
+                    let d_mu = if has_tors {
+                        torsion_shift_adjustment(rname, "CA", phi_k, psi_k, next_pro_k).0
+                    } else {
+                        0.0
+                    };
+                    res_ca.push(obs[idx].0 - (mu_ca + d_mu));
                 }
             }
         }
@@ -1709,8 +1803,25 @@ pub fn refine_anchor_reference_offsets(
                 let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
                 if !obs.is_empty() {
                     if let Some((mu_cb, _)) = priors.get(rname, "CB") {
-                        let (_, idx) = candidate_llr(&init_priors, rname, "CB", &obs, 0.7);
-                        res_cb.push(obs[idx].0 - mu_cb);
+                        let (_, idx) = if has_tors {
+                            conditioned_candidate_llr(
+                                &init_priors,
+                                rname,
+                                "CB",
+                                &obs,
+                                0.7,
+                                (phi_k, psi_k),
+                                next_pro_k,
+                            )
+                        } else {
+                            candidate_llr(&init_priors, rname, "CB", &obs, 0.7)
+                        };
+                        let d_mu = if has_tors {
+                            torsion_shift_adjustment(rname, "CB", phi_k, psi_k, next_pro_k).0
+                        } else {
+                            0.0
+                        };
+                        res_cb.push(obs[idx].0 - (mu_cb + d_mu));
                     }
                 }
             }
@@ -1719,16 +1830,50 @@ pub fn refine_anchor_reference_offsets(
             let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
             if !obs.is_empty() {
                 if let Some((mu_c, _)) = priors.get(prev_name, "C") {
-                    let (_, idx) = candidate_llr(&init_priors, prev_name, "C", &obs, 0.7);
-                    res_c.push(obs[idx].0 - mu_c);
+                    let (_, idx) = if has_tors {
+                        conditioned_candidate_llr(
+                            &init_priors,
+                            prev_name,
+                            "C",
+                            &obs,
+                            0.7,
+                            (phi_km1, psi_km1),
+                            next_pro_km1,
+                        )
+                    } else {
+                        candidate_llr(&init_priors, prev_name, "C", &obs, 0.7)
+                    };
+                    let d_mu = if has_tors {
+                        torsion_shift_adjustment(prev_name, "C", phi_km1, psi_km1, next_pro_km1).0
+                    } else {
+                        0.0
+                    };
+                    res_c.push(obs[idx].0 - (mu_c + d_mu));
                 }
             }
         } else if let Some(cands) = ss.cands.get(&("C".to_string(), 0)) {
             let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
             if !obs.is_empty() {
                 if let Some((mu_c, _)) = priors.get(rname, "C") {
-                    let (_, idx) = candidate_llr(&init_priors, rname, "C", &obs, 0.7);
-                    res_c.push(obs[idx].0 - mu_c);
+                    let (_, idx) = if has_tors {
+                        conditioned_candidate_llr(
+                            &init_priors,
+                            rname,
+                            "C",
+                            &obs,
+                            0.7,
+                            (phi_k, psi_k),
+                            next_pro_k,
+                        )
+                    } else {
+                        candidate_llr(&init_priors, rname, "C", &obs, 0.7)
+                    };
+                    let d_mu = if has_tors {
+                        torsion_shift_adjustment(rname, "C", phi_k, psi_k, next_pro_k).0
+                    } else {
+                        0.0
+                    };
+                    res_c.push(obs[idx].0 - (mu_c + d_mu));
                 }
             }
         }
@@ -3141,13 +3286,14 @@ fn assign_evo_graph_core(
 
     // Pass 2: High-consensus anchor reference offset refinement + 2-layer graph self-consistency
     let (final_offsets, n_anchors) = if cfg.auto_reference {
-        refine_anchor_reference_offsets(
+        refine_anchor_reference_offsets_with_torsions(
             systems,
             &norm_seq,
             priors,
             &res1,
             cfg.anchor_consensus_threshold,
             pass1_offsets,
+            cfg.structure_torsions,
         )
     } else {
         (ReferenceOffsets::default(), 0)

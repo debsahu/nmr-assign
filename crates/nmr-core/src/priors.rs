@@ -610,14 +610,33 @@ pub fn estimate_reference_offsets(
         return ShiftOffsets::default();
     }
 
-    let slot_count = |ss: &SpinSystem| -> usize {
-        ss.cands
-            .values()
-            .filter(|cands| cands.iter().any(|&(_, sup)| sup > 0))
-            .count()
+    let slot_and_support = |ss: &SpinSystem| -> (usize, usize) {
+        let mut slots = 0usize;
+        let mut sup_sum = 0usize;
+        for cands in ss.cands.values() {
+            if let Some(&(_, sup)) = cands.iter().find(|&&(_, sup)| sup > 0) {
+                slots += 1;
+                sup_sum += sup;
+            }
+        }
+        (sup_sum, slots)
     };
-    let multi_slot: Vec<&SpinSystem> = systems.iter().filter(|ss| slot_count(ss) >= 2).collect();
-    let selected: Vec<&SpinSystem> = if multi_slot.len() >= 8 {
+    let assignable = sequence
+        .iter()
+        .enumerate()
+        .filter(|&(k, r)| k > 0 && r != "PRO")
+        .count()
+        .max(sequence.len());
+    let max_selected = ((assignable * 4) / 3).max(24);
+    let mut multi_slot: Vec<&SpinSystem> = systems
+        .iter()
+        .filter(|ss| slot_and_support(ss).1 >= 2)
+        .collect();
+    if multi_slot.len() > max_selected {
+        multi_slot.sort_by_key(|b| std::cmp::Reverse(slot_and_support(b)));
+        multi_slot.truncate(max_selected);
+    }
+    let mut selected: Vec<&SpinSystem> = if multi_slot.len() >= 8 {
         multi_slot
     } else {
         systems
@@ -625,6 +644,10 @@ pub fn estimate_reference_offsets(
             .filter(|ss| ss.has_observed_carbons())
             .collect()
     };
+    if selected.len() > max_selected {
+        selected.sort_by_key(|b| std::cmp::Reverse(slot_and_support(b)));
+        selected.truncate(max_selected);
+    }
     if selected.len() < 6 {
         return ShiftOffsets::default();
     }

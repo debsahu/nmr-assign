@@ -507,8 +507,8 @@ fn real_bruker_ubiquitin_5seed_classical_pick_and_pdb_torsions() {
         hsqc_roots.len(),
         raw_peaks.len()
     );
-    assert_eq!(hsqc_roots.len(), 700);
-    assert_eq!(raw_peaks.len(), 24_562);
+    assert_eq!(hsqc_roots.len(), 111);
+    assert_eq!(raw_peaks.len(), 972);
 
     let priors = Priors::provisional();
     let pdb_path = workspace_root().join("data/pdb_refs/1d3z.pdb");

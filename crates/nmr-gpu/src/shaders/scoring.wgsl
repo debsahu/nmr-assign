@@ -17,8 +17,8 @@ struct ScoreParams {
     gly_cb: f32,
     assign_cost: f32,
     forbid_zero_carbons: u32,
-    pad0: u32,
-    pad1: u32,
+    has_excess_roots: u32,
+    multi_slot_dataset: u32,
 };
 
 struct PriorEntry {
@@ -50,6 +50,7 @@ struct CandEntry {
 
 const TAU: f32 = 6.283185307179586;
 const FORBID: f32 = -1e9;
+const GLY_IDX: u32 = 7u;
 const PRO_IDX: u32 = 14u;
 
 fn logpdf(v: f32, mu: f32, sd: f32) -> f32 {
@@ -111,6 +112,9 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var sc: f32 = 0.0;
     var total_pos_cands: u32 = 0u;
+    var has_obs_ca: u32 = 0u;
+    var obs_slots: u32 = 0u;
+    var max_sup: u32 = 0u;
     for (var atom_c: u32 = 0u; atom_c < 3u; atom_c = atom_c + 1u) {
         let atom_idx = atom_c + 2u; // 2=CA, 3=CB, 4=C
         for (var off_idx: u32 = 0u; off_idx < 2u; off_idx = off_idx + 1u) {
@@ -127,6 +131,9 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let ce = cands[base + c];
                 if (ce.support > 0u) {
                     n_pos = n_pos + 1u;
+                    if (ce.support > max_sup) {
+                        max_sup = ce.support;
+                    }
                     let term = llr(target_res, atom_idx, ce.val)
                         + params.support_bonus * (f32(ce.support) - 1.0);
                     if (term > best) {
@@ -136,6 +143,10 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             if (n_pos > 0u) {
                 total_pos_cands = total_pos_cands + n_pos;
+                obs_slots = obs_slots + 1u;
+                if (atom_c == 0u) {
+                    has_obs_ca = 1u;
+                }
                 sc = sc + best - log(f32(n_pos));
             }
         }
@@ -145,10 +156,20 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
         out_u[out_idx] = FORBID;
         return;
     }
+    if (params.has_excess_roots != 0u && has_obs_ca == 0u && res != GLY_IDX && prev != PRO_IDX) {
+        out_u[out_idx] = FORBID;
+        return;
+    }
 
     if (params.use_hn != 0u) {
         let hn = roots_hn[s];
         sc = sc + llr(res, 1u, hn.y) + llr(res, 0u, hn.x);
+    }
+    if (params.has_excess_roots != 0u
+        && params.multi_slot_dataset != 0u
+        && (has_obs_ca == 0u || (obs_slots <= 1u && max_sup <= 1u)))
+    {
+        sc = sc - 4.5;
     }
     sc = sc - params.assign_cost;
     out_u[out_idx] = sc;

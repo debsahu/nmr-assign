@@ -12,7 +12,8 @@ use bytemuck::{Pod, Zeroable};
 use nmr_core::priors::{Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
 use nmr_core::solver::{
-    consensus_from_runs, AnnealConfig, AssignResult, Matrix2D, ScoreConfig, FORBID,
+    consensus_from_runs, prepare_scoring_priors, AnnealConfig, AssignResult, Matrix2D, ScoreConfig,
+    FORBID,
 };
 use nmr_core::spinsystems::SpinSystem;
 use wgpu::util::DeviceExt;
@@ -34,7 +35,8 @@ struct ScoreParamsGpu {
     gly_cb: f32,
     assign_cost: f32,
     forbid_zero_carbons: u32,
-    _pad: [u32; 2],
+    has_excess_roots: u32,
+    multi_slot_dataset: u32,
 }
 
 #[repr(C)]
@@ -406,6 +408,30 @@ impl GpuEngine {
             ));
         }
 
+        let (eff_priors, _) = prepare_scoring_priors(systems, sequence, priors, cfg);
+        let assignable = sequence
+            .iter()
+            .enumerate()
+            .filter(|&(k, r)| k > 0 && r != "PRO")
+            .count();
+        let has_excess_roots = cfg.forbid_ca_less_excess_roots && s_len > assignable;
+        let multi_slot_dataset = if has_excess_roots {
+            let mut multi_slot_count = 0usize;
+            for ss in systems {
+                let n_slots = ss
+                    .cands
+                    .values()
+                    .filter(|raw| raw.iter().any(|&(_, sup)| sup > 0))
+                    .count();
+                if n_slots >= 3 {
+                    multi_slot_count += 1;
+                }
+            }
+            multi_slot_count >= 8
+        } else {
+            false
+        };
+
         let params = ScoreParamsGpu {
             s_len: s_len as u32,
             k_len: k_len as u32,
@@ -421,13 +447,14 @@ impl GpuEngine {
             gly_cb: (0.02_f64.ln()) as f32,
             assign_cost: cfg.assign_cost as f32,
             forbid_zero_carbons: u32::from(cfg.forbid_zero_carbons),
-            _pad: [0; 2],
+            has_excess_roots: u32::from(has_excess_roots),
+            multi_slot_dataset: u32::from(multi_slot_dataset),
         };
 
         let mut prior_table = Vec::with_capacity(20 * 5);
         for &(res, _) in &STANDARD_RESIDUES {
             for &atom in &ATOMS {
-                if let Some(&(mu, sd)) = priors.table.get(res).and_then(|m| m.get(atom)) {
+                if let Some(&(mu, sd)) = eff_priors.table.get(res).and_then(|m| m.get(atom)) {
                     prior_table.push(PriorEntryGpu {
                         mu: mu as f32,
                         sd: sd as f32,
