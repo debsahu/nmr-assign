@@ -1,0 +1,17 @@
+[project]
+name = "nmrassign"
+version = "0.1.0"
+description = "Open source automated protein NMR backbone resonance assignment"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+nmrassign = "nmrassign.cli:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
