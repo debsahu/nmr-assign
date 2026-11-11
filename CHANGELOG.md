@@ -4,9 +4,25 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## 2026-11-11 — Realistic Bruker Peak & 2D/3D Volumetric Spectrum Physics Simulator (`nmr-core`)
+## 2026-11-11 — Clean-Room Parallel Tripeptide Fragment Assignment Solver (`nmr-core`)
 
-- **Source Branch / Reviewed Commit:** `swarm/simulator` (`b3a5c1202e1bf024e29eee409bc5622c191c162f`)
+- **Source Branch / Reviewed Commit:** `swarm/tripeptide` (`c03e85443d479007978a095346bb45af7e5a2a8c`)
+- **Architectural Summary:**
+  - **Cooperative Tripeptide Fragment Engine (`crates/nmr-core/src/tripeptide.rs`, `docs/specs/09-tripeptide-solver.md`):** Implemented `TripeptideSolver`, `TripeptideConfig`, `TripeptideFragmentDb`, `TripeptidePairTensor`, `ReferenceOffsets`, `estimate_reference_offsets`, `assign_tripeptide`, and `assign_tripeptide_with_db`. Evaluates bounded cooperative 3-residue secondary-shift $(\Delta\delta\text{C}^\alpha, \Delta\delta\text{C}^\beta, \Delta\delta\text{C}', \Delta\delta\text{N}, \Delta\delta\text{H}^{\text{N}})$ log-Bayes-factors relative to uncorrelated single-residue marginals (avoiding single-atom prior double-counting) across a WASM-ready embedded 4-state (`Helix`, `Sheet`, `Ppii`, `Turn`) corpus and optional public BMRB entries filtered by `< 35%` global Needleman–Wunsch sequence identity and zero shared 7-mer peptide substrings.
+  - **Internal Prior Reference Shifting:** Fits global `(dCA, dCB, dC, dH, dN)` chemical-shift referencing offsets against sequence-weighted `Priors` and applies them internally during scoring while keeping `SpinSystem` candidates and `to_reference` output shifts strictly in the experimental spectrum's `ppm` frame.
+  - **Clean-Room Provenance:** Implemented strictly from Shen et al. (*PNAS* 2008), Shen & Bax (*J. Biomol. NMR* 2013), Wishart et al. (*J. Biomol. NMR* 1995), Schwarzinger et al. (*JACS* 2001), Spera & Bax (*JACS* 1991), Henikoff & Henikoff (*PNAS* 1992), Zhang et al. (*J. Biomol. NMR* 2003), and public CC0 BMRB entries (`data/benchmark/*.str`, `data/priors/bmrb_priors.json`).
+- **Verified Metrics (`assign_tripeptide` vs. `solver::assign`):**
+  - **`synthetic_ubiquitin.str` (7-Experiment, `seed = 0`):** **`100.0% (68/68)` accuracy** (`+2.9%` vs. `97.1%`), **`100.0%` recall**, **`100.0% (68/68)` high-confidence precision** (resolves `ILE30`/`PHE45` overlap at `conf = 1.00`; `to_reference` agreement `H 68/68, N 68/68, CA 74/75, CB 68/69, C 72/74`).
+  - **Degenerate 5-Experiment Subset without `HNCA` / `HN(CO)CA` (`bmr17769.str`, 8-Seed Mean):** **`97.54%` accuracy** (`+1.69%` vs. `95.85%`), **`92.94%` recall** (`+1.41%`), **`98.96%` high-confidence precision**.
+  - **TMS `-2.75 ppm` $^{13}\text{C}$ Offset + 250 Spurious Noise Roots (`bmr17769.str`):** Recovers `dCA = -2.76, dCB = -2.76, dC = -2.73 ppm` (`0.00` on unshifted DSS); **`100.0%` accuracy** (`+9.7%` vs. `90.3%`), **`97.1%` recall**, **`100.0%` high-confidence precision**, preserving experimental `ppm` output within `< 0.08 ppm`.
+  - **12-Protein Multi-Fold BMRB Suite (`< 35%` Identity + 7-mer Homolog Exclusion):** **`89.57%` mean accuracy** (`+2.47%` vs. `87.10%`), **`86.72%` recall** (`+3.55%`), **`98.17%` high-confidence precision** (including `bmr4375` `78.8% -> 92.8%`, `bmr15176` `54.3% -> 64.2%`, `bmr6541` `78.6% -> 88.0%`, `bmr6968` `51.7% -> 55.0%`).
+  - **Real 5-Spectrum Bruker Ubiquitin (`pdata`, No `HNCA`):** Recovers `dCA = -2.72, dCB = -2.72, dC = -2.87 ppm`; cross-sample `bmr17769` agreement `CA 62.0% (+15.7%), CB 62.1% (+9.7%), C 55.9% (+14.5%)` (`HC >= 0.8`: `CA 76.3%, CB 79.5%`), and 5-seed direct reference-table score **`65.9%` mean accuracy** (up to **`72.7%`** on seed 2) / **`78.9%` mean HC precision** (up to **`83.3%`**).
+
+---
+
+## `84e1ea8` — 2026-11-11 — Realistic Bruker Peak & 2D/3D Volumetric Spectrum Physics Simulator (`nmr-core`)
+
+- **Commit:** `84e1ea8` (from `swarm/simulator` `b3a5c1202e1bf024e29eee409bc5622c191c162f`)
 - **Architectural Summary:**
   - **Realistic Bruker Peak & Volumetric Presets (`crates/nmr-core/src/simulate.rs`, `neural_picker.rs`, `docs/specs/05-benchmark.md`):** Added `SimConfig::realistic_bruker()`, `SpectrumRenderConfig::realistic_bruker()`, and `E2eBenchmarkConfig::realistic_bruker()` modeling standard 5-experiment triple-resonance acquisitions (`HSQC`, `HNCACB`, `CBCACONH`, `HNCO`, `HNCACO` without `HNCA`/`HNCOCA`) while preserving bit-for-bit default PRNG stream parity when realistic options are inactive.
   - **Experimental Artifact & Referencing Physics:** Models uncropped spectral sweep widths (`11.75..-2.25 ppm` $^{1}\text{H}$, `137.5..100.2 ppm` $^{15}\text{N}$, `76.5..1.63 ppm` aliphatic $^{13}\text{C}$, `187.0..165.0 ppm` carbonyl $^{13}\text{C}$), high dynamic range (`max_abs / MAD > 1,000`), finite-$TD$ cosine-bell apodized `sinc` truncation sidelobes (`2–6%` positive/negative lobes, `> 20x–30x MAD`), multiplicative $t_1$ indirect column/strip noise ridges (`> 5x MAD`), residual `~4.77 ppm` water suppression stripe (`> 20x–50x MAD`), `< 4.3 ppm` aliphatic bleed, paired Asn/Gln sidechain $\text{NH}_2$ doublets with `HNCO`/`CBCACONH` correlations, wide log-normal conformational exchange dispersion, and `-2.75 ppm` $^{13}\text{C}$ (`-0.02 ppm` $^{1}\text{H}$, `+0.25 ppm` $^{15}\text{N}$) TMS-vs-DSS chemical-shift referencing offsets.

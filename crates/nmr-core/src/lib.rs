@@ -30,6 +30,7 @@ pub mod spectrum;
 pub mod spinsystems;
 pub mod structure;
 pub mod topology;
+pub mod tripeptide;
 
 // ============================================================================
 // Seamless Interoperability Bridges: `octet_mol` <-> `octet_analyt` <-> `octet_render`
