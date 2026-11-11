@@ -4,15 +4,18 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## 2026-11-11 — Out-of-Sample Cold Validation (`BMRB 51439` `CISD3`), Hz-Scaled $^3J_{\text{HNH}\alpha}$ Doublet Coalescing, and Removal of `tripeptide` & CLI `--pdb` (`nmr-core`, `nmr-cli`, `docs`)
+## `04b1769` — 2026-11-11 — Out-of-Sample Cold Validation (`BMRB 51439` `CISD3`), Hz-Scaled $^3J_{\text{HNH}\alpha}$ Doublet Coalescing, Removal of `tripeptide` & CLI `--pdb`, and CI Verification (`nmr-core`, `nmr-cli`, `docs`)
 
+- **Commit:** `04b1769`
 - **Architectural Summary:**
   - **Field-Independent Hz Doublet Threshold (`crates/nmr-core/src/picker.rs`, `docs/specs/02-peak-picking.md`):** Replaced the hardcoded `0.019 ppm` $^{15}\text{N}$-HSQC $^3J_{\text{HNH}\alpha}$ doublet coalescing cutoff (`~9.5 Hz` only at `500 MHz`) and `0.008 ppm` grid step check with `PickerConfig::max_j_hnha_hz: f64` (default `9.5 Hz`), converted dynamically to ppm via `spec.axis_x.obs_mhz` (`max_j_ppm = max_j_hnha_hz / obs_mhz`), paired with Hz-scaled digital-resolution gating (`|step_ppm| * obs_mhz <= 6.5 Hz/pt`, covering `SI = 2048, SW = 14 ppm` up to `950 MHz`) and direct-dimension sinc-sidelobe lower spacing (`max(12.0 / obs_mhz, max_j_ppm)`). Verified at `500 MHz` vs `800 MHz` in `test_hsqc_j_doublet_threshold_scales_with_spectrometer_mhz`.
   - **Solver Consolidation & Structural-Leakage Elimination (`crates/nmr-core`, `crates/nmr-cli`, `docs/specs/`):** Removed `nmr_core::tripeptide` (`tripeptide.rs`, `tripeptide_tests.rs`, `09-tripeptide-solver.md`) after out-of-sample evaluation showed miscalibrated high-confidence false positives on gapped chains without outperforming `standard` on complete data, while retaining `--solver standard|evo-graph`. Removed `--pdb` from all backbone assignment and benchmark CLI commands (`assign`, `pipeline`, `benchmark`, `benchmark-suite`) and removed `1d3z.pdb` from `evo_graph_tests.rs` so every assignment benchmark runs strictly sequence-only.
   - **`nmrassign score` Global Reference-Frame Alignment & CLI Docs (`crates/nmr-cli/src/main.rs`, `README.md`, `docs/specs/08-service.md`):** Updated `nmrassign score` to detect systematic global `(dH, dN, dCA, dCB, dC)` reference offsets (`pred - truth`) when scoring experimental-frame `.str` outputs against DSS/liquid-$\text{NH}_3$-referenced BMRB depositions (remaining exact `0.0` when already aligned), and documented the real-spectrum `nmrassign pipeline` flags (`--triple EXP=path` and `--out-dir <dir>`).
-- **Verified Metrics:**
+- **Verified Metrics & CI Gate (`.github/workflows/ci.yml`):**
+  - **Full CI Check Suite:** `cargo fmt --all -- --check` (`0` diffs), `cargo clippy --workspace --all-targets -- -D warnings` (`0` warnings), `cargo check --release -p nmr-gui --target wasm32-unknown-unknown` (`0` errors), and `cargo test --release --workspace` (`17/17` test binaries passed, verified both with local real spectra and under clean CI environment without git-ignored local data).
   - **Synthetic Ubiquitin Gate (`synthetic_ubiquitin.str`, 7-Experiment):**
-    - `--solver standard --engine gpu`: **`100.0% (68/68)` accuracy**, **`100.0%` recall**, **`100.0% (52/52)` HC precision** (`0.91 s`).
+    - `--solver standard --engine cpu`: **`100.0% (68/68)` accuracy**, **`100.0%` recall**, **`100.0% (50/50)` HC precision** (`0.06 s`, CI gate: `>=95.0%` acc / `>=97.0%` HC prec).
+    - `--solver standard --engine gpu`: **`100.0% (68/68)` accuracy**, **`100.0%` recall**, **`100.0% (52/52)` HC precision** (`0.90 s`).
     - `--solver evo-graph`: **`98.5% (66/67)` accuracy**, **`97.1%` recall**, **`98.5% (66/67)` HC precision** (`0.15 s`).
   - **Cold Out-of-Sample Real Bruker Dataset — Human Mitochondrial `CISD3` (`BMRB 51439` / `BMRbig 82`, `700.13 MHz`, 93 aa, `HSQC` + `HNCA` + `HNCOCA` + `CBCACONH` + `HNCO`, no `HNCACB`, `51` BMRB amides / `38` picked roots, zero parameter tuning):**
     - `--solver standard --engine gpu`: **`38.9% (14/36)` accuracy** on `seed 0` (**`43.9%` 5-seed mean**, range `36.1%–50.0%`), **`27.5%` recall** vs all `51` BMRB amides (**`31.0%` 5-seed mean**, `41.6%` of `38` picked roots), **`100.0% (2/2..3/3)` HC precision**, **`5.1%` mean HC recall** (`0.73 s` pipeline).
