@@ -5,7 +5,8 @@
 //! representation of NMR restraint data", *Nature Structural & Molecular Biology*
 //! 22, 433–434 (2015), covering `nef_nmr_meta_data`, `nef_molecular_system`,
 //! `nef_chemical_shift_list`, `nef_nmr_spectrum`, `nef_distance_restraint_list`,
-//! and `nef_dihedral_restraint_list`.
+//! `nef_dihedral_restraint_list`, and vendor-prefixed `save_nmrassign_workbench`
+//! (`nmrassign_workbench_session`) saveframes per NEF v1.1 extensibility rules.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::nmrstar::Reference;
 use crate::peaks::Peak;
+pub use crate::session::{
+    read_session_nef_file, read_session_nef_str, write_session_nef_file, write_session_nef_str,
+};
 
 /// Alias to `nmr-core`'s `Reference` shift/sequence container for interoperability.
 pub type StarData = Reference;
@@ -582,6 +586,97 @@ impl Default for NefDihedralRestraintList {
     }
 }
 
+/// Lossless sequence residue row in `_nmrassign_residue` within `save_nmrassign_workbench`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NefWorkbenchResidueRow {
+    pub seq_id: i32,
+    pub residue_name: String,
+}
+
+/// Lossless peak row in `_nmrassign_peak` within `save_nmrassign_workbench`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefWorkbenchPeakRow {
+    pub experiment: String,
+    pub h: f64,
+    pub n: f64,
+    pub c: Option<f64>,
+    pub sign: i32,
+    pub height: Option<f64>,
+    pub volume: Option<f64>,
+    pub h2: Option<f64>,
+}
+
+/// Lossless residue assignment row in `_nmrassign_assignment` within `save_nmrassign_workbench`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefWorkbenchAssignmentRow {
+    pub residue_seq_idx: usize,
+    pub spin_system_id: Option<usize>,
+    pub confidence: f64,
+}
+
+/// Lossless assigned atom shift row in `_nmrassign_assignment_shift` within `save_nmrassign_workbench`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefWorkbenchShiftRow {
+    pub residue_seq_idx: usize,
+    pub atom_name: String,
+    pub value: f64,
+}
+
+/// Lossless user lock row in `_nmrassign_lock` within `save_nmrassign_workbench`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NefWorkbenchLockRow {
+    pub spin_system_id: usize,
+    pub residue_seq_idx: usize,
+}
+
+/// Lossless confirmed sequential link row in `_nmrassign_confirmed_link` within `save_nmrassign_workbench`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NefWorkbenchLinkRow {
+    pub pred_spin_system: usize,
+    pub succ_spin_system: usize,
+}
+
+/// Lossless 2D/slice contour layer row in `_nmrassign_contour_layer` within `save_nmrassign_workbench`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefWorkbenchContourLayerRow {
+    pub layer_id: String,
+    pub visible: bool,
+    pub base_level: f32,
+    pub level_factor: f32,
+    pub num_levels: u32,
+    pub show_negative: bool,
+    pub pos_rgba: [f32; 4],
+    pub neg_rgba: [f32; 4],
+    pub ppm_nudge: [f32; 2],
+}
+
+/// Lossless FID processing recipe row in `_nmrassign_processing_recipe` within `save_nmrassign_workbench`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NefWorkbenchRecipeRow {
+    pub spectrum_id: String,
+    pub recipe_json: String,
+}
+
+/// Vendor-prefixed `save_nmrassign_workbench` saveframe per NEF v1.1 extensibility rules
+/// (Gutmanas et al., *Nat. Struct. Mol. Biol.* 2015).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefWorkbenchSaveframe {
+    pub schema_version: String,
+    pub protein_name: String,
+    pub chain_code: String,
+    pub reference_offsets: [f64; 5],
+    pub qc_verdict: Option<String>,
+    pub view_bounds_ppm: Option<[f64; 4]>,
+    pub residues: Vec<NefWorkbenchResidueRow>,
+    pub peaks: Vec<NefWorkbenchPeakRow>,
+    pub assignments: Vec<NefWorkbenchAssignmentRow>,
+    pub assignment_shifts: Vec<NefWorkbenchShiftRow>,
+    pub locks: Vec<NefWorkbenchLockRow>,
+    pub confirmed_links: Vec<NefWorkbenchLinkRow>,
+    pub contour_layers: Vec<NefWorkbenchContourLayerRow>,
+    pub processing_recipes: Vec<NefWorkbenchRecipeRow>,
+}
+
 /// Complete in-memory NEF v1.1 data block (`data_nef_<project_name>`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NefDocument {
@@ -592,6 +687,9 @@ pub struct NefDocument {
     pub peak_lists: Vec<NefPeakList>,
     pub distance_restraint_lists: Vec<NefDistanceRestraintList>,
     pub dihedral_restraint_lists: Vec<NefDihedralRestraintList>,
+    /// Optional vendor-prefixed `save_nmrassign_workbench` session saveframe (`NEF v1.1` extensibility).
+    #[serde(default)]
+    pub workbench_session: Option<NefWorkbenchSaveframe>,
 }
 
 impl NefDocument {
@@ -604,6 +702,7 @@ impl NefDocument {
             peak_lists: Vec::new(),
             distance_restraint_lists: Vec::new(),
             dihedral_restraint_lists: Vec::new(),
+            workbench_session: None,
         }
     }
 
@@ -1628,10 +1727,347 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                 potential_type: pot,
                 restraints,
             });
+        } else if cat == "nmrassign_workbench_session"
+            || sf.name.eq_ignore_ascii_case("nmrassign_workbench")
+            || sf
+                .name
+                .to_ascii_lowercase()
+                .starts_with("nmrassign_workbench")
+        {
+            doc.workbench_session = Some(parse_workbench_saveframe(&sf)?);
         }
     }
 
     Ok(doc)
+}
+
+fn parse_exact_f64_tag(
+    tags: &BTreeMap<String, String>,
+    key: &str,
+    default: f64,
+) -> Result<f64, String> {
+    match tags.get(key) {
+        Some(v) if v != "." && v != "?" && !v.is_empty() => v
+            .parse::<f64>()
+            .map_err(|e| format!("invalid float for tag '{key}' ('{v}'): {e}")),
+        _ => Ok(default),
+    }
+}
+
+fn parse_opt_exact_f64_cell(raw: &str, label: &str) -> Result<Option<f64>, String> {
+    if raw.is_empty() || raw == "." || raw == "?" {
+        Ok(None)
+    } else {
+        raw.parse::<f64>()
+            .map(Some)
+            .map_err(|e| format!("invalid float for {label} ('{raw}'): {e}"))
+    }
+}
+
+fn parse_workbench_saveframe(sf: &Saveframe) -> Result<NefWorkbenchSaveframe, String> {
+    let schema_version = sf
+        .tags
+        .get("_nmrassign_workbench.schema_version")
+        .cloned()
+        .unwrap_or_else(|| "1.1".to_string());
+    let protein_name = match sf.tags.get("_nmrassign_workbench.protein_name") {
+        Some(v) => decode_lossless_star_token(v)?,
+        None => String::new(),
+    };
+    let chain_code = match sf.tags.get("_nmrassign_workbench.chain_code") {
+        Some(v) => decode_lossless_star_token(v)?,
+        None => "A".to_string(),
+    };
+    let reference_offsets = [
+        parse_exact_f64_tag(&sf.tags, "_nmrassign_workbench.ref_offset_h", 0.0)?,
+        parse_exact_f64_tag(&sf.tags, "_nmrassign_workbench.ref_offset_n", 0.0)?,
+        parse_exact_f64_tag(&sf.tags, "_nmrassign_workbench.ref_offset_ca", 0.0)?,
+        parse_exact_f64_tag(&sf.tags, "_nmrassign_workbench.ref_offset_cb", 0.0)?,
+        parse_exact_f64_tag(&sf.tags, "_nmrassign_workbench.ref_offset_c", 0.0)?,
+    ];
+    let qc_verdict = match sf.tags.get("_nmrassign_workbench.qc_verdict") {
+        Some(v) if v != "." && v != "?" && !v.is_empty() => Some(decode_lossless_star_token(v)?),
+        _ => None,
+    };
+    let view_bounds_ppm = match (
+        sf.tags
+            .get("_nmrassign_workbench.view_h_left")
+            .and_then(|s| opt_str(s)),
+        sf.tags
+            .get("_nmrassign_workbench.view_h_right")
+            .and_then(|s| opt_str(s)),
+        sf.tags
+            .get("_nmrassign_workbench.view_n_top")
+            .and_then(|s| opt_str(s)),
+        sf.tags
+            .get("_nmrassign_workbench.view_n_bottom")
+            .and_then(|s| opt_str(s)),
+    ) {
+        (Some(hl), Some(hr), Some(nt), Some(nb)) => Some([
+            hl.parse::<f64>()
+                .map_err(|e| format!("invalid view_h_left: {e}"))?,
+            hr.parse::<f64>()
+                .map_err(|e| format!("invalid view_h_right: {e}"))?,
+            nt.parse::<f64>()
+                .map_err(|e| format!("invalid view_n_top: {e}"))?,
+            nb.parse::<f64>()
+                .map_err(|e| format!("invalid view_n_bottom: {e}"))?,
+        ]),
+        _ => None,
+    };
+
+    let mut residues = Vec::new();
+    let mut peaks = Vec::new();
+    let mut assignments = Vec::new();
+    let mut assignment_shifts = Vec::new();
+    let mut locks = Vec::new();
+    let mut confirmed_links = Vec::new();
+    let mut contour_layers = Vec::new();
+    let mut processing_recipes = Vec::new();
+
+    for (ltags, rows) in &sf.loops {
+        if ltags.iter().any(|t| t.starts_with("_nmrassign_residue.")) {
+            let c_seq = col_idx(ltags, "seq_id")
+                .ok_or_else(|| "missing _nmrassign_residue.seq_id".to_string())?;
+            let c_res = col_idx(ltags, "residue_name")
+                .ok_or_else(|| "missing _nmrassign_residue.residue_name".to_string())?;
+            for r in rows {
+                let seq_id = r[c_seq]
+                    .parse::<i32>()
+                    .map_err(|e| format!("invalid _nmrassign_residue.seq_id: {e}"))?;
+                let residue_name = decode_lossless_star_token(&r[c_res])?;
+                residues.push(NefWorkbenchResidueRow {
+                    seq_id,
+                    residue_name,
+                });
+            }
+        } else if ltags.iter().any(|t| t.starts_with("_nmrassign_peak.")) {
+            let c_exp = col_idx(ltags, "experiment")
+                .ok_or_else(|| "missing _nmrassign_peak.experiment".to_string())?;
+            let c_h = col_idx(ltags, "h").ok_or_else(|| "missing _nmrassign_peak.h".to_string())?;
+            let c_n = col_idx(ltags, "n").ok_or_else(|| "missing _nmrassign_peak.n".to_string())?;
+            let c_c = col_idx(ltags, "c");
+            let c_sgn = col_idx(ltags, "sign");
+            let c_ht = col_idx(ltags, "height");
+            let c_vol = col_idx(ltags, "volume");
+            let c_h2 = col_idx(ltags, "h2");
+            for r in rows {
+                let experiment = decode_lossless_star_token(&r[c_exp])?;
+                let h = r[c_h]
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid _nmrassign_peak.h: {e}"))?;
+                let n = r[c_n]
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid _nmrassign_peak.n: {e}"))?;
+                let c = match c_c {
+                    Some(col) => parse_opt_exact_f64_cell(&r[col], "_nmrassign_peak.c")?,
+                    None => None,
+                };
+                let sign = match c_sgn {
+                    Some(col) => r[col]
+                        .parse::<i32>()
+                        .map_err(|e| format!("invalid _nmrassign_peak.sign: {e}"))?,
+                    None => 1,
+                };
+                let height = match c_ht {
+                    Some(col) => parse_opt_exact_f64_cell(&r[col], "_nmrassign_peak.height")?,
+                    None => None,
+                };
+                let volume = match c_vol {
+                    Some(col) => parse_opt_exact_f64_cell(&r[col], "_nmrassign_peak.volume")?,
+                    None => None,
+                };
+                let h2 = match c_h2 {
+                    Some(col) => parse_opt_exact_f64_cell(&r[col], "_nmrassign_peak.h2")?,
+                    None => None,
+                };
+                peaks.push(NefWorkbenchPeakRow {
+                    experiment,
+                    h,
+                    n,
+                    c,
+                    sign,
+                    height,
+                    volume,
+                    h2,
+                });
+            }
+        } else if ltags
+            .iter()
+            .any(|t| t.starts_with("_nmrassign_assignment."))
+        {
+            let c_res = col_idx(ltags, "residue_seq_idx")
+                .ok_or_else(|| "missing _nmrassign_assignment.residue_seq_idx".to_string())?;
+            let c_ss = col_idx(ltags, "spin_system_id");
+            let c_conf = col_idx(ltags, "confidence")
+                .ok_or_else(|| "missing _nmrassign_assignment.confidence".to_string())?;
+            for r in rows {
+                let residue_seq_idx = r[c_res]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid _nmrassign_assignment.residue_seq_idx: {e}"))?;
+                let spin_system_id = c_ss.and_then(|c| opt_usize(&r[c]));
+                let confidence = r[c_conf]
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid _nmrassign_assignment.confidence: {e}"))?;
+                assignments.push(NefWorkbenchAssignmentRow {
+                    residue_seq_idx,
+                    spin_system_id,
+                    confidence,
+                });
+            }
+        } else if ltags
+            .iter()
+            .any(|t| t.starts_with("_nmrassign_assignment_shift."))
+        {
+            let c_res = col_idx(ltags, "residue_seq_idx")
+                .ok_or_else(|| "missing _nmrassign_assignment_shift.residue_seq_idx".to_string())?;
+            let c_atom = col_idx(ltags, "atom_name")
+                .ok_or_else(|| "missing _nmrassign_assignment_shift.atom_name".to_string())?;
+            let c_val = col_idx(ltags, "value")
+                .ok_or_else(|| "missing _nmrassign_assignment_shift.value".to_string())?;
+            for r in rows {
+                let residue_seq_idx = r[c_res].parse::<usize>().map_err(|e| {
+                    format!("invalid _nmrassign_assignment_shift.residue_seq_idx: {e}")
+                })?;
+                let atom_name = decode_lossless_star_token(&r[c_atom])?;
+                let value = r[c_val]
+                    .parse::<f64>()
+                    .map_err(|e| format!("invalid _nmrassign_assignment_shift.value: {e}"))?;
+                assignment_shifts.push(NefWorkbenchShiftRow {
+                    residue_seq_idx,
+                    atom_name,
+                    value,
+                });
+            }
+        } else if ltags.iter().any(|t| t.starts_with("_nmrassign_lock.")) {
+            let c_ss = col_idx(ltags, "spin_system_id")
+                .ok_or_else(|| "missing _nmrassign_lock.spin_system_id".to_string())?;
+            let c_res = col_idx(ltags, "residue_seq_idx")
+                .ok_or_else(|| "missing _nmrassign_lock.residue_seq_idx".to_string())?;
+            for r in rows {
+                let spin_system_id = r[c_ss]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid _nmrassign_lock.spin_system_id: {e}"))?;
+                let residue_seq_idx = r[c_res]
+                    .parse::<usize>()
+                    .map_err(|e| format!("invalid _nmrassign_lock.residue_seq_idx: {e}"))?;
+                locks.push(NefWorkbenchLockRow {
+                    spin_system_id,
+                    residue_seq_idx,
+                });
+            }
+        } else if ltags
+            .iter()
+            .any(|t| t.starts_with("_nmrassign_confirmed_link."))
+        {
+            let c_pred = col_idx(ltags, "pred_spin_system")
+                .ok_or_else(|| "missing _nmrassign_confirmed_link.pred_spin_system".to_string())?;
+            let c_succ = col_idx(ltags, "succ_spin_system")
+                .ok_or_else(|| "missing _nmrassign_confirmed_link.succ_spin_system".to_string())?;
+            for r in rows {
+                let pred_spin_system = r[c_pred].parse::<usize>().map_err(|e| {
+                    format!("invalid _nmrassign_confirmed_link.pred_spin_system: {e}")
+                })?;
+                let succ_spin_system = r[c_succ].parse::<usize>().map_err(|e| {
+                    format!("invalid _nmrassign_confirmed_link.succ_spin_system: {e}")
+                })?;
+                confirmed_links.push(NefWorkbenchLinkRow {
+                    pred_spin_system,
+                    succ_spin_system,
+                });
+            }
+        } else if ltags
+            .iter()
+            .any(|t| t.starts_with("_nmrassign_contour_layer."))
+        {
+            let req = |name: &str| -> Result<usize, String> {
+                col_idx(ltags, name)
+                    .ok_or_else(|| format!("missing _nmrassign_contour_layer.{name}"))
+            };
+            let c_lid = req("layer_id")?;
+            let c_vis = req("visible")?;
+            let c_base = req("base_level")?;
+            let c_fac = req("level_factor")?;
+            let c_num = req("num_levels")?;
+            let c_neg = req("show_negative")?;
+            let c_pr = req("pos_r")?;
+            let c_pg = req("pos_g")?;
+            let c_pb = req("pos_b")?;
+            let c_pa = req("pos_a")?;
+            let c_nr = req("neg_r")?;
+            let c_ng = req("neg_g")?;
+            let c_nb = req("neg_b")?;
+            let c_na = req("neg_a")?;
+            let c_nx = req("ppm_nudge_x")?;
+            let c_ny = req("ppm_nudge_y")?;
+
+            let pf32 = |s: &str, name: &str| -> Result<f32, String> {
+                s.parse::<f32>()
+                    .map_err(|e| format!("invalid _nmrassign_contour_layer.{name} ('{s}'): {e}"))
+            };
+            for r in rows {
+                contour_layers.push(NefWorkbenchContourLayerRow {
+                    layer_id: decode_lossless_star_token(&r[c_lid])?,
+                    visible: opt_bool(&r[c_vis]).unwrap_or(true),
+                    base_level: pf32(&r[c_base], "base_level")?,
+                    level_factor: pf32(&r[c_fac], "level_factor")?,
+                    num_levels: r[c_num]
+                        .parse::<u32>()
+                        .map_err(|e| format!("invalid num_levels: {e}"))?,
+                    show_negative: opt_bool(&r[c_neg]).unwrap_or(true),
+                    pos_rgba: [
+                        pf32(&r[c_pr], "pos_r")?,
+                        pf32(&r[c_pg], "pos_g")?,
+                        pf32(&r[c_pb], "pos_b")?,
+                        pf32(&r[c_pa], "pos_a")?,
+                    ],
+                    neg_rgba: [
+                        pf32(&r[c_nr], "neg_r")?,
+                        pf32(&r[c_ng], "neg_g")?,
+                        pf32(&r[c_nb], "neg_b")?,
+                        pf32(&r[c_na], "neg_a")?,
+                    ],
+                    ppm_nudge: [
+                        pf32(&r[c_nx], "ppm_nudge_x")?,
+                        pf32(&r[c_ny], "ppm_nudge_y")?,
+                    ],
+                });
+            }
+        } else if ltags
+            .iter()
+            .any(|t| t.starts_with("_nmrassign_processing_recipe."))
+        {
+            let c_sid = col_idx(ltags, "spectrum_id")
+                .ok_or_else(|| "missing _nmrassign_processing_recipe.spectrum_id".to_string())?;
+            let c_json = col_idx(ltags, "recipe_json")
+                .ok_or_else(|| "missing _nmrassign_processing_recipe.recipe_json".to_string())?;
+            for r in rows {
+                let spectrum_id = decode_lossless_star_token(&r[c_sid])?;
+                let recipe_json = decode_lossless_star_token(&r[c_json])?;
+                processing_recipes.push(NefWorkbenchRecipeRow {
+                    spectrum_id,
+                    recipe_json,
+                });
+            }
+        }
+    }
+
+    Ok(NefWorkbenchSaveframe {
+        schema_version,
+        protein_name,
+        chain_code,
+        reference_offsets,
+        qc_verdict,
+        view_bounds_ppm,
+        residues,
+        peaks,
+        assignments,
+        assignment_shifts,
+        locks,
+        confirmed_links,
+        contour_layers,
+        processing_recipes,
+    })
 }
 
 // ============================================================================
@@ -2130,5 +2566,375 @@ pub fn write_nef_str(doc: &NefDocument) -> String {
         out.push_str("save_\n\n");
     }
 
+    // 7. Optional vendor-prefixed `save_nmrassign_workbench` (`NEF v1.1` extensibility)
+    if let Some(ref wb) = doc.workbench_session {
+        write_workbench_saveframe(&mut out, wb);
+    }
+
     out
+}
+
+pub(crate) fn fmt_exact_f64(v: f64) -> String {
+    if v == 0.0 {
+        if v.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        }
+    } else {
+        format!("{v}")
+    }
+}
+
+pub(crate) fn fmt_exact_f32(v: f32) -> String {
+    if v == 0.0 {
+        if v.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        }
+    } else {
+        format!("{v}")
+    }
+}
+
+pub(crate) fn fmt_opt_exact_f64(v: Option<f64>) -> String {
+    match v {
+        Some(x) => fmt_exact_f64(x),
+        None => ".".to_string(),
+    }
+}
+
+pub(crate) fn encode_lossless_star_token(s: &str) -> String {
+    let low = s.to_ascii_lowercase();
+    let is_star_keyword = low == "stop_"
+        || low == "save_"
+        || low == "loop_"
+        || low.starts_with("save_")
+        || low.starts_with("data_");
+    let needs_hex = s.is_empty()
+        || s == "."
+        || s == "?"
+        || is_star_keyword
+        || s.starts_with("~hex:")
+        || s.chars()
+            .any(|c| c == '\'' || c == '"' || c == '\n' || c == '\r' || c.is_control());
+    if needs_hex {
+        let mut out = String::with_capacity(5 + s.len() * 2);
+        out.push_str("~hex:");
+        for b in s.as_bytes() {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    } else {
+        fmt_val(s)
+    }
+}
+
+pub(crate) fn decode_lossless_star_token(raw: &str) -> Result<String, String> {
+    if let Some(hex) = raw.strip_prefix("~hex:") {
+        if hex.len() % 2 != 0 {
+            return Err(format!("invalid ~hex token length in '{raw}'"));
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for chunk in hex.as_bytes().chunks_exact(2) {
+            let pair = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+            let b = u8::from_str_radix(pair, 16)
+                .map_err(|e| format!("invalid hex byte '{pair}' in ~hex token: {e}"))?;
+            bytes.push(b);
+        }
+        String::from_utf8(bytes).map_err(|e| format!("invalid UTF-8 in ~hex token: {e}"))
+    } else {
+        Ok(raw.to_string())
+    }
+}
+
+pub(crate) fn encode_json_star_token(json: &str) -> String {
+    let safe = json.replace('\'', "\\u0027");
+    if safe.is_empty()
+        || safe.contains('\n')
+        || safe.contains('\r')
+        || safe.chars().any(char::is_control)
+    {
+        encode_lossless_star_token(json)
+    } else {
+        format!("'{safe}'")
+    }
+}
+
+fn write_workbench_saveframe(out: &mut String, wb: &NefWorkbenchSaveframe) {
+    out.push_str("save_nmrassign_workbench\n");
+    out.push_str("   _nmrassign_workbench.sf_category     nmrassign_workbench_session\n");
+    out.push_str("   _nmrassign_workbench.sf_framecode    nmrassign_workbench\n");
+    out.push_str(&format!(
+        "   _nmrassign_workbench.schema_version  {}\n",
+        encode_lossless_star_token(&wb.schema_version)
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.protein_name    {}\n",
+        encode_lossless_star_token(&wb.protein_name)
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.chain_code      {}\n",
+        encode_lossless_star_token(&wb.chain_code)
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.ref_offset_h    {}\n",
+        fmt_exact_f64(wb.reference_offsets[0])
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.ref_offset_n    {}\n",
+        fmt_exact_f64(wb.reference_offsets[1])
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.ref_offset_ca   {}\n",
+        fmt_exact_f64(wb.reference_offsets[2])
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.ref_offset_cb   {}\n",
+        fmt_exact_f64(wb.reference_offsets[3])
+    ));
+    out.push_str(&format!(
+        "   _nmrassign_workbench.ref_offset_c    {}\n",
+        fmt_exact_f64(wb.reference_offsets[4])
+    ));
+    let qc_tok = match wb.qc_verdict.as_deref() {
+        Some(v) => encode_lossless_star_token(v),
+        None => ".".to_string(),
+    };
+    out.push_str(&format!(
+        "   _nmrassign_workbench.qc_verdict      {qc_tok}\n"
+    ));
+    if let Some([hl, hr, nt, nb]) = wb.view_bounds_ppm {
+        out.push_str(&format!(
+            "   _nmrassign_workbench.view_h_left     {}\n",
+            fmt_exact_f64(hl)
+        ));
+        out.push_str(&format!(
+            "   _nmrassign_workbench.view_h_right    {}\n",
+            fmt_exact_f64(hr)
+        ));
+        out.push_str(&format!(
+            "   _nmrassign_workbench.view_n_top      {}\n",
+            fmt_exact_f64(nt)
+        ));
+        out.push_str(&format!(
+            "   _nmrassign_workbench.view_n_bottom   {}\n",
+            fmt_exact_f64(nb)
+        ));
+    }
+
+    if !wb.residues.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_residue.index",
+            "_nmrassign_residue.seq_id",
+            "_nmrassign_residue.residue_name",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, r) in wb.residues.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {}\n",
+                i + 1,
+                r.seq_id,
+                encode_lossless_star_token(&r.residue_name)
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.peaks.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_peak.index",
+            "_nmrassign_peak.experiment",
+            "_nmrassign_peak.h",
+            "_nmrassign_peak.n",
+            "_nmrassign_peak.c",
+            "_nmrassign_peak.sign",
+            "_nmrassign_peak.height",
+            "_nmrassign_peak.volume",
+            "_nmrassign_peak.h2",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, p) in wb.peaks.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {} {} {} {} {} {} {}\n",
+                i + 1,
+                encode_lossless_star_token(&p.experiment),
+                fmt_exact_f64(p.h),
+                fmt_exact_f64(p.n),
+                fmt_opt_exact_f64(p.c),
+                p.sign,
+                fmt_opt_exact_f64(p.height),
+                fmt_opt_exact_f64(p.volume),
+                fmt_opt_exact_f64(p.h2),
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.assignments.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_assignment.index",
+            "_nmrassign_assignment.residue_seq_idx",
+            "_nmrassign_assignment.spin_system_id",
+            "_nmrassign_assignment.confidence",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, a) in wb.assignments.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {} {}\n",
+                i + 1,
+                a.residue_seq_idx,
+                fmt_opt_usize(a.spin_system_id),
+                fmt_exact_f64(a.confidence),
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.assignment_shifts.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_assignment_shift.index",
+            "_nmrassign_assignment_shift.residue_seq_idx",
+            "_nmrassign_assignment_shift.atom_name",
+            "_nmrassign_assignment_shift.value",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, s) in wb.assignment_shifts.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {} {}\n",
+                i + 1,
+                s.residue_seq_idx,
+                encode_lossless_star_token(&s.atom_name),
+                fmt_exact_f64(s.value),
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.locks.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_lock.index",
+            "_nmrassign_lock.spin_system_id",
+            "_nmrassign_lock.residue_seq_idx",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, lk) in wb.locks.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {}\n",
+                i + 1,
+                lk.spin_system_id,
+                lk.residue_seq_idx,
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.confirmed_links.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_confirmed_link.index",
+            "_nmrassign_confirmed_link.pred_spin_system",
+            "_nmrassign_confirmed_link.succ_spin_system",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, lnk) in wb.confirmed_links.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {}\n",
+                i + 1,
+                lnk.pred_spin_system,
+                lnk.succ_spin_system,
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.contour_layers.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_contour_layer.index",
+            "_nmrassign_contour_layer.layer_id",
+            "_nmrassign_contour_layer.visible",
+            "_nmrassign_contour_layer.base_level",
+            "_nmrassign_contour_layer.level_factor",
+            "_nmrassign_contour_layer.num_levels",
+            "_nmrassign_contour_layer.show_negative",
+            "_nmrassign_contour_layer.pos_r",
+            "_nmrassign_contour_layer.pos_g",
+            "_nmrassign_contour_layer.pos_b",
+            "_nmrassign_contour_layer.pos_a",
+            "_nmrassign_contour_layer.neg_r",
+            "_nmrassign_contour_layer.neg_g",
+            "_nmrassign_contour_layer.neg_b",
+            "_nmrassign_contour_layer.neg_a",
+            "_nmrassign_contour_layer.ppm_nudge_x",
+            "_nmrassign_contour_layer.ppm_nudge_y",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, cl) in wb.contour_layers.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+                i + 1,
+                encode_lossless_star_token(&cl.layer_id),
+                fmt_opt_bool(Some(cl.visible)),
+                fmt_exact_f32(cl.base_level),
+                fmt_exact_f32(cl.level_factor),
+                cl.num_levels,
+                fmt_opt_bool(Some(cl.show_negative)),
+                fmt_exact_f32(cl.pos_rgba[0]),
+                fmt_exact_f32(cl.pos_rgba[1]),
+                fmt_exact_f32(cl.pos_rgba[2]),
+                fmt_exact_f32(cl.pos_rgba[3]),
+                fmt_exact_f32(cl.neg_rgba[0]),
+                fmt_exact_f32(cl.neg_rgba[1]),
+                fmt_exact_f32(cl.neg_rgba[2]),
+                fmt_exact_f32(cl.neg_rgba[3]),
+                fmt_exact_f32(cl.ppm_nudge[0]),
+                fmt_exact_f32(cl.ppm_nudge[1]),
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    if !wb.processing_recipes.is_empty() {
+        out.push_str("\n   loop_\n");
+        for tag in [
+            "_nmrassign_processing_recipe.index",
+            "_nmrassign_processing_recipe.spectrum_id",
+            "_nmrassign_processing_recipe.recipe_json",
+        ] {
+            out.push_str(&format!("      {tag}\n"));
+        }
+        out.push('\n');
+        for (i, pr) in wb.processing_recipes.iter().enumerate() {
+            out.push_str(&format!(
+                "      {} {} {}\n",
+                i + 1,
+                encode_lossless_star_token(&pr.spectrum_id),
+                encode_json_star_token(&pr.recipe_json),
+            ));
+        }
+        out.push_str("   stop_\n");
+    }
+
+    out.push_str("save_\n\n");
 }

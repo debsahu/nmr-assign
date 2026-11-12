@@ -32,6 +32,7 @@ pub mod qc;
 pub mod report;
 pub mod rng;
 pub mod service;
+pub mod session;
 pub mod sidechain;
 pub mod simulate;
 pub mod solver;
