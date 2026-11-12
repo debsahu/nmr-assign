@@ -34,12 +34,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fid::{
-    read_fid_2d, read_fid_3d, Complex64, Fid1D, Fid2D, Fid3D, FidAxisMeta, FidVendor,
+    read_fid_2d, read_fid_3d, Complex64, Fid1D, Fid2D, Fid3D, FidAxisMeta, FidVendor, QuadMode,
     StoredWindowHint,
 };
 use crate::ops::{
     auto_phase_1d, auto_phase_direct_nd, auto_phase_indirect_nd, hilbert_transform_in_place,
-    lock_biphasic_ca_polarity_3d, AutoPhaseConfig, PolarityMode,
+    lock_all_positive_polarity_3d, lock_biphasic_ca_polarity_3d, AutoPhaseConfig, PolarityMode,
 };
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
@@ -1479,8 +1479,24 @@ fn transform_trace_steps_1_to_5(
 // Clean-Room 1D & 2D Hypercomplex NUS Reconstruction (FISTA / IST)
 // ============================================================================
 
+/// Enforce the `States`-recombined hypercomplex invariant prior to 1D/2D `IST` / `FISTA`
+/// non-uniform sampling reconstruction: Echo-Antiecho `(S+, S-)` pairs must already be recombined
+/// into separate `(cos, sin)` channels and `States-TPPI` `(-1)^k` sign alternation must already be
+/// removed so every point peak corresponds to a single sparse complex / bicomplex exponential.
+pub fn validate_nus_states_axis(axis: &FidAxisMeta, dim_desc: &str) -> Result<(), String> {
+    if !axis.states_recombined || axis.quad_mode == QuadMode::Qf {
+        return Err(format!(
+            "NUS IST/FISTA on {dim_desc} ('{}', quad_mode={:?}) requires uniform States-recombined hypercomplex input prior to reconstruction",
+            axis.label, axis.quad_mode
+        ));
+    }
+    Ok(())
+}
+
 /// Reconstruct missing samples of a 1D indirect complex trace `obs[0..n1]` sampled on `mask[0..n1]`
-/// using FISTA / IST ($L_1$ soft-thresholding in the unitary frequency domain with exact data consistency).
+/// using proximal-gradient `FISTA` / `IST` ($L_1$ soft-thresholding in the unitary frequency domain
+/// with dynamic **residual-spectrum** $\sigma_{\text{MAD}}$ noise estimation and exact data consistency;
+/// Stern et al. 2007; Beck & Teboulle 2009; Hyberts et al. 2012).
 pub fn reconstruct_nus_1d_ist(
     obs: &[Complex64],
     mask: &[bool],
@@ -1502,118 +1518,152 @@ pub fn reconstruct_nus_1d_ist(
         }
     }
 
-    // Compute initial dirty spectrum to calibrate geometric threshold schedule
-    let mut spec = vec![[0.0, 0.0]; n_fft];
-    spec[..n1].copy_from_slice(&y_obs);
-    fft_in_place(&mut spec, false);
-    let mut mags = Vec::with_capacity(n_fft);
-    let mut max_mag = 0.0_f64;
-    for c in &mut spec {
-        c[0] *= scale_fwd;
-        c[1] *= scale_fwd;
-        let m = (c[0] * c[0] + c[1] * c[1]).sqrt();
-        if m > max_mag {
-            max_mag = m;
-        }
-        mags.push(m);
-    }
-    if max_mag <= 1e-30 {
-        return y_obs;
-    }
-
-    let med_mag = median_in_place(&mut mags);
-    for v in &mut mags {
-        *v = (*v - med_mag).abs();
-    }
-    let mad_noise = 1.4826 * median_in_place(&mut mags);
-
     let iters = cfg.iterations.max(1);
-    let lam_start = (cfg.initial_thresh_frac.clamp(0.1, 0.99)) * max_mag;
-    let lam_end = (cfg.final_noise_sigma.max(0.5) * mad_noise)
-        .max(0.002 * max_mag)
-        .min(lam_start);
-    let ratio = if iters > 1 && lam_start > 1e-30 {
-        (lam_end / lam_start).powf(1.0 / ((iters - 1) as f64))
+    let init_frac = cfg.initial_thresh_frac.clamp(0.1, 0.99);
+    // Geometric continuation schedule reaches 1e-4 * max_mag so >= 100:1 dynamic-range weak peaks
+    // enter cleanly once strong-peak PSF sidelobes are subtracted from the residual spectrum.
+    let sched_ratio = if iters > 1 {
+        (1e-4_f64 / init_frac).powf(1.0 / ((iters - 1) as f64))
     } else {
         1.0
     };
+    let noise_mult = cfg.final_noise_sigma.max(0.5);
 
-    let mut z_cur = vec![[0.0, 0.0]; n_fft];
-    z_cur[..n1].copy_from_slice(&y_obs);
-    let mut z_prev = z_cur.clone();
-    let mut w_ext = z_cur.clone();
+    let mut x_spec = vec![[0.0, 0.0]; n_fft];
+    let mut x_next = vec![[0.0, 0.0]; n_fft];
+    let mut w_spec = vec![[0.0, 0.0]; n_fft];
+    let mut td_work = vec![[0.0, 0.0]; n_fft];
+    let mut mags = vec![0.0_f64; n_fft];
     let mut active = vec![false; n_fft];
-    let mut lam = lam_start;
-    let beta_mom = if cfg.fista_momentum { 0.30 } else { 0.0 };
+
+    let mut max_mag = 0.0_f64;
+    let mut lam_start = 0.0_f64;
+    let mut t_fista = 1.0_f64;
+    let mut prev_res_e = f64::INFINITY;
 
     for it in 0..iters {
-        spec.copy_from_slice(&w_ext);
-        for k in 0..n1 {
-            if mask[k] {
-                spec[k] = y_obs[k];
+        // Compute masked time-domain residual r_td = P_Omega(y_obs - F^{-1}(w_spec))
+        let mut res_e = 0.0_f64;
+        if it == 0 {
+            td_work.fill([0.0, 0.0]);
+            for k in 0..n1 {
+                if mask[k] {
+                    td_work[k] = y_obs[k];
+                    res_e += y_obs[k][0] * y_obs[k][0] + y_obs[k][1] * y_obs[k][1];
+                }
+            }
+        } else {
+            for m in 0..n_fft {
+                td_work[m] = [w_spec[m][0] * scale_inv, w_spec[m][1] * scale_inv];
+            }
+            fft_in_place(&mut td_work, true);
+            for k in 0..n_fft {
+                if k < n1 && mask[k] {
+                    let dr = y_obs[k][0] - td_work[k][0];
+                    let di = y_obs[k][1] - td_work[k][1];
+                    td_work[k] = [dr, di];
+                    res_e += dr * dr + di * di;
+                } else {
+                    td_work[k] = [0.0, 0.0];
+                }
             }
         }
-        fft_in_place(&mut spec, false);
+
+        // Unitary residual spectrum R = F(r_td) / sqrt(n_fft)
+        fft_in_place(&mut td_work, false);
+        for (m, c) in td_work.iter_mut().enumerate() {
+            c[0] *= scale_fwd;
+            c[1] *= scale_fwd;
+            let mag = (c[0] * c[0] + c[1] * c[1]).sqrt();
+            mags[m] = mag;
+            if it == 0 && mag > max_mag {
+                max_mag = mag;
+            }
+        }
+        if it == 0 {
+            if max_mag <= 1e-30 {
+                return y_obs;
+            }
+            lam_start = init_frac * max_mag;
+        }
+
+        // Estimate thermal / unmodeled noise floor from the CURRENT residual spectrum (not initial dirty FT!)
+        let med_res = median_in_place(&mut mags);
+        for v in &mut mags {
+            *v = (*v - med_res).abs();
+        }
+        let sigma_res = 1.4826 * median_in_place(&mut mags);
+        let lam_sched = lam_start * sched_ratio.powi(it as i32);
+        let lam = lam_sched
+            .max(noise_mult * sigma_res)
+            .max(1e-5 * max_mag)
+            .min(lam_start);
+
         let is_last = it + 1 == iters;
-        for (m, c) in spec.iter_mut().enumerate() {
-            let sr = c[0] * scale_fwd;
-            let si = c[1] * scale_fwd;
-            let mag = (sr * sr + si * si).sqrt();
+        for m in 0..n_fft {
+            let ur = w_spec[m][0] + td_work[m][0];
+            let ui = w_spec[m][1] + td_work[m][1];
+            let mag = (ur * ur + ui * ui).sqrt();
             if mag > lam {
-                let shrink = (1.0 - lam / mag) * scale_inv;
-                *c = [sr * shrink, si * shrink];
+                let s = 1.0 - lam / mag;
+                x_next[m] = [ur * s, ui * s];
                 if is_last {
                     active[m] = true;
                 }
             } else {
-                *c = [0.0, 0.0];
-            }
-        }
-        fft_in_place(&mut spec, true);
-
-        z_prev.copy_from_slice(&z_cur);
-        z_cur.copy_from_slice(&spec);
-        for k in 0..n1 {
-            if mask[k] {
-                z_cur[k] = y_obs[k];
+                x_next[m] = [0.0, 0.0];
             }
         }
 
-        if beta_mom > 0.0 {
-            for k in 0..n_fft {
-                if k < n1 && mask[k] {
-                    w_ext[k] = y_obs[k];
-                } else {
-                    w_ext[k] = [
-                        z_cur[k][0] + beta_mom * (z_cur[k][0] - z_prev[k][0]),
-                        z_cur[k][1] + beta_mom * (z_cur[k][1] - z_prev[k][1]),
-                    ];
-                }
+        if cfg.fista_momentum {
+            if res_e > prev_res_e * 1.05 {
+                t_fista = 1.0;
             }
+            let t_next = 0.5 * (1.0 + (1.0 + 4.0 * t_fista * t_fista).sqrt());
+            let beta = ((t_fista - 1.0) / t_next).min(0.75);
+            for m in 0..n_fft {
+                w_spec[m] = [
+                    x_next[m][0] + beta * (x_next[m][0] - x_spec[m][0]),
+                    x_next[m][1] + beta * (x_next[m][1] - x_spec[m][1]),
+                ];
+            }
+            t_fista = t_next;
+            prev_res_e = res_e;
         } else {
-            w_ext.copy_from_slice(&z_cur);
+            w_spec.copy_from_slice(&x_next);
         }
+        x_spec.copy_from_slice(&x_next);
+    }
 
-        lam *= ratio;
+    // Transform sparse unitary frequency solution back to time domain and enforce exact data consistency
+    let mut z_cur = vec![[0.0, 0.0]; n_fft];
+    for m in 0..n_fft {
+        z_cur[m] = [x_spec[m][0] * scale_inv, x_spec[m][1] * scale_inv];
+    }
+    fft_in_place(&mut z_cur, true);
+    for k in 0..n1 {
+        if mask[k] {
+            z_cur[k] = y_obs[k];
+        }
     }
 
     // Debiasing support projections: eliminate L1 soft-thresholding shrinkage bias on active peaks
     if active.iter().any(|&a| a) {
         for _ in 0..8 {
-            spec.copy_from_slice(&z_cur);
+            td_work.copy_from_slice(&z_cur);
             for k in 0..n1 {
                 if mask[k] {
-                    spec[k] = y_obs[k];
+                    td_work[k] = y_obs[k];
                 }
             }
-            fft_in_place(&mut spec, false);
-            for (m, c) in spec.iter_mut().enumerate() {
+            fft_in_place(&mut td_work, false);
+            for (m, c) in td_work.iter_mut().enumerate() {
                 if !active[m] {
                     *c = [0.0, 0.0];
                 }
             }
-            fft_in_place(&mut spec, true);
-            z_cur.copy_from_slice(&spec);
+            fft_in_place(&mut td_work, true);
+            z_cur.copy_from_slice(&td_work);
             for k in 0..n1 {
                 if mask[k] {
                     z_cur[k] = y_obs[k];
@@ -1628,7 +1678,8 @@ pub fn reconstruct_nus_1d_ist(
 
 /// Reconstruct missing hypercomplex samples `(cc, cs, sc, ss)` on a 2D indirect grid `(n2, n1)`
 /// (`mask[k2 * n1 + k1]`) via bicomplex `(u_+, u_-)` 2D unitary FFT + joint quaternion norm
-/// soft-thresholding (`FISTA / IST`, Stern et al. 2007; Hyberts et al. 2012).
+/// proximal-gradient soft-thresholding with dynamic **residual-spectrum** $\sigma_{\text{MAD}}$
+/// noise calibration (`FISTA / IST`, Stern et al. 2007; Hyberts et al. 2012).
 pub fn reconstruct_nus_2d_hypercomplex_ist(
     obs_quad: &[[f64; 4]],
     n2: usize,
@@ -1664,7 +1715,15 @@ pub fn reconstruct_nus_2d_hypercomplex_ist(
 
     let mut sp_plus = vec![[0.0, 0.0]; n_vox];
     let mut sp_minus = vec![[0.0, 0.0]; n_vox];
+    let mut xp_spec = vec![[0.0, 0.0]; n_vox];
+    let mut xm_spec = vec![[0.0, 0.0]; n_vox];
+    let mut xp_next = vec![[0.0, 0.0]; n_vox];
+    let mut xm_next = vec![[0.0, 0.0]; n_vox];
+    let mut wp_spec = vec![[0.0, 0.0]; n_vox];
+    let mut wm_spec = vec![[0.0, 0.0]; n_vox];
+    let mut norms = vec![0.0_f64; n_vox];
     let mut col_buf = vec![[0.0, 0.0]; f2];
+    let mut active_plus = vec![false; n_vox];
 
     let fft_2d = |grid: &mut [Complex64], col_tmp: &mut [Complex64], inverse: bool| {
         for r in 0..f2 {
@@ -1681,104 +1740,135 @@ pub fn reconstruct_nus_2d_hypercomplex_ist(
         }
     };
 
-    // Initial dirty spectrum for threshold calibration
-    for k2 in 0..n2 {
-        sp_plus[k2 * f1..k2 * f1 + n1].copy_from_slice(&y_plus[k2 * n1..(k2 + 1) * n1]);
-        sp_minus[k2 * f1..k2 * f1 + n1].copy_from_slice(&y_minus[k2 * n1..(k2 + 1) * n1]);
-    }
-    fft_2d(&mut sp_plus, &mut col_buf, false);
-    fft_2d(&mut sp_minus, &mut col_buf, false);
-
-    let mut norms = Vec::with_capacity(n_vox);
-    let mut max_norm = 0.0_f64;
-    for m2 in 0..f2 {
-        for m1 in 0..f1 {
-            let m1_conj = (f1 - m1) % f1;
-            let up = sp_plus[m2 * f1 + m1];
-            let um = sp_minus[m2 * f1 + m1_conj];
-            let e = 0.5
-                * (up[0] * up[0] + up[1] * up[1] + um[0] * um[0] + um[1] * um[1])
-                * (scale_fwd * scale_fwd);
-            let h = e.sqrt();
-            if h > max_norm {
-                max_norm = h;
-            }
-            norms.push(h);
-        }
-    }
-    if max_norm <= 1e-30 {
-        return vec![[0.0; 4]; total];
-    }
-
-    let med = median_in_place(&mut norms);
-    for v in &mut norms {
-        *v = (*v - med).abs();
-    }
-    let mad_noise = 1.4826 * median_in_place(&mut norms);
-
     let iters = cfg.iterations.max(1);
-    let lam_start = (cfg.initial_thresh_frac.clamp(0.1, 0.99)) * max_norm;
-    let lam_end = (cfg.final_noise_sigma.max(0.5) * mad_noise)
-        .max(0.002 * max_norm)
-        .min(lam_start);
-    let ratio = if iters > 1 && lam_start > 1e-30 {
-        (lam_end / lam_start).powf(1.0 / ((iters - 1) as f64))
+    let init_frac = cfg.initial_thresh_frac.clamp(0.1, 0.99);
+    let sched_ratio = if iters > 1 {
+        (1e-4_f64 / init_frac).powf(1.0 / ((iters - 1) as f64))
     } else {
         1.0
     };
+    let noise_mult = cfg.final_noise_sigma.max(0.5);
 
-    let mut zp_cur = vec![[0.0, 0.0]; n_vox];
-    let mut zm_cur = vec![[0.0, 0.0]; n_vox];
-    for k2 in 0..n2 {
-        zp_cur[k2 * f1..k2 * f1 + n1].copy_from_slice(&y_plus[k2 * n1..(k2 + 1) * n1]);
-        zm_cur[k2 * f1..k2 * f1 + n1].copy_from_slice(&y_minus[k2 * n1..(k2 + 1) * n1]);
-    }
-    let mut zp_prev = zp_cur.clone();
-    let mut zm_prev = zm_cur.clone();
-    let mut wp = zp_cur.clone();
-    let mut wm = zm_cur.clone();
-    let mut active_plus = vec![false; n_vox];
-    let mut lam = lam_start;
-    let beta_mom = if cfg.fista_momentum { 0.30 } else { 0.0 };
+    let mut max_norm = 0.0_f64;
+    let mut lam_start = 0.0_f64;
+    let mut t_fista = 1.0_f64;
+    let mut prev_res_e = f64::INFINITY;
 
     for it in 0..iters {
-        sp_plus.copy_from_slice(&wp);
-        sp_minus.copy_from_slice(&wm);
-        for k2 in 0..n2 {
-            for k1 in 0..n1 {
-                let idx = k2 * n1 + k1;
-                if mask[idx] {
-                    sp_plus[k2 * f1 + k1] = y_plus[idx];
-                    sp_minus[k2 * f1 + k1] = y_minus[idx];
+        let mut res_e = 0.0_f64;
+        if it == 0 {
+            sp_plus.fill([0.0, 0.0]);
+            sp_minus.fill([0.0, 0.0]);
+            for k2 in 0..n2 {
+                for k1 in 0..n1 {
+                    let idx = k2 * n1 + k1;
+                    if mask[idx] {
+                        let yp = y_plus[idx];
+                        let ym = y_minus[idx];
+                        sp_plus[k2 * f1 + k1] = yp;
+                        sp_minus[k2 * f1 + k1] = ym;
+                        res_e += yp[0] * yp[0] + yp[1] * yp[1] + ym[0] * ym[0] + ym[1] * ym[1];
+                    }
+                }
+            }
+        } else {
+            for i in 0..n_vox {
+                sp_plus[i] = [wp_spec[i][0] * scale_inv, wp_spec[i][1] * scale_inv];
+                sp_minus[i] = [wm_spec[i][0] * scale_inv, wm_spec[i][1] * scale_inv];
+            }
+            fft_2d(&mut sp_plus, &mut col_buf, true);
+            fft_2d(&mut sp_minus, &mut col_buf, true);
+            for k2 in 0..f2 {
+                for k1 in 0..f1 {
+                    let g_idx = k2 * f1 + k1;
+                    if k2 < n2 && k1 < n1 && mask[k2 * n1 + k1] {
+                        let idx = k2 * n1 + k1;
+                        let dp = [
+                            y_plus[idx][0] - sp_plus[g_idx][0],
+                            y_plus[idx][1] - sp_plus[g_idx][1],
+                        ];
+                        let dm = [
+                            y_minus[idx][0] - sp_minus[g_idx][0],
+                            y_minus[idx][1] - sp_minus[g_idx][1],
+                        ];
+                        sp_plus[g_idx] = dp;
+                        sp_minus[g_idx] = dm;
+                        res_e += dp[0] * dp[0] + dp[1] * dp[1] + dm[0] * dm[0] + dm[1] * dm[1];
+                    } else {
+                        sp_plus[g_idx] = [0.0, 0.0];
+                        sp_minus[g_idx] = [0.0, 0.0];
+                    }
                 }
             }
         }
 
+        // Unitary 2D residual spectrum (res_plus, res_minus)
         fft_2d(&mut sp_plus, &mut col_buf, false);
         fft_2d(&mut sp_minus, &mut col_buf, false);
+        for i in 0..n_vox {
+            sp_plus[i][0] *= scale_fwd;
+            sp_plus[i][1] *= scale_fwd;
+            sp_minus[i][0] *= scale_fwd;
+            sp_minus[i][1] *= scale_fwd;
+        }
+
+        for m2 in 0..f2 {
+            for m1 in 0..f1 {
+                let m1_conj = (f1 - m1) % f1;
+                let up = sp_plus[m2 * f1 + m1];
+                let um = sp_minus[m2 * f1 + m1_conj];
+                let h =
+                    (0.5 * (up[0] * up[0] + up[1] * up[1] + um[0] * um[0] + um[1] * um[1])).sqrt();
+                norms[m2 * f1 + m1] = h;
+                if it == 0 && h > max_norm {
+                    max_norm = h;
+                }
+            }
+        }
+        if it == 0 {
+            if max_norm <= 1e-30 {
+                return vec![[0.0; 4]; total];
+            }
+            lam_start = init_frac * max_norm;
+        }
+
+        // Dynamic MAD noise floor of the CURRENT quaternion residual spectrum
+        let med = median_in_place(&mut norms);
+        for v in &mut norms {
+            *v = (*v - med).abs();
+        }
+        let sigma_res = 1.4826 * median_in_place(&mut norms);
+        let lam_sched = lam_start * sched_ratio.powi(it as i32);
+        let lam = lam_sched
+            .max(noise_mult * sigma_res)
+            .max(1e-5 * max_norm)
+            .min(lam_start);
 
         let is_last = it + 1 == iters;
-        // Joint group-sparse quaternion thresholding at aligned `(m2, m1)` and `(m2, (f1 - m1) % f1)`:
+        // Joint group-sparse quaternion soft-thresholding on `w_spec + res_spec`
         for m2 in 0..f2 {
             for &m1 in &[0usize, f1 / 2] {
                 let i_pos = m2 * f1 + m1;
-                let up = [sp_plus[i_pos][0] * scale_fwd, sp_plus[i_pos][1] * scale_fwd];
+                let up = [
+                    wp_spec[i_pos][0] + sp_plus[i_pos][0],
+                    wp_spec[i_pos][1] + sp_plus[i_pos][1],
+                ];
                 let um = [
-                    sp_minus[i_pos][0] * scale_fwd,
-                    sp_minus[i_pos][1] * scale_fwd,
+                    wm_spec[i_pos][0] + sp_minus[i_pos][0],
+                    wm_spec[i_pos][1] + sp_minus[i_pos][1],
                 ];
                 let h =
                     (0.5 * (up[0] * up[0] + up[1] * up[1] + um[0] * um[0] + um[1] * um[1])).sqrt();
                 if h > lam {
-                    let s = (1.0 - lam / h) * scale_inv;
-                    sp_plus[i_pos] = [up[0] * s, up[1] * s];
-                    sp_minus[i_pos] = [um[0] * s, um[1] * s];
+                    let s = 1.0 - lam / h;
+                    xp_next[i_pos] = [up[0] * s, up[1] * s];
+                    xm_next[i_pos] = [um[0] * s, um[1] * s];
                     if is_last {
                         active_plus[i_pos] = true;
                     }
                 } else {
-                    sp_plus[i_pos] = [0.0, 0.0];
-                    sp_minus[i_pos] = [0.0, 0.0];
+                    xp_next[i_pos] = [0.0, 0.0];
+                    xm_next[i_pos] = [0.0, 0.0];
                 }
             }
             for m1 in 1..(f1 / 2) {
@@ -1786,10 +1876,13 @@ pub fn reconstruct_nus_2d_hypercomplex_ist(
                 let idx_a = m2 * f1 + m1;
                 let idx_b = m2 * f1 + m1_c;
 
-                let up_a = [sp_plus[idx_a][0] * scale_fwd, sp_plus[idx_a][1] * scale_fwd];
+                let up_a = [
+                    wp_spec[idx_a][0] + sp_plus[idx_a][0],
+                    wp_spec[idx_a][1] + sp_plus[idx_a][1],
+                ];
                 let um_a = [
-                    sp_minus[idx_b][0] * scale_fwd,
-                    sp_minus[idx_b][1] * scale_fwd,
+                    wm_spec[idx_b][0] + sp_minus[idx_b][0],
+                    wm_spec[idx_b][1] + sp_minus[idx_b][1],
                 ];
                 let h_a = (0.5
                     * (up_a[0] * up_a[0]
@@ -1798,10 +1891,13 @@ pub fn reconstruct_nus_2d_hypercomplex_ist(
                         + um_a[1] * um_a[1]))
                     .sqrt();
 
-                let up_b = [sp_plus[idx_b][0] * scale_fwd, sp_plus[idx_b][1] * scale_fwd];
+                let up_b = [
+                    wp_spec[idx_b][0] + sp_plus[idx_b][0],
+                    wp_spec[idx_b][1] + sp_plus[idx_b][1],
+                ];
                 let um_b = [
-                    sp_minus[idx_a][0] * scale_fwd,
-                    sp_minus[idx_a][1] * scale_fwd,
+                    wm_spec[idx_a][0] + sp_minus[idx_a][0],
+                    wm_spec[idx_a][1] + sp_minus[idx_a][1],
                 ];
                 let h_b = (0.5
                     * (up_b[0] * up_b[0]
@@ -1811,74 +1907,73 @@ pub fn reconstruct_nus_2d_hypercomplex_ist(
                     .sqrt();
 
                 if h_a > lam {
-                    let s = (1.0 - lam / h_a) * scale_inv;
-                    sp_plus[idx_a] = [up_a[0] * s, up_a[1] * s];
-                    sp_minus[idx_b] = [um_a[0] * s, um_a[1] * s];
+                    let s = 1.0 - lam / h_a;
+                    xp_next[idx_a] = [up_a[0] * s, up_a[1] * s];
+                    xm_next[idx_b] = [um_a[0] * s, um_a[1] * s];
                     if is_last {
                         active_plus[idx_a] = true;
                     }
                 } else {
-                    sp_plus[idx_a] = [0.0, 0.0];
-                    sp_minus[idx_b] = [0.0, 0.0];
+                    xp_next[idx_a] = [0.0, 0.0];
+                    xm_next[idx_b] = [0.0, 0.0];
                 }
 
                 if h_b > lam {
-                    let s = (1.0 - lam / h_b) * scale_inv;
-                    sp_plus[idx_b] = [up_b[0] * s, up_b[1] * s];
-                    sp_minus[idx_a] = [um_b[0] * s, um_b[1] * s];
+                    let s = 1.0 - lam / h_b;
+                    xp_next[idx_b] = [up_b[0] * s, up_b[1] * s];
+                    xm_next[idx_a] = [um_b[0] * s, um_b[1] * s];
                     if is_last {
                         active_plus[idx_b] = true;
                     }
                 } else {
-                    sp_plus[idx_b] = [0.0, 0.0];
-                    sp_minus[idx_a] = [0.0, 0.0];
+                    xp_next[idx_b] = [0.0, 0.0];
+                    xm_next[idx_a] = [0.0, 0.0];
                 }
             }
         }
 
-        fft_2d(&mut sp_plus, &mut col_buf, true);
-        fft_2d(&mut sp_minus, &mut col_buf, true);
-
-        zp_prev.copy_from_slice(&zp_cur);
-        zm_prev.copy_from_slice(&zm_cur);
-        zp_cur.copy_from_slice(&sp_plus);
-        zm_cur.copy_from_slice(&sp_minus);
-        for k2 in 0..n2 {
-            for k1 in 0..n1 {
-                let idx = k2 * n1 + k1;
-                if mask[idx] {
-                    zp_cur[k2 * f1 + k1] = y_plus[idx];
-                    zm_cur[k2 * f1 + k1] = y_minus[idx];
-                }
+        if cfg.fista_momentum {
+            if res_e > prev_res_e * 1.05 {
+                t_fista = 1.0;
             }
-        }
-
-        if beta_mom > 0.0 {
+            let t_next = 0.5 * (1.0 + (1.0 + 4.0 * t_fista * t_fista).sqrt());
+            let beta = ((t_fista - 1.0) / t_next).min(0.75);
             for i in 0..n_vox {
-                wp[i] = [
-                    zp_cur[i][0] + beta_mom * (zp_cur[i][0] - zp_prev[i][0]),
-                    zp_cur[i][1] + beta_mom * (zp_cur[i][1] - zp_prev[i][1]),
+                wp_spec[i] = [
+                    xp_next[i][0] + beta * (xp_next[i][0] - xp_spec[i][0]),
+                    xp_next[i][1] + beta * (xp_next[i][1] - xp_spec[i][1]),
                 ];
-                wm[i] = [
-                    zm_cur[i][0] + beta_mom * (zm_cur[i][0] - zm_prev[i][0]),
-                    zm_cur[i][1] + beta_mom * (zm_cur[i][1] - zm_prev[i][1]),
+                wm_spec[i] = [
+                    xm_next[i][0] + beta * (xm_next[i][0] - xm_spec[i][0]),
+                    xm_next[i][1] + beta * (xm_next[i][1] - xm_spec[i][1]),
                 ];
             }
-            for k2 in 0..n2 {
-                for k1 in 0..n1 {
-                    let idx = k2 * n1 + k1;
-                    if mask[idx] {
-                        wp[k2 * f1 + k1] = y_plus[idx];
-                        wm[k2 * f1 + k1] = y_minus[idx];
-                    }
-                }
-            }
+            t_fista = t_next;
+            prev_res_e = res_e;
         } else {
-            wp.copy_from_slice(&zp_cur);
-            wm.copy_from_slice(&zm_cur);
+            wp_spec.copy_from_slice(&xp_next);
+            wm_spec.copy_from_slice(&xm_next);
         }
+        xp_spec.copy_from_slice(&xp_next);
+        xm_spec.copy_from_slice(&xm_next);
+    }
 
-        lam *= ratio;
+    let mut zp_cur = vec![[0.0, 0.0]; n_vox];
+    let mut zm_cur = vec![[0.0, 0.0]; n_vox];
+    for i in 0..n_vox {
+        zp_cur[i] = [xp_spec[i][0] * scale_inv, xp_spec[i][1] * scale_inv];
+        zm_cur[i] = [xm_spec[i][0] * scale_inv, xm_spec[i][1] * scale_inv];
+    }
+    fft_2d(&mut zp_cur, &mut col_buf, true);
+    fft_2d(&mut zm_cur, &mut col_buf, true);
+    for k2 in 0..n2 {
+        for k1 in 0..n1 {
+            let idx = k2 * n1 + k1;
+            if mask[idx] {
+                zp_cur[k2 * f1 + k1] = y_plus[idx];
+                zm_cur[k2 * f1 + k1] = y_minus[idx];
+            }
+        }
     }
 
     // Debiasing support projections on active quaternion frequencies
@@ -2077,6 +2172,7 @@ pub fn process_fid_2d_mut(
                 mask.len()
             ));
         }
+        validate_nus_states_axis(&fid.axis_y, "2D indirect F1")?;
     }
 
     // ------------------------------------------------------------------------
@@ -2099,33 +2195,39 @@ pub fn process_fid_2d_mut(
             let mut sc = Vec::new();
             let mut sample_x = Vec::new();
             let mut ax_rep: Option<AxisPpm> = None;
-            for k1 in 0..n1 {
+            'sample_2d_x: for k1 in 0..n1 {
                 if let Some(ref mask) = fid.nus_mask {
                     if !mask[k1] {
                         continue;
                     }
                 }
-                transform_trace_steps_1_to_5(
-                    fid.trace(k1, 0),
-                    &fid.axis_x,
-                    &dim_x,
-                    &mut wt,
-                    &mut wf,
-                    &mut sc,
-                );
-                apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
-                if ax_rep.is_none() {
-                    ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
-                }
-                sample_x.push(conj_trace_for_ops(&sc));
-                if sample_x.len() >= 64 {
-                    break;
+                for c1 in 0..2 {
+                    transform_trace_steps_1_to_5(
+                        fid.trace(k1, c1),
+                        &fid.axis_x,
+                        &dim_x,
+                        &mut wt,
+                        &mut wf,
+                        &mut sc,
+                    );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
+                    if ax_rep.is_none() {
+                        ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
+                    }
+                    sample_x.push(conj_trace_for_ops(&sc));
+                    if sample_x.len() >= 64 {
+                        break 'sample_2d_x;
+                    }
                 }
             }
             if let Some(ax_x_full) = ax_rep {
                 let mut cfg_direct = AutoPhaseConfig::default();
                 if dim_x.remove_digital_filter && dim_x.group_delay > 0.0 {
                     cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(18.0);
+                } else if fid.axis_x.group_delay == 0.0
+                    && fid.axis_x.stored_proc.p1_deg.unwrap_or(0.0).abs() <= 20.0
+                {
+                    cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(25.0);
                 }
                 let sol = auto_phase_direct_nd(&sample_x, &ax_x_full, &cfg_direct);
                 (sol.p0_deg, sol.p1_deg)
@@ -2205,12 +2307,15 @@ pub fn process_fid_2d_mut(
     // ------------------------------------------------------------------------
     // Dimension 1 (Indirect F1): Optional NUS IST + Steps 3–9 across `nx_out` columns
     // ------------------------------------------------------------------------
-    let dim_y = recipe.dims[1].clone();
+    let mut dim_y = recipe.dims[1].clone();
     let si_y = dim_y.si.max(n1).max(2);
     let full_axis_y = build_full_axis_ppm(&fid.axis_y, si_y);
     let (y0, y1, axis_y_out) = compute_axis_roi(&full_axis_y, dim_y.roi_ppm)?;
     let ny_out = axis_y_out.size;
     let nus_cfg = recipe.nus.clone().unwrap_or_default();
+    let auto_solved_y = dim_y.p0_deg.is_none()
+        && dim_y.p1_deg.is_none()
+        && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
 
     let (p0_y, p1_y) = match (dim_y.p0_deg, dim_y.p1_deg, dim_y.phase_source) {
         (Some(p0), Some(p1), _) => (p0, p1),
@@ -2272,6 +2377,10 @@ pub fn process_fid_2d_mut(
     };
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
+    if auto_solved_y && p1_y.abs() > 15.0 {
+        dim_y.fcor = 1.0;
+        recipe.dims[1].fcor = 1.0;
+    }
 
     // Process each `ix in 0..nx_out` column independently in parallel, storing transposed `[nx_out * ny_out]`
     // then scattering to row-major `[ny_out * nx_out]`.
@@ -2372,11 +2481,449 @@ pub fn process_fid_3d(
     process_fid_3d_mut(fid, exp, &mut rec)
 }
 
+/// Build indirect-focused 1D complex direct (`1H`) frequency traces for 3D blind autophasing.
+///
+/// On low-SNR 3D cubes (especially `HNCACB` where `CA(+)` and `CB(-)` cancel at `t_C = 0` and any
+/// single raw `(k2, c2, k1, c1)` 1D trace has `SNR ~ 1–2`), raw time-slice sampling is dominated
+/// by thermal noise. Applying a real-weight 2D indirect sine-bell DFT over `(k2 < m2, k1 < m1)`
+/// separately to `Re_x` and `Im_x` preserves the exact direct complex phase `exp(+i phi_x(ix))`
+/// (modulo `180 deg`) with zero cross-mixing of `Re_x`/`Im_x` and zero dependence on unknown
+/// indirect phases, while boosting amide peak SNR by `~sqrt(m1 * m2)` (`15x–25x`) and separating
+/// `CA(+)` from `CB(-)` in indirect frequency space.
+fn focused_direct_traces_3d(
+    fid: &Fid3D,
+    dim_x: &DimRecipe,
+    conj_y: bool,
+    conj_z: bool,
+    ap_cfg: &AutoPhaseConfig,
+) -> (Option<AxisPpm>, Vec<Vec<Complex64>>) {
+    let n1 = fid.axis_y.complex_points;
+    let n2 = fid.axis_z.complex_points;
+    let cap = if fid.nus_mask.is_some() { 48 } else { 24 };
+    let m1 = n1.min(cap).max(1);
+    let m2 = n2.min(cap).max(1);
+    let p1_ch = if fid.axis_y.quad_mode == QuadMode::Qf {
+        1
+    } else {
+        2
+    };
+    let p2_ch = if fid.axis_z.quad_mode == QuadMode::Qf {
+        1
+    } else {
+        2
+    };
+
+    let mut coords: Vec<(usize, usize)> = Vec::new();
+    for k2 in 0..m2 {
+        for k1 in 0..m1 {
+            if fid.nus_mask.as_ref().is_none_or(|mask| mask[k2 * n1 + k1]) {
+                coords.push((k2, k1));
+            }
+        }
+    }
+    if coords.is_empty() {
+        if let Some(first_idx) = fid
+            .nus_mask
+            .as_ref()
+            .and_then(|m| m.iter().position(|&b| b))
+        {
+            coords.push((first_idx / n1, first_idx % n1));
+        } else if n1 > 0 && n2 > 0 {
+            coords.push((0, 0));
+        }
+    }
+    if coords.is_empty() {
+        return (None, Vec::new());
+    }
+
+    let sub_per_coord = p2_ch * p1_ch;
+    let total_tr = coords.len() * sub_per_coord;
+    let mut tr_specs: Vec<Vec<Complex64>> = vec![Vec::new(); total_tr];
+
+    parallel_chunks_mut(
+        &mut tr_specs,
+        default_chunk_size(total_tr),
+        |base_idx, chunk| {
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut sc = Vec::new();
+            for (local, slot) in chunk.iter_mut().enumerate() {
+                let idx = base_idx + local;
+                let coord_i = idx / sub_per_coord;
+                let rem = idx % sub_per_coord;
+                let c2 = rem / p1_ch;
+                let c1 = rem % p1_ch;
+                let (k2, k1) = coords[coord_i];
+                transform_trace_steps_1_to_5(
+                    fid.trace(k2, c2, k1, c1),
+                    &fid.axis_x,
+                    dim_x,
+                    &mut wt,
+                    &mut wf,
+                    &mut sc,
+                );
+                apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
+                *slot = conj_trace_for_ops(&sc);
+            }
+        },
+    );
+
+    let si_x = tr_specs[0].len();
+    if si_x == 0 {
+        return (None, Vec::new());
+    }
+    let ax_x_full = build_full_axis_ppm(&fid.axis_x, si_x);
+
+    if coords.len() < 4 {
+        return (Some(ax_x_full), tr_specs);
+    }
+
+    let is_excluded = |ppm: f64| -> bool {
+        ap_cfg.water_mask_ppm.is_some_and(|(a, b)| {
+            let (lo, hi) = (a.min(b), a.max(b));
+            ppm >= lo && ppm <= hi
+        })
+    };
+    let mut cand_ix: Vec<usize> = (0..si_x)
+        .filter(|&ix| {
+            let ppm = ax_x_full.index_to_ppm(ix as f64);
+            if is_excluded(ppm) {
+                return false;
+            }
+            if let Some((r0, r1)) = ap_cfg.direct_roi_ppm {
+                let (lo, hi) = (r0.min(r1), r0.max(r1));
+                ppm >= lo && ppm <= hi
+            } else {
+                true
+            }
+        })
+        .collect();
+    if cand_ix.len() < 8 {
+        cand_ix = (0..si_x)
+            .filter(|&ix| !is_excluded(ax_x_full.index_to_ppm(ix as f64)))
+            .collect();
+    }
+    if cand_ix.is_empty() {
+        cand_ix = (0..si_x).collect();
+    }
+    let stride = (cand_ix.len() / 64).max(1);
+    let sample_ix: Vec<usize> = cand_ix.into_iter().step_by(stride).take(64).collect();
+
+    let g1 = (2 * m1).max(2);
+    let g2 = (2 * m2).max(2);
+    let sy = if conj_y { -1.0 } else { 1.0 };
+    let sz = if conj_z { -1.0 } else { 1.0 };
+
+    let mut w1 = vec![1.0_f64; m1];
+    if m1 > 1 {
+        for (k1, w) in w1.iter_mut().enumerate() {
+            *w = (0.5 * PI * (k1 as f64) / (m1 as f64)).cos();
+        }
+        w1[0] *= 0.5;
+    }
+    let mut w2 = vec![1.0_f64; m2];
+    if m2 > 1 {
+        for (k2, w) in w2.iter_mut().enumerate() {
+            *w = (0.5 * PI * (k2 as f64) / (m2 as f64)).cos();
+        }
+        w2[0] *= 0.5;
+    }
+
+    let mut by = vec![[0.0_f64; 4]; g1 * m1];
+    for iy in 0..g1 {
+        for k1 in 0..m1 {
+            let theta = -2.0 * PI * (k1 as f64) * (iy as f64) / (g1 as f64);
+            let (s, c) = theta.sin_cos();
+            let wk = w1[k1];
+            by[iy * m1 + k1] = [wk * c, -wk * sy * s, wk * s, wk * sy * c];
+        }
+    }
+    let mut bz = vec![[0.0_f64; 4]; g2 * m2];
+    for iz in 0..g2 {
+        for k2 in 0..m2 {
+            let theta = -2.0 * PI * (k2 as f64) * (iz as f64) / (g2 as f64);
+            let (s, c) = theta.sin_cos();
+            let wk = w2[k2];
+            bz[iz * m2 + k2] = [wk * c, -wk * sz * s, wk * s, wk * sz * c];
+        }
+    }
+
+    let mut voxel_e = vec![0.0_f64; g2 * g1 * 4];
+    let mut coord_map = vec![usize::MAX; m2 * m1];
+    for (ci, &(k2, k1)) in coords.iter().enumerate() {
+        if k2 < m2 && k1 < m1 {
+            coord_map[k2 * m1 + k1] = ci;
+        }
+    }
+
+    let mut after_y = vec![[[0.0_f64; 2]; 4]; m2 * g1];
+    for &ix in &sample_ix {
+        after_y.fill([[0.0, 0.0]; 4]);
+        for k2 in 0..m2 {
+            for k1 in 0..m1 {
+                let ci = coord_map[k2 * m1 + k1];
+                if ci == usize::MAX {
+                    continue;
+                }
+                let base = ci * sub_per_coord;
+                let z00 = tr_specs[base][ix];
+                let z01 = if p1_ch > 1 {
+                    tr_specs[base + 1][ix]
+                } else {
+                    [0.0, 0.0]
+                };
+                let z10 = if p2_ch > 1 {
+                    tr_specs[base + p1_ch][ix]
+                } else {
+                    [0.0, 0.0]
+                };
+                let z11 = if p2_ch > 1 && p1_ch > 1 {
+                    tr_specs[base + p1_ch + 1][ix]
+                } else {
+                    [0.0, 0.0]
+                };
+                for iy in 0..g1 {
+                    let b = by[iy * m1 + k1];
+                    let dst = &mut after_y[k2 * g1 + iy];
+                    dst[0][0] += b[0] * z00[0] + b[1] * z01[0];
+                    dst[0][1] += b[0] * z00[1] + b[1] * z01[1];
+                    dst[1][0] += b[2] * z00[0] + b[3] * z01[0];
+                    dst[1][1] += b[2] * z00[1] + b[3] * z01[1];
+                    if p2_ch > 1 {
+                        dst[2][0] += b[0] * z10[0] + b[1] * z11[0];
+                        dst[2][1] += b[0] * z10[1] + b[1] * z11[1];
+                        dst[3][0] += b[2] * z10[0] + b[3] * z11[0];
+                        dst[3][1] += b[2] * z10[1] + b[3] * z11[1];
+                    }
+                }
+            }
+        }
+
+        for iz in 0..g2 {
+            for iy in 0..g1 {
+                let mut acc = [[0.0_f64; 2]; 4];
+                for k2 in 0..m2 {
+                    let b = bz[iz * m2 + k2];
+                    let src = &after_y[k2 * g1 + iy];
+                    acc[0][0] += b[0] * src[0][0] + b[1] * src[2][0];
+                    acc[0][1] += b[0] * src[0][1] + b[1] * src[2][1];
+                    acc[1][0] += b[0] * src[1][0] + b[1] * src[3][0];
+                    acc[1][1] += b[0] * src[1][1] + b[1] * src[3][1];
+                    acc[2][0] += b[2] * src[0][0] + b[3] * src[2][0];
+                    acc[2][1] += b[2] * src[0][1] + b[3] * src[2][1];
+                    acc[3][0] += b[2] * src[1][0] + b[3] * src[3][0];
+                    acc[3][1] += b[2] * src[1][1] + b[3] * src[3][1];
+                }
+                let vbase = (iz * g1 + iy) * 4;
+                for comp in 0..4 {
+                    voxel_e[vbase + comp] +=
+                        acc[comp][0] * acc[comp][0] + acc[comp][1] * acc[comp][1];
+                }
+            }
+        }
+    }
+
+    let mut ranked: Vec<(f64, usize, usize, usize)> = Vec::with_capacity(g2 * g1 * 4);
+    for iz in 0..g2 {
+        for iy in 0..g1 {
+            let vbase = (iz * g1 + iy) * 4;
+            for comp in 0..4 {
+                let e = voxel_e[vbase + comp];
+                if e > 0.0 {
+                    ranked.push((e, iz, iy, comp));
+                }
+            }
+        }
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
+    for &(_, iz, iy, comp) in &ranked {
+        if chosen.iter().all(|&(qz, qy, _)| qz != iz || qy != iy) {
+            chosen.push((iz, iy, comp));
+            if chosen.len() >= 24 {
+                break;
+            }
+        }
+    }
+
+    let mut out_traces: Vec<Vec<Complex64>> = Vec::with_capacity(1 + chosen.len());
+    out_traces.push(tr_specs[0].clone());
+
+    let mut weights = vec![0.0_f64; total_tr];
+    for (iz, iy, comp) in chosen {
+        let comp_z = comp / 2;
+        let comp_y = comp % 2;
+        let mut w_norm2 = 0.0_f64;
+        weights.fill(0.0);
+        for (ci, &(k2, k1)) in coords.iter().enumerate() {
+            if k2 >= m2 || k1 >= m1 {
+                continue;
+            }
+            let bz_pair = if comp_z == 0 {
+                [bz[iz * m2 + k2][0], bz[iz * m2 + k2][1]]
+            } else {
+                [bz[iz * m2 + k2][2], bz[iz * m2 + k2][3]]
+            };
+            let by_pair = if comp_y == 0 {
+                [by[iy * m1 + k1][0], by[iy * m1 + k1][1]]
+            } else {
+                [by[iy * m1 + k1][2], by[iy * m1 + k1][3]]
+            };
+            for c2 in 0..p2_ch {
+                for c1 in 0..p1_ch {
+                    let w = bz_pair[c2] * by_pair[c1];
+                    weights[ci * sub_per_coord + c2 * p1_ch + c1] = w;
+                    w_norm2 += w * w;
+                }
+            }
+        }
+        if w_norm2 <= 1e-30 {
+            continue;
+        }
+        let inv_norm = 1.0 / w_norm2.sqrt();
+        let mut focused = vec![[0.0_f64; 2]; si_x];
+        for (t_idx, &w_raw) in weights.iter().enumerate() {
+            let w = w_raw * inv_norm;
+            if w.abs() <= 1e-15 {
+                continue;
+            }
+            let src = &tr_specs[t_idx];
+            for (dst, &s) in focused.iter_mut().zip(src.iter()) {
+                dst[0] += w * s[0];
+                dst[1] += w * s[1];
+            }
+        }
+        out_traces.push(focused);
+    }
+
+    (Some(ax_x_full), out_traces)
+}
+
+/// Detect whether an un-annotated broad-band aliphatic `13CA/CB` axis (`CBCACONH` / `HNCACB`) is
+/// carrier-mirrored (`conjugate_for_fft` inverted due to missing `procpar` `f1coef` or raw `ser`
+/// custom pulse program) using universal BMRB backbone `(CA, CB)` chemical shift bounds:
+/// - Canonical `CA` (`51.5..64.8 ppm`, ~92% of residues) and `Ala CB` (`15.5..22.2 ppm`, ~8%) vs
+/// - Forbidden downfield region `72.2..79.5 ppm` (zero canonical amino-acid `CA`/`CB`, populated
+///   only when `Ala CB` mirrors across a `43..48 ppm` carrier!).
+fn is_mirrored_aliphatic_cacb_3d(
+    spec: &Spectrum3D,
+    full_c_axis: &AxisPpm,
+    c0_offset: usize,
+) -> bool {
+    let nz = spec.axis_z.size;
+    let ny = spec.axis_y.size;
+    let nx = spec.axis_x.size;
+    let si_c = full_c_axis.size;
+    if nz < 16 || ny < 4 || nx < 8 || si_c < 16 || spec.data.len() != nz * ny * nx {
+        return false;
+    }
+    let p_a = spec.axis_z.index_to_ppm(0.0);
+    let p_b = spec.axis_z.index_to_ppm((nz - 1) as f64);
+    let (z_min, z_max) = (p_a.min(p_b), p_a.max(p_b));
+    if (z_max - z_min) < 45.0 || z_min > 21.5 || z_max < 73.0 {
+        return false;
+    }
+
+    let step = (spec.data.len() / 32_768).max(1);
+    let mut abs_vals: Vec<f32> = spec
+        .data
+        .iter()
+        .step_by(step)
+        .map(|v| v.abs())
+        .filter(|v| v.is_finite())
+        .collect();
+    if abs_vals.len() < 64 {
+        return false;
+    }
+    let mid = abs_vals.len() / 2;
+    let (_, med, _) = abs_vals.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let sigma = ((*med as f64) * 1.4826).max(1e-12);
+    let thr = (6.0 * sigma) as f32;
+
+    let prior = |ppm: f64| -> f64 {
+        if (51.5..=64.8).contains(&ppm) {
+            1.0
+        } else if (15.5..=22.2).contains(&ppm) {
+            1.4
+        } else if (67.0..=71.5).contains(&ppm) {
+            0.6
+        } else if (72.2..=79.5).contains(&ppm) {
+            -2.5
+        } else if (10.0..=14.8).contains(&ppm) {
+            -2.0
+        } else {
+            0.0
+        }
+    };
+
+    let plane = ny * nx;
+    let mut n_peaks = 0usize;
+    let mut score_orig = 0.0_f64;
+    let mut score_rev = 0.0_f64;
+    let mut ca_orig = 0.0_f64;
+    let mut ca_rev = 0.0_f64;
+
+    for iz in 1..(nz - 1) {
+        let iz_full = c0_offset + iz;
+        let iz_rev = (si_c - (iz_full % si_c)) % si_c;
+        let ppm_orig = full_c_axis.index_to_ppm(iz_full as f64);
+        let ppm_rev = full_c_axis.index_to_ppm(iz_rev as f64);
+        let pr_o = prior(ppm_orig);
+        let pr_r = prior(ppm_rev);
+        let in_ca_o = (51.5..=64.8).contains(&ppm_orig);
+        let in_ca_r = (51.5..=64.8).contains(&ppm_rev);
+
+        for iy in 1..(ny - 1) {
+            let row_base = iz * plane + iy * nx;
+            for ix in 1..(nx - 1) {
+                let idx = row_base + ix;
+                let av = spec.data[idx].abs();
+                if av < thr {
+                    continue;
+                }
+                if av >= spec.data[idx - 1].abs()
+                    && av > spec.data[idx + 1].abs()
+                    && av >= spec.data[idx - nx].abs()
+                    && av >= spec.data[idx + nx].abs()
+                    && av >= spec.data[idx - plane].abs()
+                    && av >= spec.data[idx + plane].abs()
+                {
+                    let w = (((av as f64) / sigma) - 5.5).clamp(0.5, 6.0);
+                    n_peaks += 1;
+                    score_orig += w * pr_o;
+                    score_rev += w * pr_r;
+                    if in_ca_o {
+                        ca_orig += w;
+                    }
+                    if in_ca_r {
+                        ca_rev += w;
+                    }
+                }
+            }
+        }
+    }
+
+    n_peaks >= 12
+        && score_rev > 20.0
+        && score_rev > score_orig * 1.6 + 12.0
+        && ca_rev > ca_orig * 1.35
+}
+
 /// Process a 3D FID while recording any automatically solved `(p0_deg, p1_deg)` back into `recipe`.
 pub fn process_fid_3d_mut(
     fid: &Fid3D,
     exp: &str,
     recipe: &mut ProcessingRecipe,
+) -> Result<Spectrum3D, String> {
+    process_fid_3d_inner(fid, exp, recipe, true)
+}
+
+fn process_fid_3d_inner(
+    fid: &Fid3D,
+    exp: &str,
+    recipe: &mut ProcessingRecipe,
+    allow_cacb_unmirror: bool,
 ) -> Result<Spectrum3D, String> {
     if recipe.dims.len() < 3 {
         return Err(format!(
@@ -2403,6 +2950,8 @@ pub fn process_fid_3d_mut(
                 n2 * n1
             ));
         }
+        validate_nus_states_axis(&fid.axis_y, "3D indirect F2")?;
+        validate_nus_states_axis(&fid.axis_z, "3D indirect F1")?;
     }
 
     let ap_cfg = auto_phase_cfg_for_exp(exp);
@@ -2430,56 +2979,21 @@ pub fn process_fid_3d_mut(
         (None, Some(p1), _) => (0.0, p1),
         (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
         (None, None, PhaseSource::Auto) => {
-            let mut wt = Vec::new();
-            let mut wf = Vec::new();
-            let mut sc = Vec::new();
-            let mut sample_x = Vec::new();
-            let mut ax_rep: Option<AxisPpm> = None;
-            for k2 in 0..n2.min(8) {
-                for k1 in 0..n1.min(8) {
-                    if let Some(ref mask) = fid.nus_mask {
-                        if !mask[k2 * n1 + k1] {
-                            continue;
-                        }
-                    }
-                    transform_trace_steps_1_to_5(
-                        fid.trace(k2, 0, k1, 0),
-                        &fid.axis_x,
-                        &dim_x,
-                        &mut wt,
-                        &mut wf,
-                        &mut sc,
-                    );
-                    apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
-                    if ax_rep.is_none() {
-                        ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
-                    }
-                    sample_x.push(conj_trace_for_ops(&sc));
-                }
-            }
-            if sample_x.is_empty() {
-                if let Some(first_idx) = fid
-                    .nus_mask
-                    .as_ref()
-                    .and_then(|m| m.iter().position(|&b| b))
-                {
-                    transform_trace_steps_1_to_5(
-                        fid.trace(first_idx / n1, 0, first_idx % n1, 0),
-                        &fid.axis_x,
-                        &dim_x,
-                        &mut wt,
-                        &mut wf,
-                        &mut sc,
-                    );
-                    apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
-                    ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
-                    sample_x.push(conj_trace_for_ops(&sc));
-                }
-            }
+            let (ax_rep, sample_x) = focused_direct_traces_3d(
+                fid,
+                &dim_x,
+                recipe.dims[1].conjugate_for_fft,
+                recipe.dims[2].conjugate_for_fft,
+                &ap_cfg,
+            );
             if let Some(ax_x_full) = ax_rep {
                 let mut cfg_direct = ap_cfg.clone();
                 if dim_x.remove_digital_filter && dim_x.group_delay > 0.0 {
                     cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(18.0);
+                } else if fid.axis_x.group_delay == 0.0
+                    && fid.axis_x.stored_proc.p1_deg.unwrap_or(0.0).abs() <= 20.0
+                {
+                    cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(25.0);
                 }
                 let sol = auto_phase_direct_nd(&sample_x, &ax_x_full, &cfg_direct);
                 (sol.p0_deg, sol.p1_deg)
@@ -2567,8 +3081,8 @@ pub fn process_fid_3d_mut(
     // Step B: Indirect `(F2 = dim 1, F1 = dim 2)` per direct `1H` column `ix in 0..nx_out`
     // Parallelized across `1H` columns via `std::thread::scope`!
     // ------------------------------------------------------------------------
-    let dim_y = recipe.dims[1].clone();
-    let dim_z = recipe.dims[2].clone();
+    let mut dim_y = recipe.dims[1].clone();
+    let mut dim_z = recipe.dims[2].clone();
     let si_y = dim_y.si.max(n1).max(2);
     let si_z = dim_z.si.max(n2).max(2);
     let full_axis_y = build_full_axis_ppm(&fid.axis_y, si_y);
@@ -2607,6 +3121,26 @@ pub fn process_fid_3d_mut(
                 }
             }
         }
+        if dim_x.roi_ppm.is_none() && fid.axis_x.label.to_ascii_uppercase().contains('H') {
+            let mut masked = ix_energy.clone();
+            for (ix, val) in masked.iter_mut().enumerate() {
+                let ppm = axis_x_out.index_to_ppm(ix as f64);
+                let in_water = ap_cfg.water_mask_ppm.is_some_and(|(a, b)| {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    ppm >= lo && ppm <= hi
+                });
+                let out_amide = ap_cfg.direct_roi_ppm.is_some_and(|(r0, r1)| {
+                    let (lo, hi) = (r0.min(r1), r0.max(r1));
+                    ppm < lo || ppm > hi
+                });
+                if in_water || out_amide {
+                    *val = 0.0;
+                }
+            }
+            if masked.iter().any(|&v| v > 0.0) {
+                ix_energy = masked;
+            }
+        }
         let sel_ix = select_apex_indices(&ix_energy, 3, 24);
         let n_sel = sel_ix.len();
         let mut sel_quads = vec![vec![[0.0_f64; 4]; n2 * n1]; n_sel];
@@ -2641,29 +3175,60 @@ pub fn process_fid_3d_mut(
             let mut wf = Vec::new();
             let mut sc = Vec::new();
             let mut ax_y_rep: Option<AxisPpm> = None;
+            // Select the single dominant `(k2_best, c2_best)` slice (preferring `k2 = 0` so all columns
+            // share a coherent `F1` sign without `k2 > 0` inter-residue cosine/sine sign alternation).
+            let mut slice_e = Vec::new();
             for k2 in 0..n2.min(4) {
-                for qp in &sel_quads {
-                    for k1 in 0..n1 {
-                        let q = qp[k2 * n1 + k1];
-                        td_y[k1] = [q[0], q[1]];
+                for c2 in 0..2 {
+                    let mut se = 0.0_f64;
+                    for qp in &sel_quads {
+                        for k1 in 0..n1 {
+                            let q = qp[k2 * n1 + k1];
+                            let c = if c2 == 0 { [q[0], q[1]] } else { [q[2], q[3]] };
+                            se += c[0] * c[0] + c[1] * c[1];
+                        }
                     }
-                    transform_trace_steps_1_to_5(
-                        &td_y,
-                        &fid.axis_y,
-                        &dim_y,
-                        &mut wt,
-                        &mut wf,
-                        &mut sc,
-                    );
-                    apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
-                    if ax_y_rep.is_none() {
-                        ax_y_rep = Some(build_full_axis_ppm(&fid.axis_y, sc.len()));
-                    }
-                    cand_y_cols.push(conj_trace_for_ops(&sc));
+                    slice_e.push((se, k2, c2));
                 }
             }
+            let max_se = slice_e.iter().map(|s| s.0).fold(0.0_f64, f64::max);
+            let best_k2_0 = slice_e
+                .iter()
+                .filter(|s| s.1 == 0)
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .copied();
+            let (_, k2_best, c2_best) = match best_k2_0 {
+                Some(s0) if s0.0 >= 0.20 * max_se => s0,
+                _ => slice_e
+                    .into_iter()
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .unwrap_or((0.0, 0, 0)),
+            };
+
+            for qp in &sel_quads {
+                for k1 in 0..n1 {
+                    let q = qp[k2_best * n1 + k1];
+                    td_y[k1] = if c2_best == 0 {
+                        [q[0], q[1]]
+                    } else {
+                        [q[2], q[3]]
+                    };
+                }
+                transform_trace_steps_1_to_5(&td_y, &fid.axis_y, &dim_y, &mut wt, &mut wf, &mut sc);
+                apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
+                if ax_y_rep.is_none() {
+                    ax_y_rep = Some(build_full_axis_ppm(&fid.axis_y, sc.len()));
+                }
+                cand_y_cols.push(conj_trace_for_ops(&sc));
+            }
             if let Some(ax_y_full) = ax_y_rep {
-                let sol = auto_phase_indirect_nd(&cand_y_cols, &ax_y_full, &ap_cfg);
+                let mut cfg_y = ap_cfg.clone();
+                if cfg_y.polarity == PolarityMode::Biphasic
+                    && !fid.axis_y.label.to_ascii_uppercase().contains('C')
+                {
+                    cfg_y.polarity = PolarityMode::AllPositive;
+                }
+                let sol = auto_phase_indirect_nd(&cand_y_cols, &ax_y_full, &cfg_y);
                 (sol.p0_deg, sol.p1_deg)
             } else {
                 (0.0, 0.0)
@@ -2671,6 +3236,10 @@ pub fn process_fid_3d_mut(
         } else {
             (p0_y, p1_y)
         };
+        if need_auto_y && sy1.abs() > 15.0 {
+            dim_y.fcor = 1.0;
+            recipe.dims[1].fcor = 1.0;
+        }
 
         let (sz0, sz1) = if need_auto_z {
             // Transform `dim_y` across the `n_sel` apex planes using `(sy0, sy1)` and select top `(plane, iy)` ridges
@@ -2727,10 +3296,32 @@ pub fn process_fid_3d_mut(
                 }
             }
 
+            // When `axis_y` is `13C` in `Biphasic` (`HNCACB`, e.g. Varian BioPack) and `axis_z` is `15N`,
+            // restrict ridge selection to the `CA` band (`48..60 ppm`) so all `15N` columns share one sign!
+            let restrict_y_to_ca = ap_cfg.polarity == PolarityMode::Biphasic
+                && fid.axis_y.label.to_ascii_uppercase().contains('C')
+                && !fid.axis_z.label.to_ascii_uppercase().contains('C');
+            let (ca_lo, ca_hi) = (
+                ap_cfg
+                    .biphasic_pos_band_ppm
+                    .0
+                    .min(ap_cfg.biphasic_pos_band_ppm.1),
+                ap_cfg
+                    .biphasic_pos_band_ppm
+                    .0
+                    .max(ap_cfg.biphasic_pos_band_ppm.1),
+            );
             let mut ridges: Vec<(f64, usize, usize)> = Vec::new();
             let mut y_col_e = vec![0.0_f64; ny_out];
             for (pi, ay) in sel_after_y.iter().enumerate() {
                 for iy in 0..ny_out {
+                    if restrict_y_to_ca {
+                        let y_ppm = axis_y_out.index_to_ppm(iy as f64);
+                        if y_ppm < ca_lo || y_ppm > ca_hi {
+                            y_col_e[iy] = 0.0;
+                            continue;
+                        }
+                    }
                     let mut e = 0.0;
                     for k2 in 0..n2 {
                         let re = ay[(k2 * 2) * ny_out + iy];
@@ -2795,7 +3386,13 @@ pub fn process_fid_3d_mut(
                 cand_z_cols.push(conj_trace_for_ops(&sc));
             }
             if let Some(ax_z_full) = ax_z_rep {
-                let sol = auto_phase_indirect_nd(&cand_z_cols, &ax_z_full, &ap_cfg);
+                let mut cfg_z = ap_cfg.clone();
+                if cfg_z.polarity == PolarityMode::Biphasic
+                    && !fid.axis_z.label.to_ascii_uppercase().contains('C')
+                {
+                    cfg_z.polarity = PolarityMode::AllPositive;
+                }
+                let sol = auto_phase_indirect_nd(&cand_z_cols, &ax_z_full, &cfg_z);
                 (sol.p0_deg, sol.p1_deg)
             } else {
                 (0.0, 0.0)
@@ -2813,6 +3410,10 @@ pub fn process_fid_3d_mut(
     p0_z = p0_z_solved;
     let p1_y = p1_y_solved;
     let p1_z = p1_z_solved;
+    if need_auto_z && p1_z.abs() > 15.0 {
+        dim_z.fcor = 1.0;
+        recipe.dims[2].fcor = 1.0;
+    }
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
     recipe.dims[2].p0_deg = Some(p0_z);
@@ -3033,16 +3634,247 @@ pub fn process_fid_3d_mut(
         }
     };
 
-    if ap_cfg.polarity == PolarityMode::Biphasic
-        && (any_dim_auto || need_auto_y || need_auto_z)
-        && lock_biphasic_ca_polarity_3d(&mut out_spec, ap_cfg.biphasic_pos_band_ppm)
-    {
-        let flip_dim = if swap_yz { 1 } else { 2 };
-        let cur = recipe.dims[flip_dim].p0_deg.unwrap_or(0.0);
-        recipe.dims[flip_dim].p0_deg = Some(wrap_deg_180(cur + 180.0));
+    let any_explicit = recipe.dims[..3]
+        .iter()
+        .any(|d| d.phase_source == PhaseSource::Explicit);
+    if allow_cacb_unmirror && !any_explicit {
+        let exp_u = exp.trim().to_ascii_uppercase();
+        if matches!(exp_u.as_str(), "CBCACONH" | "CBCA(CO)NH" | "HNCACB") {
+            let (c_dim, full_c_axis, c0_off) = if swap_yz {
+                (1usize, &full_axis_y, y0)
+            } else {
+                (2usize, &full_axis_z, z0)
+            };
+            if is_mirrored_aliphatic_cacb_3d(&out_spec, full_c_axis, c0_off) {
+                recipe.dims[c_dim].conjugate_for_fft = !recipe.dims[c_dim].conjugate_for_fft;
+                if need_auto_y {
+                    recipe.dims[1].set_auto_phase();
+                }
+                if need_auto_z {
+                    recipe.dims[2].set_auto_phase();
+                }
+                return process_fid_3d_inner(fid, exp, recipe, false);
+            }
+        }
+    }
+    if !any_explicit {
+        if ap_cfg.polarity == PolarityMode::Biphasic {
+            if lock_biphasic_ca_polarity_3d(&mut out_spec, ap_cfg.biphasic_pos_band_ppm) {
+                let flip_dim = if swap_yz { 1 } else { 2 };
+                let cur = recipe.dims[flip_dim].p0_deg.unwrap_or(0.0);
+                recipe.dims[flip_dim].p0_deg = Some(wrap_deg_180(cur + 180.0));
+            }
+        } else if (any_dim_auto || need_auto_y || need_auto_z)
+            && ap_cfg.polarity == PolarityMode::AllPositive
+            && lock_all_positive_polarity_3d(&mut out_spec)
+        {
+            let flip_dim = if swap_yz { 1 } else { 2 };
+            let cur = recipe.dims[flip_dim].p0_deg.unwrap_or(0.0);
+            recipe.dims[flip_dim].p0_deg = Some(wrap_deg_180(cur + 180.0));
+        }
     }
 
     Ok(out_spec)
+}
+
+/// Align a processed 3D `(1H, 15N, 13C)` spectrum (`spec_3d`) to a reference 2D `(1H, 15N)` HSQC
+/// (`hsqc_2d`) against small rigid `(dH, dN)` carrier/temperature drift across multi-spectrometer
+/// experiment bundles, using unlabelled 2D sky-projection capped-SNR bilinear cross-correlation.
+///
+/// Updates `spec_3d.axis_x.first_ppm += dh` and `spec_3d.axis_y.first_ppm += dn` in place when a
+/// statistically significant peak alignment shift is detected within `[-max_dh_ppm, +max_dh_ppm]`
+/// and `[-max_dn_ppm, +max_dn_ppm]`, returning `(applied_dh_ppm, applied_dn_ppm)`.
+pub fn register_3d_hn_to_hsqc_2d(
+    spec_3d: &mut Spectrum3D,
+    hsqc_2d: &Spectrum2D,
+    max_dh_ppm: f64,
+    max_dn_ppm: f64,
+) -> (f64, f64) {
+    let nx3 = spec_3d.axis_x.size;
+    let ny3 = spec_3d.axis_y.size;
+    let nz3 = spec_3d.axis_z.size;
+    let nx2 = hsqc_2d.axis_x.size;
+    let ny2 = hsqc_2d.axis_y.size;
+    if nx3 < 4
+        || ny3 < 4
+        || nz3 == 0
+        || nx2 < 4
+        || ny2 < 4
+        || max_dh_ppm <= 0.0
+        || max_dn_ppm <= 0.0
+    {
+        return (0.0, 0.0);
+    }
+
+    // 1. Build 2D `(15N, 1H)` max-abs sky-projection of `spec_3d` (supports both AllPositive & Biphasic cubes)
+    let plane3 = ny3 * nx3;
+    let mut proj = vec![0.0_f64; plane3];
+    for plane_slice in spec_3d.data.chunks_exact(plane3).take(nz3) {
+        for (dst, &s) in proj.iter_mut().zip(plane_slice.iter()) {
+            let v = (s as f64).abs();
+            if v > *dst {
+                *dst = v;
+            }
+        }
+    }
+    let max3 = proj.iter().copied().fold(0.0_f64, f64::max);
+    if max3 <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut scratch = proj.clone();
+    let med3 = median_in_place(&mut scratch);
+    for v in &mut scratch {
+        *v = (*v - med3).abs();
+    }
+    let sigma3 = (1.4826 * median_in_place(&mut scratch)).max(0.02 * max3);
+    let thresh3 = (med3 + 3.5 * sigma3).max(0.04 * max3);
+
+    // Extract distinct 2D local maxima on the 3D `(1H, 15N)` sky-projection with capped SNR weights
+    let mut pts3: Vec<(f64, f64, f64)> = Vec::new();
+    for iy in 1..ny3.saturating_sub(1) {
+        let n_ppm = spec_3d.axis_y.index_to_ppm(iy as f64);
+        for ix in 1..nx3.saturating_sub(1) {
+            let v = proj[iy * nx3 + ix];
+            if v <= thresh3 {
+                continue;
+            }
+            if v >= proj[(iy - 1) * nx3 + ix]
+                && v >= proj[(iy + 1) * nx3 + ix]
+                && v >= proj[iy * nx3 + ix - 1]
+                && v >= proj[iy * nx3 + ix + 1]
+            {
+                let h_ppm = spec_3d.axis_x.index_to_ppm(ix as f64);
+                let w = ((v - med3) / sigma3).clamp(0.5, 10.0);
+                pts3.push((w, h_ppm, n_ppm));
+            }
+        }
+    }
+    if pts3.len() < 4 {
+        return (0.0, 0.0);
+    }
+    pts3.sort_by(|a, b| b.0.total_cmp(&a.0));
+    pts3.truncate(256);
+
+    // 2. Extract distinct positive 2D local maxima from `hsqc_2d` (invariant to baseline zeroing / clean Lorentzians)
+    let max2 = hsqc_2d
+        .data
+        .iter()
+        .map(|&v| v as f64)
+        .fold(0.0_f64, f64::max);
+    if max2 <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut scratch2: Vec<f64> = hsqc_2d.data.iter().map(|&v| v as f64).collect();
+    let med2 = median_in_place(&mut scratch2);
+    for v in &mut scratch2 {
+        *v = (*v - med2).abs();
+    }
+    let sigma2 = (1.4826 * median_in_place(&mut scratch2)).max(0.02 * max2);
+    let thresh2 = (med2 + 3.5 * sigma2).max(0.04 * max2);
+
+    let mut pts2: Vec<(f64, f64, f64)> = Vec::new();
+    for iy in 1..ny2.saturating_sub(1) {
+        let n_ppm = hsqc_2d.axis_y.index_to_ppm(iy as f64);
+        for ix in 1..nx2.saturating_sub(1) {
+            let v = hsqc_2d.data[iy * nx2 + ix] as f64;
+            if v <= thresh2 {
+                continue;
+            }
+            if v >= hsqc_2d.data[(iy - 1) * nx2 + ix] as f64
+                && v >= hsqc_2d.data[(iy + 1) * nx2 + ix] as f64
+                && v >= hsqc_2d.data[iy * nx2 + ix - 1] as f64
+                && v >= hsqc_2d.data[iy * nx2 + ix + 1] as f64
+            {
+                let h_ppm = hsqc_2d.axis_x.index_to_ppm(ix as f64);
+                let w = ((v - med2) / sigma2).clamp(0.5, 10.0);
+                pts2.push((w, h_ppm, n_ppm));
+            }
+        }
+    }
+    if pts2.len() < 4 {
+        return (0.0, 0.0);
+    }
+    pts2.sort_by(|a, b| b.0.total_cmp(&a.0));
+    pts2.truncate(256);
+
+    // Pre-filter candidate `(3D, 2D)` peak pairs within the search window plus 4 Gaussian widths
+    let sig_h = 0.022_f64;
+    let sig_n = 0.20_f64;
+    let lim_dh = max_dh_ppm + 4.0 * sig_h;
+    let lim_dn = max_dn_ppm + 4.0 * sig_n;
+    let mut pairs: Vec<(f64, f64, f64)> = Vec::new();
+    for &(w3, h3, n3) in &pts3 {
+        for &(w2, h2, n2) in &pts2 {
+            let pdh = h2 - h3;
+            let pdn = n2 - n3;
+            if pdh.abs() <= lim_dh && pdn.abs() <= lim_dn {
+                pairs.push((w3 * w2, pdh, pdn));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let inv_vh = 1.0 / (sig_h * sig_h);
+    let inv_vn = 1.0 / (sig_n * sig_n);
+    let eval_shift = |dh: f64, dn: f64| -> f64 {
+        let mut s = 0.0_f64;
+        for &(w, pdh, pdn) in &pairs {
+            let eh = dh - pdh;
+            let en = dn - pdn;
+            let d2 = eh * eh * inv_vh + en * en * inv_vn;
+            if d2 < 18.0 {
+                s += w * (-0.5 * d2).exp();
+            }
+        }
+        s
+    };
+
+    let zero_score = eval_shift(0.0, 0.0);
+    let mut best_score = zero_score;
+    let mut best_dh = 0.0_f64;
+    let mut best_dn = 0.0_f64;
+
+    let step_h_coarse = 0.006_f64;
+    let step_n_coarse = 0.06_f64;
+    let nh = (max_dh_ppm / step_h_coarse).ceil() as isize;
+    let nn = (max_dn_ppm / step_n_coarse).ceil() as isize;
+    for ih in -nh..=nh {
+        let dh = (ih as f64 * step_h_coarse).clamp(-max_dh_ppm, max_dh_ppm);
+        for in_idx in -nn..=nn {
+            let dn = (in_idx as f64 * step_n_coarse).clamp(-max_dn_ppm, max_dn_ppm);
+            let sc = eval_shift(dh, dn);
+            if sc > best_score {
+                best_score = sc;
+                best_dh = dh;
+                best_dn = dn;
+            }
+        }
+    }
+
+    let center_dh = best_dh;
+    let center_dn = best_dn;
+    for ih in -12..=12 {
+        let dh = (center_dh + ih as f64 * 0.001).clamp(-max_dh_ppm, max_dh_ppm);
+        for in_idx in -12..=12 {
+            let dn = (center_dn + in_idx as f64 * 0.01).clamp(-max_dn_ppm, max_dn_ppm);
+            let sc = eval_shift(dh, dn);
+            if sc > best_score {
+                best_score = sc;
+                best_dh = dh;
+                best_dn = dn;
+            }
+        }
+    }
+
+    if best_score > 0.0 && best_score > zero_score * 1.08 + 1e-6 {
+        spec_3d.axis_x.first_ppm += best_dh;
+        spec_3d.axis_y.first_ppm += best_dn;
+        (best_dh, best_dn)
+    } else {
+        (0.0, 0.0)
+    }
 }
 
 /// Convenience helper: read and process a 2D FID directory, returning `(Spectrum2D, resolved ProcessingRecipe)`.

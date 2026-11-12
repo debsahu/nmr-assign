@@ -69,6 +69,10 @@ pub struct StoredDimProc {
     pub bcfw_ppm: Option<f64>,
 }
 
+fn default_states_recombined() -> bool {
+    true
+}
+
 /// Metadata for a single time-domain axis.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FidAxisMeta {
@@ -86,6 +90,11 @@ pub struct FidAxisMeta {
     /// Chemical shift (ppm) at frequency-domain index `0` (downfield / high-ppm edge).
     pub first_ppm: f64,
     pub quad_mode: QuadMode,
+    /// Whether hypercomplex indirect pairs (`EchoAntiecho` P/N channels, `StatesTppi` odd-increment
+    /// $180^\circ$ alternation, Varian `fcoef`) have already been recombined into uniform `States`
+    /// `(cos, sin)` form (`false` for single-channel `QF` or unrecombined raw interleaving).
+    #[serde(default = "default_states_recombined")]
+    pub states_recombined: bool,
     /// Digital filter group delay in complex points (`0.0` on indirect axes).
     pub group_delay: f64,
     /// Sign convention for complex DFT (`true` = conjugate time signal before standard forward DFT,
@@ -585,16 +594,27 @@ fn read_merged_bruker_params(
     Ok(merged)
 }
 
+fn bruker_proc_is_processed(pm: &HashMap<String, String>) -> bool {
+    // In XWIN-NMR and TopSpin, `##$FT_mod= 0` marks an un-transformed acquisition template
+    // whose `OFFSET`, `SF`, `WDW`, `PHC0`, and `REVERSE` have never been populated by `efp`/`xfb`/`ftnd`.
+    pm.get("FT_mod")
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|ft_mod| ft_mod != 0)
+        .unwrap_or(true)
+}
+
 fn read_optional_bruker_proc(dir: &Path, proc_name: &str) -> Option<HashMap<String, String>> {
     if let Some(pdata_dir) = find_dir_ci(dir, "pdata") {
         if let Some(d1) = find_dir_ci(&pdata_dir, "1") {
             if let Some(p1) = find_file_ci(&d1, proc_name) {
-                return parse_jcamp_file(&p1).ok();
+                return parse_jcamp_file(&p1).ok().filter(bruker_proc_is_processed);
             }
         }
     }
     if let Some(p_direct) = find_file_ci(dir, proc_name) {
-        return parse_jcamp_file(&p_direct).ok();
+        return parse_jcamp_file(&p_direct)
+            .ok()
+            .filter(bruker_proc_is_processed);
     }
     None
 }
@@ -607,14 +627,14 @@ fn extract_bruker_stored_proc(proc_map: Option<&HashMap<String, String>>) -> Sto
         .get("PH_mod")
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(1);
-    let p0_deg =
-        pm.get("PHC0")
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|v| if ph_mod == 0 { 0.0 } else { v });
-    let p1_deg =
-        pm.get("PHC1")
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|v| if ph_mod == 0 { 0.0 } else { v });
+    let (p0_deg, p1_deg) = if ph_mod == 0 {
+        (None, None)
+    } else {
+        (
+            pm.get("PHC0").and_then(|s| s.parse::<f64>().ok()),
+            pm.get("PHC1").and_then(|s| s.parse::<f64>().ok()),
+        )
+    };
 
     let wdw = pm
         .get("WDW")
@@ -910,6 +930,7 @@ fn parse_bruker_direct_axis(
             carrier_mhz: sfo1,
             first_ppm,
             quad_mode,
+            states_recombined: quad_mode != QuadMode::Qf,
             group_delay,
             conjugate_for_fft: true,
             stored_proc,
@@ -919,7 +940,54 @@ fn parse_bruker_direct_axis(
     ))
 }
 
+/// Resolve hardware RF channel synthesizer frequency `SFO{ch}` (`ch in 2..=4`) from `acqus`
+/// for a `15N` indirect dimension when processed `proc2s`/`proc3s` is absent.
+///
+/// In legacy Bruker XWIN-NMR (`DSPFVS <= 12`), modifying `O3` (`15N` transmitter offset on `:f3`)
+/// updates `acqus.SFO3` directly while `acqu2s.SFO1` can retain a stale pre-`eda` value until
+/// explicitly synchronized. When `acqus.NUC{ch}` matches `15N` on the same base frequency `BF{ch}`
+/// (within `10 ppm` of `acqu_ind.SFO1`), `acqus.SFO{ch}` is the physical synthesizer frequency
+/// applied to the `15N` channel during evolution.
+fn resolve_bruker_indirect_sfo1(
+    acqus: &HashMap<String, String>,
+    proc_ind: Option<&HashMap<String, String>>,
+    label: &str,
+    sfo_ind: f64,
+    bf_ind: f64,
+) -> f64 {
+    if proc_ind.is_some() || label != "15N" || bf_ind <= 0.0 {
+        return sfo_ind;
+    }
+    for ch in 2..=4 {
+        let nuc_key = format!("NUC{ch}");
+        let Some(raw_nuc) = acqus.get(&nuc_key) else {
+            continue;
+        };
+        if normalize_nucleus_label(raw_nuc, "") != "15N" {
+            continue;
+        }
+        let bf_key = format!("BF{ch}");
+        let sfo_key = format!("SFO{ch}");
+        let Some(bf_ch) = acqus.get(&bf_key).and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        let Some(sfo_ch) = acqus.get(&sfo_key).and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        if (bf_ch - bf_ind).abs() <= 1e-3 && sfo_ch > 0.0 {
+            let ppm_ch = (sfo_ch - bf_ch) * 1.0e6 / bf_ch;
+            let ppm_ind = (sfo_ind - bf_ind) * 1.0e6 / bf_ind;
+            let uninit_ind = ppm_ind.abs() <= 1e-3 && (90.0..=150.0).contains(&ppm_ch);
+            if (ppm_ch - ppm_ind).abs() <= 20.0 || uninit_ind {
+                return sfo_ch;
+            }
+        }
+    }
+    sfo_ind
+}
+
 fn parse_bruker_indirect_axis(
+    acqus: &HashMap<String, String>,
     acqu_ind: &HashMap<String, String>,
     proc_ind: Option<&HashMap<String, String>>,
     fallback_label: &str,
@@ -943,6 +1011,7 @@ fn parse_bruker_indirect_axis(
         .parse()
         .map_err(|e| format!("invalid FnMODE: {e}"))?;
 
+    // Bruker FnMODE codes: 0=Undefined, 1=QF, 2=QSEQ, 3=TPPI, 4=States, 5=States-TPPI, 6=Echo-Antiecho.
     let quad_mode = match fnmode {
         1 => QuadMode::Qf,
         4 => QuadMode::States,
@@ -950,7 +1019,7 @@ fn parse_bruker_indirect_axis(
         6 => QuadMode::EchoAntiecho,
         other => {
             return Err(format!(
-                "unsupported Bruker indirect FnMODE={other} on {fallback_label} (expected 1=QF, 4=States, 5=States-TPPI, 6=Echo-Antiecho; never guessing)"
+                "unsupported Bruker indirect FnMODE={other} on {fallback_label} (expected 1=QF, 4=States, 5=States-TPPI, 6=Echo-Antiecho; 0=Undefined, 2=QSEQ, 3=TPPI rejected; never guessing)"
             ));
         }
     };
@@ -961,7 +1030,14 @@ fn parse_bruker_indirect_axis(
         ));
     }
 
-    let sfo1: f64 = acqu_ind
+    let raw_nuc = acqu_ind
+        .get("NUC1")
+        .map(String::as_str)
+        .or_else(|| proc_ind.and_then(|p| p.get("AXNUC").map(String::as_str)))
+        .unwrap_or(fallback_label);
+    let label = normalize_nucleus_label(raw_nuc, fallback_label);
+
+    let sfo1_raw: f64 = acqu_ind
         .get("SFO1")
         .and_then(|v| v.parse().ok())
         .or_else(|| acqu_ind.get("BF1").and_then(|v| v.parse().ok()))
@@ -969,7 +1045,8 @@ fn parse_bruker_indirect_axis(
     let bf1: f64 = acqu_ind
         .get("BF1")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(sfo1);
+        .unwrap_or(sfo1_raw);
+    let sfo1 = resolve_bruker_indirect_sfo1(acqus, proc_ind, &label, sfo1_raw, bf1);
 
     // In TopSpin 2.x/3.x/4.x indirect acqu2s/acqu3s, SW (ppm) * SFO1 (MHz) is authoritative
     // because SW_h may retain a default 1D template value or be omitted.
@@ -978,7 +1055,7 @@ fn parse_bruker_indirect_axis(
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&v| v > 0.0);
     let sw_hz = sw_ppm_acq
-        .map(|sw| sw * sfo1)
+        .map(|sw| sw * sfo1_raw)
         .or_else(|| {
             acqu_ind
                 .get("SW_h")
@@ -993,13 +1070,6 @@ fn parse_bruker_indirect_axis(
         .filter(|&v| v > 0.0);
     let obs_mhz = proc_sf.unwrap_or(bf1);
     let first_ppm = bruker_proc_first_ppm(proc_ind, sfo1, obs_mhz, sw_hz);
-
-    let raw_nuc = acqu_ind
-        .get("NUC1")
-        .map(String::as_str)
-        .or_else(|| proc_ind.and_then(|p| p.get("AXNUC").map(String::as_str)))
-        .unwrap_or(fallback_label);
-    let label = normalize_nucleus_label(raw_nuc, fallback_label);
 
     let complex_points = if quad_mode == QuadMode::Qf {
         td
@@ -1024,6 +1094,7 @@ fn parse_bruker_indirect_axis(
         carrier_mhz: sfo1,
         first_ppm,
         quad_mode,
+        states_recombined: quad_mode != QuadMode::Qf,
         group_delay: 0.0,
         conjugate_for_fft: true,
         stored_proc,
@@ -1320,9 +1391,35 @@ fn extract_calph_90deg_macro(text: &str, macro_prefix: &str) -> Option<(usize, i
     }
 }
 
+fn first_word_token_pos(text: &str, word: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let wb = word.as_bytes();
+    if wb.is_empty() || bytes.len() < wb.len() {
+        return None;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut pos = 0usize;
+    while pos + wb.len() <= bytes.len() {
+        if let Some(rel) = text[pos..].find(word) {
+            let start = pos + rel;
+            let end = start + wb.len();
+            let left_ok = start == 0 || !is_ident(bytes[start - 1]);
+            let right_ok = end == bytes.len() || !is_ident(bytes[end]);
+            if left_ok && right_ok {
+                return Some(start);
+            }
+            pos = start + 1;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 /// Infer Bruker indirect `##$REVERSE` from spin-physics phase incrementation in `pulseprogram`
 /// when `pdata/1/proc2s` or `proc3s` is absent (States, Haberkorn & Ruben *J. Magn. Reson.* **1982**,
-/// 48, 286–292; Marion et al. *J. Magn. Reson.* **1989**, 85, 393–399):
+/// 48, 286–292; Marion et al. *J. Magn. Reson.* **1989**, 85, 393–399; Kay, Keifer & Saarinen
+/// *J. Am. Chem. Soc.* **1992**, 114, 10663–10665):
 /// - `f_dim == 1`: Bruker `F1` (`acqu2s` in 2D, `acqu3s` in 3D; evolution delay `d0`).
 /// - `f_dim == 2`: Bruker `F2` (`acqu2s` in 3D; evolution delay `d10`).
 pub fn infer_bruker_raw_indirect_reverse(
@@ -1351,6 +1448,51 @@ pub fn infer_bruker_raw_indirect_reverse(
                 }
             }
         }
+    }
+
+    if quad_mode == QuadMode::EchoAntiecho {
+        // Sensitivity-enhanced Echo-Antiecho constant-time / semi-constant-time indirect evolution
+        // (Kay, Keifer & Saarinen 1992): when the incremented delay (`d10`/`id10` or `d0`/`id0`)
+        // precedes the `180 deg` refocusing pulse and the decremented delay (`d30`/`dd30` or `d20`/`dd20`)
+        // follows it, the `180 deg` pulse inverts the precession phase to `-omega * (d_inc - d_dec)`,
+        // requiring `REVERSE = true` relative to standard `(d30 ... p22 ... d10)` order.
+        if let Some(txt) = pp_text {
+            let mut rf_exec_lines: Vec<&str> = Vec::new();
+            for raw_line in txt.lines() {
+                let code = raw_line.split(';').next().unwrap_or("").trim();
+                if code.is_empty()
+                    || code.starts_with('#')
+                    || code.starts_with('"')
+                    || code.starts_with("define ")
+                    || code.contains("caldel")
+                {
+                    continue;
+                }
+                if let Some(rest) = code.strip_prefix("ph") {
+                    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+                    if digits_len > 0 && rest[digits_len..].trim_start().starts_with('=') {
+                        break;
+                    }
+                }
+                rf_exec_lines.push(code);
+            }
+            let rf_joined = rf_exec_lines.join("\n");
+            let (evo_tok, dec_tok, inc_evo, dec_dec) = if f_dim == 1 {
+                ("d0", "d20", "id0", "dd20")
+            } else {
+                ("d10", "d30", "id10", "dd30")
+            };
+            if contains_word_token(&rf_joined, inc_evo) && contains_word_token(&rf_joined, dec_dec)
+            {
+                if let (Some(e_pos), Some(d_pos)) = (
+                    first_word_token_pos(&rf_joined, evo_tok),
+                    first_word_token_pos(&rf_joined, dec_tok),
+                ) {
+                    return e_pos < d_pos;
+                }
+            }
+        }
+        return false;
     }
 
     if !matches!(quad_mode, QuadMode::States | QuadMode::StatesTppi) {
@@ -1496,7 +1638,8 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
         td_acq_y
     };
 
-    let mut axis_y = parse_bruker_indirect_axis(&acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
+    let mut axis_y =
+        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
     if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
         let pp_txt = read_optional_bruker_pulseprogram(&dir);
         let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
@@ -1722,9 +1865,16 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
     let acqu3s = read_merged_bruker_params(&dir, "acqu3s", "acqu3")?;
     let is_fntype_nus = validate_bruker_fntype(&dir, &acqus, &[&acqu2s, &acqu3s])?;
 
-    let procs = read_optional_bruker_proc(&dir, "procs");
-    let proc2s = read_optional_bruker_proc(&dir, "proc2s");
-    let proc3s = read_optional_bruker_proc(&dir, "proc3s");
+    let procs_raw = read_optional_bruker_proc(&dir, "procs");
+    let proc2s_raw = read_optional_bruker_proc(&dir, "proc2s");
+    let proc3s_raw = read_optional_bruker_proc(&dir, "proc3s");
+    // If `pdata/1` contains `proc2s` without `proc3s`, only a 2D `xfb` scout plane was transformed
+    // rather than the 3D cube — ignore its 2D plane phase/reverse metadata.
+    let (procs, proc2s, proc3s) = if proc2s_raw.is_some() && proc3s_raw.is_none() {
+        (None, None, None)
+    } else {
+        (procs_raw, proc2s_raw, proc3s_raw)
+    };
 
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
 
@@ -1799,8 +1949,10 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
         (td_acq_y, td_acq_z)
     };
 
-    let mut axis_y = parse_bruker_indirect_axis(&acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
-    let mut axis_z = parse_bruker_indirect_axis(&acqu3s, proc3s.as_ref(), "13C", Some(td_full_z))?;
+    let mut axis_y =
+        parse_bruker_indirect_axis(&acqus, &acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
+    let mut axis_z =
+        parse_bruker_indirect_axis(&acqus, &acqu3s, proc3s.as_ref(), "13C", Some(td_full_z))?;
     if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
         || proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
     {
@@ -2451,6 +2603,25 @@ fn non_empty_procpar_str<'a>(pp: &'a HashMap<String, ProcparVal>, key: &str) -> 
         .filter(|s| !s.is_empty())
 }
 
+fn varian_fcoef_conjugate_for_fft(fcoef: Option<[f64; 8]>) -> bool {
+    let Some(c) = fcoef else {
+        return false;
+    };
+    // Pure States-type `fcoef` (`c[2..=5] == 0`):
+    // Default VnmrJ `wft2da` / `ft3d` (`fcoef = ""`) corresponds to `"1 0 0 0 0 0 -1 0"`
+    // (`conjugate_for_fft = false`), whereas BioPack sequences that explicitly specify
+    // `f1coef = "1 0 0 0 0 0 1 0"` (e.g. `ghn_cacb`) invert the indirect sine channel relative
+    // to default `wft2da` (`re_sign * im_sign > 0.0` -> `true`), as do Rance-Kay Echo-Antiecho
+    // `fcoef` strings with non-zero cross terms `c[2..=5]`.
+    if c[2..=5].iter().all(|v| v.abs() <= 1e-9) {
+        let re_sign = if c[0].abs() > 1e-9 { c[0] } else { c[1] };
+        let im_sign = if c[6].abs() > 1e-9 { c[6] } else { c[7] };
+        re_sign * im_sign > 0.0
+    } else {
+        true
+    }
+}
+
 fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
     let procpar_path = find_file_ci(dir, "procpar")
         .ok_or_else(|| format!("missing Varian procpar in {}", dir.display()))?;
@@ -2458,7 +2629,17 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         .map_err(|e| format!("failed to read {}: {e}", procpar_path.display()))?;
     let pp = parse_procpar_str(&procpar_txt)?;
 
-    let fid_path = find_file_ci(dir, "fid")
+    // When a Varian/Kay post-acquisition preprocessor (`mungefid` / `r2s` / `se_sort`) recombines
+    // and transposes `fid` in place without updating `procpar` (`array`, `f*coef`), it preserves
+    // the untouched raw spectrometer binary as `origfid` of identical byte length. Prefer `origfid`
+    // whenever present with matching size so `procpar` hypercomplex coefficients apply once cleanly.
+    let fid_path = find_file_ci(dir, "origfid")
+        .and_then(|orig| {
+            let fid_meta = find_file_ci(dir, "fid").and_then(|f| fs::metadata(f).ok())?;
+            let orig_meta = fs::metadata(&orig).ok()?;
+            (orig_meta.len() == fid_meta.len() && orig_meta.len() >= 32).then_some(orig)
+        })
+        .or_else(|| find_file_ci(dir, "fid"))
         .ok_or_else(|| format!("missing Varian fid binary in {}", dir.display()))?;
     let bin = read_varian_fid_binary(&fid_path)?;
 
@@ -2498,6 +2679,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         carrier_mhz: sfrq,
         first_ppm: first_ppm_x,
         quad_mode: QuadMode::Dqd,
+        states_recombined: true,
         group_delay: lsfid,
         // Varian receiver phase convention uses standard negative-exponent forward FFT without conjugation
         conjugate_for_fft: false,
@@ -2621,6 +2803,10 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         .filter(|&v| v > 0);
 
     let p1_mult = if qm1 == QuadMode::Qf { 1 } else { 2 };
+    let f1180 = pp
+        .get("f1180")
+        .and_then(ProcparVal::first_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("y"));
     let axis_y = FidAxisMeta {
         label: label_1,
         td_raw: ni * p1_mult,
@@ -2630,10 +2816,9 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         carrier_mhz: carrier_1,
         first_ppm: first_ppm_1,
         quad_mode: qm1,
+        states_recombined: qm1 != QuadMode::Qf,
         group_delay: 0.0,
-        // VnmrJ `wft2da`/`ft3d` transforms explicit `fcoef` coefficients with `+i` indirect FT,
-        // whereas default States without `fcoef` folds imaginary negation into `[1,0,0,0,0,0,+1,0]`.
-        conjugate_for_fft: fcoef_1.is_some(),
+        conjugate_for_fft: varian_fcoef_conjugate_for_fft(fcoef_1),
         stored_proc: StoredDimProc {
             p0_deg: pp.get("rp1").and_then(ProcparVal::first_f64),
             p1_deg: pp.get("lp1").and_then(ProcparVal::first_f64),
@@ -2642,7 +2827,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             }),
             si: fn1,
             td_eff: None,
-            fcor: Some(0.5),
+            fcor: if f1180 { Some(1.0) } else { None },
             reverse: false,
             bc_mod: None,
             bcfw_ppm: None,
@@ -2772,6 +2957,10 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         .map(|v| (v.round() as usize) / 2)
         .filter(|&v| v > 0);
 
+    let f2180 = pp
+        .get("f2180")
+        .and_then(ProcparVal::first_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("y"));
     let p2_mult = if qm2 == QuadMode::Qf { 1 } else { 2 };
     let axis_z = FidAxisMeta {
         label: label_2,
@@ -2782,8 +2971,9 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         carrier_mhz: carrier_2,
         first_ppm: first_ppm_2,
         quad_mode: qm2,
+        states_recombined: qm2 != QuadMode::Qf,
         group_delay: 0.0,
-        conjugate_for_fft: fcoef_2.is_some(),
+        conjugate_for_fft: varian_fcoef_conjugate_for_fft(fcoef_2),
         stored_proc: StoredDimProc {
             p0_deg: pp.get("rp2").and_then(ProcparVal::first_f64),
             p1_deg: pp.get("lp2").and_then(ProcparVal::first_f64),
@@ -2792,7 +2982,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
             }),
             si: fn2,
             td_eff: None,
-            fcor: Some(0.5),
+            fcor: if f2180 { Some(1.0) } else { None },
             reverse: false,
             bc_mod: None,
             bcfw_ppm: None,

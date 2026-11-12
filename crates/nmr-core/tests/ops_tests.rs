@@ -1040,3 +1040,169 @@ fn blind_autophase_on_real_ubiquitin_hsqc_and_biphasic_hncacb_ser() {
         100.0 * sign_acc3
     );
 }
+
+#[test]
+fn nus_1d_recovers_100_to_1_adjacent_weak_peak_and_rejects_unrecombined_trace() {
+    let n = 128usize;
+    // Strong peak (amp = 100.0) at normalized offset f1 = +0.125 (bin 64 - 16 = 48 -> 122.0 ppm)
+    // Weak adjacent peak (amp = 1.0, 100:1 dynamic range!) just 8 bins away at f2 = +0.1875 (bin 40 -> 124.0 ppm)
+    let dense: Vec<Complex64> = (0..n)
+        .map(|k| {
+            let t = k as f64;
+            let env = (-0.008 * t).exp();
+            let p_strong = 2.0 * PI * 0.125 * t;
+            let p_weak = 2.0 * PI * 0.1875 * t;
+            // Deterministic micro-noise (1e-3) so MAD is non-zero and realistic
+            let noise = (((k * 97 + 13) % 53) as f64 - 26.0) * 4e-4;
+            [
+                env * (100.0 * p_strong.cos() + 1.0 * p_weak.cos()) + noise,
+                -env * (100.0 * p_strong.sin() + 1.0 * p_weak.sin()) - noise,
+            ]
+        })
+        .collect();
+
+    // ~45% aperiodic pseudo-random NUS schedule (first 8 increments dense + Knuth multiplicative hash)
+    let mask: Vec<bool> = (0..n)
+        .map(|k| k < 8 || ((k.wrapping_mul(2_654_435_761) >> 16) % 100) < 42)
+        .collect();
+    let mut sparse = vec![[0.0, 0.0]; n];
+    for k in 0..n {
+        if mask[k] {
+            sparse[k] = dense[k];
+        }
+    }
+
+    let pipe = AxisPipeline::new(vec![
+        StageOp::SineWindow {
+            off: 0.5,
+            end: 1.0,
+            pow: 2.0,
+            first_scale: 0.5,
+        },
+        StageOp::FourierTransform {
+            inverse: false,
+            negate_imag: true,
+            sign_alt: false,
+            real_only: false,
+        },
+        StageOp::DeleteImaginary,
+    ]);
+    let mut tr_dense = Trace1D::new_time_domain("15N", 1945.6, 60.8, 134.0, dense.clone());
+    pipe.apply(&mut tr_dense).unwrap();
+    let spec_dense = tr_dense.real_vec();
+    // After `negate_imag` + forward FFT + `fftshift` (`rotate_right(64)`), `+0.125` (`m = 16`)
+    // lands at `64 + 16 = 80` and `+0.1875` (`m = 24`) lands at `64 + 24 = 88`.
+    let dense_weak_prom = spec_dense[88] - 0.5 * (spec_dense[84] + spec_dense[92]);
+    assert!(
+        dense_weak_prom > 30.0,
+        "unexpected uniform weak prominence: {dense_weak_prom}"
+    );
+
+    for method in [NusMethod::Fista, NusMethod::Ist] {
+        let cfg = NusConfig {
+            method,
+            max_iter: if method == NusMethod::Ist { 300 } else { 180 },
+            stop_rel_thresh: 0.001,
+            ..NusConfig::default()
+        };
+        let rec = reconstruct_nus_1d(&sparse, &mask, &cfg);
+        let mut tr = Trace1D::new_time_domain("15N", 1945.6, 60.8, 134.0, rec);
+        pipe.apply(&mut tr).unwrap();
+        let spec = tr.real_vec();
+        let strong_val = spec[80];
+        let weak_prom = spec[88] - 0.5 * (spec[84] + spec[92]);
+        let mut art: Vec<f64> = (12..56).map(|i| (spec[i] - spec_dense[i]).abs()).collect();
+        art.sort_by(|a, b| a.total_cmp(b));
+        let art_med = art[art.len() / 2].max(1e-9);
+        assert!(
+            weak_prom > 0.65 * dense_weak_prom && weak_prom > 12.0 * art_med,
+            "{method:?} failed to recover 100:1 adjacent weak peak: strong={strong_val:.3}, weak_prom={weak_prom:.3} (dense={dense_weak_prom:.3}), art_med={art_med:.4}"
+        );
+    }
+
+    // Verify `StageOp::NusReconstruct` rejects any trace not yet converted to States (`states_recombined == false`)
+    let mut unrecombined = Trace1D::new_time_domain("15N", 1945.6, 60.8, 134.0, sparse);
+    unrecombined.states_recombined = false;
+    let err = AxisPipeline::new(vec![StageOp::NusReconstruct {
+        mask,
+        config: NusConfig::default(),
+    }])
+    .apply(&mut unrecombined)
+    .expect_err("unrecombined Echo-Antiecho / States-TPPI trace must fail before IST/FISTA");
+    assert!(
+        err.contains("States"),
+        "expected States precondition error, got: {err}"
+    );
+}
+
+#[test]
+fn biphasic_polarity_lock_resists_ser_thr_cb_and_intense_artifact_spike() {
+    // 256-pt 13C indirect axis spanning 80.0 .. 10.0 ppm
+    let n = 256usize;
+    let axis = AxisPpm::from_bounds("13C", n, 80.0, 10.0, 150.9);
+    let lorentz = |k: usize, ppm0: f64, amp: f64, hwhm_bins: f64| -> Complex64 {
+        let k0 = axis.ppm_to_index(ppm0);
+        let x = ((k as f64) - k0) / hwhm_bins;
+        let denom = 1.0 + x * x;
+        // Rotated by true phase +180 deg (inverted input: CA currently negative, CB positive!)
+        [-amp / denom, -amp * x / denom]
+    };
+
+    // Build an inverted (`p0_true = 180 deg`) Ser/Thr-rich HNCACB column set where:
+    // - 5 true CA(+) peaks sit in 52..59 ppm (amp = 10.0 each)
+    // - 7 strong Ser/Thr CB(-) peaks sit in 61.5..65.5 ppm (amp = -14.0 each; previously inside 48..66!)
+    // - 4 aliphatic CB(-) peaks sit in 24..35 ppm (amp = -9.0 each)
+    // - 1 huge opposite-sign artifact spike (amp = -800.0) sits at 55.0 ppm!
+    let mut cols: Vec<Vec<Complex64>> = Vec::new();
+    let ca_ppms = [52.8, 54.4, 56.2, 57.8, 59.1];
+    let ser_thr_cb_ppms = [61.6, 62.3, 63.1, 63.8, 64.4, 65.0, 65.6];
+    let aliph_cb_ppms = [19.2, 27.8, 31.4, 35.6];
+
+    for r in 0..7 {
+        let mut col = vec![[0.0, 0.0]; n];
+        for (k, slot) in col.iter_mut().enumerate() {
+            let jitter = (((k * 31 + r * 17) % 23) as f64 - 11.0) * 0.02;
+            slot[0] += jitter;
+            if r < ca_ppms.len() {
+                let c = lorentz(k, ca_ppms[r], 10.0, 1.4);
+                slot[0] += c[0];
+                slot[1] += c[1];
+            }
+            let c_st = lorentz(k, ser_thr_cb_ppms[r], -14.0, 1.4);
+            slot[0] += c_st[0];
+            slot[1] += c_st[1];
+            if r < aliph_cb_ppms.len() {
+                let c_cb = lorentz(k, aliph_cb_ppms[r], -9.0, 1.4);
+                slot[0] += c_cb[0];
+                slot[1] += c_cb[1];
+            }
+            if r == 0 {
+                // Single 80x intense inverted artifact spike inside 48..60 ppm!
+                let spike = lorentz(k, 55.0, -800.0, 1.1);
+                slot[0] += spike[0];
+                slot[1] += spike[1];
+            }
+        }
+        cols.push(col);
+    }
+
+    let cfg = AutoPhaseConfig::biphasic();
+    assert_eq!(cfg.biphasic_pos_band_ppm, (48.0, 60.0));
+    let sol = auto_phase_indirect_nd(&cols, &axis, &cfg);
+
+    // Applying `sol.p0_deg` to `cols[1]` (`CA` at 54.4 ppm, `Ser CB` at 62.3 ppm, `CB` at 27.8 ppm)
+    // must make `CA` strictly positive and both `Ser CB` and aliphatic `CB` strictly negative!
+    let eval_real_at = |col: &[Complex64], ppm: f64| -> f64 {
+        let k = axis.ppm_to_index(ppm).round() as usize;
+        let phi = (sol.p0_deg + sol.p1_deg * ((k as f64) / (n as f64))).to_radians();
+        let (sp, cp) = phi.sin_cos();
+        col[k][0] * cp - col[k][1] * sp
+    };
+    let ca_val = eval_real_at(&cols[1], 54.4);
+    let ser_cb_val = eval_real_at(&cols[1], 62.3);
+    let cb_val = eval_real_at(&cols[1], 27.8);
+    assert!(
+        ca_val > 5.0 && ser_cb_val < -5.0 && cb_val < -4.0,
+        "Biphasic lock failed under Ser/Thr CB + intense spike: sol={sol:?}, ca={ca_val:.2}, ser_cb={ser_cb_val:.2}, cb={cb_val:.2}"
+    );
+}

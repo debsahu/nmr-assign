@@ -80,6 +80,7 @@ fn make_axis_meta(
         carrier_mhz: obs_mhz * (1.0 + carrier_ppm * 1e-6),
         first_ppm: carrier_ppm + 0.5 * sw_ppm,
         quad_mode: QuadMode::Dqd,
+        states_recombined: true,
         group_delay,
         conjugate_for_fft,
         stored_proc: StoredDimProc::default(),
@@ -1502,5 +1503,383 @@ fn blind_3d_hncacb_autophasing_locks_ca_positive_and_cb_negative() {
     assert!(
         cb1 < 0.0 && cb2 < 0.0,
         "expected negative CB peaks after blind HNCACB autophase, got cb1={cb1}, cb2={cb2}"
+    );
+}
+
+#[test]
+fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unrecombined_axes() {
+    // 1. Precondition enforcement: `states_recombined == false` or `QuadMode::Qf` on NUS must fail
+    let nx = 64usize;
+    let ny = 64usize;
+    let ax_x = make_axis_meta("1H", nx, 6400.0, 600.0, 4.70, true, 0.0);
+    let mut ax_y_bad = make_axis_meta("15N", ny, 1920.0, 60.8, 118.0, true, 0.0);
+    ax_y_bad.states_recombined = false;
+    let mask_2d: Vec<bool> = (0..ny).map(|k| k < 8 || (k * 37 + 5) % 10 < 5).collect();
+    let bad_fid2 = Fid2D {
+        name: "bad_nus2".into(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "hsqc".into(),
+        axis_x: ax_x.clone(),
+        axis_y: ax_y_bad,
+        data: vec![[0.0, 0.0]; ny * 2 * nx],
+        nus_mask: Some(mask_2d.clone()),
+    };
+    let rec_bad2 = ProcessingRecipe::from_fid_2d(&bad_fid2);
+    let err2 =
+        process_fid_2d(&bad_fid2, &rec_bad2).expect_err("unrecombined 2D NUS axis must fail");
+    assert!(err2.contains("States"), "unexpected error: {err2}");
+
+    // 2. 2D hypercomplex NUS with 100:1 dynamic-range weak peak adjacent to strong peak at SAME 1H shift!
+    let mut ax_x_ph = ax_x.clone();
+    ax_x_ph.stored_proc.p0_deg = Some(0.0);
+    ax_x_ph.stored_proc.p1_deg = Some(0.0);
+    let mut ax_y_ok = make_axis_meta("15N", ny, 1920.0, 60.8, 118.0, true, 0.0);
+    ax_y_ok.stored_proc.p0_deg = Some(0.0);
+    ax_y_ok.stored_proc.p1_deg = Some(0.0);
+
+    let mut data2 = vec![[0.0, 0.0]; ny * 2 * nx];
+    let peaks_2d = [
+        (8.30, 121.5, 100.0), // Strong peak
+        (8.30, 124.2, 1.0),   // 100:1 weak peak in the exact same 1H column, 2.7 ppm away!
+    ];
+    for &(ph, pn, amp) in &peaks_2d {
+        let fx = (ph - 4.70) * 600.0 / 6400.0;
+        let fy = (pn - 118.0) * 60.8 / 1920.0;
+        for (k1, &sampled) in mask_2d.iter().enumerate().take(ny) {
+            if !sampled {
+                continue;
+            }
+            let ey = (-(k1 as f64) / 48.0).exp();
+            let py = 2.0 * PI * fy * (k1 as f64);
+            let weights = [ey * py.cos(), ey * py.sin()];
+            for (c1, &wy) in weights.iter().enumerate() {
+                let base = (k1 * 2 + c1) * nx;
+                for k0 in 0..nx {
+                    let ex = amp * (-(k0 as f64) / 48.0).exp();
+                    let px = 2.0 * PI * fx * (k0 as f64);
+                    data2[base + k0][0] += wy * ex * px.cos();
+                    data2[base + k0][1] += wy * ex * px.sin();
+                }
+            }
+        }
+    }
+    let fid2 = Fid2D {
+        name: "nus2_100_to_1".into(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "hsqc".into(),
+        axis_x: ax_x_ph.clone(),
+        axis_y: ax_y_ok.clone(),
+        data: data2,
+        nus_mask: Some(mask_2d),
+    };
+    let rec2 = ProcessingRecipe::from_fid_2d(&fid2);
+    let spec2 = process_fid_2d(&fid2, &rec2).expect("process 2D NUS 100:1");
+    let ix_col = spec2.axis_x.ppm_to_index(8.30).round() as usize;
+    let iy_strong = spec2.axis_y.ppm_to_index(121.5).round() as usize;
+    let iy_weak = spec2.axis_y.ppm_to_index(124.2).round() as usize;
+    let strong_2d = (-1isize..=1)
+        .map(|d| spec2.get(ix_col, (iy_strong as isize + d) as usize))
+        .fold(0.0_f32, f32::max);
+    let weak_2d = (-1isize..=1)
+        .map(|d| spec2.get(ix_col, (iy_weak as isize + d) as usize))
+        .fold(0.0_f32, f32::max);
+    let bg_2d = spec2
+        .get(ix_col, spec2.axis_y.ppm_to_index(110.0).round() as usize)
+        .abs();
+    assert!(
+        weak_2d > 0.004 * strong_2d && weak_2d > 8.0 * bg_2d.max(1e-6),
+        "2D NUS failed to recover 100:1 adjacent weak peak: strong={strong_2d}, weak={weak_2d}, bg={bg_2d}"
+    );
+
+    // 3. 3D hypercomplex NUS: precondition check + 100:1 dynamic-range weak peak recovery
+    let n1 = 24usize;
+    let n2 = 24usize;
+    let mut ax_y3 = make_axis_meta("15N", n1, 1920.0, 60.8, 118.0, true, 0.0);
+    let mut ax_z3 = make_axis_meta("13C", n2, 2400.0, 150.9, 176.0, true, 0.0);
+    ax_y3.stored_proc.p0_deg = Some(0.0);
+    ax_y3.stored_proc.p1_deg = Some(0.0);
+    ax_z3.stored_proc.p0_deg = Some(0.0);
+    ax_z3.stored_proc.p1_deg = Some(0.0);
+    let mask_3d: Vec<bool> = (0..(n2 * n1))
+        .map(|idx| {
+            let (k2, k1) = (idx / n1, idx % n1);
+            (k2 < 4 && k1 < 4) || ((k2 * 31 + k1 * 17 + 3) % 10 < 5)
+        })
+        .collect();
+
+    let mut bad_z3 = ax_z3.clone();
+    bad_z3.quad_mode = QuadMode::Qf;
+    let bad_fid3 = Fid3D {
+        name: "bad_nus3".into(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "hnco".into(),
+        axis_x: ax_x_ph.clone(),
+        axis_y: ax_y3.clone(),
+        axis_z: bad_z3,
+        data: vec![[0.0, 0.0]; n2 * 2 * n1 * 2 * nx],
+        nus_mask: Some(mask_3d.clone()),
+    };
+    let rec_bad3 = ProcessingRecipe::from_fid_3d(&bad_fid3);
+    assert!(process_fid_3d(&bad_fid3, "HNCO", &rec_bad3).is_err());
+
+    let mut data3 = vec![[0.0, 0.0]; n2 * 2 * n1 * 2 * nx];
+    let peaks_3d = [
+        (8.30, 121.0, 177.2, 100.0), // Strong 3D peak
+        (8.30, 121.0, 173.4, 1.0),   // 100:1 weak peak on the same (1H, 15N) strip!
+    ];
+    for &(ph, pn, pc, amp) in &peaks_3d {
+        let fx = (ph - 4.70) * 600.0 / 6400.0;
+        let fy = (pn - 118.0) * 60.8 / 1920.0;
+        let fz = (pc - 176.0) * 150.9 / 2400.0;
+        for k2 in 0..n2 {
+            let ez = (-(k2 as f64) / 20.0).exp();
+            let pz = 2.0 * PI * fz * (k2 as f64);
+            let (sz, cz) = (ez * pz.sin(), ez * pz.cos());
+            for k1 in 0..n1 {
+                if !mask_3d[k2 * n1 + k1] {
+                    continue;
+                }
+                let ey = (-(k1 as f64) / 20.0).exp();
+                let py = 2.0 * PI * fy * (k1 as f64);
+                let (sy, cy) = (ey * py.sin(), ey * py.cos());
+                let q = [cz * cy, cz * sy, sz * cy, sz * sy];
+                for c2 in 0..2 {
+                    for c1 in 0..2 {
+                        let w = q[c2 * 2 + c1];
+                        let base = (((k2 * 2 + c2) * n1 + k1) * 2 + c1) * nx;
+                        for k0 in 0..nx {
+                            let ex = amp * (-(k0 as f64) / 48.0).exp();
+                            let px = 2.0 * PI * fx * (k0 as f64);
+                            data3[base + k0][0] += w * ex * px.cos();
+                            data3[base + k0][1] += w * ex * px.sin();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let fid3 = Fid3D {
+        name: "nus3_100_to_1".into(),
+        vendor: FidVendor::Bruker,
+        pulse_program: "hnco".into(),
+        axis_x: ax_x_ph,
+        axis_y: ax_y3,
+        axis_z: ax_z3,
+        data: data3,
+        nus_mask: Some(mask_3d),
+    };
+    let rec3 = ProcessingRecipe::from_fid_3d(&fid3);
+    let spec3 = process_fid_3d(&fid3, "HNCO", &rec3).expect("process 3D NUS 100:1");
+    let ix3 = spec3.axis_x.ppm_to_index(8.30).round() as usize;
+    let iy3 = spec3.axis_y.ppm_to_index(121.0).round() as usize;
+    let iz_strong = spec3.axis_z.ppm_to_index(177.2).round() as usize;
+    let iz_weak = spec3.axis_z.ppm_to_index(173.4).round() as usize;
+    let strong_3d = (-1isize..=1)
+        .map(|d| spec3.get(ix3, iy3, (iz_strong as isize + d) as usize))
+        .fold(0.0_f32, f32::max);
+    let weak_3d = (-1isize..=1)
+        .map(|d| spec3.get(ix3, iy3, (iz_weak as isize + d) as usize))
+        .fold(0.0_f32, f32::max);
+    let flank_lo = spec3.get(ix3, iy3, iz_weak.saturating_sub(3));
+    let flank_hi = spec3.get(ix3, iy3, (iz_weak + 3).min(spec3.axis_z.size - 1));
+    let mut plane_bg: Vec<f32> = Vec::new();
+    for iy in 0..spec3.axis_y.size {
+        if iy.abs_diff(iy3) <= 3 {
+            continue;
+        }
+        for iz in 0..spec3.axis_z.size {
+            plane_bg.push(spec3.get(ix3, iy, iz).abs());
+        }
+    }
+    plane_bg.sort_by(|a, b| a.total_cmp(b));
+    let bg_3d = plane_bg[plane_bg.len() / 2];
+    let flank_mean = 0.5 * (flank_lo + flank_hi);
+    let weak_prom = weak_3d - flank_mean;
+    assert!(
+        weak_prom > 0.006 * strong_3d
+            && weak_3d > 2.2 * flank_mean
+            && weak_prom > 50.0 * bg_3d.max(1e-6),
+        "3D NUS failed to recover 100:1 adjacent weak peak: strong={strong_3d}, weak={weak_3d}, weak_prom={weak_prom}, flanks=({flank_lo}, {flank_hi}), bg={bg_3d}"
+    );
+}
+
+#[test]
+fn low_snr_3d_focused_autophase_mirrored_cacb_recovery_and_rigid_hn_registration() {
+    use nmr_core::process::register_3d_hn_to_hsqc_2d;
+
+    // Synthesize a 16-spin-system Varian-layout 3D `CBCACONH` (`axis_y = 13C`, `axis_z = 15N`)
+    // where:
+    // 1. `axis_y` (`13C`, carrier = 46.0 ppm, SW = 62 ppm -> 77..15 ppm) is un-annotated and
+    //    carrier-mirrored (`conjugate_for_fft = false` while time-domain signal uses `+i` phase),
+    //    initially placing Ala CB (19.0 ppm) into the forbidden 73.0 ppm mirror zone and CA into 32..38 ppm!
+    // 2. Direct `1H` has blind phase `-86 deg` and per-trace thermal noise so single raw traces have low SNR.
+    // 3. Indirect `15N` has Rance-Kay + half-dwell phase `(+90 deg, -180 deg)`.
+    let nx = 128usize;
+    let nc = 32usize;
+    let nn = 24usize;
+    let ax_x = make_axis_meta("1H", nx, 8000.0, 500.0, 4.75, false, 0.0);
+    let ax_c = make_axis_meta("13C", nc, 7800.0, 125.7, 46.0, false, 0.0); // intentionally inverted conjugate_for_fft!
+    let ax_n = make_axis_meta("15N", nn, 1400.0, 50.66, 119.0, true, 0.0);
+
+    let residues: &[(f64, f64, f64, f64)] = &[
+        (8.42, 120.5, 53.2, 19.0),
+        (8.18, 116.2, 56.4, 19.4),
+        (7.94, 123.8, 52.9, 18.8),
+        (8.65, 118.4, 58.6, 63.8),
+        (7.68, 114.5, 61.4, 69.5),
+        (8.05, 125.1, 55.2, 31.4),
+        (8.81, 121.9, 57.1, 29.8),
+        (7.52, 117.0, 54.6, 39.2),
+        (8.29, 112.8, 59.8, 33.1),
+        (7.83, 126.4, 53.5, 19.2),
+        (8.51, 115.3, 60.5, 36.8),
+        (7.41, 119.7, 56.9, 28.4),
+    ];
+
+    let phi_x_true = 86.0_f64.to_radians(); // Varian non-conjugated direct phase
+    let phi_n0 = (-90.0_f64).to_radians();
+    let mut data3 = vec![[0.0, 0.0]; nn * 2 * nc * 2 * nx];
+
+    // Add deterministic pseudo-Gaussian noise across all traces (`sigma ~ 0.35`, comparable to single-peak trace amplitude!)
+    let mut rng_state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next_noise = || -> f64 {
+        let mut s = 0.0;
+        for _ in 0..4 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s += ((rng_state >> 32) as f64) / (u32::MAX as f64) - 0.5;
+        }
+        s * 0.30
+    };
+    for sample in &mut data3 {
+        sample[0] = next_noise();
+        sample[1] = next_noise();
+    }
+
+    for &(ph, pn, pca, pcb) in residues {
+        // Non-conjugated direct `1H`: downfield (+offset) uses `-2*pi*fx*k0` so standard forward FFT places it at `j < N/2`
+        let fx = -(ph - 4.75) * 500.0 / 8000.0;
+        let fn_off = (pn - 119.0) * 50.66 / 1400.0;
+        for &(pc, amp) in &[(pca, 1.4), (pcb, 1.0)] {
+            // Generated with `+2*pi*fc*k1` (`conjugate_for_fft = true` physics), while `ax_c.conjugate_for_fft = false`!
+            let fc = (pc - 46.0) * 125.7 / 7800.0;
+            for k2 in 0..nn {
+                let en = (-(k2 as f64) / 20.0).exp();
+                let pn_ang = 2.0 * PI * fn_off * ((k2 as f64) + 0.5) + phi_n0;
+                let (sn, cn) = (en * pn_ang.sin(), en * pn_ang.cos());
+                for k1 in 0..nc {
+                    let ec = (-(k1 as f64) / 24.0).exp();
+                    let pc_ang = 2.0 * PI * fc * (k1 as f64);
+                    let (sc, cc) = (ec * pc_ang.sin(), ec * pc_ang.cos());
+                    let q = [cn * cc, cn * sc, sn * cc, sn * sc];
+                    for c2 in 0..2 {
+                        for c1 in 0..2 {
+                            let w = q[c2 * 2 + c1];
+                            let base = (((k2 * 2 + c2) * nc + k1) * 2 + c1) * nx;
+                            for k0 in 0..nx {
+                                let ex = amp * (-(k0 as f64) / 64.0).exp();
+                                let px = 2.0 * PI * fx * (k0 as f64) + phi_x_true;
+                                data3[base + k0][0] += w * ex * px.cos();
+                                data3[base + k0][1] += w * ex * px.sin();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let fid3 = Fid3D {
+        name: "varian_unannotated_cbca".into(),
+        vendor: FidVendor::Varian,
+        pulse_program: "gcbca_co_nh".into(),
+        axis_x: ax_x.clone(),
+        axis_y: ax_c,
+        axis_z: ax_n.clone(),
+        data: data3,
+        nus_mask: None,
+    };
+    let mut rec3 = ProcessingRecipe::from_fid_3d(&fid3);
+    let initial_conj_c = rec3.dims[1].conjugate_for_fft;
+    assert!(
+        initial_conj_c,
+        "DimRecipe::from_axis_meta inverts ax_c.conjugate_for_fft (false -> true)"
+    );
+    let mut spec3 =
+        nmr_core::process::process_fid_3d_mut(&fid3, "CBCACONH", &mut rec3).expect("process 3D");
+
+    assert_eq!(
+        rec3.dims[1].conjugate_for_fft, !initial_conj_c,
+        "Un-annotated carrier-mirrored 13CA/CB axis must be automatically detected and un-mirrored"
+    );
+    // Verify true Ala CA (53.2 ppm) and Ala CB (19.0 ppm) are strong positive peaks on residue 0!
+    let mut roots_true: Vec<Peak> = residues
+        .iter()
+        .map(|&(h, n, _, _)| Peak {
+            exp: "HSQC".into(),
+            h,
+            n,
+            c: None,
+            sign: 1,
+            height: Some(100.0),
+            volume: None,
+            h2: None,
+        })
+        .collect();
+    let picked_3d = pick_triple_3d(&spec3, &roots_true, &PickerConfig::default());
+    let has_ca0 = picked_3d.iter().any(|p| {
+        (p.h - 8.42).abs() < 0.05
+            && (p.n - 120.5).abs() < 0.5
+            && (p.c.unwrap_or(0.0) - 53.2).abs() < 0.8
+            && p.sign > 0
+    });
+    let has_ala_cb0 = picked_3d.iter().any(|p| {
+        (p.h - 8.42).abs() < 0.05
+            && (p.n - 120.5).abs() < 0.5
+            && (p.c.unwrap_or(0.0) - 19.0).abs() < 0.8
+            && p.sign > 0
+    });
+    assert!(
+        has_ca0 && has_ala_cb0,
+        "Expected un-mirrored positive CA (53.2) and Ala CB (19.0) peaks, picked {} peaks",
+        picked_3d.len()
+    );
+
+    // 4. Test rigid `(dH, dN)` registration of `spec3` against a shifted 2D `HSQC` (`+0.035 ppm 1H, -0.32 ppm 15N`)
+    let dh_shift = 0.035;
+    let dn_shift = -0.32;
+    let hsqc_ax_x = AxisPpm::from_bounds("1H", 256, 10.5, 6.0, 800.0);
+    let hsqc_ax_y = AxisPpm::from_bounds("15N", 128, 132.0, 108.0, 81.0);
+    let mut hsqc_data = vec![0.0_f32; 128 * 256];
+    for &(h, n, _, _) in residues {
+        let h_ref = h + dh_shift;
+        let n_ref = n + dn_shift;
+        for iy in 0..128 {
+            let yn = (hsqc_ax_y.index_to_ppm(iy as f64) - n_ref) / 0.22;
+            for ix in 0..256 {
+                let xh = (hsqc_ax_x.index_to_ppm(ix as f64) - h_ref) / 0.025;
+                hsqc_data[iy * 256 + ix] += (100.0 / ((1.0 + xh * xh) * (1.0 + yn * yn))) as f32;
+            }
+        }
+    }
+    let hsqc_2d = nmr_core::spectrum::Spectrum2D {
+        name: "hsqc_ref".into(),
+        axis_x: hsqc_ax_x,
+        axis_y: hsqc_ax_y,
+        data: hsqc_data,
+    };
+    let (applied_dh, applied_dn) = register_3d_hn_to_hsqc_2d(&mut spec3, &hsqc_2d, 0.08, 0.8);
+    assert!(
+        (applied_dh - dh_shift).abs() < 0.008 && (applied_dn - dn_shift).abs() < 0.06,
+        "Expected rigid shift ({dh_shift:+.4}, {dn_shift:+.3}), got ({applied_dh:+.4}, {applied_dn:+.3})"
+    );
+    for r in &mut roots_true {
+        r.h += dh_shift;
+        r.n += dn_shift;
+    }
+    let picked_reg = pick_triple_3d(&spec3, &roots_true, &PickerConfig::default());
+    assert!(
+        picked_reg.len() >= 18,
+        "Expected >= 18 registered 3D peaks on shifted HSQC roots, got {}",
+        picked_reg.len()
     );
 }

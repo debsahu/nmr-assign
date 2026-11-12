@@ -104,8 +104,8 @@ impl Default for NusConfig {
         Self {
             method: NusMethod::Fista,
             max_iter: 80,
-            stop_rel_thresh: 0.005,
-            schedule_decay: 0.95,
+            stop_rel_thresh: 5e-4,
+            schedule_decay: 0.94,
             negate_imag: true,
             first_scale: 0.5,
             virtual_echo_phase: None,
@@ -264,6 +264,9 @@ pub struct Trace1D {
     pub data: Vec<Complex64>,
     pub is_freq_domain: bool,
     pub has_imaginary: bool,
+    /// Whether hypercomplex indirect pairs (`EchoAntiecho`, `StatesTppi`) have already been
+    /// recombined into uniform `States` `(cos, sin)` form (`false` for `QF` or unrecombined traces).
+    pub states_recombined: bool,
     /// Residual sub-sample group delay (`delay_pts - round(delay_pts)`) applied as an exact
     /// linear phase across the zero-filled frequency grid during forward `FourierTransform`.
     pub pending_group_delay_pts: f64,
@@ -287,6 +290,7 @@ impl Trace1D {
             data: samples,
             is_freq_domain: false,
             has_imaginary: true,
+            states_recombined: meta.states_recombined && meta.quad_mode != crate::fid::QuadMode::Qf,
             pending_group_delay_pts: 0.0,
         }
     }
@@ -313,6 +317,7 @@ impl Trace1D {
             data,
             is_freq_domain: false,
             has_imaginary: true,
+            states_recombined: true,
             pending_group_delay_pts: 0.0,
         }
     }
@@ -326,6 +331,7 @@ impl Trace1D {
             data,
             is_freq_domain: true,
             has_imaginary: true,
+            states_recombined: true,
             pending_group_delay_pts: 0.0,
         }
     }
@@ -340,6 +346,7 @@ impl Trace1D {
             data,
             is_freq_domain: true,
             has_imaginary: false,
+            states_recombined: true,
             pending_group_delay_pts: 0.0,
         }
     }
@@ -923,6 +930,7 @@ pub fn reconstruct_nus_1d(
 
     let n_fft = (2 * n).next_power_of_two();
     let sign_im = if config.negate_imag { -1.0 } else { 1.0 };
+    let use_ve_fcor = config.virtual_echo_phase.is_some();
 
     // Forward operator `A(x_spec) -> time_masked` and adjoint `A*(time_res) -> spec_grad`
     let time_to_spec = |td: &[Complex64]| -> Vec<Complex64> {
@@ -930,7 +938,7 @@ pub fn reconstruct_nus_1d(
         for (k, &c) in td.iter().enumerate() {
             buf[k] = [c[0], sign_im * c[1]];
         }
-        if !buf.is_empty() {
+        if use_ve_fcor && !buf.is_empty() {
             buf[0][0] *= config.first_scale;
             buf[0][1] *= config.first_scale;
         }
@@ -956,7 +964,7 @@ pub fn reconstruct_nus_1d(
         fft_arbitrary_in_place(&mut buf, true);
         let mut td = Vec::with_capacity(n);
         for (k, &c) in buf.iter().enumerate().take(n) {
-            let inv_f = if k == 0 && config.first_scale.abs() > 1e-6 {
+            let inv_f = if use_ve_fcor && k == 0 && config.first_scale.abs() > 1e-6 {
                 1.0 / config.first_scale
             } else {
                 1.0
@@ -989,13 +997,17 @@ pub fn reconstruct_nus_1d(
         return b_obs;
     }
 
+    let tau_start = 0.85 * max_amp;
     let tau_min = (config.stop_rel_thresh.clamp(1e-5, 0.5)) * max_amp;
-    let decay = config.schedule_decay.clamp(0.5, 0.999);
     let max_it = config.max_iter.max(1);
+    let ramp_iters = (max_it / 2).max(1) as f64;
 
     let mut x_spec = vec![[0.0, 0.0]; n_fft];
     let mut y_spec = vec![[0.0, 0.0]; n_fft];
+    let mut active = vec![false; n_fft];
+    let mut res_mags = Vec::with_capacity(n_fft);
     let mut t_fista = 1.0_f64;
+    let mut prev_res_e = f64::INFINITY;
 
     for it in 0..max_it {
         let base_spec = match config.method {
@@ -1004,44 +1016,71 @@ pub fn reconstruct_nus_1d(
         };
         let pred_td = spec_to_time(base_spec);
         let mut res_td = vec![[0.0, 0.0]; n];
+        let mut res_e = 0.0_f64;
         for k in 0..n {
             if mask[k] {
-                res_td[k] = c_sub(b_obs[k], pred_td[k]);
+                let d = c_sub(b_obs[k], pred_td[k]);
+                res_td[k] = d;
+                res_e += d[0] * d[0] + d[1] * d[1];
             }
         }
         let grad_spec = time_to_spec(&res_td);
 
-        let tau = match config.method {
-            NusMethod::Ist => (max_amp * decay.powi((it + 1) as i32)).max(tau_min),
-            NusMethod::Fista => {
-                let frac = (it as f64) / ((max_it.saturating_sub(1)).max(1) as f64);
-                (max_amp * (tau_min / max_amp).powf(frac)).max(tau_min)
-            }
-        };
+        // Estimate MAD noise dynamically from the frequency-domain residual `grad_spec`
+        // rather than the PSF-artifact-dominated initial zero-filled spectrum.
+        res_mags.clear();
+        for c in &grad_spec {
+            res_mags.push(if config.virtual_echo_phase.is_some() {
+                c[0].abs()
+            } else {
+                c[0].hypot(c[1])
+            });
+        }
+        let med_res = median_f64(&mut res_mags);
+        for v in &mut res_mags {
+            *v = (*v - med_res).abs();
+        }
+        let sigma_res = 1.4826 * median_f64(&mut res_mags);
+        let tau_floor = (2.0 * sigma_res).max(tau_min);
 
+        let frac = ((it as f64) / ramp_iters).min(1.0);
+        let tau = (tau_start * (tau_min / tau_start.max(tau_min)).powf(frac)).max(tau_floor);
+
+        let is_last = it + 1 == max_it;
+        if is_last {
+            active.fill(false);
+        }
         let mut x_next = vec![[0.0, 0.0]; n_fft];
         for i in 0..n_fft {
             let u = c_add(base_spec[i], grad_spec[i]);
             if config.virtual_echo_phase.is_some() {
                 let r_abs = u[0].abs();
-                let r_shrunk = if r_abs > tau {
-                    u[0].signum() * (r_abs - tau)
-                } else {
-                    0.0
-                };
-                x_next[i] = [r_shrunk, 0.0];
+                if r_abs > tau {
+                    x_next[i] = [u[0].signum() * (r_abs - tau), 0.0];
+                    if is_last {
+                        active[i] = true;
+                    }
+                }
             } else {
                 let mag = u[0].hypot(u[1]);
                 if mag > tau {
                     let sc = (mag - tau) / mag;
                     x_next[i] = [u[0] * sc, u[1] * sc];
+                    if is_last {
+                        active[i] = true;
+                    }
                 }
             }
         }
 
         if config.method == NusMethod::Fista {
+            // Adaptive momentum restart (O'Donoghue & Candes 2015) prevents oscillatory overshoot
+            // on strong peaks during homotopic threshold continuation.
+            if res_e > prev_res_e * 1.02 {
+                t_fista = 1.0;
+            }
             let t_next = 0.5 * (1.0 + (1.0 + 4.0 * t_fista * t_fista).sqrt());
-            let mom = (t_fista - 1.0) / t_next;
+            let mom = ((t_fista - 1.0) / t_next).min(0.75);
             for i in 0..n_fft {
                 y_spec[i] = [
                     x_next[i][0] + mom * (x_next[i][0] - x_spec[i][0]),
@@ -1049,19 +1088,38 @@ pub fn reconstruct_nus_1d(
                 ];
             }
             t_fista = t_next;
+            prev_res_e = res_e;
         }
         x_spec = x_next;
 
-        if config.method == NusMethod::Ist && tau <= tau_min * 1.001 {
+        if is_last {
             break;
         }
     }
 
     let mut out_td = spec_to_time(&x_spec);
-    // Enforce exact data fidelity on measured schedule coordinates
     for k in 0..n {
         if mask[k] {
             out_td[k] = trace[k];
+        }
+    }
+    // Debiasing support projections: eliminate L1 soft-thresholding shrinkage bias on recovered weak peaks
+    if active.iter().any(|&a| a) {
+        for _ in 0..16 {
+            let mut sp = time_to_spec(&out_td);
+            for (i, c) in sp.iter_mut().enumerate() {
+                if !active[i] {
+                    *c = [0.0, 0.0];
+                } else if config.virtual_echo_phase.is_some() {
+                    c[1] = 0.0;
+                }
+            }
+            out_td = spec_to_time(&sp);
+            for k in 0..n {
+                if mask[k] {
+                    out_td[k] = trace[k];
+                }
+            }
         }
     }
     out_td
@@ -1261,6 +1319,12 @@ pub fn apply_stage(trace: &mut Trace1D, op: &StageOp) -> Result<(), String> {
         }
 
         StageOp::NusReconstruct { mask, config } => {
+            if !trace.states_recombined {
+                return Err(format!(
+                    "NUS IST/FISTA on axis '{}' requires uniform States-recombined hypercomplex input (Echo-Antiecho recombined and States-TPPI alternation removed)",
+                    trace.axis.label
+                ));
+            }
             if mask.len() != n {
                 return Err(format!(
                     "NUS mask length ({}) does not match trace length ({n})",
@@ -2063,7 +2127,7 @@ pub struct AutoPhaseConfig {
     /// (falls back automatically to full non-water axis when `< 5%` energy lies inside).
     pub direct_roi_ppm: Option<(f64, f64)>,
     /// Positive-polarity reference band `(min_ppm, max_ppm)` in `PolarityMode::Biphasic`
-    /// (`CA` chemical-shift band `48.0..66.0 ppm` for `HNCACB`).
+    /// (`CA` chemical-shift band `48.0..60.0 ppm` for `HNCACB`, excluding `Ser`/`Thr` `CB(-)` at `60..66 ppm`).
     pub biphasic_pos_band_ppm: (f64, f64),
     /// Maximum number of high-SNR traces/columns selected for N-D autophasing.
     pub top_traces: usize,
@@ -2080,14 +2144,14 @@ impl Default for AutoPhaseConfig {
             wing_asymmetry_weight: 4.5,
             water_mask_ppm: Some((4.55, 5.05)),
             direct_roi_ppm: Some((5.80, 10.60)),
-            biphasic_pos_band_ppm: (48.0, 66.0),
+            biphasic_pos_band_ppm: (48.0, 60.0),
             top_traces: 32,
         }
     }
 }
 
 impl AutoPhaseConfig {
-    /// Preset for `HNCACB` / biphasic spectra (`PolarityMode::Biphasic`, `CA` positive in `48..66 ppm`).
+    /// Preset for `HNCACB` / biphasic spectra (`PolarityMode::Biphasic`, `CA` positive in `48..60 ppm`).
     pub fn biphasic() -> Self {
         Self {
             polarity: PolarityMode::Biphasic,
@@ -2192,6 +2256,34 @@ fn build_active_indices(
                     .map(|tr| roi.iter().map(|&k| c_abs2(tr[k])).sum::<f64>())
                     .sum();
                 if e_roi >= 0.04 * e_non_water && e_roi > 1e-30 {
+                    return roi;
+                }
+                // Even when a massive residual HDO skirt outside `water_mask_ppm` (`4.2..5.3 ppm`)
+                // inflates `e_non_water` on weak 3D `HNCACB` traces, keep the amide ROI if `roi`
+                // itself contains clear discrete peaks (`max / MAD >= 5.0`) and clean aliphatic
+                // `< 3.5 ppm` does not out-energize `roi` by `> 20x`.
+                let upfield_clean: Vec<usize> = non_water
+                    .iter()
+                    .copied()
+                    .filter(|&k| axis.index_to_ppm(k as f64) < 3.5)
+                    .collect();
+                let e_upfield: f64 = traces
+                    .iter()
+                    .take(16)
+                    .map(|tr| upfield_clean.iter().map(|&k| c_abs2(tr[k])).sum::<f64>())
+                    .sum();
+                let roi_has_peaks = traces.iter().take(16).any(|tr| {
+                    let mut mags: Vec<f64> =
+                        roi.iter().map(|&k| tr[k][0].hypot(tr[k][1])).collect();
+                    let max_m = mags.iter().copied().fold(0.0_f64, f64::max);
+                    let med_m = median_f64(&mut mags);
+                    for v in &mut mags {
+                        *v = (*v - med_m).abs();
+                    }
+                    let mad_m = (1.4826 * median_f64(&mut mags)).max(1e-30);
+                    (max_m - med_m) >= 5.0 * mad_m
+                });
+                if roi_has_peaks && e_upfield <= 20.0 * e_roi {
                     return roi;
                 }
             }
@@ -2853,6 +2945,87 @@ fn net_signed_peak_polarity(
     net
 }
 
+/// Compute capped-SNR local-extremum polarity votes `(ca_vote, cb_vote)` for `Biphasic` (`HNCACB`)
+/// 1D / indirect traces across `ca_band_ppm` (`48..60 ppm`, excluding `Ser`/`Thr` `CB(-)` at `60..66 ppm`)
+/// and `cb_band_ppm` (`14..38 ppm`).
+///
+/// Each local extremum exceeding `4.0 * sigma_mad` contributes `sign(r) * min(|r|/sigma_mad - 4.0, 8.0)`,
+/// preventing a single intense artifact spike or `Ser`-rich `CB(-)` cluster from inverting `HNCACB` sign.
+fn biphasic_capped_snr_votes_1d(
+    traces: &[&[Complex64]],
+    axis: &AxisPpm,
+    p0_deg: f64,
+    p1_deg: f64,
+    ca_band_ppm: (f64, f64),
+    cb_band_ppm: (f64, f64),
+) -> (f64, f64) {
+    let n = axis.size;
+    if n < 4 || traces.is_empty() {
+        return (0.0, 0.0);
+    }
+    let (ca_lo, ca_hi) = (
+        ca_band_ppm.0.min(ca_band_ppm.1),
+        ca_band_ppm.0.max(ca_band_ppm.1),
+    );
+    let (cb_lo, cb_hi) = (
+        cb_band_ppm.0.min(cb_band_ppm.1),
+        cb_band_ppm.0.max(cb_band_ppm.1),
+    );
+    let nf = n as f64;
+    let mut r_buf = vec![0.0; n];
+    let mut tmp = vec![0.0; n];
+    let mut ca_vote = 0.0;
+    let mut cb_vote = 0.0;
+
+    for tr in traces {
+        if tr.len() < n {
+            continue;
+        }
+        for (k, slot) in r_buf.iter_mut().enumerate() {
+            let phi = (p0_deg + p1_deg * ((k as f64) / nf)).to_radians();
+            let (sp, cp) = phi.sin_cos();
+            *slot = tr[k][0] * cp - tr[k][1] * sp;
+        }
+        tmp.copy_from_slice(&r_buf);
+        let med = median_f64(&mut tmp);
+        for v in &mut r_buf {
+            *v -= med;
+        }
+        let sigma_raw = robust_mad_sigma(&r_buf).max(1e-12);
+        let mut cands: Vec<(f64, f64, usize)> = Vec::new();
+        for k in 1..(n - 1) {
+            let av = r_buf[k].abs();
+            let al = r_buf[k - 1].abs();
+            let ar = r_buf[k + 1].abs();
+            if av > 4.0 * sigma_raw && av >= al && av >= ar && (av > al || av > ar) {
+                cands.push((av, r_buf[k].signum(), k));
+            }
+        }
+        if cands.is_empty() {
+            continue;
+        }
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // Guard against noise-free synthetic spectra (`sigma_raw ~ 0`, where `< 2%` apodization
+        // sidelobes would otherwise exceed `4 * sigma_raw`) while remaining immune to a single
+        // intense artifact spike by referencing the 3rd-largest extremum (`cands[min(2, len-1)]`).
+        let ref_amp = cands[2.min(cands.len() - 1)].0;
+        let sigma = sigma_raw.max(0.02 * ref_amp);
+        for &(av, sgn, k) in &cands {
+            let snr = av / sigma;
+            if snr > 4.0 {
+                let vote = sgn * (snr - 4.0).min(8.0);
+                let ppm = axis.index_to_ppm(k as f64);
+                if ppm >= ca_lo && ppm <= ca_hi {
+                    ca_vote += vote;
+                } else if ppm >= cb_lo && ppm <= cb_hi {
+                    cb_vote += vote;
+                }
+            }
+        }
+    }
+    (ca_vote, cb_vote)
+}
+
 /// Automatically phase a single complex 1D frequency-domain spectrum `spec_cplx`
 /// (`spec_cplx.len() == axis.size`).
 pub fn auto_phase_1d(
@@ -2977,34 +3150,47 @@ pub fn auto_phase_1d(
             best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
         }
     } else {
-        // Biphasic 1D: if axis overlaps `biphasic_pos_band_ppm`, lock positive band
-        let (b0, b1) = (
-            config
-                .biphasic_pos_band_ppm
-                .0
-                .min(config.biphasic_pos_band_ppm.1),
-            config
-                .biphasic_pos_band_ppm
-                .0
-                .max(config.biphasic_pos_band_ppm.1),
+        // Biphasic 1D: lock `CA(+)` (`48..60 ppm`) vs `CB(-)` (`14..38 ppm`) via capped-SNR peak votes
+        let (ca_v, cb_v) = biphasic_capped_snr_votes_1d(
+            &slice_refs,
+            axis,
+            best_sol.p0_deg,
+            best_sol.p1_deg,
+            config.biphasic_pos_band_ppm,
+            (14.0, 38.0),
         );
-        let pos_idx: Vec<usize> = (0..cplx_ref.len())
-            .filter(|&k| {
-                let ppm = axis.index_to_ppm(k as f64);
-                ppm >= b0 && ppm <= b1
-            })
-            .collect();
-        if pos_idx.len() >= 4 {
-            let net = net_signed_peak_polarity(
-                &slice_refs,
-                cplx_ref.len(),
-                &pos_idx,
-                best_sol.p0_deg,
-                best_sol.p1_deg,
-                false,
+        let net_biph = ca_v - cb_v;
+        if net_biph < -1e-9 {
+            best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
+        } else if net_biph.abs() <= 1e-9 {
+            let (b0, b1) = (
+                config
+                    .biphasic_pos_band_ppm
+                    .0
+                    .min(config.biphasic_pos_band_ppm.1),
+                config
+                    .biphasic_pos_band_ppm
+                    .0
+                    .max(config.biphasic_pos_band_ppm.1),
             );
-            if net < 0.0 {
-                best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
+            let pos_idx: Vec<usize> = (0..cplx_ref.len())
+                .filter(|&k| {
+                    let ppm = axis.index_to_ppm(k as f64);
+                    ppm >= b0 && ppm <= b1
+                })
+                .collect();
+            if pos_idx.len() >= 4 {
+                let net = net_signed_peak_polarity(
+                    &slice_refs,
+                    cplx_ref.len(),
+                    &pos_idx,
+                    best_sol.p0_deg,
+                    best_sol.p1_deg,
+                    false,
+                );
+                if net < 0.0 {
+                    best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
+                }
             }
         }
     }
@@ -3188,9 +3374,18 @@ pub fn auto_phase_direct_nd(
         }
     }
 
-    // Lock `0 deg` vs `180 deg` polarity on the `t_ind = 0` first cosine increment (`valid_traces[0]`)
+    // Lock `0 deg` vs `180 deg` polarity on `valid_traces[0]` (`t_ind = 0` cosine increment) when it
+    // carries non-trivial amide-band energy (`>= 5%` of top trace), or on `prep[0].cplx` when `t_ind = 0`
+    // is zero/cancelled (e.g. `p0_ind = +-90 deg` Echo-Antiecho or `HNCACB` `CA+CB` cancellation).
     if config.polarity == PolarityMode::AllPositive {
-        let first_ref = [valid_traces[0].as_slice()];
+        let e_first: f64 = active_idx.iter().map(|&k| c_abs2(valid_traces[0][k])).sum();
+        let e_top: f64 = active_idx.iter().map(|&k| c_abs2(prep[0].cplx[k])).sum();
+        let ref_slice = if e_first >= 0.05 * e_top.max(1e-30) {
+            valid_traces[0].as_slice()
+        } else {
+            prep[0].cplx
+        };
+        let first_ref = [ref_slice];
         let net0 = net_signed_peak_polarity(
             &first_ref,
             n,
@@ -3204,8 +3399,8 @@ pub fn auto_phase_direct_nd(
         }
     } else {
         // In `Biphasic` mode on direct 1H, choose the canonical representative with smaller |p0|
-        // (e.g. `0 deg` over `180 deg`), or positive first-trace net energy if tied; final 3D
-        // `CA`-band (`48..66 ppm`) polarity is locked unambiguously on the `13C` axis!
+        // (e.g. `0 deg` over `180 deg`); final 3D `CA`-band (`48..60 ppm`) vs `CB`-band (`14..38 ppm`)
+        // polarity is locked unambiguously on the `13C` axis!
         let alt_p0 = wrap_deg_180(best_sol.p0_deg + 180.0);
         if alt_p0.abs() + 1e-6 < best_sol.p0_deg.abs() {
             best_sol.p0_deg = alt_p0;
@@ -3271,6 +3466,11 @@ pub fn auto_phase_indirect_nd(
         };
     }
 
+    // Optimize dispersive-free Lorentzian symmetry (`apply_neg = false`) across `prep`:
+    // in 3D experiments, columns along `F2` (`15N`) extracted at `k2 > 0` are modulated by
+    // `cos(omega_C * k2 * dt_C)` / `sin(omega_C * k2 * dt_C)` and legitimately contain both
+    // positive and negative absorption peaks even in `AllPositive` experiments! Global `0 deg`
+    // vs `180 deg` polarity is locked cleanly after `(p0, p1)` symmetry optimization.
     let apply_neg = config.polarity == PolarityMode::AllPositive;
 
     let top_refs: Vec<&[Complex64]> = prep.iter().map(|p| p.cplx).collect();
@@ -3309,9 +3509,15 @@ pub fn auto_phase_indirect_nd(
         if !check_biphasic_opp {
             return 0.0;
         }
-        let n_ca = net_signed_peak_polarity(&top_refs, n, &ca_band_idx, p0, p1, false);
-        let n_cb = net_signed_peak_polarity(&top_refs, n, &cb_band_idx, p0, p1, false);
-        if n_ca.abs() > 1e-30 && n_cb.abs() > 1e-30 && n_ca * n_cb >= 0.0 {
+        let (n_ca, n_cb) = biphasic_capped_snr_votes_1d(
+            &top_refs,
+            axis_ind,
+            p0,
+            p1,
+            config.biphasic_pos_band_ppm,
+            (14.0, 38.0),
+        );
+        if n_ca.abs() > 1e-6 && n_cb.abs() > 1e-6 && n_ca * n_cb >= 0.0 {
             1.5
         } else {
             0.0
@@ -3320,7 +3526,8 @@ pub fn auto_phase_indirect_nd(
 
     // 1. Canonical indirect sampling-delay phase states + coarse grid
     // Indirect axes have no FIR digital filter; physical `p1` arises from initial evolution delay
-    // `t0 / dt in {0, 0.5, 1.0}` (`p1 in {0, +-180, +-360}`), with zero-delay `p1 = 0` most common.
+    // `t0 / dt in {0, 0.5, 1.0}` (`p1 in {0, +-180, +-360}`), with zero-delay `p1 = 0` (including
+    // constant-time Echo-Antiecho `p0 = +-90, p1 = 0`) most common.
     let delay_prior = |p1: f64| -> f64 {
         let a = p1.abs();
         if a < 1.0 {
@@ -3334,6 +3541,8 @@ pub fn auto_phase_indirect_nd(
 
     let canonical: &[(f64, f64)] = &[
         (0.0, 0.0),
+        (90.0, 0.0),
+        (-90.0, 0.0),
         (-180.0, 0.0),
         (-90.0, 180.0),
         (90.0, -180.0),
@@ -3426,34 +3635,32 @@ pub fn auto_phase_indirect_nd(
             best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
         }
     } else {
-        // Biphasic mode (e.g. `13C` in `HNCACB`): lock `CA` band (`48..66 ppm`) positive!
-        let (b0, b1) = (
-            config
-                .biphasic_pos_band_ppm
-                .0
-                .min(config.biphasic_pos_band_ppm.1),
-            config
-                .biphasic_pos_band_ppm
-                .0
-                .max(config.biphasic_pos_band_ppm.1),
-        );
-        let ca_idx: Vec<usize> = (0..n)
-            .filter(|&k| {
-                let ppm = axis_ind.index_to_ppm(k as f64);
-                ppm >= b0 && ppm <= b1
-            })
-            .collect();
-        if ca_idx.len() >= 4 {
-            let net_ca = net_signed_peak_polarity(
+        // Biphasic mode (e.g. `13C` in `HNCACB`): lock `CA(+)` (`48..60 ppm`, excluding `Ser`/`Thr`
+        // `CB(-)` at `60..66 ppm`) vs `CB(-)` (`14..38 ppm`) via capped-SNR local-extremum peak votes!
+        if ca_band_idx.len() >= 4 || cb_band_idx.len() >= 4 {
+            let (n_ca, n_cb) = biphasic_capped_snr_votes_1d(
                 &top_refs,
-                n,
-                &ca_idx,
+                axis_ind,
                 best_sol.p0_deg,
                 best_sol.p1_deg,
-                false,
+                config.biphasic_pos_band_ppm,
+                (14.0, 38.0),
             );
-            if net_ca < 0.0 {
+            let net_biph = n_ca - n_cb;
+            if net_biph < -1e-9 {
                 best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
+            } else if net_biph.abs() <= 1e-9 && ca_band_idx.len() >= 4 {
+                let net_ca = net_signed_peak_polarity(
+                    &top_refs,
+                    n,
+                    &ca_band_idx,
+                    best_sol.p0_deg,
+                    best_sol.p1_deg,
+                    false,
+                );
+                if net_ca < 0.0 {
+                    best_sol.p0_deg = wrap_deg_180(best_sol.p0_deg + 180.0);
+                }
             }
         } else {
             let alt_p0 = wrap_deg_180(best_sol.p0_deg + 180.0);
@@ -3467,19 +3674,27 @@ pub fn auto_phase_indirect_nd(
 }
 
 /// Verify and lock global `0 deg` vs `180 deg` polarity of a 3D `Biphasic` (`HNCACB`) cube
-/// so that strong peaks in `ca_band_ppm` (`48..66 ppm` on the `13C` axis) are strictly positive.
+/// so that `CA` peaks in `ca_band_ppm` (`48..60 ppm`, excluding `Ser`/`Thr` `CB(-)` at `60..66 ppm`)
+/// are positive and `CB` peaks in `14..38 ppm` are negative, using capped-SNR 3D local-extremum
+/// peak votes rather than raw intensity sums.
 /// Returns `true` if the cube was inverted (`* -1.0`).
 pub fn lock_biphasic_ca_polarity_3d(spec: &mut Spectrum3D, ca_band_ppm: (f64, f64)) -> bool {
     let (lo, hi) = (
         ca_band_ppm.0.min(ca_band_ppm.1),
         ca_band_ppm.0.max(ca_band_ppm.1),
     );
+    let (cb_lo, cb_hi) = (14.0_f64, 38.0_f64);
     let z_is_c = spec.axis_z.label.to_ascii_uppercase().contains('C')
         || (spec.axis_z.min_ppm() <= lo && spec.axis_z.max_ppm() >= hi);
     let y_is_c = !z_is_c
         && (spec.axis_y.label.to_ascii_uppercase().contains('C')
             || (spec.axis_y.min_ppm() <= lo && spec.axis_y.max_ppm() >= hi));
     if !z_is_c && !y_is_c {
+        return false;
+    }
+
+    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+    if nx < 3 || ny < 3 || nz < 3 {
         return false;
     }
 
@@ -3490,44 +3705,155 @@ pub fn lock_biphasic_ca_polarity_3d(spec: &mut Spectrum3D, ca_band_ppm: (f64, f6
     for v in &mut sub {
         *v = (*v - med).abs();
     }
-    let sigma = (1.4826 * median_f64(&mut sub)).max(1e-12);
-    let thresh = (4.5 * sigma) as f32;
+    let sigma_raw = (1.4826 * median_f64(&mut sub)).max(1e-12);
+    let thresh_raw = (4.5 * sigma_raw) as f32;
+    let plane_stride = ny * nx;
 
-    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
-    let mut net_ca = 0.0f64;
-    if z_is_c {
-        for iz in 0..nz {
-            let ppm = spec.axis_z.index_to_ppm(iz as f64);
-            if ppm < lo || ppm > hi {
+    let mut cands: Vec<(f64, f64, bool)> = Vec::new();
+    for iz in 1..(nz - 1) {
+        let z_ppm = if z_is_c {
+            spec.axis_z.index_to_ppm(iz as f64)
+        } else {
+            0.0
+        };
+        if z_is_c && !((z_ppm >= lo && z_ppm <= hi) || (z_ppm >= cb_lo && z_ppm <= cb_hi)) {
+            continue;
+        }
+        for iy in 1..(ny - 1) {
+            let c_ppm = if z_is_c {
+                z_ppm
+            } else {
+                spec.axis_y.index_to_ppm(iy as f64)
+            };
+            let in_ca = c_ppm >= lo && c_ppm <= hi;
+            let in_cb = !in_ca && c_ppm >= cb_lo && c_ppm <= cb_hi;
+            if !in_ca && !in_cb {
                 continue;
             }
-            let z_off = iz * ny * nx;
-            for &v in &spec.data[z_off..z_off + ny * nx] {
-                if v.abs() > thresh {
-                    let vf = v as f64;
-                    net_ca += vf.signum() * vf * vf;
-                }
-            }
-        }
-    } else {
-        for iz in 0..nz {
-            for iy in 0..ny {
-                let ppm = spec.axis_y.index_to_ppm(iy as f64);
-                if ppm < lo || ppm > hi {
+            let row_off = iz * plane_stride + iy * nx;
+            for ix in 1..(nx - 1) {
+                let idx = row_off + ix;
+                let v = spec.data[idx];
+                let av = v.abs();
+                if av <= thresh_raw {
                     continue;
                 }
-                let off = (iz * ny + iy) * nx;
-                for &v in &spec.data[off..off + nx] {
-                    if v.abs() > thresh {
-                        let vf = v as f64;
-                        net_ca += vf.signum() * vf * vf;
-                    }
+                let n0 = spec.data[idx - 1].abs();
+                let n1 = spec.data[idx + 1].abs();
+                let n2 = spec.data[idx - nx].abs();
+                let n3 = spec.data[idx + nx].abs();
+                let n4 = spec.data[idx - plane_stride].abs();
+                let n5 = spec.data[idx + plane_stride].abs();
+                if av >= n0
+                    && av >= n1
+                    && av >= n2
+                    && av >= n3
+                    && av >= n4
+                    && av >= n5
+                    && (av > n0 || av > n1 || av > n4 || av > n5)
+                {
+                    cands.push((av as f64, (v as f64).signum(), in_ca));
                 }
             }
         }
     }
 
-    if net_ca < 0.0 {
+    if cands.is_empty() {
+        return false;
+    }
+    cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let ref_amp = cands[2.min(cands.len() - 1)].0;
+    let sigma = sigma_raw.max(0.02 * ref_amp);
+
+    let mut net_vote = 0.0_f64;
+    for &(av, sgn, in_ca) in &cands {
+        let snr_ex = (av / sigma - 4.5).min(8.0);
+        if snr_ex > 0.0 {
+            let vote = sgn * snr_ex;
+            if in_ca {
+                net_vote += vote;
+            } else {
+                net_vote -= vote;
+            }
+        }
+    }
+
+    if net_vote < 0.0 {
+        for v in &mut spec.data {
+            *v = -*v;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Verify and lock global `0 deg` vs `180 deg` positive polarity of a 3D `AllPositive` cube
+/// (`HNCO`, `HN(CA)CO`, `HNCA`, `HN(CO)CA`, `CBCA(CO)NH`) using capped-SNR 3D local-extremum
+/// peak votes so a `180 deg` indirect sign ambiguity is resolved without sensitivity to outliers.
+/// Returns `true` if the cube was inverted (`* -1.0`).
+pub fn lock_all_positive_polarity_3d(spec: &mut Spectrum3D) -> bool {
+    let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+    if nx < 3 || ny < 3 || nz < 3 {
+        return false;
+    }
+    let step = (spec.data.len() / 16_384).max(1);
+    let mut sub: Vec<f64> = spec.data.iter().step_by(step).map(|&v| v as f64).collect();
+    let med = median_f64(&mut sub);
+    for v in &mut sub {
+        *v = (*v - med).abs();
+    }
+    let sigma_raw = (1.4826 * median_f64(&mut sub)).max(1e-12);
+    let thresh_raw = (5.0 * sigma_raw) as f32;
+    let plane_stride = ny * nx;
+
+    let mut cands: Vec<(f64, f64)> = Vec::new();
+    for iz in 1..(nz - 1) {
+        for iy in 1..(ny - 1) {
+            let row_off = iz * plane_stride + iy * nx;
+            for ix in 1..(nx - 1) {
+                let idx = row_off + ix;
+                let v = spec.data[idx];
+                let av = v.abs();
+                if av <= thresh_raw {
+                    continue;
+                }
+                let n0 = spec.data[idx - 1].abs();
+                let n1 = spec.data[idx + 1].abs();
+                let n2 = spec.data[idx - nx].abs();
+                let n3 = spec.data[idx + nx].abs();
+                let n4 = spec.data[idx - plane_stride].abs();
+                let n5 = spec.data[idx + plane_stride].abs();
+                if av >= n0
+                    && av >= n1
+                    && av >= n2
+                    && av >= n3
+                    && av >= n4
+                    && av >= n5
+                    && (av > n0 || av > n1 || av > n4 || av > n5)
+                {
+                    cands.push((av as f64, (v as f64).signum()));
+                }
+            }
+        }
+    }
+
+    if cands.is_empty() {
+        return false;
+    }
+    cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let ref_amp = cands[2.min(cands.len() - 1)].0;
+    let sigma = sigma_raw.max(0.02 * ref_amp);
+
+    let mut net_vote = 0.0_f64;
+    for &(av, sgn) in &cands {
+        let snr_ex = (av / sigma - 5.0).min(8.0);
+        if snr_ex > 0.0 {
+            net_vote += sgn * snr_ex;
+        }
+    }
+
+    if net_vote < 0.0 {
         for v in &mut spec.data {
             *v = -*v;
         }
@@ -3624,13 +3950,18 @@ pub fn blind_autophase_fid_2d(
     let axis_x = axis_x_out.ok_or("empty 2D FID")?;
     let nx = axis_x.size;
 
-    // 2. Blindly autophase direct `1H` on the cosine traces (`x_cos_cplx[0]` = `t1 = 0`).
-    // When FIR `group_delay` has already been compensated, residual physical `DE` first-order phase is small (`<= 30 deg`).
+    // 2. Blindly autophase direct `1H` across early `(k1, c1)` traces (`(0, 0)` first, plus `sin` channel
+    // so `p0_y = +-90 deg` constant-time / Echo-Antiecho experiments with zero `k1 = 0, c1 = 0` still phase cleanly).
     let mut cfg_direct = config.clone();
     if fid.axis_x.group_delay > 0.0 {
         cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(18.0);
     }
-    let sol_x = auto_phase_direct_nd(&x_cos_cplx, &axis_x, &cfg_direct);
+    let mut x_phase_samples: Vec<Vec<Complex64>> = Vec::with_capacity(2 * n1.min(32));
+    for k1 in 0..n1.min(32) {
+        x_phase_samples.push(x_cos_cplx[k1].clone());
+        x_phase_samples.push(x_sin_cplx[k1].clone());
+    }
+    let sol_x = auto_phase_direct_nd(&x_phase_samples, &axis_x, &cfg_direct);
 
     // Apply `sol_x` + `DeleteImaginary` + linear baseline to all `2 * n1` traces
     let mut x_cos_re = vec![vec![0.0; nx]; n1];
@@ -3664,6 +3995,14 @@ pub fn blind_autophase_fid_2d(
         ind_pipe.push(StageOp::Reverse);
     }
 
+    if fid.nus_mask.is_some()
+        && (!fid.axis_y.states_recombined || fid.axis_y.quad_mode == crate::fid::QuadMode::Qf)
+    {
+        return Err(format!(
+            "2D NUS IST/FISTA on axis '{}' requires uniform States-recombined hypercomplex input",
+            fid.axis_y.label
+        ));
+    }
     let mut cols_cplx: Vec<Vec<Complex64>> = Vec::with_capacity(nx);
     let mut axis_y_out: Option<AxisPpm> = None;
     for ix in 0..nx {
@@ -3718,6 +4057,38 @@ pub fn blind_autophase_fid_2d(
         active_ix.iter().map(|&ix| cols_cplx[ix].clone()).collect()
     };
     let sol_y = auto_phase_indirect_nd(&cand_cols, &axis_y, config);
+    if sol_y.p1_deg.abs() > 15.0 && fid.axis_y.stored_proc.fcor.is_none() {
+        let mut ind_pipe_fcor1 = AxisPipeline::new(vec![
+            default_apod_op(&fid.axis_y, 1.0),
+            StageOp::ZeroFill {
+                target_size: Some(si_y),
+                factor: None,
+                pad: None,
+                auto_pow2: true,
+            },
+            StageOp::FourierTransform {
+                inverse: false,
+                negate_imag: fid.axis_y.conjugate_for_fft,
+                sign_alt: false,
+                real_only: false,
+            },
+        ]);
+        if fid.axis_y.stored_proc.reverse {
+            ind_pipe_fcor1.push(StageOp::Reverse);
+        }
+        for (ix, col_out) in cols_cplx.iter_mut().enumerate() {
+            let mut raw_col = Vec::with_capacity(n1);
+            for k1 in 0..n1 {
+                raw_col.push([x_cos_re[k1][ix], x_sin_re[k1][ix]]);
+            }
+            if let Some(mask) = &fid.nus_mask {
+                raw_col = reconstruct_nus_1d(&raw_col, mask, &NusConfig::default());
+            }
+            let mut ty = Trace1D::from_fid_axis(&fid.axis_y, raw_col);
+            ind_pipe_fcor1.apply(&mut ty)?;
+            *col_out = ty.data;
+        }
+    }
 
     let mut data = vec![0.0f32; ny * nx];
     for (ix, col) in cols_cplx.iter_mut().enumerate() {
@@ -3746,6 +4117,16 @@ pub fn blind_autophase_fid_3d(
     exp: &str,
     config: &AutoPhaseConfig,
 ) -> Result<(PhaseSolution, PhaseSolution, PhaseSolution, Spectrum3D), String> {
+    if fid.nus_mask.is_some() {
+        for (dim_name, ax) in [("F2", &fid.axis_y), ("F1", &fid.axis_z)] {
+            if !ax.states_recombined || ax.quad_mode == crate::fid::QuadMode::Qf {
+                return Err(format!(
+                    "3D NUS processing on {dim_name} ('{}') requires uniform States-recombined hypercomplex input",
+                    ax.label
+                ));
+            }
+        }
+    }
     let n1 = fid.axis_y.complex_points;
     let n2 = fid.axis_z.complex_points;
     let si_x = fid
@@ -3788,22 +4169,27 @@ pub fn blind_autophase_fid_3d(
         },
     ]);
 
-    // 1. Sample early `(k2, k1)` cosine-cosine direct traces (`(0,0)` first!) to autophase `1H`
+    // 1. Sample early `(k2, c2, k1, c1)` direct traces (`(0,0,0,0)` first!) to autophase `1H`
     let mut sample_x_traces: Vec<Vec<Complex64>> = Vec::new();
     let mut axis_x_out: Option<AxisPpm> = None;
-    for k2 in 0..n2.min(8) {
-        for k1 in 0..n1.min(8) {
-            if let Some(mask) = &fid.nus_mask {
-                if !mask[k2 * n1 + k1] {
-                    continue;
+    for k2 in 0..n2.min(6) {
+        for c2 in 0..2 {
+            for k1 in 0..n1.min(6) {
+                if let Some(mask) = &fid.nus_mask {
+                    if !mask[k2 * n1 + k1] {
+                        continue;
+                    }
+                }
+                for c1 in 0..2 {
+                    let mut tr =
+                        Trace1D::from_fid_axis(&fid.axis_x, fid.trace(k2, c2, k1, c1).to_vec());
+                    direct_pipe.apply(&mut tr)?;
+                    if axis_x_out.is_none() {
+                        axis_x_out = Some(tr.axis.clone());
+                    }
+                    sample_x_traces.push(tr.data);
                 }
             }
-            let mut tr = Trace1D::from_fid_axis(&fid.axis_x, fid.trace(k2, 0, k1, 0).to_vec());
-            direct_pipe.apply(&mut tr)?;
-            if axis_x_out.is_none() {
-                axis_x_out = Some(tr.axis.clone());
-            }
-            sample_x_traces.push(tr.data);
         }
     }
     let axis_x = axis_x_out.ok_or("no sampled traces in 3D FID")?;
@@ -3864,18 +4250,20 @@ pub fn blind_autophase_fid_3d(
         pipe_y.push(StageOp::Reverse);
     }
 
-    // Collect candidate `y` columns from `k2 = 0..min(4, n2), c2 = 0` at distinct `1H` local-maximum apices
+    // Collect candidate `y` columns from `k2 = 0..min(4, n2), c2 = 0..2` at distinct `1H` local-maximum apices
     let mut ix_y_energy = vec![0.0f64; nx];
     for k2 in 0..n2.min(4) {
-        for &ix in &active_ix {
-            let mut e = 0.0;
-            for k1 in 0..n1 {
-                let p0 = ((k2 * 2) * n1 + k1) * 2;
-                let re = x_real[p0 * nx + ix];
-                let im = x_real[(p0 + 1) * nx + ix];
-                e += re * re + im * im;
+        for c2 in 0..2 {
+            for &ix in &active_ix {
+                let mut e = 0.0;
+                for k1 in 0..n1 {
+                    let p0 = ((k2 * 2 + c2) * n1 + k1) * 2;
+                    let re = x_real[p0 * nx + ix];
+                    let im = x_real[(p0 + 1) * nx + ix];
+                    e += re * re + im * im;
+                }
+                ix_y_energy[ix] += e;
             }
-            ix_y_energy[ix] += e;
         }
     }
     let mut y_apex_ix: Vec<(f64, usize)> = active_ix
@@ -3907,27 +4295,81 @@ pub fn blind_autophase_fid_3d(
         sel_y_ix = active_ix.clone();
     }
 
+    // Select the single dominant `(k2_best, c2_best)` slice (preferring `k2 = 0` so all columns share
+    // a coherent indirect `F1` phase without `k2 > 0` sign oscillation across residues)
+    let mut slice_e = Vec::new();
+    for k2 in 0..n2.min(4) {
+        for c2 in 0..2 {
+            let mut se = 0.0_f64;
+            for &ix in &sel_y_ix {
+                for k1 in 0..n1 {
+                    let p0 = ((k2 * 2 + c2) * n1 + k1) * 2;
+                    let re = x_real[p0 * nx + ix];
+                    let im = x_real[(p0 + 1) * nx + ix];
+                    se += re * re + im * im;
+                }
+            }
+            slice_e.push((se, k2, c2));
+        }
+    }
+    let max_se = slice_e.iter().map(|s| s.0).fold(0.0_f64, f64::max);
+    let best_k2_0 = slice_e
+        .iter()
+        .filter(|s| s.1 == 0)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .copied();
+    let (_, k2_best, c2_best) = match best_k2_0 {
+        Some(s0) if s0.0 >= 0.20 * max_se => s0,
+        _ => slice_e
+            .into_iter()
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap_or((0.0, 0, 0)),
+    };
+
     let mut cand_y_cols: Vec<Vec<Complex64>> = Vec::new();
     let mut axis_y_out: Option<AxisPpm> = None;
-    for k2 in 0..n2.min(4) {
-        for &ix in &sel_y_ix {
-            let mut raw_y = Vec::with_capacity(n1);
-            for k1 in 0..n1 {
-                let p0 = ((k2 * 2) * n1 + k1) * 2;
-                let p1 = p0 + 1;
-                raw_y.push([x_real[p0 * nx + ix], x_real[p1 * nx + ix]]);
-            }
-            let mut ty = Trace1D::from_fid_axis(&fid.axis_y, raw_y);
-            pipe_y.apply(&mut ty)?;
-            if axis_y_out.is_none() {
-                axis_y_out = Some(ty.axis.clone());
-            }
-            cand_y_cols.push(ty.data);
+    for &ix in &sel_y_ix {
+        let mut raw_y = Vec::with_capacity(n1);
+        for k1 in 0..n1 {
+            let p0 = ((k2_best * 2 + c2_best) * n1 + k1) * 2;
+            let p1 = p0 + 1;
+            raw_y.push([x_real[p0 * nx + ix], x_real[p1 * nx + ix]]);
         }
+        let mut ty = Trace1D::from_fid_axis(&fid.axis_y, raw_y);
+        pipe_y.apply(&mut ty)?;
+        if axis_y_out.is_none() {
+            axis_y_out = Some(ty.axis.clone());
+        }
+        cand_y_cols.push(ty.data);
     }
     let axis_y = axis_y_out.ok_or("empty axis_y in 3D FID")?;
     let ny = axis_y.size;
-    let mut sol_y = auto_phase_indirect_nd(&cand_y_cols, &axis_y, config);
+    let mut cfg_y = config.clone();
+    if cfg_y.polarity == PolarityMode::Biphasic && !axis_y.label.to_ascii_uppercase().contains('C')
+    {
+        cfg_y.polarity = PolarityMode::AllPositive;
+    }
+    let mut sol_y = auto_phase_indirect_nd(&cand_y_cols, &axis_y, &cfg_y);
+    if sol_y.p1_deg.abs() > 15.0 && fid.axis_y.stored_proc.fcor.is_none() {
+        pipe_y = AxisPipeline::new(vec![
+            default_apod_op(&fid.axis_y, 1.0),
+            StageOp::ZeroFill {
+                target_size: Some(si_y),
+                factor: None,
+                pad: None,
+                auto_pow2: true,
+            },
+            StageOp::FourierTransform {
+                inverse: false,
+                negate_imag: fid.axis_y.conjugate_for_fft,
+                sign_alt: false,
+                real_only: false,
+            },
+        ]);
+        if fid.axis_y.stored_proc.reverse {
+            pipe_y.push(StageOp::Reverse);
+        }
+    }
 
     // Transform & phase `axis_y` across the full cube -> `[n2 * 2 * ny * nx]` real values
     let mut xy_real = vec![0.0f64; n2 * 2 * ny * nx];
@@ -4046,7 +4488,32 @@ pub fn blind_autophase_fid_3d(
     }
     let axis_z = axis_z_out.ok_or("empty axis_z in 3D FID")?;
     let nz = axis_z.size;
-    let mut sol_z = auto_phase_indirect_nd(&cand_z_cols, &axis_z, config);
+    let mut cfg_z = config.clone();
+    if cfg_z.polarity == PolarityMode::Biphasic && !axis_z.label.to_ascii_uppercase().contains('C')
+    {
+        cfg_z.polarity = PolarityMode::AllPositive;
+    }
+    let mut sol_z = auto_phase_indirect_nd(&cand_z_cols, &axis_z, &cfg_z);
+    if sol_z.p1_deg.abs() > 15.0 && fid.axis_z.stored_proc.fcor.is_none() {
+        pipe_z = AxisPipeline::new(vec![
+            default_apod_op(&fid.axis_z, 1.0),
+            StageOp::ZeroFill {
+                target_size: Some(si_z),
+                factor: None,
+                pad: None,
+                auto_pow2: true,
+            },
+            StageOp::FourierTransform {
+                inverse: false,
+                negate_imag: fid.axis_z.conjugate_for_fft,
+                sign_alt: false,
+                real_only: false,
+            },
+        ]);
+        if fid.axis_z.stored_proc.reverse {
+            pipe_z.push(StageOp::Reverse);
+        }
+    }
 
     let mut cube_data = vec![0.0f32; nz * ny * nx];
     for iy in 0..ny {
@@ -4075,15 +4542,17 @@ pub fn blind_autophase_fid_3d(
         data: cube_data,
     };
 
-    if config.polarity == PolarityMode::Biphasic
-        && lock_biphasic_ca_polarity_3d(&mut spec3, config.biphasic_pos_band_ppm)
-    {
-        // Record the 180-deg global flip on the non-13C indirect axis (`sol_y`) or `sol_z`
-        if spec3.axis_z.label.to_ascii_uppercase().contains('C') {
-            sol_z.p0_deg = wrap_deg_180(sol_z.p0_deg + 180.0);
-        } else {
-            sol_y.p0_deg = wrap_deg_180(sol_y.p0_deg + 180.0);
+    if config.polarity == PolarityMode::Biphasic {
+        if lock_biphasic_ca_polarity_3d(&mut spec3, config.biphasic_pos_band_ppm) {
+            // Record the 180-deg global flip on the non-13C indirect axis (`sol_y`) or `sol_z`
+            if spec3.axis_z.label.to_ascii_uppercase().contains('C') {
+                sol_z.p0_deg = wrap_deg_180(sol_z.p0_deg + 180.0);
+            } else {
+                sol_y.p0_deg = wrap_deg_180(sol_y.p0_deg + 180.0);
+            }
         }
+    } else if lock_all_positive_polarity_3d(&mut spec3) {
+        sol_z.p0_deg = wrap_deg_180(sol_z.p0_deg + 180.0);
     }
 
     Ok((sol_x, sol_y, sol_z, spec3))

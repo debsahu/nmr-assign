@@ -1429,3 +1429,292 @@ ph3=0
         QuadMode::StatesTppi
     ));
 }
+
+#[test]
+fn bruker_xwin_nmr_unprocessed_pdata_channel_sfo_and_echo_antiecho_reverse() {
+    use nmr_core::fid::infer_bruker_raw_indirect_reverse;
+
+    // 1. Echo-Antiecho (`FnMODE = 6`) SCT delay ordering (`f_dim = 1`: `d0`/`d20`, `f_dim = 2`: `d10`/`d30`)
+    let pp_ea_f1_d0_first = "\
+  (p21 ph1):f3
+  d0
+  (p22 ph2):f3
+  d20
+  go=2 ph31
+  MCWRK id0
+  MCWRK dd20
+";
+    assert!(
+        infer_bruker_raw_indirect_reverse(
+            Some(pp_ea_f1_d0_first),
+            "hsqcetf3gpsi",
+            1,
+            QuadMode::EchoAntiecho
+        ),
+        "2D Echo-Antiecho SCT with d0 before d20 evolves exp(-i*w*t1) and requires REVERSE = true"
+    );
+    let pp_ea_f1_d20_first = "\
+  (p21 ph1):f3
+  d20
+  (p22 ph2):f3
+  d0
+  go=2 ph31
+  MCWRK id0
+  MCWRK dd20
+";
+    assert!(
+        !infer_bruker_raw_indirect_reverse(
+            Some(pp_ea_f1_d20_first),
+            "hsqcetf3gpsi",
+            1,
+            QuadMode::EchoAntiecho
+        ),
+        "2D Echo-Antiecho SCT with d20 before d0 evolves exp(+i*w*t1) and requires REVERSE = false"
+    );
+    let pp_ea_d10_first = "\
+  (p21 ph1):f3
+  d10
+  (p22 ph2):f3
+  d30
+  go=2 ph31
+  MCWRK id10
+  MCWRK dd30
+";
+    assert!(
+        infer_bruker_raw_indirect_reverse(
+            Some(pp_ea_d10_first),
+            "hncacbgp3d",
+            2,
+            QuadMode::EchoAntiecho
+        ),
+        "3D F2 Echo-Antiecho SCT with d10 before d30 evolves exp(-i*w*t2) and requires REVERSE = true"
+    );
+
+    // 2. Synthetic XWIN-NMR 3D directory:
+    // - `pdata/1/procs` has `FT_mod = 0`, `PH_mod = 0`, `PHC0 = 0`, bogus `OFFSET = 99.0`
+    // - `pdata/1/proc2s` exists WITHOUT `proc3s` (incomplete 2D scout plane)
+    // - `acqus` has `NUC3 = <15N>`, `BF3 = 60.8106`, `SFO3 = 60.8180` while `acqu2s` has stale `SFO1 = 60.8106`
+    let dir = temp_test_dir("xwin_nmr_3d_guards");
+    let acqus = "\
+##TITLE= XWIN-NMR 3D test
+##$BYTORDA= 0
+##$DTYPA= 0
+##$AQ_mod= 3
+##$TD= 32
+##$SW_h= 8000.0
+##$SFO1= 600.1328
+##$BF1= 600.1300
+##$NUC1= <1H>
+##$NUC2= <13C>
+##$BF2= 150.9028
+##$SFO2= 150.9112
+##$NUC3= <15N>
+##$BF3= 60.8106
+##$SFO3= 60.8180
+##$DECIM= 1
+##$DSPFVS= 0
+##$AQSEQ= 0
+##$PULPROG= <hncogp3d>
+##END=
+";
+    let acqu2s = "\
+##$FnMODE= 6
+##$TD= 8
+##$SW= 32.0
+##$SFO1= 60.8106
+##$BF1= 60.8106
+##$NUC1= <15N>
+##END=
+";
+    let acqu3s = "\
+##$FnMODE= 4
+##$TD= 8
+##$SW= 14.0
+##$SFO1= 150.9293
+##$BF1= 150.9028
+##$NUC1= <13C>
+##END=
+";
+    fs::write(dir.join("acqus"), acqus).unwrap();
+    fs::write(dir.join("acqu2s"), acqu2s).unwrap();
+    fs::write(dir.join("acqu3s"), acqu3s).unwrap();
+    fs::write(dir.join("pulseprogram"), pp_ea_d10_first).unwrap();
+
+    // 8 * 8 = 64 traces, each 1024-byte block (256 i32 words)
+    let mut ser_bytes = Vec::with_capacity(64 * 1024);
+    for t in 0..64i32 {
+        for w in 0..256i32 {
+            let val = if w < 32 { (t + 1) * 10 + w } else { 0 };
+            ser_bytes.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+    fs::write(dir.join("ser"), &ser_bytes).unwrap();
+
+    let pdata1 = dir.join("pdata").join("1");
+    fs::create_dir_all(&pdata1).unwrap();
+    // Unprocessed XWIN-NMR template (`FT_mod = 0`, `PH_mod = 0`) + incomplete 2D scout `proc2s`
+    fs::write(
+        pdata1.join("procs"),
+        "##$FT_mod= 0\n##$PH_mod= 0\n##$PHC0= 0\n##$PHC1= 0\n##$OFFSET= 99.0\n##$SF= 599.0\n##$SI= 64\n##END=\n",
+    )
+    .unwrap();
+    fs::write(
+        pdata1.join("proc2s"),
+        "##$FT_mod= 4\n##$PH_mod= 1\n##$PHC0= 123.0\n##$OFFSET= 250.0\n##$SF= 60.8106\n##$SI= 32\n##$REVERSE= no\n##END=\n",
+    )
+    .unwrap();
+
+    let fid3 = read_fid_3d(&dir).expect("read XWIN-NMR 3D ser");
+    assert!(
+        fid3.axis_x.stored_proc.p0_deg.is_none() && fid3.axis_x.stored_proc.p1_deg.is_none(),
+        "PH_mod = 0 / FT_mod = 0 must leave stored phases as None so blind autophasing activates"
+    );
+    assert!(
+        (fid3.axis_x.obs_mhz - 600.1300).abs() < 1e-6 && fid3.axis_x.first_ppm < 20.0,
+        "FT_mod = 0 bogus OFFSET/SF must not override acqus referencing: got {:?}",
+        fid3.axis_x
+    );
+    assert!(
+        fid3.axis_y.stored_proc.p0_deg.is_none(),
+        "Incomplete 2D scout proc2s (without proc3s) must not leak into 3D indirect axis"
+    );
+    assert!(
+        (fid3.axis_y.carrier_mhz - 60.8180).abs() < 1e-6,
+        "Indirect 15N carrier must sync to active acqus SFO3 (60.8180) over stale acqu2s SFO1 (60.8106), got {}",
+        fid3.axis_y.carrier_mhz
+    );
+    assert!(
+        fid3.axis_y.stored_proc.reverse,
+        "Echo-Antiecho with (d10 ... d30) must infer REVERSE = true when calibrated proc2s/proc3s is absent"
+    );
+    assert!(fid3.axis_y.states_recombined && fid3.axis_z.states_recombined);
+
+    // 3. Unsupported Bruker `FnMODE` codes (`0 = Undefined`, `2 = QSEQ`, `3 = TPPI`) must fail explicitly
+    for bad_mode in [0, 2, 3, 99] {
+        fs::write(
+            dir.join("acqu2s"),
+            format!("##$FnMODE= {bad_mode}\n##$TD= 8\n##$SW= 32.0\n##$SFO1= 60.8180\n##$BF1= 60.8106\n##$NUC1= <15N>\n##END=\n"),
+        )
+        .unwrap();
+        let err = read_fid_3d(&dir).expect_err("unsupported FnMODE must return Err");
+        assert!(
+            err.contains("FnMODE"),
+            "expected FnMODE error message for mode {bad_mode}, got: {err}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn varian_3d_fcoef_sign_and_origfid_untouched_backup() {
+    let dir = temp_test_dir("varian_3d_fcoef_origfid");
+    let make_procpar = |f1coef_str: &str, f2coef_str: &str| -> String {
+        format!(
+            "\
+sfrq 1 1 1000 0 0 2 1 1 1 1
+1 499.915
+0
+dfrq 1 1 1000 0 0 2 1 1 1 2
+1 125.708
+0
+dfrq2 1 1 1000 0 0 2 1 1 1 3
+1 50.662
+0
+sw 1 1 100000 0 0 2 1 1 1 4
+1 8000.0
+0
+sw1 1 1 100000 0 0 2 1 1 1 5
+1 7542.0
+0
+sw2 1 1 100000 0 0 2 1 1 1 6
+1 1347.0
+0
+np 1 1 65536 2 2 2 1 1 1 7
+1 16
+0
+ni 1 1 4096 0 1 2 1 1 1 8
+1 2
+0
+ni2 1 1 4096 0 1 2 1 1 1 9
+1 2
+0
+tn 2 2 8 0 0 2 1 1 1 10
+1 \"H1\"
+0
+dn 2 2 8 0 0 2 1 1 1 11
+1 \"C13\"
+0
+dn2 2 2 8 0 0 2 1 1 1 12
+1 \"N15\"
+0
+phase 1 1 4 1 1 2 1 1 1 13
+2 1 2
+0
+phase2 1 1 4 1 1 2 1 1 1 14
+2 1 2
+0
+array 2 2 32 0 0 2 1 1 1 15
+1 \"phase,phase2\"
+0
+f1coef 2 2 32 0 0 2 1 1 1 16
+1 \"{f1coef_str}\"
+0
+f2coef 2 2 32 0 0 2 1 1 1 17
+1 \"{f2coef_str}\"
+0
+"
+        )
+    };
+
+    // ni = 2, ni2 = 2, 4 traces per point -> 16 traces of 8 complex points
+    let mut orig_traces: Vec<Vec<[f32; 2]>> = (0..16).map(|_| vec![[0.0, 0.0]; 8]).collect();
+    orig_traces[0][0] = [10.0, 0.0]; // Echo
+    orig_traces[1][0] = [6.0, 0.0]; // Antiecho
+    let mut munged_traces = orig_traces.clone();
+    munged_traces[0][0] = [999.0, -999.0]; // Pre-shuffled `fid` that disagrees with procpar
+
+    fs::write(dir.join("fid"), build_varian_f32_fid(&munged_traces)).unwrap();
+    fs::write(dir.join("origfid"), build_varian_f32_fid(&orig_traces)).unwrap();
+
+    // Case A: `f1coef = ""` (default VnmrJ `"1 0 0 0 0 0 -1 0"` -> `false`), Rance-Kay `f2coef` -> `true`
+    fs::write(dir.join("procpar"), make_procpar("", "1 0 -1 0 0 -1 0 -1")).unwrap();
+    let f_default = read_fid_3d(&dir).expect("read Varian 3D with empty f1coef");
+    assert!(
+        !f_default.axis_y.conjugate_for_fft,
+        "Empty Varian f1coef must use conjugate_for_fft = false"
+    );
+    assert!(
+        f_default.axis_z.conjugate_for_fft,
+        "Rance-Kay Echo-Antiecho f2coef must use conjugate_for_fft = true"
+    );
+    // Verify `origfid` was read (`z_cos = 10 - 6 = 4.0`, NOT `999 - 6`!)
+    assert!(
+        (f_default.trace(0, 0, 0, 0)[0][0] - 4.0).abs() < 1e-5,
+        "Expected untouched `origfid` trace recombination (10 - 6 = 4.0), got {:?}",
+        f_default.trace(0, 0, 0, 0)[0]
+    );
+
+    // Case B: explicit `f1coef = "1 0 0 0 0 0 -1 0"` -> `false`
+    fs::write(
+        dir.join("procpar"),
+        make_procpar("1 0 0 0 0 0 -1 0", "1 0 -1 0 0 -1 0 -1"),
+    )
+    .unwrap();
+    let f_neg = read_fid_3d(&dir).expect("read Varian 3D with -1 f1coef");
+    assert!(!f_neg.axis_y.conjugate_for_fft);
+
+    // Case C: explicit `f1coef = "1 0 0 0 0 0 1 0"` (`ghn_cacb` constant-time States) -> `true`
+    fs::write(
+        dir.join("procpar"),
+        make_procpar("1 0 0 0 0 0 1 0", "1 0 -1 0 0 -1 0 -1"),
+    )
+    .unwrap();
+    let f_pos = read_fid_3d(&dir).expect("read Varian 3D with +1 f1coef");
+    assert!(
+        f_pos.axis_y.conjugate_for_fft,
+        "Same-sign States f1coef '1 0 0 0 0 0 1 0' must set conjugate_for_fft = true"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
