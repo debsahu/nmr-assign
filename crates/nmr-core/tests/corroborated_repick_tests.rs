@@ -763,3 +763,239 @@ fn corroborated_repick_handles_out_of_band_carbon_targets_on_both_ends_without_p
         "rescued HNCA peaks must stay strictly inside [42.0, 66.0] ppm: {rescued:?}"
     );
 }
+
+#[test]
+fn corroborated_repick_rejects_opposite_sign_folded_hsqc_roots() {
+    let pcfg = PickerConfig {
+        snr_threshold: 5.5,
+        ..PickerConfig::default()
+    };
+    let repick_cfg = CorroboratedRepickConfig::default();
+
+    // Two positive backbone amide roots (+1 majority) and one folded Arg sidechain root (-1)
+    let roots = vec![
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 8.30,
+            n: 120.0,
+            c: None,
+            sign: 1,
+            height: Some(260.0),
+            volume: Some(1500.0),
+            h2: None,
+        },
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 7.95,
+            n: 117.5,
+            c: None,
+            sign: 1,
+            height: Some(250.0),
+            volume: Some(1450.0),
+            h2: None,
+        },
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 7.42,
+            n: 112.4,
+            c: None,
+            sign: -1,
+            height: Some(-240.0),
+            volume: Some(-1400.0),
+            h2: None,
+        },
+    ];
+
+    let cbcaconh = make_test_cube(
+        "CBCACONH",
+        75.0,
+        15.0,
+        &[
+            (8.30, 120.0, 58.6, 16.0),
+            (7.95, 117.5, 54.2, 16.0),
+            (7.42, 112.4, 43.1, 16.0), // Strong anchor on folded root — must NOT trigger rescue or enter pool
+        ],
+    );
+    let hnca = make_test_cube(
+        "HNCA",
+        70.0,
+        38.0,
+        &[
+            (8.30, 120.0, 58.6, 15.0),
+            (7.95, 117.5, 54.2, 4.6), // Weak peak on majority-sign root -> rescued
+            (7.42, 112.4, 43.1, 4.6), // Identical weak peak on opposite-sign root -> rejected by Q2(i)
+        ],
+    );
+    let hnco = make_test_cube(
+        "HNCO",
+        182.0,
+        168.0,
+        &[
+            (8.30, 120.0, 175.4, 15.0),
+            (7.95, 117.5, 174.1, 15.0),
+            (7.42, 112.4, 173.2, 15.0),
+        ],
+    );
+
+    let mut bank = StripBank3D::new();
+    let mut p1 = roots.clone();
+    p1.extend(bank.pick_and_record_3d(&cbcaconh, &roots, &pcfg));
+    p1.extend(bank.pick_and_record_3d(&hnca, &roots, &pcfg));
+    p1.extend(bank.pick_and_record_3d(&hnco, &roots, &pcfg));
+
+    let rescued = corroborated_re_pick_3d(&bank, &roots, &p1, &pcfg, &repick_cfg);
+    assert!(
+        rescued.iter().any(|p| p.exp == "HNCA"
+            && (p.h - 7.95).abs() < 0.05
+            && (p.c.unwrap_or(0.0) - 54.2).abs() < 0.20),
+        "majority-sign root (7.95, 117.5) should be rescued at ~54.2 ppm, got {rescued:?}"
+    );
+    assert!(
+        rescued.iter().all(|p| (p.h - 7.42).abs() > 0.10),
+        "opposite-sign folded HSQC root (7.42, 112.4) must never be rescued in Pass 2: {rescued:?}"
+    );
+}
+
+#[test]
+fn corroborated_repick_rejects_t1_noise_ridges_without_transverse_hn_prominence() {
+    let pcfg = PickerConfig {
+        snr_threshold: 5.5,
+        ..PickerConfig::default()
+    };
+    let repick_cfg = CorroboratedRepickConfig::default();
+
+    let roots = vec![
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 8.30,
+            n: 120.0,
+            c: None,
+            sign: 1,
+            height: Some(260.0),
+            volume: Some(1500.0),
+            h2: None,
+        },
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 7.95,
+            n: 117.5,
+            c: None,
+            sign: 1,
+            height: Some(255.0),
+            volume: Some(1480.0),
+            h2: None,
+        },
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 7.60,
+            n: 115.0,
+            c: None,
+            sign: 1,
+            height: Some(250.0),
+            volume: Some(1460.0),
+            h2: None,
+        },
+    ];
+
+    let cbcaconh = make_test_cube(
+        "CBCACONH",
+        75.0,
+        15.0,
+        &[
+            (8.30, 120.0, 54.2, 16.0),
+            (7.95, 117.5, 60.5, 16.0),
+            (7.60, 115.0, 51.8, 16.0),
+        ],
+    );
+
+    // Start HNCA with one strong peak plus one genuine sub-threshold 3D Gaussian at (8.30, 120.0, 54.2)
+    let mut hnca = make_test_cube(
+        "HNCA",
+        70.0,
+        38.0,
+        &[(8.30, 120.0, 58.8, 15.0), (8.30, 120.0, 54.2, 4.6)],
+    );
+    let sigma = estimate_noise_mad(&hnca.data);
+    let (nx, ny, nz) = (hnca.nx(), hnca.ny(), hnca.nz());
+
+    // Inject Artifact A at (7.95, 117.5, 60.5): flat (H, N) sheet/ridge that peaks along 13C
+    // (4.8 * sigma at center vs 4.65 * sigma across its 3x3 (dh, dn) halo -> strict 3x3x3 extremum
+    // by 0.15 * sigma, yet lacks 2D transverse (H, N) concavity/prominence).
+    let ix_a = hnca.axis_x.ppm_to_index(7.95).round() as usize;
+    let iy_a = hnca.axis_y.ppm_to_index(117.5).round() as usize;
+    let iz_a = hnca.axis_z.ppm_to_index(60.5).round() as usize;
+    for dz in -3isize..=3 {
+        let z_env = (-0.5 * ((dz as f32) / 1.4).powi(2)).exp();
+        let iz = (iz_a as isize + dz) as usize;
+        for dy in -2isize..=2 {
+            let iy = (iy_a as isize + dy) as usize;
+            for dx in -2isize..=2 {
+                let ix = (ix_a as isize + dx) as usize;
+                let center_bump = if dx == 0 && dy == 0 && dz == 0 {
+                    4.80 * sigma
+                } else {
+                    4.65 * sigma * z_env
+                };
+                hnca.data[(iz * ny + iy) * nx + ix] = center_bump;
+            }
+        }
+    }
+
+    // Inject Artifact B at (7.60, 115.0, 51.8): elevated 13C t1 ridge baseline pedestal along the
+    // entire (ix_b, iy_b) column (`3.4 * sigma` baseline + `1.4 * sigma` Gaussian bump = `4.8 * sigma`
+    // raw voxel amplitude, which looks > 3.8 * smad above zero but is only 1.4 * smad above `smed`).
+    let ix_b = hnca.axis_x.ppm_to_index(7.60).round() as usize;
+    let iy_b = hnca.axis_y.ppm_to_index(115.0).round() as usize;
+    let iz_b = hnca.axis_z.ppm_to_index(51.8).round() as usize;
+    for iz in 0..nz {
+        hnca.data[(iz * ny + iy_b) * nx + ix_b] += 3.4 * sigma;
+    }
+    for dz in -3isize..=3 {
+        let iz = (iz_b as isize + dz) as usize;
+        for dy in -2isize..=2 {
+            let iy = (iy_b as isize + dy) as usize;
+            for dx in -2isize..=2 {
+                let ix = (ix_b as isize + dx) as usize;
+                let g = (-0.5
+                    * (((dx as f32) / 1.3).powi(2)
+                        + ((dy as f32) / 1.3).powi(2)
+                        + ((dz as f32) / 1.4).powi(2)))
+                .exp();
+                hnca.data[(iz * ny + iy) * nx + ix] += 1.4 * sigma * g;
+            }
+        }
+    }
+
+    let hnco = make_test_cube(
+        "HNCO",
+        182.0,
+        168.0,
+        &[
+            (8.30, 120.0, 175.4, 15.0),
+            (7.95, 117.5, 174.1, 15.0),
+            (7.60, 115.0, 173.0, 15.0),
+        ],
+    );
+
+    let mut bank = StripBank3D::new();
+    let mut p1 = roots.clone();
+    p1.extend(bank.pick_and_record_3d(&cbcaconh, &roots, &pcfg));
+    p1.extend(bank.pick_and_record_3d(&hnca, &roots, &pcfg));
+    p1.extend(bank.pick_and_record_3d(&hnco, &roots, &pcfg));
+
+    let rescued = corroborated_re_pick_3d(&bank, &roots, &p1, &pcfg, &repick_cfg);
+    assert!(
+        rescued.iter().any(|p| p.exp == "HNCA"
+            && (p.h - 8.30).abs() < 0.05
+            && (p.c.unwrap_or(0.0) - 54.2).abs() < 0.20),
+        "genuine 3D Gaussian peak at (8.30, 120.0, 54.2) must be rescued, got {rescued:?}"
+    );
+    assert!(
+        rescued.iter().all(|p| (p.h - 7.95).abs() > 0.08),
+        "flat (H, N) ridge artifact at (7.95, 117.5, 60.5) must be rejected by Q2(ii): {rescued:?}"
+    );
+    assert!(
+        rescued.iter().all(|p| (p.h - 7.60).abs() > 0.08),
+        "t1 column baseline pedestal bump at (7.60, 115.0, 51.8) must be rejected by Q2(ii): {rescued:?}"
+    );
+}

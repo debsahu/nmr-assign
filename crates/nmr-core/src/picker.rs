@@ -94,12 +94,12 @@ pub fn estimate_noise_mad(data: &[f32]) -> f32 {
     (1.4826 * median_f32(&mut dev1)).max(1e-12)
 }
 
-/// Compute two-pass outlier-trimmed local MAD (floored at `fallback_mad`) and `max_abs` for a 1D slice.
-fn slice_trimmed_mad_and_max(
+/// Compute two-pass outlier-trimmed baseline median, local MAD (floored at `fallback_mad`), and `max_abs`.
+fn slice_trimmed_median_mad_and_max(
     vals: &[f32],
     scratch: &mut Vec<f32>,
     fallback_mad: f32,
-) -> (f32, f32) {
+) -> (f32, f32, f32) {
     let mut max_abs = 0.0f32;
     for &v in vals {
         let a = v.abs();
@@ -107,8 +107,8 @@ fn slice_trimmed_mad_and_max(
             max_abs = a;
         }
     }
-    if vals.len() < 24 {
-        return (fallback_mad, max_abs);
+    if vals.len() < 8 {
+        return (0.0, fallback_mad, max_abs);
     }
     scratch.clear();
     scratch.extend_from_slice(vals);
@@ -117,6 +117,9 @@ fn slice_trimmed_mad_and_max(
         *x = (*x - med0).abs();
     }
     let mad0 = (1.4826 * median_f32(scratch)).max(1e-12);
+    if vals.len() < 24 {
+        return (med0, fallback_mad, max_abs);
+    }
 
     scratch.clear();
     scratch.extend(
@@ -125,14 +128,24 @@ fn slice_trimmed_mad_and_max(
             .filter(|&v| (v - med0).abs() <= 3.5 * mad0),
     );
     if scratch.len() < 12 {
-        return (mad0.max(fallback_mad), max_abs);
+        return (med0, mad0.max(fallback_mad), max_abs);
     }
     let med1 = median_f32(scratch);
     for x in scratch.iter_mut() {
         *x = (*x - med1).abs();
     }
     let mad1 = (1.4826 * median_f32(scratch)).max(fallback_mad);
-    (mad1, max_abs)
+    (med1, mad1, max_abs)
+}
+
+/// Compute two-pass outlier-trimmed local MAD (floored at `fallback_mad`) and `max_abs` for a 1D slice.
+fn slice_trimmed_mad_and_max(
+    vals: &[f32],
+    scratch: &mut Vec<f32>,
+    fallback_mad: f32,
+) -> (f32, f32) {
+    let (_, mad, max_abs) = slice_trimmed_median_mad_and_max(vals, scratch, fallback_mad);
+    (mad, max_abs)
 }
 
 /// Sub-voxel 3-point peak offset in `[-0.5, 0.5]` using log-Gaussian fit (with parabolic fallback).
@@ -761,6 +774,7 @@ impl Default for CorroboratedRepickConfig {
 struct ActiveStripCol {
     ix: usize,
     in_idx: usize,
+    smed: f32,
     smad: f32,
     smax: f32,
 }
@@ -919,7 +933,7 @@ impl StripCube3D {
         let high_dr = spec_max_abs > 40.0 * noise;
         let far_sinc_frac = (cfg.sinc_frac * 0.4).min(0.012);
 
-        // Compute full-column outlier-trimmed MAD & max identically to Pass 1 before cropping 13C storage
+        // Compute full-column outlier-trimmed median, MAD & max identically to Pass 1 before cropping 13C storage
         let mut strip_buf = Vec::with_capacity(n_c);
         let mut scratch = Vec::with_capacity(n_c);
         let mut active_strips = Vec::with_capacity(raw_active.len());
@@ -928,10 +942,12 @@ impl StripCube3D {
             for ic in 0..n_c {
                 strip_buf.push(get_voxel(ix, in_idx, ic));
             }
-            let (smad, smax) = slice_trimmed_mad_and_max(&strip_buf, &mut scratch, noise);
+            let (smed, smad, smax) =
+                slice_trimmed_median_mad_and_max(&strip_buf, &mut scratch, noise);
             active_strips.push(ActiveStripCol {
                 ix,
                 in_idx,
+                smed,
                 smad,
                 smax,
             });
@@ -1097,7 +1113,16 @@ impl StripCube3D {
                 }
 
                 let raw_sign = if raw_v >= 0.0 { 1 } else { -1 };
+                let sgn_f = raw_sign as f32;
+                // Guard against t1 baseline/pedestal ridges that raise the DC floor along the 13C column:
+                // deduct strip baseline median shifts beyond normal zero-mean thermal sampling jitter.
+                let pedestal = (sgn_f * scol.smed - 0.60 * scol.smad).max(0.0);
+                if eff_v.abs() - pedestal < base_thr {
+                    continue;
+                }
+
                 let mut is_extremum = true;
+                let mut halo_hn_sum = 0.0f32;
                 'nbr: for dc in -1isize..=1 {
                     for dn in -1isize..=1 {
                         for dx in -1isize..=1 {
@@ -1113,10 +1138,53 @@ impl StripCube3D {
                                 is_extremum = false;
                                 break 'nbr;
                             }
+                            if dc == 0 {
+                                halo_hn_sum += sgn_f * nv;
+                            }
                         }
                     }
                 }
                 if !is_extremum {
+                    continue;
+                }
+
+                // Q2(ii) t1 noise ridge guard: require genuine 2D (H, N) transverse prominence
+                // across the 3x3 (dh, dn) halo at slice `ic` (using 8-voxel halo mean and 3-voxel
+                // marginal row/column sums so sub-voxel split 3D Gaussian peaks are preserved while
+                // flat (H, N) sheets and 1D H/N ridges are rejected).
+                let c0 = raw_v.abs();
+                let mut col_m1 = 0.0f32;
+                let mut col_0 = 0.0f32;
+                let mut col_p1 = 0.0f32;
+                let mut row_m1 = 0.0f32;
+                let mut row_0 = 0.0f32;
+                let mut row_p1 = 0.0f32;
+                for dn in -1isize..=1 {
+                    for dx in -1isize..=1 {
+                        let pv = sgn_f
+                            * self.get(
+                                (scol.ix as isize + dx) as usize,
+                                (scol.in_idx as isize + dn) as usize,
+                                ic,
+                            );
+                        match dx {
+                            -1 => col_m1 += pv,
+                            0 => col_0 += pv,
+                            _ => col_p1 += pv,
+                        }
+                        match dn {
+                            -1 => row_m1 += pv,
+                            0 => row_0 += pv,
+                            _ => row_p1 += pv,
+                        }
+                    }
+                }
+                let halo_hn_mean = halo_hn_sum * 0.125;
+                if halo_hn_mean > 0.84 * c0
+                    || (c0 - halo_hn_mean) < 0.65 * scol.smad
+                    || (col_0 > 0.0 && col_m1 > 0.92 * col_0 && col_p1 > 0.92 * col_0)
+                    || (row_0 > 0.0 && row_m1 > 0.92 * row_0 && row_p1 > 0.92 * row_0)
+                {
                     continue;
                 }
 
@@ -1336,6 +1404,19 @@ pub fn corroborated_re_pick_3d(
         .map(|(a, b)| a.min(b).max(6.0))
         .unwrap_or(0.0);
 
+    // Q2(i): Determine majority sign of 2D HSQC roots and reject Pass-2 rescue on opposite-sign
+    // roots (e.g. folded Arg Nε/Nη sidechain peaks folded with inverted sign in 15N).
+    let n_neg_roots = hsqc_roots.iter().filter(|r| r.sign < 0).count();
+    let majority_hsqc_sign = if n_neg_roots * 2 > hsqc_roots.len() {
+        -1
+    } else {
+        1
+    };
+    let root_matches_majority_sign = |r: &Peak| -> bool {
+        let sgn = if r.sign < 0 { -1 } else { 1 };
+        sgn == majority_hsqc_sign
+    };
+
     // Identify paired sidechain NH2 doublets (`|dN| <= 0.12 ppm`, `0.30 <= |dH| <= 1.20 ppm`)
     let mut is_nh2_pair = vec![false; hsqc_roots.len()];
     for i in 0..hsqc_roots.len() {
@@ -1406,7 +1487,8 @@ pub fn corroborated_re_pick_3d(
 
     // Pass 2A: Intra-strip cross-experiment corroboration at the same HSQC root
     for (ri, r) in hsqc_roots.iter().enumerate() {
-        if r.h < min_amide_h
+        if !root_matches_majority_sign(r)
+            || r.h < min_amide_h
             || (is_nh2_pair[ri]
                 && !root_peaks[ri].iter().any(|rp| {
                     (rp.exp == "HNCA" || rp.exp == "HNCACB") && rp.lsnr >= anchor_min_snr
@@ -1603,11 +1685,14 @@ pub fn corroborated_re_pick_3d(
         return rescued;
     }
 
-    // Build global high-SNR experimental pools strictly from Pass-1 non-NH2 backbone peaks
+    // Build global high-SNR experimental pools strictly from majority-sign Pass-1 non-NH2 backbone peaks
     let mut pool_co_im1: Vec<f64> = Vec::new();
     let mut pool_ca_im1: Vec<f64> = Vec::new();
     for (ri, rps) in root_peaks.iter().enumerate() {
-        if hsqc_roots[ri].h < min_amide_h || is_nh2_pair[ri] {
+        if !root_matches_majority_sign(&hsqc_roots[ri])
+            || hsqc_roots[ri].h < min_amide_h
+            || is_nh2_pair[ri]
+        {
             continue;
         }
         for rp in rps {
@@ -1644,7 +1729,7 @@ pub fn corroborated_re_pick_3d(
 
     // Pass 2B: Cross-strip 0-peak rescue on multi-experiment validated backbone strips
     for (ri, r) in hsqc_roots.iter().enumerate() {
-        if r.h < min_amide_h || is_nh2_pair[ri] {
+        if !root_matches_majority_sign(r) || r.h < min_amide_h || is_nh2_pair[ri] {
             continue;
         }
         let mut distinct_exps: Vec<&str> = root_peaks[ri]

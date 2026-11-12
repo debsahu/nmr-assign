@@ -87,7 +87,9 @@ NMR* 1995, 6, 135–140; Schwarzinger et al., *J. Am. Chem. Soc.* 2001, 123,
   and tertiary-imide electronic upfield shifts `Delta = (-1.95, -1.80) ppm` on
   `(CA, C)` for standard residues (`(-1.00, -1.50) ppm` for `GLY`,
   `(-1.75, -1.70) ppm` for `PRO`), evaluated via the `0.85 / 0.15`
-  coil/PPII-vs-helical-kink mixture `P_cov` (MacArthur & Thornton, 1991) and
+  coil/PPII-vs-helical-kink mixture `P_cov` (MacArthur & Thornton, 1991;
+  mixture weights `0.85 / 0.15` calibrated on `dev` data — `bmrb_phase1_tests`
+  calmodulin + `CISD3` — for a `+1.1` percentage-point accuracy gain) and
   centered around `p_Pro = 91 / 2508` (`d_pre = 0.85 * (1 - p_Pro) * Delta`,
   `d_non = -0.85 * p_Pro * Delta`) so `p_Pro * d_pre + (1 - p_Pro) * d_non == 0`
   identically across natural sequences, coil/turn pre-Proline residues gain

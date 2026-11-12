@@ -23,7 +23,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::nmrstar::{read_star, read_star_all_atoms};
+use serde::{Deserialize, Serialize};
+
+use crate::nmrstar::{read_star, read_star_all_atoms, Reference};
 use crate::spinsystems::SpinSystem;
 
 pub const ATOMS: [&str; 5] = ["H", "N", "CA", "CB", "C"];
@@ -526,7 +528,7 @@ impl Priors {
 }
 
 /// Global chemical-shift referencing offsets `(experimental_ppm - dss_prior_ppm)` per backbone nucleus.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ShiftOffsets {
     pub h: f64,
     pub n: f64,
@@ -568,6 +570,125 @@ impl fmt::Display for ShiftOffsets {
     }
 }
 
+/// Distinct statistical outcome of fitting a global chemical-shift reference offset on one nucleus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OffsetFitStatus {
+    /// Significant reference offset exceeding both minimum amplitude and log-likelihood gain gates.
+    Fitted,
+    /// Sufficient observations were present, but the candidate offset did not clear deadband / ΔLL gates (`applied_ppm = 0.0`).
+    NotSignificant,
+    /// Too few observations (`n_values < min_values`) to fit an offset (`applied_ppm = 0.0`).
+    #[default]
+    TooFewValues,
+}
+
+/// Detailed per-nucleus chemical-shift offset fit diagnostic (`Fitted`, `NotSignificant`, or `TooFewValues`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NucleusOffsetFit {
+    pub status: OffsetFitStatus,
+    /// Offset actually applied (`0.0` unless `status == OffsetFitStatus::Fitted`).
+    pub applied_ppm: f64,
+    /// Maximum-likelihood candidate shift found before deadband / ΔLL gating (`0.0` when `TooFewValues`).
+    pub candidate_ppm: f64,
+    /// Log-likelihood improvement `ΔLL = max(0, LL(candidate_ppm) - LL(0))` in nats.
+    pub log_likelihood_gain: f64,
+    /// Number of unlabelled observations contributing to the fit (`min(n_pred, n_truth)` or `n_obs`).
+    pub n_values: usize,
+}
+
+impl NucleusOffsetFit {
+    /// Format a compact diagnostic token (`dCA=-2.77(ΔLL=41.2)` vs `dCA=ns(ΔLL=0.8)` vs `dCA=n<5(0)`).
+    pub fn format_compact(&self, label: &str) -> String {
+        self.format_compact_with_min(label, 5)
+    }
+
+    /// Format a compact diagnostic token with an explicit minimum sample threshold `min_values`.
+    pub fn format_compact_with_min(&self, label: &str, min_values: usize) -> String {
+        match self.status {
+            OffsetFitStatus::Fitted => {
+                if label == "dH" {
+                    format!(
+                        "{label}={:+.3}(ΔLL={:.1})",
+                        self.applied_ppm, self.log_likelihood_gain
+                    )
+                } else {
+                    format!(
+                        "{label}={:+.2}(ΔLL={:.1})",
+                        self.applied_ppm, self.log_likelihood_gain
+                    )
+                }
+            }
+            OffsetFitStatus::NotSignificant => {
+                format!("{label}=ns(ΔLL={:.1})", self.log_likelihood_gain)
+            }
+            OffsetFitStatus::TooFewValues => {
+                format!("{label}=n<{min_values}({})", self.n_values)
+            }
+        }
+    }
+}
+
+/// Detailed per-nucleus reference offset diagnostics across `(H, N, CA, CB, C)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DetailedReferenceOffsets {
+    pub h: NucleusOffsetFit,
+    pub n: NucleusOffsetFit,
+    pub ca: NucleusOffsetFit,
+    pub cb: NucleusOffsetFit,
+    pub c: NucleusOffsetFit,
+}
+
+impl DetailedReferenceOffsets {
+    /// Look up the fit record for a backbone atom (`"H"`, `"N"`, `"CA"`, `"CB"`, `"C"`).
+    #[inline]
+    pub fn get(&self, atom: &str) -> Option<&NucleusOffsetFit> {
+        match atom {
+            "H" => Some(&self.h),
+            "N" => Some(&self.n),
+            "CA" => Some(&self.ca),
+            "CB" => Some(&self.cb),
+            "C" => Some(&self.c),
+            _ => None,
+        }
+    }
+
+    /// Extract the backwards-compatible applied `ShiftOffsets` (`0.0` for `NotSignificant` / `TooFewValues`).
+    #[inline]
+    pub fn to_shift_offsets(&self) -> ShiftOffsets {
+        ShiftOffsets {
+            h: self.h.applied_ppm,
+            n: self.n.applied_ppm,
+            ca: self.ca.applied_ppm,
+            cb: self.cb.applied_ppm,
+            c: self.c.applied_ppm,
+        }
+    }
+
+    /// Format all five nuclei in compact one-line diagnostic form.
+    pub fn format_compact(&self) -> String {
+        format!(
+            "{}, {}, {}, {}, {}",
+            self.h.format_compact("dH"),
+            self.n.format_compact("dN"),
+            self.ca.format_compact("dCA"),
+            self.cb.format_compact("dCB"),
+            self.c.format_compact("dC")
+        )
+    }
+}
+
+impl From<DetailedReferenceOffsets> for ShiftOffsets {
+    fn from(d: DetailedReferenceOffsets) -> Self {
+        d.to_shift_offsets()
+    }
+}
+
+impl fmt::Display for DetailedReferenceOffsets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.format_compact())
+    }
+}
+
 /// Empirical BMRB training-set Proline occurrence fraction (`91 / 2508 ≈ 3.63%`, from
 /// `data/priors/PROVENANCE.md`) already absorbed into pooled BMRB prior means.
 const NATURAL_PRO_FRACTION: f64 = 91.0 / 2508.0;
@@ -575,8 +696,9 @@ const NATURAL_PRO_FRACTION: f64 = 91.0 / 2508.0;
 /// Mixture weight (`0.85`) for the sterically upfield coil/turn/PPII pre-Proline state in
 /// [`Priors::llr_shifted`], paired with `0.15` weight on the unshifted globular state (consistent
 /// with the ~85% non-helical vs ~15% kinked alpha-helical distribution of proline-preceding
-/// residues in globular proteins per MacArthur & Thornton, *J. Mol. Biol.* 1991, 218, 397–412) so
-/// kinked alpha-helical pre-Proline residues do not suffer unbounded quadratic tail penalties.
+/// residues in globular proteins per MacArthur & Thornton, *J. Mol. Biol.* 1991, 218, 397–412;
+/// calibrated on `dev` data — `bmrb_phase1_tests` calmodulin + `CISD3` — for a `+1.1` point gain)
+/// so kinked alpha-helical pre-Proline residues do not suffer unbounded quadratic tail penalties.
 pub const COVALENT_COIL_WEIGHT: f64 = 0.85;
 
 /// Deterministic zero-mean primary-sequence covalent tripeptide `(seq[k-1], seq[k], seq[k+1])`
@@ -989,6 +1111,574 @@ pub fn estimate_reference_offsets(
         cb: cb_off,
         c: c_off,
     }
+}
+
+/// Blind untethered per-nucleus reference offset diagnostics against sequence-weighted `Priors`
+/// (without ground truth), recording `OffsetFitStatus`, candidate shift, `ΔLL` gain, and `n_values`
+/// independently for `(H, N, CA, CB, C)` so `qc::check_offset_consistency` can detect single-channel
+/// carrier/folding anomalies when no ground-truth `Reference` is available.
+pub fn estimate_reference_offsets_detailed(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+) -> DetailedReferenceOffsets {
+    if systems.is_empty() {
+        return DetailedReferenceOffsets::default();
+    }
+
+    let slot_and_support = |ss: &SpinSystem| -> (usize, usize) {
+        let mut slots = 0usize;
+        let mut sup_sum = 0usize;
+        for cands in ss.cands.values() {
+            if let Some(&(_, sup)) = cands.iter().find(|&&(_, sup)| sup > 0) {
+                slots += 1;
+                sup_sum += sup;
+            }
+        }
+        (sup_sum, slots)
+    };
+    let assignable = sequence
+        .iter()
+        .enumerate()
+        .filter(|&(k, r)| k > 0 && r != "PRO")
+        .count()
+        .max(sequence.len());
+    let max_selected = ((assignable * 4) / 3).max(24);
+    let mut multi_slot: Vec<&SpinSystem> = systems
+        .iter()
+        .filter(|ss| slot_and_support(ss).1 >= 2)
+        .collect();
+    if multi_slot.len() > max_selected {
+        multi_slot.sort_by_key(|b| std::cmp::Reverse(slot_and_support(b)));
+        multi_slot.truncate(max_selected);
+    }
+    let mut selected: Vec<&SpinSystem> = if multi_slot.len() >= 8 {
+        multi_slot
+    } else {
+        systems
+            .iter()
+            .filter(|ss| ss.has_observed_carbons())
+            .collect()
+    };
+    if selected.len() > max_selected {
+        selected.sort_by_key(|b| std::cmp::Reverse(slot_and_support(b)));
+        selected.truncate(max_selected);
+    }
+
+    let collect_carbon = |atom: &str, lo: f64, hi: f64| -> (Vec<(f64, bool)>, f64) {
+        let mut obs = Vec::new();
+        let mut n0 = 0usize;
+        let mut nm1 = 0usize;
+        for ss in &selected {
+            for (off, is_im1) in [(0, false), (-1, true)] {
+                if let Some(list) = ss.cands.get(&(atom.to_string(), off)) {
+                    if let Some(&(v, _)) = list.iter().find(|&&(_, sup)| sup > 0) {
+                        if (lo..=hi).contains(&v) {
+                            obs.push((v, is_im1));
+                            if is_im1 {
+                                nm1 += 1;
+                            } else {
+                                n0 += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let scale = if obs.is_empty() {
+            1.0
+        } else {
+            (n0.max(nm1).max(1) as f64) / (obs.len() as f64)
+        };
+        (obs, scale)
+    };
+
+    let (obs_ca, scale_ca) = collect_carbon("CA", 34.0, 76.0);
+    let (obs_cb, scale_cb) = collect_carbon("CB", 8.0, 78.0);
+    let (obs_c, scale_c) = collect_carbon("C", 162.0, 188.0);
+    let obs_h: Vec<(f64, bool)> = selected
+        .iter()
+        .filter(|ss| (5.0..=12.5).contains(&ss.h))
+        .map(|ss| (ss.h, false))
+        .collect();
+    let obs_n: Vec<(f64, bool)> = selected
+        .iter()
+        .filter(|ss| (95.0..=145.0).contains(&ss.n))
+        .map(|ss| (ss.n, false))
+        .collect();
+
+    const N_GRID_C: usize = 241;
+    const ZERO_C: usize = 120;
+    const MIN_C: f64 = -6.0;
+    const STEP_C: f64 = 0.05;
+    let round3 = |x: f64| (x * 1000.0).round() / 1000.0;
+
+    let fit_blind_c = |atom: &str,
+                       obs: &[(f64, bool)],
+                       scale: f64,
+                       range_ppm: f64,
+                       min_amp: f64,
+                       min_gain: f64|
+     -> NucleusOffsetFit {
+        let n_values = obs.len();
+        if n_values < 5 || selected.len() < 6 {
+            return NucleusOffsetFit {
+                status: OffsetFitStatus::TooFewValues,
+                applied_ppm: 0.0,
+                candidate_ppm: 0.0,
+                log_likelihood_gain: 0.0,
+                n_values,
+            };
+        }
+        let mix0 = build_sequence_mixture(sequence, priors, atom, false);
+        let mixm1 = build_sequence_mixture(sequence, priors, atom, true);
+        let l_c: Vec<f64> = (0..N_GRID_C)
+            .map(|i| {
+                let d = MIN_C + (i as f64) * STEP_C;
+                scale * outlier_robust_mixture_ll(obs, &mix0, &mixm1, range_ppm, d)
+                    - 0.5 * (d / 4.5).powi(2)
+            })
+            .collect();
+        let (best_i, &best_sc) = l_c
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_C, &0.0));
+        let d_cand = round3(refine_grid_peak(&l_c, best_i, MIN_C, STEP_C));
+        let gain = (best_sc - l_c[ZERO_C]).max(0.0);
+        if n_values >= 8 && d_cand.abs() >= min_amp && gain >= min_gain {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: d_cand,
+                candidate_ppm: d_cand,
+                log_likelihood_gain: gain,
+                n_values,
+            }
+        } else {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: d_cand,
+                log_likelihood_gain: gain,
+                n_values,
+            }
+        }
+    };
+
+    // Untethered blind carbon fits: conservative amplitude gates protect strongly alpha-helical
+    // DSS proteins (mean helical ΔCA <= ~1.8 ppm) while catching TMS (-2.7 ppm) and mis-referenced channels.
+    let ca = fit_blind_c("CA", &obs_ca, scale_ca, 45.0, 2.15, 12.0);
+    let cb = fit_blind_c("CB", &obs_cb, scale_cb, 65.0, 1.50, 10.0);
+    let c = fit_blind_c("C", &obs_c, scale_c, 25.0, 1.45, 7.0);
+
+    let h = if obs_h.len() < 5 || selected.len() < 6 {
+        NucleusOffsetFit {
+            status: OffsetFitStatus::TooFewValues,
+            applied_ppm: 0.0,
+            candidate_ppm: 0.0,
+            log_likelihood_gain: 0.0,
+            n_values: obs_h.len(),
+        }
+    } else {
+        const N_GRID_H: usize = 301;
+        const ZERO_H: usize = 150;
+        const MIN_H: f64 = -1.5;
+        const STEP_H: f64 = 0.01;
+        let mix_h = build_sequence_mixture(sequence, priors, "H", false);
+        let l_h: Vec<f64> = (0..N_GRID_H)
+            .map(|i| {
+                let d = MIN_H + (i as f64) * STEP_H;
+                outlier_robust_mixture_ll(&obs_h, &mix_h, &mix_h, 6.0, d) - 0.5 * (d / 0.8).powi(2)
+            })
+            .collect();
+        let (best_i, &best_sc) = l_h
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_H, &0.0));
+        let d_h = round3(refine_grid_peak(&l_h, best_i, MIN_H, STEP_H));
+        let gain = (best_sc - l_h[ZERO_H]).max(0.0);
+        if obs_h.len() >= 12 && d_h.abs() >= 0.22 && gain >= 6.0 {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: d_h,
+                candidate_ppm: d_h,
+                log_likelihood_gain: gain,
+                n_values: obs_h.len(),
+            }
+        } else {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: d_h,
+                log_likelihood_gain: gain,
+                n_values: obs_h.len(),
+            }
+        }
+    };
+
+    let n = if obs_n.len() < 5 || selected.len() < 6 {
+        NucleusOffsetFit {
+            status: OffsetFitStatus::TooFewValues,
+            applied_ppm: 0.0,
+            candidate_ppm: 0.0,
+            log_likelihood_gain: 0.0,
+            n_values: obs_n.len(),
+        }
+    } else {
+        let mix_n = build_sequence_mixture(sequence, priors, "N", false);
+        let l_n: Vec<f64> = (0..N_GRID_C)
+            .map(|i| {
+                let d = MIN_C + (i as f64) * STEP_C;
+                outlier_robust_mixture_ll(&obs_n, &mix_n, &mix_n, 40.0, d) - 0.5 * (d / 4.0).powi(2)
+            })
+            .collect();
+        let (best_i, &best_sc) = l_n
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap_or((ZERO_C, &0.0));
+        let d_n = round3(refine_grid_peak(&l_n, best_i, MIN_C, STEP_C));
+        let gain = (best_sc - l_n[ZERO_C]).max(0.0);
+        if obs_n.len() >= 12 && d_n.abs() >= 1.25 && gain >= 6.0 {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: d_n,
+                candidate_ppm: d_n,
+                log_likelihood_gain: gain,
+                n_values: obs_n.len(),
+            }
+        } else {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: d_n,
+                log_likelihood_gain: gain,
+                n_values: obs_n.len(),
+            }
+        }
+    };
+
+    DetailedReferenceOffsets { h, n, ca, cb, c }
+}
+
+/// Fit one global chemical-shift reference offset per atom type `(dH, dN, dCA, dCB, dC)`
+/// (`pred - truth`, in ppm) strictly from **unlabelled** empirical distributions — discarding all
+/// residue indices `k` so the fitted offset is invariant to any permutation of predicted assignments
+/// and never uses matched `(pred_k, truth_k)` pairs — returning per-nucleus `OffsetFitStatus`,
+/// `applied_ppm`, `candidate_ppm`, `log_likelihood_gain`, and `n_values`.
+pub fn fit_unlabelled_global_offsets_detailed(
+    pred: &Reference,
+    truth: &Reference,
+    opt_systems: Option<&[SpinSystem]>,
+) -> DetailedReferenceOffsets {
+    let collect_sorted_atom = |r: &Reference, atom_name: &str| -> Vec<f64> {
+        let mut vals: Vec<f64> = r
+            .shifts
+            .iter()
+            .filter_map(|((_, a), &v)| (a == atom_name).then_some(v))
+            .collect();
+        vals.sort_by(|a, b| a.total_cmp(b));
+        vals
+    };
+
+    let fit_1d_marginal = |p_vals: &[f64], t_vals: &[f64], sigma: f64| -> NucleusOffsetFit {
+        let n_values = p_vals.len().min(t_vals.len());
+        if n_values < 5 {
+            return NucleusOffsetFit {
+                status: OffsetFitStatus::TooFewValues,
+                applied_ppm: 0.0,
+                candidate_ppm: 0.0,
+                log_likelihood_gain: 0.0,
+                n_values,
+            };
+        }
+        let inv2 = 1.0 / (2.0 * sigma * sigma);
+        let nt = t_vals.len() as f64;
+        let eval_ll = |d: f64| -> f64 {
+            let mut tot = 0.0;
+            for &pv in p_vals {
+                let mut mx = f64::NEG_INFINITY;
+                for &tv in t_vals {
+                    let z = -(pv - tv - d).powi(2) * inv2;
+                    if z > mx {
+                        mx = z;
+                    }
+                }
+                let mut acc = 0.0;
+                for &tv in t_vals {
+                    acc += (-(pv - tv - d).powi(2) * inv2 - mx).exp();
+                }
+                let lse = mx + (acc / nt).ln();
+                tot += lse.max(-8.0);
+            }
+            tot - 0.5 * (d / 8.0).powi(2)
+        };
+
+        let s0 = eval_ll(0.0);
+        let mut best_d = 0.0;
+        let mut best_s = f64::NEG_INFINITY;
+        for step in -250..=250 {
+            let d = (step as f64) * 0.02;
+            let sc = eval_ll(d);
+            if sc > best_s {
+                best_s = sc;
+                best_d = d;
+            }
+        }
+        for step in -20..=20 {
+            let d = best_d + (step as f64) * 0.002;
+            let sc = eval_ll(d);
+            if sc > best_s {
+                best_s = sc;
+                best_d = d;
+            }
+        }
+        let gain = (best_s - s0).max(0.0);
+        let min_gain = (0.12 * (p_vals.len() as f64)).max(2.5);
+        if best_d.abs() < 0.35 || gain < min_gain {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: best_d,
+                log_likelihood_gain: gain,
+                n_values,
+            }
+        } else {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: best_d,
+                candidate_ppm: best_d,
+                log_likelihood_gain: gain,
+                n_values,
+            }
+        }
+    };
+
+    // Unlabelled 2D `(H, N)` point clouds sorted lexicographically (independent of residue labels)
+    let mut probe_hn: Vec<(f64, f64)> = if let Some(systems) = opt_systems {
+        systems.iter().map(|s| (s.h, s.n)).collect()
+    } else {
+        (0..pred.sequence.len())
+            .filter_map(|k| {
+                let h = *pred.shifts.get(&(k, "H".to_string()))?;
+                let n = *pred.shifts.get(&(k, "N".to_string()))?;
+                Some((h, n))
+            })
+            .collect()
+    };
+    probe_hn.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
+    let mut true_hn: Vec<(f64, f64)> = (0..truth.sequence.len())
+        .filter(|&k| k > 0 && truth.sequence[k] != "PRO")
+        .filter_map(|k| {
+            let h = *truth.shifts.get(&(k, "H".to_string()))?;
+            let n = *truth.shifts.get(&(k, "N".to_string()))?;
+            Some((h, n))
+        })
+        .collect();
+    true_hn.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
+    let n_hn = probe_hn.len().min(true_hn.len());
+    let (h, n) = if n_hn < 5 {
+        let tfv = NucleusOffsetFit {
+            status: OffsetFitStatus::TooFewValues,
+            applied_ppm: 0.0,
+            candidate_ppm: 0.0,
+            log_likelihood_gain: 0.0,
+            n_values: n_hn,
+        };
+        (tfv, tfv)
+    } else {
+        let sh = 0.035_f64;
+        let sn = 0.35_f64;
+        let invh = 1.0 / (2.0 * sh * sh);
+        let invn = 1.0 / (2.0 * sn * sn);
+        let nt = true_hn.len() as f64;
+        let eval_2d = |dh_try: f64, dn_try: f64| -> f64 {
+            let mut tot = 0.0;
+            for &(ph, pn) in &probe_hn {
+                let mut mx = f64::NEG_INFINITY;
+                for &(th, tn) in &true_hn {
+                    let z =
+                        -((ph - th - dh_try).powi(2) * invh + (pn - tn - dn_try).powi(2) * invn);
+                    if z > mx {
+                        mx = z;
+                    }
+                }
+                let mut acc = 0.0;
+                for &(th, tn) in &true_hn {
+                    let z =
+                        -((ph - th - dh_try).powi(2) * invh + (pn - tn - dn_try).powi(2) * invn);
+                    acc += (z - mx).exp();
+                }
+                tot += (mx + (acc / nt).ln()).max(-9.0);
+            }
+            tot
+        };
+
+        let s0 = eval_2d(0.0, 0.0);
+        // Check whether unshifted clouds already overlap (`>= 50%` within wide 2D kernel)
+        let zero_near = probe_hn
+            .iter()
+            .filter(|&&(ph, pn)| {
+                true_hn
+                    .iter()
+                    .any(|&(th, tn)| (ph - th).abs() <= 0.05 && (pn - tn).abs() <= 0.50)
+            })
+            .count();
+        if zero_near * 2 >= n_hn {
+            let mut loc_dh = 0.0;
+            let mut loc_dn = 0.0;
+            let mut loc_s = s0;
+            for ih in -4..=4 {
+                for jn in -4..=4 {
+                    let cdh = (ih as f64) * 0.01;
+                    let cdn = (jn as f64) * 0.10;
+                    let sc = eval_2d(cdh, cdn);
+                    if sc > loc_s {
+                        loc_s = sc;
+                        loc_dh = cdh;
+                        loc_dn = cdn;
+                    }
+                }
+            }
+            let gain_h = (eval_2d(loc_dh, 0.0) - s0).max(0.0);
+            let gain_n = (eval_2d(0.0, loc_dn) - s0).max(0.0);
+            (
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: loc_dh,
+                    log_likelihood_gain: gain_h,
+                    n_values: n_hn,
+                },
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: loc_dn,
+                    log_likelihood_gain: gain_n,
+                    n_values: n_hn,
+                },
+            )
+        } else {
+            let mut best_dh = 0.0;
+            let mut best_dn = 0.0;
+            let mut best_s = s0;
+            for &(ph, pn) in &probe_hn {
+                for &(th, tn) in &true_hn {
+                    let cdh = ph - th;
+                    let cdn = pn - tn;
+                    if cdh.abs() <= 0.50 && cdn.abs() <= 4.00 {
+                        let sc = eval_2d(cdh, cdn);
+                        if sc > best_s {
+                            best_s = sc;
+                            best_dh = cdh;
+                            best_dn = cdn;
+                        }
+                    }
+                }
+            }
+            for ih in -8..=8 {
+                for jn in -8..=8 {
+                    let cdh = best_dh + (ih as f64) * 0.003;
+                    let cdn = best_dn + (jn as f64) * 0.03;
+                    let sc = eval_2d(cdh, cdn);
+                    if sc > best_s {
+                        best_s = sc;
+                        best_dh = cdh;
+                        best_dn = cdn;
+                    }
+                }
+            }
+            let joint_gain = (best_s - s0).max(0.0);
+            let min_gain = (0.35 * (n_hn as f64)).max(6.0);
+            if (best_dh.abs() < 0.05 && best_dn.abs() < 0.45) || joint_gain < min_gain {
+                (
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: best_dh,
+                        log_likelihood_gain: joint_gain,
+                        n_values: n_hn,
+                    },
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: best_dn,
+                        log_likelihood_gain: joint_gain,
+                        n_values: n_hn,
+                    },
+                )
+            } else {
+                let gain_h = (best_s - eval_2d(0.0, best_dn)).max(0.0);
+                let gain_n = (best_s - eval_2d(best_dh, 0.0)).max(0.0);
+                let fit_h = if best_dh.abs() < 0.030 && gain_h < 1.5 {
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: best_dh,
+                        log_likelihood_gain: gain_h,
+                        n_values: n_hn,
+                    }
+                } else {
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::Fitted,
+                        applied_ppm: best_dh,
+                        candidate_ppm: best_dh,
+                        log_likelihood_gain: gain_h.max(joint_gain * 0.5),
+                        n_values: n_hn,
+                    }
+                };
+                let fit_n = if best_dn.abs() < 0.30 && gain_n < 1.5 {
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: best_dn,
+                        log_likelihood_gain: gain_n,
+                        n_values: n_hn,
+                    }
+                } else {
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::Fitted,
+                        applied_ppm: best_dn,
+                        candidate_ppm: best_dn,
+                        log_likelihood_gain: gain_n.max(joint_gain * 0.5),
+                        n_values: n_hn,
+                    }
+                };
+                (fit_h, fit_n)
+            }
+        }
+    };
+
+    let ca = fit_1d_marginal(
+        &collect_sorted_atom(pred, "CA"),
+        &collect_sorted_atom(truth, "CA"),
+        0.55,
+    );
+    let cb = fit_1d_marginal(
+        &collect_sorted_atom(pred, "CB"),
+        &collect_sorted_atom(truth, "CB"),
+        0.55,
+    );
+    let c = fit_1d_marginal(
+        &collect_sorted_atom(pred, "C"),
+        &collect_sorted_atom(truth, "C"),
+        0.55,
+    );
+
+    DetailedReferenceOffsets { h, n, ca, cb, c }
+}
+
+/// Backwards-compatible unlabelled global chemical-shift reference offset fit returning `ShiftOffsets`
+/// (`0.0` for any nucleus with `NotSignificant` or `TooFewValues`).
+pub fn fit_unlabelled_global_offsets(
+    pred: &Reference,
+    truth: &Reference,
+    opt_systems: Option<&[SpinSystem]>,
+) -> ShiftOffsets {
+    fit_unlabelled_global_offsets_detailed(pred, truth, opt_systems).to_shift_offsets()
 }
 
 fn bio_plausible_bounds(atom: &str) -> Option<(f64, f64)> {

@@ -36,6 +36,7 @@ use crate::priors::{
     covalent_atom_offset, delta_covalent, expected_covalent_atom_offset, logpdf, one_to_three,
     Priors, STANDARD_RESIDUES,
 };
+use crate::qc::{apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport};
 use crate::rng::Rng;
 use crate::solver::{
     candidate_llr_shifted, consensus_from_runs, pair_matrix, AssignResult, Matrix2D, ScoreConfig,
@@ -119,6 +120,8 @@ pub struct EvoGraphConfig<'a> {
     pub anchor_consensus_threshold: f64,
     /// Enable 2-layer message-passing graph self-consistency check between Pass 1 and Pass 2.
     pub graph_consistency: bool,
+    /// Automatically evaluate per-dataset QC (`DatasetQcReport`) and apply confidence calibration / abstention.
+    pub apply_qc_calibration: bool,
     /// Optional 3D backbone `(phi_deg, psi_deg)` torsions aligned to `sequence` (`None` = sequence-only).
     pub structure_torsions: Option<&'a [(Option<f64>, Option<f64>)]>,
     /// Deterministic PRNG seed.
@@ -155,6 +158,7 @@ impl Default for EvoGraphConfig<'_> {
             auto_reference: true,
             anchor_consensus_threshold: 0.70,
             graph_consistency: true,
+            apply_qc_calibration: true,
             structure_torsions: None,
             seed: 0,
         }
@@ -162,7 +166,7 @@ impl Default for EvoGraphConfig<'_> {
 }
 
 /// Diagnostic telemetry produced by stoichiometric filtering, two-pass reference estimation,
-/// and residue-graph self-consistency.
+/// residue-graph self-consistency, and unlabelled per-dataset quality control.
 #[derive(Clone, Debug, Default)]
 pub struct EvoGraphReport {
     pub raw_peak_count: usize,
@@ -181,6 +185,7 @@ pub struct EvoGraphReport {
     pub graph_pruned_count: usize,
     pub pass1_best_score: f64,
     pub final_best_score: f64,
+    pub qc_report: DatasetQcReport,
 }
 
 impl EvoGraphReport {
@@ -3451,7 +3456,21 @@ pub fn assign_evo_graph_with_report(
         kept_hsqc_indices: (0..systems.len()).collect(),
         ..Default::default()
     };
-    let result = assign_evo_graph_core(systems, sequence, priors, cfg, &mut report);
+    let mut result = assign_evo_graph_core(systems, sequence, priors, cfg, &mut report);
+    let mut qc = evaluate_dataset_qc(
+        None,
+        systems,
+        sequence,
+        priors,
+        &cfg.score_cfg,
+        &result,
+        None,
+    );
+    if cfg.apply_qc_calibration {
+        apply_dataset_qc_to_assignments(&mut result, &qc);
+        qc.already_applied = true;
+    }
+    report.qc_report = qc;
     (result, report)
 }
 
@@ -3585,6 +3604,20 @@ pub fn assign_evo_graph_from_peaks(
     let mut report = EvoGraphReport::default();
     let filtered = filter_peaks_with_report(peaks, sequence, cfg, &mut report);
     let systems = build_stoichiometric_spin_systems(&filtered, &cfg.tolerances, cfg.max_cands);
-    let result = assign_evo_graph_core(&systems, sequence, priors, cfg, &mut report);
+    let mut result = assign_evo_graph_core(&systems, sequence, priors, cfg, &mut report);
+    let mut qc = evaluate_dataset_qc(
+        Some(peaks),
+        &systems,
+        sequence,
+        priors,
+        &cfg.score_cfg,
+        &result,
+        None,
+    );
+    if cfg.apply_qc_calibration {
+        apply_dataset_qc_to_assignments(&mut result, &qc);
+        qc.already_applied = true;
+    }
+    report.qc_report = qc;
     (systems, result, report)
 }
