@@ -53,7 +53,9 @@ use nmr_core::priors::{
     compute_priors, fit_unlabelled_global_offsets_detailed, one_to_three, DetailedReferenceOffsets,
     NucleusOffsetFit, OffsetFitStatus, Priors, ShiftOffsets,
 };
-use nmr_core::process::{process_fid_2d_mut, process_fid_3d_mut, ProcessingRecipe};
+use nmr_core::process::{
+    process_fid_2d_mut, process_fid_3d_mut, register_3d_hn_to_hsqc_2d, ProcessingRecipe,
+};
 use nmr_core::qc::{
     apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport, DatasetQcVerdict,
     ProteinReliabilityCurve,
@@ -1398,12 +1400,23 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
 
 fn pick_in_memory_spectra(
     hsqc_spec: Option<&Spectrum2D>,
-    triples: &[(String, Spectrum3D)],
+    triples: &mut [(String, Spectrum3D)],
     method: &str,
     engine: EngineKind,
     snr: f32,
     prob: f32,
 ) -> Result<(Vec<Peak>, Vec<Peak>, String), String> {
+    // Register each 3D spectrum to the HSQC via rigid (dH, dN) carrier alignment
+    // (cross-correlation of sky-projected HN planes). Conservative bounds guard
+    // against false shifts on well-calibrated single-spectrometer datasets.
+    if let Some(s2) = hsqc_spec {
+        for (_exp, s3) in triples.iter_mut() {
+            let (dh, dn) = register_3d_hn_to_hsqc_2d(s3, s2, 0.08, 0.60);
+            if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
+                eprintln!("[register] aligned 3D {_exp} to HSQC: dH={dh:+.4} ppm, dN={dn:+.3} ppm");
+            }
+        }
+    }
     match method {
         "classical" => {
             let cfg = PickerConfig {
@@ -1416,7 +1429,7 @@ fn pick_in_memory_spectra(
             };
             let mut all = r.clone();
             let mut strip_bank = StripBank3D::new();
-            for (_exp, s3) in triples {
+            for (_exp, s3) in triples.iter() {
                 all.extend(strip_bank.pick_and_record_3d(s3, &r, &cfg));
             }
             if triples.len() >= 2 && !r.is_empty() {
@@ -1448,7 +1461,7 @@ fn pick_in_memory_spectra(
                         prob_threshold: prob,
                         ..GpuNeuralPickerConfig::default()
                     };
-                    for (exp, s3) in triples {
+                    for (exp, s3) in triples.iter() {
                         all.extend(gpu_picker.pick_triple_3d_gpu(s3, exp, &r, &gcfg)?);
                     }
                     Ok((
@@ -1466,7 +1479,7 @@ fn pick_in_memory_spectra(
                         hsqc_roots: r.clone(),
                         ..NeuralPickerConfig::default()
                     };
-                    for (exp, s3) in triples {
+                    for (exp, s3) in triples.iter() {
                         all.extend(model.pick_3d(s3, exp, &cfg_3d));
                     }
                     Ok((r, all, "neural (CPU)".to_string()))
@@ -1492,7 +1505,14 @@ fn pick_spectra_bundle(
     for (exp, path) in triples {
         loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
     }
-    pick_in_memory_spectra(Some(&hsqc_spec), &loaded_triples, method, engine, snr, prob)
+    pick_in_memory_spectra(
+        Some(&hsqc_spec),
+        &mut loaded_triples,
+        method,
+        engine,
+        snr,
+        prob,
+    )
 }
 
 fn indent_json_block(json: &str, prefix: &str) -> String {
@@ -1531,8 +1551,14 @@ fn process_and_pick_fid_bundle(
         loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
     }
 
-    let (roots, all_peaks, label) =
-        pick_in_memory_spectra(Some(&hsqc_spec), &loaded_triples, method, engine, snr, prob)?;
+    let (roots, all_peaks, label) = pick_in_memory_spectra(
+        Some(&hsqc_spec),
+        &mut loaded_triples,
+        method,
+        engine,
+        snr,
+        prob,
+    )?;
     let hsqc_json = hsqc_recipe.to_json_pretty()?;
     let bundle_recipe_json = if triple_recipe_entries.is_empty() {
         hsqc_json
@@ -1742,7 +1768,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 } else {
                     pick_in_memory_spectra(
                         Some(&spec2),
-                        &loaded_triples,
+                        &mut loaded_triples,
                         &method,
                         engine,
                         snr,
@@ -1763,7 +1789,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 };
                 pick_in_memory_spectra(
                     opt_hsqc.as_ref(),
-                    &[(exp, spec3)],
+                    &mut [(exp, spec3)],
                     &method,
                     engine,
                     snr,

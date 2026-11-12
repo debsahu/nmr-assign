@@ -24,7 +24,7 @@ use nmr_core::picker::{
     corroborated_re_pick_3d, pick_hsqc_2d, CorroboratedRepickConfig, PickerConfig, StripBank3D,
 };
 use nmr_core::priors::{DetailedReferenceOffsets, NucleusOffsetFit, OffsetFitStatus, ShiftOffsets};
-use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
+use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d, register_3d_hn_to_hsqc_2d};
 use nmr_core::qc::{DatasetQcReport, ProteinReliabilityCurve};
 use nmr_core::solver::ScoreConfig;
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
@@ -1766,7 +1766,6 @@ pub fn run_real_benchmark_with_loaders(
         };
 
         let roots = pick_hsqc_2d(&hsqc_spec, &picker_cfg);
-        drop(hsqc_spec);
         let mut all_peaks: Vec<Peak> = roots.clone();
         let mut used_exps: Vec<(String, String)> =
             vec![("HSQC".to_string(), hsqc_exp.rel_path.clone())];
@@ -1778,7 +1777,15 @@ pub fn run_real_benchmark_with_loaders(
             let is_required =
                 required_set.is_empty() || required_set.contains(texp.exp_type.as_str());
             match load_fid_3d(&texp.dir, &texp.exp_type) {
-                Ok(spec3d) => {
+                Ok(mut spec3d) => {
+                    // Align 3D HN plane to HSQC via rigid (dH, dN) registration
+                    let (dh, dn) = register_3d_hn_to_hsqc_2d(&mut spec3d, &hsqc_spec, 0.08, 0.60);
+                    if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
+                        eprintln!(
+                            "[register] {}: aligned {} to HSQC: dH={:+.4} ppm, dN={:+.3} ppm",
+                            entry.bmrb_id, texp.exp_type, dh, dn
+                        );
+                    }
                     let pks = strip_bank.pick_and_record_3d(&spec3d, &roots, &picker_cfg);
                     all_peaks.extend(pks);
                     used_exps.push((texp.exp_type.clone(), texp.rel_path.clone()));

@@ -4,6 +4,40 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## `[0.4.0]` — 2026-11-12 — Phase 8 Post-Review Remediation: Dataset QC Calibration, FID/DSP Hardening, Detailed Offset States, 3D-to-HSQC Registration, `evo-graph` Default Solver, and Expanded Benchmark Governance (`nmr-core`, `nmr-cli`, `nmr-gui`, `docs`)
+
+- **Tag:** `v0.4.0`
+- **Architectural Summary:**
+  - **Dataset Quality Control & Per-Protein Confidence Calibration (`nmr-core::qc`, `nmr-core::priors`, `nmr-cli`):** Introduced `DatasetQcReport` (`PASS`/`WARN`/`ABSTAIN` verdict with `confidence_cap`, `connectivity_frac`, `detailed_offsets`, and `reasons`), `ProteinReliabilityCurve` (4-bin `[0.0–0.5, 0.5–0.8, 0.8–0.9, 0.9–1.0]` reliability + ECE + per-protein HC precision distinguishing `ABSTAIN` from `0.0%`), and `DetailedReferenceOffsets` (per-nucleus `OffsetFitStatus`: `Fitted(ΔLL)` / `NotSignificant` / `TooFewValues`) wired into `nmrassign assign`, `pipeline`, `score`, and `real-benchmark` (`P1-1`, `P1-3`).
+  - **Bruker XWIN-NMR & Varian 3D FID/DSP Hardening (`nmr-core::fid`, `nmr-core::ops`, `nmr-core::process`):** Fixed zero-phase fallback on unprocessed XWIN-NMR `pdata/1` (`FT_mod=0`, `PH_mod=0`); indirect `15N` carrier synchronization via `resolve_bruker_indirect_sfo1` when `acquNs.SFO1` holds stale/template values; `Echo-Antiecho` (`FnMODE=6`) indirect `REVERSE` inferred from `(d0..d20)/(d10..d30)` pulse program loops; Varian `origfid` backup preference over `mungefid`-overwritten `fid`; `conjugate_for_fft` derived from `fcoef` Re/Im sign product; indirect-focused 3D direct `1H` blind autophasing (`focused_direct_traces_3d`); aliphatic `13CA/CB` carrier-mirror recovery (`is_mirrored_aliphatic_cacb_3d`). `BMRB 6318` recovered from `0.0%` → `64.2%` accuracy; `BMRB 5329` recovered from `15.3%` → `65.5%` accuracy (`P1-2`).
+  - **Hypercomplex NUS IST/FISTA Precondition & HNCACB Polarity Lock (`nmr-core::ops`, `nmr-core::process`):** Enforced `States` recombination precondition before 1D/2D/3D `IST`/`FISTA` (`Err` on `states_recombined == false` or `QF`); dynamic stopping floor `2 * σ_res` (iteration residual MAD); restricted `first_scale = 0.5 / 2.0` to Virtual-Echo mode (fixing `10x` DC impulse artifact); O'Donoghue-Candes adaptive restart + active-support debiasing. Narrowed biphasic positive `CA` window from `48..66 ppm` to `48..60 ppm` (excluding `Ser`/`Thr` `CB(−)` at `60..66 ppm`), using capped-SNR (`≤ 8 σ`) local-extremum peak votes (`Q1a`, `Q1b`).
+  - **3D-to-HSQC Rigid HN Registration (`nmr-core::process`, `nmr-cli`):** Added `register_3d_hn_to_hsqc_2d` (unlabelled 2D sky-projection capped-SNR bilinear cross-correlation) to align each 3D `(1H, 15N, 13C)` spectrum to the reference 2D HSQC before picking, correcting small rigid `(dH, dN)` carrier/temperature drift across multi-spectrometer experiment bundles (conservative bounds `max_dH = 0.08 ppm`, `max_dN = 0.60 ppm`). Wired into `nmrassign pick`, `pipeline`, and `real-benchmark`.
+  - **`evo-graph` Default Solver (`nmr-cli`, `nmr-gui`):** Changed the default `--solver` for `assign`, `pipeline`, `real-benchmark`, and the GUI solver dropdown to `evo-graph` (keeping `--solver standard` explicitly selectable). Added CLI unit test `test_cli_default_solver_is_evo_graph` and GUI unit test `test_gui_default_solver_is_evo_graph` (`P1-6`).
+  - **POSIX USTAR Tar Header Checksum Validation (`nmr-cli::fetch_bmrb`):** Replaced the weak `Content-Length % 512 != 0` tar corruption heuristic with actual 512-byte POSIX USTAR tar header validation (unsigned + signed byte-sum checksum with `header[148..156]` filled with `0x20`), falling back to unpacked directory crawling when a `.tar` fails checksum validation regardless of Content-Length alignment (`P2-4`).
+  - **Benchmark Governance Update (`data/benchmark/real_manifest.tsv`):** Promoted `BMRB 5329` (WR41) and `BMRB 6318` (At3g51030) from `heldout` to `dev` after the single Phase 8 cold held-out run (per external review `Q4`). Added 2 pre-screened disjoint backup entries `BMRB 16099` (Kazal-1, 74 aa, 800 MHz Bruker) and `BMRB 18489` (NFU1, 107 aa, 800 MHz Bruker) to `heldout`. Manifest now 16 entries: 7 `dev` / 9 `heldout`. The refreshed `heldout` split stays 100% cold until Phase 9 (`Q4`).
+  - **Echo-Antiecho & FnMODE Documentation (`docs/specs/11-fid-processing.md`):** Corrected separate hypercomplex channel equations (`S_cos = (S+ + S−)/2`, `S_sin = (S+ − S−)/(2i)`), documented complete Bruker `FnMODE` table (0=Undefined→rejected, 1=QF, 2=QSEQ→rejected, 3=TPPI→rejected, 4=States, 5=States-TPPI, 6=Echo-Antiecho) (`P2-1`, `P2-2`).
+  - **TopSpin Ubiquitin Parity & HNCO/HN(CA)CO Peak Gap Documentation (`docs/specs/11-fid-processing.md`, `TODO.md`):** Documented raw-FID vs TopSpin `pdata/1` HNCO peak difference (`99 vs 140`): TopSpin `ME_mod = LPfc` doubles effective `13C`/`15N` indirect aperture; `HN(CA)CO` (`31 vs 71`): weak 2-way `1J_NCa`/`2J_N_Ca` transfer at `NS = 8` + `LPfc` SNR gain. Ubiquitin parity: `63/66` (`95.5%`) raw vs `63/67` (`94.0%`) TopSpin — both recover 63 correct residues (`P1-4`).
+- **Verified Metrics:**
+  - **Realistic Bruker 5-Seed Benchmark Gate (`nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5`):**
+    - `--solver standard --engine cpu`: **`83.4%` accuracy** (`226/271`), **`65.3%` recall**, **`96.2% (154/160)` HC precision** (`0.33 s`).
+    - `--solver standard --engine gpu`: **`88.4%` accuracy** (`243/275`), **`70.2%` recall**, **`95.9% (140/146)` HC precision** (`7.07 s`).
+    - `--solver evo-graph` (default): **`98.4%` accuracy** (`316/321`), **`91.3%` recall**, **`98.4% (308/313)` HC precision** (`0.76 s`).
+  - **Development `CISD3` (`BMRB 51439`, 900 MHz Bruker, 93 aa, 5-Seed, `--solver evo-graph`):**
+    - **`62.5%` accuracy**, **`39.2%` recall**, **`100.0%` HC precision** (59/59), unlabelled offset `dN=−0.97, dCA=−2.56, dCB=−2.53, dC=−2.66 ppm`.
+  - **7-Entry `--split dev --seeds 5` (`--solver evo-graph`, NEVER ran `--split heldout`):**
+    - `ubiquitin_local` (Ubiquitin, 76 aa, Bruker, QC=PASS): **`92.3%` acc**, `85.7%` rec, **`96.6%` HC-prec**.
+    - `51439` (CISD3, 93 aa, Bruker, QC=PASS): **`62.5%` acc**, `39.2%` rec, **`100.0%` HC-prec**.
+    - `53371` (hDVL2_PDZ, 102 aa, Bruker, QC=PASS): **`71.2%` acc**, `46.9%` rec, **`93.6%` HC-prec**.
+    - `18465` (OR135, 110 aa, Varian, QC=WARN): **`44.7%` acc**, `42.8%` rec, **`84.4%` HC-prec**.
+    - `15386` (StR82, 77 aa, Bruker, QC=PASS): **`85.1%` acc**, `86.4%` rec, **`96.3%` HC-prec**.
+    - `5329` (WR41, 94 aa, Varian, QC=PASS): **`65.5%` acc**, `50.7%` rec, **`91.8%` HC-prec**.
+    - `6318` (At3g51030, 124 aa, Bruker, QC=PASS): **`64.2%` acc**, `50.2%` rec, **`96.3%` HC-prec**.
+    - **Macro mean**: **`69.4%` acc**, `57.4%` rec, **`94.1%` HC-prec** (HC-active=7/7, abstained=0).
+    - **Micro pool**: `68.1%` acc, `56.0%` rec, `94.4%` HC-prec (1219/1291).
+    - **Calibration**: worst HC=OR135 `84.4%`, median=`96.3%`, pooled ECE=`0.040`.
+
+---
+
 ## `[0.3.0]` — 2026-11-11 — Workspace SemVer Versioning (`v0.3.0`), Realistic Bruker 5-Seed CI Gate, Permutation-Invariant Unlabelled `score` Referencing, and Calibrated `evo-graph` Confidence (`nmr-core`, `nmr-cli`, `nmr-gui`, `ci`, `docs`)
 
 - **Tag:** `v0.3.0`
