@@ -49,8 +49,15 @@ use nmr_core::picker::{
     corroborated_re_pick_3d, pick_c13_hsqc_2d, pick_hsqc_2d, CorroboratedRepickConfig,
     PickerConfig, StripBank3D,
 };
-use nmr_core::priors::{compute_priors, one_to_three, Priors, ShiftOffsets};
+use nmr_core::priors::{
+    compute_priors, fit_unlabelled_global_offsets_detailed, one_to_three, DetailedReferenceOffsets,
+    NucleusOffsetFit, OffsetFitStatus, Priors, ShiftOffsets,
+};
 use nmr_core::process::{process_fid_2d_mut, process_fid_3d_mut, ProcessingRecipe};
+use nmr_core::qc::{
+    apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport, DatasetQcVerdict,
+    ProteinReliabilityCurve,
+};
 use nmr_core::report::{
     predict_csi_dihedrals, write_quality_report_html, ReportInput, StructureReportSummary,
 };
@@ -186,9 +193,49 @@ pub(crate) struct SolverWorkflowOutput {
     pub(crate) result: AssignResult,
     pub(crate) effective_priors: Priors,
     pub(crate) offsets: ShiftOffsets,
+    pub(crate) detailed_offsets: DetailedReferenceOffsets,
+    pub(crate) qc_report: DatasetQcReport,
     pub(crate) engine_label: String,
     pub(crate) replicas: usize,
     pub(crate) steps_per_system: usize,
+}
+
+fn sync_detailed_prior_offsets(
+    applied: &ShiftOffsets,
+    blind: &DetailedReferenceOffsets,
+) -> DetailedReferenceOffsets {
+    let sync_one = |d_app: f64, fit: NucleusOffsetFit| -> NucleusOffsetFit {
+        if fit.status == OffsetFitStatus::TooFewValues {
+            fit
+        } else if d_app.abs() > 1e-9 {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: d_app,
+                candidate_ppm: if fit.candidate_ppm.abs() > 1e-9 {
+                    fit.candidate_ppm
+                } else {
+                    d_app
+                },
+                log_likelihood_gain: fit.log_likelihood_gain,
+                n_values: fit.n_values,
+            }
+        } else {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: fit.candidate_ppm,
+                log_likelihood_gain: fit.log_likelihood_gain,
+                n_values: fit.n_values,
+            }
+        }
+    };
+    DetailedReferenceOffsets {
+        h: sync_one(applied.h, blind.h),
+        n: sync_one(applied.n, blind.n),
+        ca: sync_one(applied.ca, blind.ca),
+        cb: sync_one(applied.cb, blind.cb),
+        c: sync_one(applied.c, blind.c),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -222,14 +269,29 @@ pub(crate) fn execute_assignment_workflow(
                 seed,
                 ..AnnealConfig::default()
             };
-            let (result, engine_label) =
+            let (mut result, engine_label) =
                 run_solver(engine, &systems, sequence, priors, score_cfg, &anneal_cfg)?;
+            let mut qc_report = evaluate_dataset_qc(
+                Some(peaks),
+                &systems,
+                sequence,
+                priors,
+                score_cfg,
+                &result,
+                None,
+            );
+            apply_dataset_qc_to_assignments(&mut result, &qc_report);
+            qc_report.already_applied = true;
+            let detailed_offsets =
+                sync_detailed_prior_offsets(&offsets, &qc_report.detailed_offsets);
             Ok(SolverWorkflowOutput {
                 systems,
                 kept_hsqc_indices: None,
                 result,
                 effective_priors,
                 offsets,
+                detailed_offsets,
+                qc_report,
                 engine_label,
                 replicas: anneal_cfg.runs,
                 steps_per_system: anneal_cfg.steps_per_system,
@@ -259,6 +321,8 @@ pub(crate) fn execute_assignment_workflow(
                 cb: rep.final_offsets.d_cb,
                 c: rep.final_offsets.d_c,
             };
+            let detailed_offsets =
+                sync_detailed_prior_offsets(&offsets, &rep.qc_report.detailed_offsets);
             let effective_priors = rep.shifted_priors(priors);
             let engine_label = "CPU (f64, evo-graph)".to_string();
             Ok(SolverWorkflowOutput {
@@ -267,6 +331,8 @@ pub(crate) fn execute_assignment_workflow(
                 result,
                 effective_priors,
                 offsets,
+                detailed_offsets,
+                qc_report: rep.qc_report,
                 engine_label,
                 replicas: evo_cfg.population_size,
                 steps_per_system: evo_cfg.generations * evo_cfg.steps_per_system_per_gen,
@@ -275,19 +341,64 @@ pub(crate) fn execute_assignment_workflow(
     }
 }
 
-fn format_star_offset_header(solver_label: &str, offsets: &ShiftOffsets) -> Option<String> {
-    (!offsets.is_zero()).then(|| {
-        format!(
-            "{} | solver={solver_label} | fitted_prior_reference_offsets (experimental - DSS prior): {offsets} | emitted chemical shifts remain in experimental spectrum ppm frame",
-            version_string()
-        )
-    })
+fn format_star_offset_header(
+    solver_label: &str,
+    offsets: &ShiftOffsets,
+    detailed_offsets: &DetailedReferenceOffsets,
+    qc_report: &DatasetQcReport,
+) -> Option<String> {
+    if offsets.is_zero() && qc_report.verdict == DatasetQcVerdict::Pass {
+        return None;
+    }
+    let mut parts = vec![
+        version_string(),
+        format!("solver={solver_label}"),
+        format!("qc_verdict={}", qc_report.verdict),
+    ];
+    if !qc_report.reasons.is_empty() {
+        parts.push(format!("qc_notes={}", qc_report.reasons.join("; ")));
+    }
+    if !offsets.is_zero() {
+        parts.push(format!(
+            "fitted_prior_reference_offsets (experimental - DSS prior): {offsets} [{}]",
+            detailed_offsets.format_compact()
+        ));
+        parts.push("emitted chemical shifts remain in experimental spectrum ppm frame".to_string());
+    } else {
+        parts.push(format!(
+            "prior_reference_offsets: {}",
+            detailed_offsets.format_compact()
+        ));
+    }
+    Some(parts.join(" | "))
 }
 
-fn log_nonzero_offsets(solver_label: &str, offsets: &ShiftOffsets, verbose: bool) {
+fn log_workflow_diagnostics(
+    solver_label: &str,
+    offsets: &ShiftOffsets,
+    detailed_offsets: &DetailedReferenceOffsets,
+    qc_report: &DatasetQcReport,
+    verbose: bool,
+) {
     if !offsets.is_zero() || verbose {
         eprintln!(
-            "[{solver_label}] fitted prior reference offsets (experimental - DSS prior; output kept in experimental ppm): {offsets}"
+            "[{solver_label}] prior reference offsets (experimental - DSS prior; output kept in experimental ppm): {} (applied: {offsets})",
+            detailed_offsets.format_compact()
+        );
+    }
+    if qc_report.verdict != DatasetQcVerdict::Pass || verbose {
+        let reasons = if qc_report.reasons.is_empty() {
+            "clean spectral stoichiometry, registration, and connectivity".to_string()
+        } else {
+            qc_report.reasons.join("; ")
+        };
+        eprintln!(
+            "[{solver_label}] dataset QC: {} (scale={:.2}, cap={:.2}, 3D_support={:.1}%, conn={:.1}%) — {reasons}",
+            qc_report.verdict,
+            qc_report.confidence_scale,
+            qc_report.confidence_cap,
+            qc_report.hsqc_3d_support_frac * 100.0,
+            qc_report.connectivity_frac * 100.0,
         );
     }
 }
@@ -476,7 +587,13 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         replicas = wf.replicas;
         steps_per_system = wf.steps_per_system;
 
-        log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+        log_workflow_diagnostics(
+            &wf.engine_label,
+            &wf.offsets,
+            &wf.detailed_offsets,
+            &wf.qc_report,
+            verbose,
+        );
 
         let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
             Some(kept) => kept
@@ -812,7 +929,13 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let wf = execute_assignment_workflow(
         solver, engine_opt, &peaks, &sequence, &pri, &score_cfg, runs, steps, 12, seed,
     )?;
-    log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+    log_workflow_diagnostics(
+        &wf.engine_label,
+        &wf.offsets,
+        &wf.detailed_offsets,
+        &wf.qc_report,
+        verbose,
+    );
 
     let (pred, conf) = to_reference(
         &wf.result,
@@ -825,17 +948,29 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
 
     let str_out = out_prefix.with_extension("str");
     let tsv_out = out_prefix.with_extension("tsv");
-    let star_hdr = format_star_offset_header(&wf.engine_label, &wf.offsets);
+    let star_hdr = format_star_offset_header(
+        &wf.engine_label,
+        &wf.offsets,
+        &wf.detailed_offsets,
+        &wf.qc_report,
+    );
     write_star_with_header(&str_out, &pred, Some(&conf), star_hdr.as_deref())?;
     write_shifts_tsv(&tsv_out, &pred, &conf)?;
 
     let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+    let hc_msg = if n_hc == 0 && wf.qc_report.verdict == DatasetQcVerdict::Abstain {
+        "ABSTAIN (0 high-confidence calls; QC capped <= 0.45)".to_string()
+    } else {
+        format!("{n_hc} with confidence >= 0.8")
+    };
     println!(
-        "[{}] {} spin systems; {} residues assigned, {} with confidence >= 0.8",
+        "[{}] QC={} | {} spin systems; {} residues assigned, {} | offsets: {}",
         wf.engine_label,
+        wf.qc_report.verdict,
         wf.systems.len(),
         conf.len(),
-        n_hc
+        hc_msg,
+        wf.detailed_offsets.format_compact()
     );
     println!("wrote {} and {}", str_out.display(), tsv_out.display());
     Ok(())
@@ -2910,7 +3045,13 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         seed,
     )?;
     let dt_solve = t_solve.elapsed().as_secs_f64();
-    log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+    log_workflow_diagnostics(
+        &wf.engine_label,
+        &wf.offsets,
+        &wf.detailed_offsets,
+        &wf.qc_report,
+        verbose,
+    );
 
     let (pred_ref, conf) = to_reference(
         &wf.result,
@@ -2925,11 +3066,24 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let tsv_out = dir.join("shifts.tsv");
     let nef_out = dir.join("result.nef");
     let html_out = dir.join("report.html");
+    let qc_out = dir.join("qc_report.json");
 
     write_peaks(&peaks_out, &peaks)?;
-    let star_hdr = format_star_offset_header(&wf.engine_label, &wf.offsets);
+    let star_hdr = format_star_offset_header(
+        &wf.engine_label,
+        &wf.offsets,
+        &wf.detailed_offsets,
+        &wf.qc_report,
+    );
     write_star_with_header(&star_out, &pred_ref, Some(&conf), star_hdr.as_deref())?;
     write_shifts_tsv(&tsv_out, &pred_ref, &conf)?;
+    let _ = fs::write(
+        &qc_out,
+        format!(
+            "{}\n",
+            real_benchmark::render_qc_report_json(&wf.qc_report, 0)
+        ),
+    );
     let nef_doc =
         NefDocument::from_reference_and_peaks(&project_name, &pred_ref, Some(&conf), &peaks);
     write_nef_file(&nef_out, &nef_doc)?;
@@ -3264,213 +3418,13 @@ fn parse_assign_tsv_confidences(path: &Path) -> Result<BTreeMap<i32, f64>, Strin
     Ok(out)
 }
 
-/// Fit one global chemical-shift reference offset per atom type `(dH, dN, dCA, dCB, dC)`
-/// (`pred - truth`, in ppm) strictly from **unlabelled** empirical distributions — discarding all
-/// residue indices `k` so the fitted offset is invariant to any permutation of predicted assignments
-/// and never uses matched `(pred_k, truth_k)` pairs.
-fn fit_unlabelled_global_offsets(
-    pred: &Reference,
-    truth: &Reference,
-    opt_systems: Option<&[SpinSystem]>,
-) -> ShiftOffsets {
-    let collect_sorted_atom = |r: &Reference, atom_name: &str| -> Vec<f64> {
-        let mut vals: Vec<f64> = r
-            .shifts
-            .iter()
-            .filter_map(|((_, a), &v)| (a == atom_name).then_some(v))
-            .collect();
-        vals.sort_by(|a, b| a.total_cmp(b));
-        vals
-    };
-
-    let fit_1d_marginal = |p_vals: &[f64], t_vals: &[f64], sigma: f64| -> f64 {
-        if p_vals.len() < 5 || t_vals.len() < 5 {
-            return 0.0;
-        }
-        let inv2 = 1.0 / (2.0 * sigma * sigma);
-        let nt = t_vals.len() as f64;
-        let eval_ll = |d: f64| -> f64 {
-            let mut tot = 0.0;
-            for &pv in p_vals {
-                let mut mx = f64::NEG_INFINITY;
-                for &tv in t_vals {
-                    let z = -(pv - tv - d).powi(2) * inv2;
-                    if z > mx {
-                        mx = z;
-                    }
-                }
-                let mut acc = 0.0;
-                for &tv in t_vals {
-                    acc += (-(pv - tv - d).powi(2) * inv2 - mx).exp();
-                }
-                let lse = mx + (acc / nt).ln();
-                tot += lse.max(-8.0);
-            }
-            tot - 0.5 * (d / 8.0).powi(2)
-        };
-
-        let s0 = eval_ll(0.0);
-        let mut best_d = 0.0;
-        let mut best_s = s0;
-        for step in -250..=250 {
-            let d = (step as f64) * 0.02;
-            let sc = eval_ll(d);
-            if sc > best_s {
-                best_s = sc;
-                best_d = d;
-            }
-        }
-        for step in -20..=20 {
-            let d = best_d + (step as f64) * 0.002;
-            let sc = eval_ll(d);
-            if sc > best_s {
-                best_s = sc;
-                best_d = d;
-            }
-        }
-        let min_gain = (0.12 * (p_vals.len() as f64)).max(2.5);
-        if best_d.abs() < 0.35 || (best_s - s0) < min_gain {
-            0.0
-        } else {
-            best_d
-        }
-    };
-
-    // Unlabelled 2D `(H, N)` point clouds sorted lexicographically (independent of residue labels)
-    let mut probe_hn: Vec<(f64, f64)> = if let Some(systems) = opt_systems {
-        systems.iter().map(|s| (s.h, s.n)).collect()
-    } else {
-        (0..pred.sequence.len())
-            .filter_map(|k| {
-                let h = *pred.shifts.get(&(k, "H".to_string()))?;
-                let n = *pred.shifts.get(&(k, "N".to_string()))?;
-                Some((h, n))
-            })
-            .collect()
-    };
-    probe_hn.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-
-    let mut true_hn: Vec<(f64, f64)> = (0..truth.sequence.len())
-        .filter(|&k| k > 0 && truth.sequence[k] != "PRO")
-        .filter_map(|k| {
-            let h = *truth.shifts.get(&(k, "H".to_string()))?;
-            let n = *truth.shifts.get(&(k, "N".to_string()))?;
-            Some((h, n))
-        })
-        .collect();
-    true_hn.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-
-    let (dh, dn) = if probe_hn.len() >= 5 && true_hn.len() >= 5 {
-        let sh = 0.035_f64;
-        let sn = 0.35_f64;
-        let invh = 1.0 / (2.0 * sh * sh);
-        let invn = 1.0 / (2.0 * sn * sn);
-        let nt = true_hn.len() as f64;
-        let eval_2d = |dh_try: f64, dn_try: f64| -> f64 {
-            let mut tot = 0.0;
-            for &(ph, pn) in &probe_hn {
-                let mut mx = f64::NEG_INFINITY;
-                for &(th, tn) in &true_hn {
-                    let z =
-                        -((ph - th - dh_try).powi(2) * invh + (pn - tn - dn_try).powi(2) * invn);
-                    if z > mx {
-                        mx = z;
-                    }
-                }
-                let mut acc = 0.0;
-                for &(th, tn) in &true_hn {
-                    let z =
-                        -((ph - th - dh_try).powi(2) * invh + (pn - tn - dn_try).powi(2) * invn);
-                    acc += (z - mx).exp();
-                }
-                tot += (mx + (acc / nt).ln()).max(-9.0);
-            }
-            tot
-        };
-
-        // Check whether unshifted clouds already overlap (`>= 50%` within wide 2D kernel)
-        let min_pool = probe_hn.len().min(true_hn.len());
-        let zero_near = probe_hn
-            .iter()
-            .filter(|&&(ph, pn)| {
-                true_hn
-                    .iter()
-                    .any(|&(th, tn)| (ph - th).abs() <= 0.05 && (pn - tn).abs() <= 0.50)
-            })
-            .count();
-        if zero_near * 2 >= min_pool {
-            (0.0, 0.0)
-        } else {
-            let s0 = eval_2d(0.0, 0.0);
-            let mut best_dh = 0.0;
-            let mut best_dn = 0.0;
-            let mut best_s = s0;
-            for &(ph, pn) in &probe_hn {
-                for &(th, tn) in &true_hn {
-                    let cdh = ph - th;
-                    let cdn = pn - tn;
-                    if cdh.abs() <= 0.50 && cdn.abs() <= 4.00 {
-                        let sc = eval_2d(cdh, cdn);
-                        if sc > best_s {
-                            best_s = sc;
-                            best_dh = cdh;
-                            best_dn = cdn;
-                        }
-                    }
-                }
-            }
-            for ih in -8..=8 {
-                for jn in -8..=8 {
-                    let cdh = best_dh + (ih as f64) * 0.003;
-                    let cdn = best_dn + (jn as f64) * 0.03;
-                    let sc = eval_2d(cdh, cdn);
-                    if sc > best_s {
-                        best_s = sc;
-                        best_dh = cdh;
-                        best_dn = cdn;
-                    }
-                }
-            }
-            let min_gain = (0.35 * (min_pool as f64)).max(6.0);
-            if (best_dh.abs() < 0.05 && best_dn.abs() < 0.45) || (best_s - s0) < min_gain {
-                (0.0, 0.0)
-            } else {
-                (best_dh, best_dn)
-            }
-        }
-    } else {
-        (0.0, 0.0)
-    };
-
-    let ca = fit_1d_marginal(
-        &collect_sorted_atom(pred, "CA"),
-        &collect_sorted_atom(truth, "CA"),
-        0.55,
-    );
-    let cb = fit_1d_marginal(
-        &collect_sorted_atom(pred, "CB"),
-        &collect_sorted_atom(truth, "CB"),
-        0.55,
-    );
-    let c = fit_1d_marginal(
-        &collect_sorted_atom(pred, "C"),
-        &collect_sorted_atom(truth, "C"),
-        0.55,
-    );
-
-    ShiftOffsets {
-        h: dh,
-        n: dn,
-        ca,
-        cb,
-        c,
-    }
-}
-
 pub(crate) struct ScoreEvaluation {
     pub(crate) pred_aligned: Reference,
     pub(crate) truth_for_cmp: Reference,
     pub(crate) global_offsets: ShiftOffsets,
+    pub(crate) detailed_offsets: DetailedReferenceOffsets,
+    pub(crate) placed_predictions: Vec<(f64, bool)>,
+    pub(crate) reliability: ProteinReliabilityCurve,
     pub(crate) assignable: usize,
     pub(crate) assigned: usize,
     pub(crate) correct: usize,
@@ -3533,11 +3487,12 @@ pub(crate) fn evaluate_prediction_against_truth(
     let tol_h = 0.045f64;
     let tol_n = 0.45f64;
 
-    let global_offs = if auto_offset {
-        fit_unlabelled_global_offsets(&pred_aligned, truth_ref, opt_systems)
+    let detailed_offs = if auto_offset {
+        fit_unlabelled_global_offsets_detailed(&pred_aligned, truth_ref, opt_systems)
     } else {
-        ShiftOffsets::default()
+        DetailedReferenceOffsets::default()
     };
+    let global_offs = detailed_offs.to_shift_offsets();
     let (truth_dh, truth_dn, truth_dca, truth_dcb, truth_dc) = (
         global_offs.h,
         global_offs.n,
@@ -3627,10 +3582,12 @@ pub(crate) fn evaluate_prediction_against_truth(
     let mut hc_assigned = 0usize;
     let mut hc_correct = 0usize;
     let mut misassigned: Vec<(Option<usize>, usize, i32, f64, f64, f64)> = Vec::new();
+    let mut placed_predictions: Vec<(f64, bool)> = Vec::with_capacity(assigned);
 
     for (pi, &(placed_k, ph, pn, conf)) in placed_roots.iter().enumerate() {
         let (ss_opt, true_k) = placed_true_k[pi];
         let is_ok = true_k >= 0 && (true_k as usize) == placed_k;
+        placed_predictions.push((conf, is_ok));
         if is_ok {
             correct += 1;
         } else {
@@ -3643,6 +3600,8 @@ pub(crate) fn evaluate_prediction_against_truth(
             }
         }
     }
+
+    let reliability = ProteinReliabilityCurve::from_predictions(&placed_predictions, hc_threshold);
 
     let mut truth_for_cmp = truth_ref.clone();
     if !global_offs.is_zero() {
@@ -3662,6 +3621,9 @@ pub(crate) fn evaluate_prediction_against_truth(
         pred_aligned,
         truth_for_cmp,
         global_offsets: global_offs,
+        detailed_offsets: detailed_offs,
+        placed_predictions,
+        reliability,
         assignable,
         assigned,
         correct,
@@ -3748,10 +3710,13 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         pred_aligned,
         truth_for_cmp,
         global_offsets: global_offs,
+        detailed_offsets: detailed_offs,
+        placed_predictions: _,
+        reliability,
         assignable,
         assigned,
         correct,
-        hc_assigned,
+        hc_assigned: _,
         hc_correct,
         misassigned,
     } = eval;
@@ -3773,11 +3738,6 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
     } else {
         0.0
     };
-    let hc_prec = if hc_assigned > 0 {
-        (hc_correct as f64) / (hc_assigned as f64)
-    } else {
-        0.0
-    };
     let hc_rec = if assignable > 0 {
         (hc_correct as f64) / (assignable as f64)
     } else {
@@ -3791,9 +3751,15 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         truth_ref.shifts.len(),
         excluded_q
     );
+    if auto_offset {
+        println!(
+            "truth reference offsets : {} (pred - truth, unlabelled global fit)",
+            detailed_offs.format_compact()
+        );
+    }
     if !global_offs.is_zero() {
         println!(
-            "truth reference offset  : dH={truth_dh:+.3}, dN={truth_dn:+.2}, dCA={truth_dca:+.2}, dCB={truth_dcb:+.2}, dC={truth_dc:+.2} ppm (pred - truth, unlabelled global fit)"
+            "applied shift offsets   : dH={truth_dh:+.3}, dN={truth_dn:+.2}, dCA={truth_dca:+.2}, dCB={truth_dcb:+.2}, dC={truth_dc:+.2} ppm"
         );
     }
     println!("assignable spin systems : {assignable}");
@@ -3807,13 +3773,29 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         rec * 100.0
     );
     println!(
-        "high-confidence (>={:.1}) precision : {:.1}% ({hc_correct}/{hc_assigned})",
-        hc_threshold,
-        hc_prec * 100.0
+        "high-confidence (>={:.1}) precision : {}",
+        hc_threshold, reliability.hc_status
     );
     println!(
         "high-confidence recall            : {:.1}% ({hc_correct}/{assignable})",
         hc_rec * 100.0
+    );
+    println!(
+        "reliability curve (ECE={:.3}) : {}",
+        reliability.ece,
+        reliability
+            .bins
+            .iter()
+            .map(|b| format!(
+                "[{:.1}-{:.1}): {}/{} ({:.1}%)",
+                b.lower,
+                b.upper,
+                b.correct,
+                b.count,
+                b.empirical_acc * 100.0
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!("shift agreement with reference (within tolerance / predicted):");
     let cmp = compare_shifts(&pred_aligned, &truth_for_cmp);
@@ -4569,6 +4551,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
 
     #[test]
     fn test_score_unlabelled_global_offset_is_permutation_invariant() {
+        use nmr_core::priors::fit_unlabelled_global_offsets;
         let star = fixture_star_path();
         let truth = read_star(&star, None).unwrap();
 
@@ -4633,6 +4616,64 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         assert!(
             (ca_ok as f64) / (ca_n as f64) < 0.25,
             "scrambled CA agreement should remain random (<25%), got {ca_ok}/{ca_n}"
+        );
+
+        // 4. Verify `DetailedReferenceOffsets` (`P1-3`) distinguishes `Fitted`, `NotSignificant`,
+        //    and `TooFewValues` (`n < 5`), and `evaluate_prediction_against_truth` (`P1-1`)
+        //    distinguishes `Abstained (0 HC calls)` from `0.0%` wrong HC calls.
+        let mut pred_partial = truth.clone();
+        pred_partial.shifts.retain(|(_, atom), _| atom != "CB");
+        for ((_, atom), val) in &mut pred_partial.shifts {
+            if atom == "CA" {
+                *val -= 2.75;
+            }
+        }
+        let det = fit_unlabelled_global_offsets_detailed(&pred_partial, &truth, None);
+        assert_eq!(det.ca.status, OffsetFitStatus::Fitted);
+        assert!((det.ca.applied_ppm + 2.75).abs() < 0.05);
+        assert!(det.ca.log_likelihood_gain > 10.0);
+        assert_eq!(det.cb.status, OffsetFitStatus::TooFewValues);
+        assert_eq!(det.cb.n_values, 0);
+        assert_eq!(det.c.status, OffsetFitStatus::NotSignificant);
+        let compact = det.format_compact();
+        assert!(compact.contains("dCA=-2.7"), "got {compact}");
+        assert!(compact.contains("dCB=n<5(0)"), "got {compact}");
+        assert!(compact.contains("dC=ns("), "got {compact}");
+
+        // Abstained (`0` HC calls when all confidences <= 0.45) vs `0.0%` (`0/N` wrong HC calls)
+        let mut pred_wrong = Reference::new(truth.sequence.clone(), truth.seq_ids.clone());
+        let mut conf_abstain = BTreeMap::new();
+        let mut conf_wrong_hc = BTreeMap::new();
+        for k in 1..truth.sequence.len() {
+            let src = if k + 1 < truth.sequence.len() {
+                k + 1
+            } else {
+                1
+            };
+            if let (Some(&h), Some(&n)) = (
+                truth.shifts.get(&(src, "H".to_string())),
+                truth.shifts.get(&(src, "N".to_string())),
+            ) {
+                pred_wrong.shifts.insert((k, "H".to_string()), h);
+                pred_wrong.shifts.insert((k, "N".to_string()), n);
+                conf_abstain.insert(truth.seq_ids[k], 0.40);
+                conf_wrong_hc.insert(truth.seq_ids[k], 0.92);
+            }
+        }
+        let eval_abs =
+            evaluate_prediction_against_truth(&pred_wrong, &truth, &conf_abstain, None, 0.8, true);
+        assert!(eval_abs.reliability.is_abstained());
+        assert_eq!(eval_abs.reliability.hc_precision, None);
+        assert_eq!(eval_abs.reliability.hc_status, "Abstained (0 HC calls)");
+
+        let eval_bad_hc =
+            evaluate_prediction_against_truth(&pred_wrong, &truth, &conf_wrong_hc, None, 0.8, true);
+        assert!(!eval_bad_hc.reliability.is_abstained());
+        assert!(eval_bad_hc.hc_assigned > 0);
+        assert!(
+            eval_bad_hc.reliability.hc_precision.unwrap_or(1.0) < 0.15,
+            "expected near-0% HC precision on shifted-by-1 wrong high-conf predictions, got {:?}",
+            eval_bad_hc.reliability.hc_precision
         );
     }
 

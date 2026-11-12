@@ -23,8 +23,9 @@ use nmr_core::peaks::Peak;
 use nmr_core::picker::{
     corroborated_re_pick_3d, pick_hsqc_2d, CorroboratedRepickConfig, PickerConfig, StripBank3D,
 };
-use nmr_core::priors::ShiftOffsets;
+use nmr_core::priors::{DetailedReferenceOffsets, NucleusOffsetFit, OffsetFitStatus, ShiftOffsets};
 use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
+use nmr_core::qc::{DatasetQcReport, ProteinReliabilityCurve};
 use nmr_core::solver::ScoreConfig;
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, Tolerances};
@@ -1484,6 +1485,11 @@ pub struct EntrySuccessMetrics {
     pub mean_hc_precision: f64,
     pub mean_hc_recall: f64,
     pub global_offsets: ShiftOffsets,
+    pub detailed_offsets: DetailedReferenceOffsets,
+    pub prior_detailed_offsets: DetailedReferenceOffsets,
+    pub qc_report: DatasetQcReport,
+    pub reliability: ProteinReliabilityCurve,
+    pub predictions: Vec<(f64, bool)>,
     pub elapsed_secs: f64,
 }
 
@@ -1491,7 +1497,7 @@ pub struct EntrySuccessMetrics {
 pub enum EntryBenchmarkOutcome {
     SkippedMissingData { expected_path: String },
     Failed(EntryFailureDiagnostic),
-    Succeeded(EntrySuccessMetrics),
+    Succeeded(Box<EntrySuccessMetrics>),
 }
 
 #[derive(Clone, Debug)]
@@ -1505,7 +1511,14 @@ pub struct RealBenchmarkSummary {
     pub split: String,
     pub solver_label: String,
     pub seeds: usize,
+    pub hc_threshold: f64,
     pub records: Vec<EntryBenchmarkRecord>,
+    pub n_hc_active_proteins: usize,
+    pub n_hc_abstained_proteins: usize,
+    pub worst_protein_hc_precision: Option<(String, String, f64)>,
+    pub median_protein_hc_precision: Option<f64>,
+    pub mean_protein_ece: f64,
+    pub pooled_reliability: ProteinReliabilityCurve,
     pub macro_accuracy: f64,
     pub macro_recall: f64,
     pub macro_hc_precision: f64,
@@ -1828,7 +1841,7 @@ pub fn run_real_benchmark_with_loaders(
                 }
             };
 
-        // 5. Run solver across `0..cfg.seeds` & score strictly with `fit_unlabelled_global_offsets`
+        // 5. Run solver across `0..cfg.seeds` & score strictly with `fit_unlabelled_global_offsets_detailed`
         let num_seeds = cfg.seeds.max(1);
         let mut tot_assignable = 0usize;
         let mut tot_assigned = 0usize;
@@ -1837,6 +1850,10 @@ pub fn run_real_benchmark_with_loaders(
         let mut tot_hc_correct = 0usize;
         let mut assignable_per_seed = 0usize;
         let mut reported_offsets = ShiftOffsets::default();
+        let mut reported_detailed_offsets = DetailedReferenceOffsets::default();
+        let mut reported_prior_detailed_offsets = DetailedReferenceOffsets::default();
+        let mut reported_qc_report = DatasetQcReport::default();
+        let mut entry_predictions: Vec<(f64, bool)> = Vec::new();
         let mut assign_err: Option<String> = None;
 
         for s_idx in 0..num_seeds {
@@ -1885,7 +1902,11 @@ pub fn run_real_benchmark_with_loaders(
             if s_idx == 0 {
                 assignable_per_seed = eval.assignable;
                 reported_offsets = eval.global_offsets;
+                reported_detailed_offsets = eval.detailed_offsets;
+                reported_prior_detailed_offsets = wf.detailed_offsets;
+                reported_qc_report = wf.qc_report;
             }
+            entry_predictions.extend_from_slice(&eval.placed_predictions);
             tot_assignable += eval.assignable;
             tot_assigned += eval.assigned;
             tot_correct += eval.correct;
@@ -1928,10 +1949,12 @@ pub fn run_real_benchmark_with_loaders(
         } else {
             0.0
         };
+        let reliability =
+            ProteinReliabilityCurve::from_predictions(&entry_predictions, cfg.hc_threshold);
 
         records.push(EntryBenchmarkRecord {
             manifest_entry: entry,
-            outcome: EntryBenchmarkOutcome::Succeeded(EntrySuccessMetrics {
+            outcome: EntryBenchmarkOutcome::Succeeded(Box::new(EntrySuccessMetrics {
                 seeds: num_seeds,
                 discovered_experiments: used_exps,
                 n_hsqc_roots: roots.len(),
@@ -1947,76 +1970,23 @@ pub fn run_real_benchmark_with_loaders(
                 mean_hc_precision,
                 mean_hc_recall,
                 global_offsets: reported_offsets,
+                detailed_offsets: reported_detailed_offsets,
+                prior_detailed_offsets: reported_prior_detailed_offsets,
+                qc_report: reported_qc_report,
+                reliability,
+                predictions: entry_predictions,
                 elapsed_secs: t_entry.elapsed().as_secs_f64(),
-            }),
+            })),
         });
     }
 
-    // Compute macro & micro averages over succeeded entries
-    let mut n_ok = 0usize;
-    let mut sum_acc = 0.0f64;
-    let mut sum_rec = 0.0f64;
-    let mut sum_hcp = 0.0f64;
-    let mut sum_hcr = 0.0f64;
-
-    let mut micro_assignable = 0usize;
-    let mut micro_assigned = 0usize;
-    let mut micro_correct = 0usize;
-    let mut micro_hc_assigned = 0usize;
-    let mut micro_hc_correct = 0usize;
-
-    for rec in &records {
-        if let EntryBenchmarkOutcome::Succeeded(m) = &rec.outcome {
-            n_ok += 1;
-            sum_acc += m.mean_accuracy;
-            sum_rec += m.mean_recall;
-            sum_hcp += m.mean_hc_precision;
-            sum_hcr += m.mean_hc_recall;
-
-            micro_assignable += m.total_assignable;
-            micro_assigned += m.total_assigned;
-            micro_correct += m.total_correct;
-            micro_hc_assigned += m.total_hc_assigned;
-            micro_hc_correct += m.total_hc_correct;
-        }
-    }
-
-    let denom_ok = if n_ok > 0 { n_ok as f64 } else { 1.0 };
-    let summary = RealBenchmarkSummary {
-        split: cfg.split.as_str().to_string(),
+    let summary = summarize_real_benchmark_records(
+        cfg.split.as_str(),
         solver_label,
-        seeds: cfg.seeds.max(1),
+        cfg.seeds.max(1),
+        cfg.hc_threshold,
         records,
-        macro_accuracy: if n_ok > 0 { sum_acc / denom_ok } else { 0.0 },
-        macro_recall: if n_ok > 0 { sum_rec / denom_ok } else { 0.0 },
-        macro_hc_precision: if n_ok > 0 { sum_hcp / denom_ok } else { 0.0 },
-        macro_hc_recall: if n_ok > 0 { sum_hcr / denom_ok } else { 0.0 },
-        micro_assignable,
-        micro_assigned,
-        micro_correct,
-        micro_hc_assigned,
-        micro_hc_correct,
-        micro_accuracy: if micro_assigned > 0 {
-            (micro_correct as f64) / (micro_assigned as f64)
-        } else {
-            0.0
-        },
-        micro_recall: if micro_assignable > 0 {
-            (micro_correct as f64) / (micro_assignable as f64)
-        } else {
-            0.0
-        },
-        micro_hc_precision: if micro_hc_assigned > 0 {
-            (micro_hc_correct as f64) / (micro_hc_assigned as f64)
-        } else {
-            0.0
-        },
-        micro_hc_recall: if micro_assignable > 0 {
-            (micro_hc_correct as f64) / (micro_assignable as f64)
-        } else {
-            0.0
-        },
-    };
+    );
 
     print_real_benchmark_report(&summary);
 
@@ -2046,23 +2016,172 @@ pub fn run_real_benchmark_with_loaders(
     Ok(summary)
 }
 
-pub fn print_real_benchmark_report(summary: &RealBenchmarkSummary) {
-    println!(
+/// Aggregate macro/micro metrics, per-protein HC abstention vs wrong-HC statistics,
+/// worst/median per-protein HC precision, and pooled + per-protein reliability curves (`P1-1`).
+pub fn summarize_real_benchmark_records(
+    split: &str,
+    solver_label: String,
+    seeds: usize,
+    hc_threshold: f64,
+    records: Vec<EntryBenchmarkRecord>,
+) -> RealBenchmarkSummary {
+    let mut n_ok = 0usize;
+    let mut n_hc_active_proteins = 0usize;
+    let mut n_hc_abstained_proteins = 0usize;
+    let mut sum_acc = 0.0f64;
+    let mut sum_rec = 0.0f64;
+    let mut sum_active_hcp = 0.0f64;
+    let mut sum_hcr = 0.0f64;
+    let mut sum_ece = 0.0f64;
+
+    let mut active_hc_precisions: Vec<(String, String, f64)> = Vec::new();
+    let mut pooled_predictions: Vec<(f64, bool)> = Vec::new();
+
+    let mut micro_assignable = 0usize;
+    let mut micro_assigned = 0usize;
+    let mut micro_correct = 0usize;
+    let mut micro_hc_assigned = 0usize;
+    let mut micro_hc_correct = 0usize;
+
+    for rec in &records {
+        if let EntryBenchmarkOutcome::Succeeded(m) = &rec.outcome {
+            n_ok += 1;
+            sum_acc += m.mean_accuracy;
+            sum_rec += m.mean_recall;
+            sum_hcr += m.mean_hc_recall;
+            sum_ece += m.reliability.ece;
+            pooled_predictions.extend_from_slice(&m.predictions);
+
+            if let Some(hcp) = m.reliability.hc_precision {
+                n_hc_active_proteins += 1;
+                sum_active_hcp += hcp;
+                active_hc_precisions.push((
+                    rec.manifest_entry.bmrb_id.clone(),
+                    rec.manifest_entry.protein.clone(),
+                    hcp,
+                ));
+            } else {
+                n_hc_abstained_proteins += 1;
+            }
+
+            micro_assignable += m.total_assignable;
+            micro_assigned += m.total_assigned;
+            micro_correct += m.total_correct;
+            micro_hc_assigned += m.total_hc_assigned;
+            micro_hc_correct += m.total_hc_correct;
+        }
+    }
+
+    active_hc_precisions.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let worst_protein_hc_precision = active_hc_precisions.first().cloned();
+    let median_protein_hc_precision = if active_hc_precisions.is_empty() {
+        None
+    } else {
+        let mid = active_hc_precisions.len() / 2;
+        if active_hc_precisions.len().is_multiple_of(2) {
+            Some(0.5 * (active_hc_precisions[mid - 1].2 + active_hc_precisions[mid].2))
+        } else {
+            Some(active_hc_precisions[mid].2)
+        }
+    };
+
+    let denom_ok = if n_ok > 0 { n_ok as f64 } else { 1.0 };
+    let pooled_reliability =
+        ProteinReliabilityCurve::from_predictions(&pooled_predictions, hc_threshold);
+
+    RealBenchmarkSummary {
+        split: split.to_string(),
+        solver_label,
+        seeds,
+        hc_threshold,
+        records,
+        n_hc_active_proteins,
+        n_hc_abstained_proteins,
+        worst_protein_hc_precision,
+        median_protein_hc_precision,
+        mean_protein_ece: if n_ok > 0 { sum_ece / denom_ok } else { 0.0 },
+        pooled_reliability,
+        macro_accuracy: if n_ok > 0 { sum_acc / denom_ok } else { 0.0 },
+        macro_recall: if n_ok > 0 { sum_rec / denom_ok } else { 0.0 },
+        macro_hc_precision: if n_hc_active_proteins > 0 {
+            sum_active_hcp / (n_hc_active_proteins as f64)
+        } else {
+            0.0
+        },
+        macro_hc_recall: if n_ok > 0 { sum_hcr / denom_ok } else { 0.0 },
+        micro_assignable,
+        micro_assigned,
+        micro_correct,
+        micro_hc_assigned,
+        micro_hc_correct,
+        micro_accuracy: if micro_assigned > 0 {
+            (micro_correct as f64) / (micro_assigned as f64)
+        } else {
+            0.0
+        },
+        micro_recall: if micro_assignable > 0 {
+            (micro_correct as f64) / (micro_assignable as f64)
+        } else {
+            0.0
+        },
+        micro_hc_precision: if micro_hc_assigned > 0 {
+            (micro_hc_correct as f64) / (micro_hc_assigned as f64)
+        } else {
+            0.0
+        },
+        micro_hc_recall: if micro_assignable > 0 {
+            (micro_hc_correct as f64) / (micro_assignable as f64)
+        } else {
+            0.0
+        },
+    }
+}
+
+fn format_reliability_bins_inline(rel: &ProteinReliabilityCurve) -> String {
+    rel.bins
+        .iter()
+        .enumerate()
+        .map(|(idx, b)| {
+            let close = if idx + 1 == rel.bins.len() { ']' } else { ')' };
+            if b.count > 0 {
+                format!(
+                    "[{:.1}-{:.1}{close}: {}/{} ({:.1}%)",
+                    b.lower,
+                    b.upper,
+                    b.correct,
+                    b.count,
+                    b.empirical_acc * 100.0
+                )
+            } else {
+                format!("[{:.1}-{:.1}{close}: 0/0 (-)", b.lower, b.upper)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn format_real_benchmark_report(summary: &RealBenchmarkSummary) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "=== Real Time-Domain Benchmark (split={}, solver={}, seeds={}) ===",
         summary.split, summary.solver_label, summary.seeds
     );
-    println!(
-        "{:<16} {:<14} {:>4} {:<7} | {:>8} {:>8} {:>8} | {:<32}",
+    let _ = writeln!(
+        out,
+        "{:<16} {:<14} {:>4} {:<7} {:<7} | {:>8} {:>8} {:>8} | {:<40}",
         "BMRB",
         "Protein",
         "Res",
         "Vendor",
+        "QC",
         "Accuracy",
         "Recall",
         "HC-Prec",
-        "Global Offset / Status"
+        "Global Offset (pred - truth) / Status"
     );
-    println!("{}", "-".repeat(112));
+    let _ = writeln!(out, "{}", "-".repeat(132));
 
     let mut n_ok = 0usize;
     let mut n_skip = 0usize;
@@ -2073,12 +2192,14 @@ pub fn print_real_benchmark_report(summary: &RealBenchmarkSummary) {
         match &rec.outcome {
             EntryBenchmarkOutcome::SkippedMissingData { expected_path } => {
                 n_skip += 1;
-                println!(
-                    "{:<16} {:<14} {:>4} {:<7} | {:>8} {:>8} {:>8} | SKIPPED (missing local data: {})",
+                let _ = writeln!(
+                    out,
+                    "{:<16} {:<14} {:>4} {:<7} {:<7} | {:>8} {:>8} {:>8} | SKIPPED (missing local data: {})",
                     e.bmrb_id,
                     truncate_col(&e.protein, 14),
                     e.residues,
                     truncate_col(&e.vendor, 7),
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -2087,12 +2208,14 @@ pub fn print_real_benchmark_report(summary: &RealBenchmarkSummary) {
             }
             EntryBenchmarkOutcome::Failed(diag) => {
                 n_fail += 1;
-                println!(
-                    "{:<16} {:<14} {:>4} {:<7} | {:>8} {:>8} {:>8} | FAILED [{}]",
+                let _ = writeln!(
+                    out,
+                    "{:<16} {:<14} {:>4} {:<7} {:<7} | {:>8} {:>8} {:>8} | FAILED [{}]",
                     e.bmrb_id,
                     truncate_col(&e.protein, 14),
                     e.residues,
                     truncate_col(&diag.vendor, 7),
+                    "ERR",
                     "ERR",
                     "ERR",
                     "ERR",
@@ -2101,59 +2224,140 @@ pub fn print_real_benchmark_report(summary: &RealBenchmarkSummary) {
             }
             EntryBenchmarkOutcome::Succeeded(m) => {
                 n_ok += 1;
+                let hc_col = if m.reliability.is_abstained() {
+                    format!("{:>8}", "ABSTAIN")
+                } else {
+                    format!("{:>7.1}%", m.mean_hc_precision * 100.0)
+                };
                 let off_str = format!(
-                    "dH={:+.2} dN={:+.2} dCA={:+.2} dCB={:+.2} dC={:+.2} ({:.1}s)",
-                    m.global_offsets.h,
-                    m.global_offsets.n,
-                    m.global_offsets.ca,
-                    m.global_offsets.cb,
-                    m.global_offsets.c,
+                    "{} ({:.1}s)",
+                    m.detailed_offsets.format_compact(),
                     m.elapsed_secs
                 );
-                println!(
-                    "{:<16} {:<14} {:>4} {:<7} | {:>7.1}% {:>7.1}% {:>7.1}% | {}",
+                let _ = writeln!(
+                    out,
+                    "{:<16} {:<14} {:>4} {:<7} {:<7} | {:>7.1}% {:>7.1}% {} | {}",
                     e.bmrb_id,
                     truncate_col(&e.protein, 14),
                     e.residues,
                     truncate_col(&e.vendor, 7),
+                    m.qc_report.verdict.as_str(),
                     m.mean_accuracy * 100.0,
                     m.mean_recall * 100.0,
-                    m.mean_hc_precision * 100.0,
+                    hc_col,
                     off_str
                 );
             }
         }
     }
 
-    println!("{}", "-".repeat(112));
+    let _ = writeln!(out, "{}", "-".repeat(132));
     if n_ok > 0 {
-        println!(
-            "MACRO MEAN ({n_ok} evaluated)                   | {:>7.1}% {:>7.1}% {:>7.1}% | HC-Recall={:.1}%",
+        let macro_hc_col = if summary.n_hc_active_proteins == 0 {
+            format!("{:>8}", "ABSTAIN")
+        } else {
+            format!("{:>7.1}%", summary.macro_hc_precision * 100.0)
+        };
+        let micro_hc_col = if summary.micro_hc_assigned == 0 {
+            format!("{:>8}", "ABSTAIN")
+        } else {
+            format!("{:>7.1}%", summary.micro_hc_precision * 100.0)
+        };
+        let _ = writeln!(
+            out,
+            "MACRO MEAN ({n_ok} evaluated)                           | {:>7.1}% {:>7.1}% {} | HC-Recall={:.1}% (HC-active={}/{n_ok}, abstained={})",
             summary.macro_accuracy * 100.0,
             summary.macro_recall * 100.0,
-            summary.macro_hc_precision * 100.0,
+            macro_hc_col,
             summary.macro_hc_recall * 100.0,
+            summary.n_hc_active_proteins,
+            summary.n_hc_abstained_proteins,
         );
-        println!(
-            "MICRO POOL ({}/{:<5} correct/assigned)      | {:>7.1}% {:>7.1}% {:>7.1}% | HC={}/{} (assignable={})",
+        let _ = writeln!(
+            out,
+            "MICRO POOL ({}/{:<5} correct/assigned)              | {:>7.1}% {:>7.1}% {} | HC={}/{} (assignable={})",
             summary.micro_correct,
             summary.micro_assigned,
             summary.micro_accuracy * 100.0,
             summary.micro_recall * 100.0,
-            summary.micro_hc_precision * 100.0,
+            micro_hc_col,
             summary.micro_hc_correct,
             summary.micro_hc_assigned,
             summary.micro_assignable,
         );
+
+        let _ = writeln!(
+            out,
+            "\nPer-Protein Confidence Calibration & Reliability Curves (threshold >= {:.2}):",
+            summary.hc_threshold
+        );
+        match (
+            &summary.worst_protein_hc_precision,
+            summary.median_protein_hc_precision,
+        ) {
+            (Some((w_id, w_prot, w_hcp)), Some(med_hcp)) => {
+                let _ = writeln!(
+                    out,
+                    "  Per-protein HC-Prec : worst={} ({}) {:.1}%, median={:.1}% across {} HC-active protein(s); abstained={}/{n_ok}",
+                    w_prot,
+                    w_id,
+                    w_hcp * 100.0,
+                    med_hcp * 100.0,
+                    summary.n_hc_active_proteins,
+                    summary.n_hc_abstained_proteins,
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "  Per-protein HC-Prec : all {n_ok} evaluated protein(s) ABSTAINED (0 HC calls >= {:.2})",
+                    summary.hc_threshold
+                );
+            }
+        }
+        let _ = writeln!(
+            out,
+            "  Calibration (ECE)   : mean per-protein ECE={:.3}, pooled ECE={:.3}",
+            summary.mean_protein_ece, summary.pooled_reliability.ece
+        );
+        let _ = writeln!(
+            out,
+            "  Pooled reliability  : {}",
+            format_reliability_bins_inline(&summary.pooled_reliability)
+        );
+        for rec in &summary.records {
+            if let EntryBenchmarkOutcome::Succeeded(m) = &rec.outcome {
+                let qc_note = if m.qc_report.reasons.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | QC notes: {}", m.qc_report.reasons.join("; "))
+                };
+                let _ = writeln!(
+                    out,
+                    "  - {:<16} ({:<12}): QC={:<7} | HC={:<22} | ECE={:.3} | {}{}",
+                    rec.manifest_entry.bmrb_id,
+                    truncate_col(&rec.manifest_entry.protein, 12),
+                    m.qc_report.verdict.as_str(),
+                    m.reliability.hc_status,
+                    m.reliability.ece,
+                    format_reliability_bins_inline(&m.reliability),
+                    qc_note
+                );
+            }
+        }
     } else {
-        println!("SUMMARY: 0 evaluated, {n_skip} SKIPPED (missing local data), {n_fail} failed");
+        let _ = writeln!(
+            out,
+            "SUMMARY: 0 evaluated, {n_skip} SKIPPED (missing local data), {n_fail} failed"
+        );
     }
 
     if n_fail > 0 {
-        println!("\nFailure Diagnostics:");
+        let _ = writeln!(out, "\nFailure Diagnostics:");
         for rec in &summary.records {
             if let EntryBenchmarkOutcome::Failed(d) = &rec.outcome {
-                println!(
+                let _ = writeln!(
+                    out,
                     "  - {} ({}): stage={}, exp={}, vendor={}, quad_mode={}, nus={} -> {}",
                     rec.manifest_entry.bmrb_id,
                     rec.manifest_entry.protein,
@@ -2167,6 +2371,11 @@ pub fn print_real_benchmark_report(summary: &RealBenchmarkSummary) {
             }
         }
     }
+    out
+}
+
+pub fn print_real_benchmark_report(summary: &RealBenchmarkSummary) {
+    print!("{}", format_real_benchmark_report(summary));
 }
 
 fn truncate_col(s: &str, width: usize) -> String {
@@ -2193,6 +2402,145 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+fn offset_status_slug(status: OffsetFitStatus) -> &'static str {
+    match status {
+        OffsetFitStatus::Fitted => "fitted",
+        OffsetFitStatus::NotSignificant => "not_significant",
+        OffsetFitStatus::TooFewValues => "too_few_values",
+    }
+}
+
+fn render_nucleus_offset_json(label: &str, fit: &NucleusOffsetFit) -> String {
+    format!(
+        "{{ \"status\": \"{}\", \"compact\": \"{}\", \"applied_ppm\": {:.4}, \"candidate_ppm\": {:.4}, \"log_likelihood_gain\": {:.3}, \"n_values\": {} }}",
+        offset_status_slug(fit.status),
+        json_escape(&fit.format_compact(label)),
+        fit.applied_ppm,
+        fit.candidate_ppm,
+        fit.log_likelihood_gain,
+        fit.n_values,
+    )
+}
+
+pub(crate) fn render_detailed_offsets_json(d: &DetailedReferenceOffsets, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let pad2 = " ".repeat(indent + 2);
+    format!(
+        "{{\n\
+         {pad2}\"compact\": \"{}\",\n\
+         {pad2}\"H\": {},\n\
+         {pad2}\"N\": {},\n\
+         {pad2}\"CA\": {},\n\
+         {pad2}\"CB\": {},\n\
+         {pad2}\"C\": {}\n\
+         {pad}}}",
+        json_escape(&d.format_compact()),
+        render_nucleus_offset_json("dH", &d.h),
+        render_nucleus_offset_json("dN", &d.n),
+        render_nucleus_offset_json("dCA", &d.ca),
+        render_nucleus_offset_json("dCB", &d.cb),
+        render_nucleus_offset_json("dC", &d.c),
+    )
+}
+
+pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let pad2 = " ".repeat(indent + 2);
+    let reasons_json = qc
+        .reasons
+        .iter()
+        .map(|r| format!("\"{}\"", json_escape(r)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{\n\
+         {pad2}\"verdict\": \"{}\",\n\
+         {pad2}\"confidence_scale\": {:.4},\n\
+         {pad2}\"confidence_cap\": {:.4},\n\
+         {pad2}\"already_applied\": {},\n\
+         {pad2}\"n_assignable_amides\": {},\n\
+         {pad2}\"n_raw_hsqc_roots\": {},\n\
+         {pad2}\"n_amide_hsqc_roots\": {},\n\
+         {pad2}\"hsqc_3d_support_frac\": {:.6},\n\
+         {pad2}\"supported_roots_per_assignable\": {:.6},\n\
+         {pad2}\"hsqc_3d_rms_dh_ppm\": {:.6},\n\
+         {pad2}\"hsqc_3d_rms_dn_ppm\": {:.6},\n\
+         {pad2}\"hsqc_multiplicity_ratio\": {:.6},\n\
+         {pad2}\"raw_hsqc_multiplicity_ratio\": {:.6},\n\
+         {pad2}\"offset_consistency_ok\": {},\n\
+         {pad2}\"connectivity_frac\": {:.6},\n\
+         {pad2}\"solution_margin\": {:.6},\n\
+         {pad2}\"reasons\": [{}],\n\
+         {pad2}\"detailed_offsets\": {}\n\
+         {pad}}}",
+        qc.verdict.as_str(),
+        qc.confidence_scale,
+        qc.confidence_cap,
+        qc.already_applied,
+        qc.n_assignable_amides,
+        qc.n_raw_hsqc_roots,
+        qc.n_amide_hsqc_roots,
+        qc.hsqc_3d_support_frac,
+        qc.supported_roots_per_assignable,
+        qc.hsqc_3d_rms_dh_ppm,
+        qc.hsqc_3d_rms_dn_ppm,
+        qc.hsqc_multiplicity_ratio,
+        qc.raw_hsqc_multiplicity_ratio,
+        qc.offset_consistency_ok,
+        qc.connectivity_frac,
+        qc.solution_margin,
+        reasons_json,
+        render_detailed_offsets_json(&qc.detailed_offsets, indent + 2),
+    )
+}
+
+pub(crate) fn render_reliability_curve_json(
+    rel: &ProteinReliabilityCurve,
+    indent: usize,
+) -> String {
+    let pad = " ".repeat(indent);
+    let pad2 = " ".repeat(indent + 2);
+    let pad4 = " ".repeat(indent + 4);
+    let hc_prec_json = match rel.hc_precision {
+        Some(v) => format!("{v:.6}"),
+        None => "null".to_string(),
+    };
+    let bins_json = rel
+        .bins
+        .iter()
+        .enumerate()
+        .map(|(idx, b)| {
+            let close = if idx + 1 == rel.bins.len() { ']' } else { ')' };
+            format!(
+                "{pad4}{{ \"range\": \"[{:.1}, {:.1}{close}\", \"lower\": {:.2}, \"upper\": {:.2}, \"count\": {}, \"correct\": {}, \"mean_conf\": {:.6}, \"empirical_acc\": {:.6} }}",
+                b.lower, b.upper, b.lower, b.upper, b.count, b.correct, b.mean_conf, b.empirical_acc
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "{{\n\
+         {pad2}\"total_predictions\": {},\n\
+         {pad2}\"ece\": {:.6},\n\
+         {pad2}\"hc_threshold\": {:.4},\n\
+         {pad2}\"abstained\": {},\n\
+         {pad2}\"hc_assigned\": {},\n\
+         {pad2}\"hc_correct\": {},\n\
+         {pad2}\"hc_precision\": {},\n\
+         {pad2}\"hc_status\": \"{}\",\n\
+         {pad2}\"bins\": [\n{bins_json}\n{pad2}]\n\
+         {pad}}}",
+        rel.total_predictions,
+        rel.ece,
+        rel.hc_threshold,
+        rel.is_abstained(),
+        rel.hc_assigned,
+        rel.hc_correct,
+        hc_prec_json,
+        json_escape(&rel.hc_status),
+    )
+}
+
 pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
     let n_total = summary.records.len();
     let n_ok = summary
@@ -2211,36 +2559,74 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
         .filter(|r| matches!(r.outcome, EntryBenchmarkOutcome::Failed(_)))
         .count();
 
+    let macro_hcp_json = if summary.n_hc_active_proteins > 0 {
+        format!("{:.6}", summary.macro_hc_precision)
+    } else {
+        "null".to_string()
+    };
+    let micro_hcp_json = if summary.micro_hc_assigned > 0 {
+        format!("{:.6}", summary.micro_hc_precision)
+    } else {
+        "null".to_string()
+    };
+    let worst_hcp_json = match &summary.worst_protein_hc_precision {
+        Some((bid, prot, val)) => format!(
+            "{{ \"bmrb_id\": \"{}\", \"protein\": \"{}\", \"hc_precision\": {:.6} }}",
+            json_escape(bid),
+            json_escape(prot),
+            val
+        ),
+        None => "null".to_string(),
+    };
+    let median_hcp_json = match summary.median_protein_hc_precision {
+        Some(val) => format!("{val:.6}"),
+        None => "null".to_string(),
+    };
+
     let mut j = String::new();
     j.push_str("{\n");
     j.push_str(&format!(
-        "  \"tool\": \"{}\",\n  \"split\": \"{}\",\n  \"solver\": \"{}\",\n  \"seeds\": {},\n",
+        "  \"tool\": \"{}\",\n  \"split\": \"{}\",\n  \"solver\": \"{}\",\n  \"seeds\": {},\n  \"hc_threshold\": {:.4},\n",
         json_escape(&version_string()),
         json_escape(&summary.split),
         json_escape(&summary.solver_label),
         summary.seeds,
+        summary.hc_threshold,
     ));
     j.push_str(&format!(
-        "  \"counts\": {{ \"total\": {n_total}, \"evaluated\": {n_ok}, \"skipped_missing_local_data\": {n_skip}, \"failed\": {n_fail} }},\n"
+        "  \"counts\": {{ \"total\": {n_total}, \"evaluated\": {n_ok}, \"hc_active_proteins\": {}, \"hc_abstained_proteins\": {}, \"skipped_missing_local_data\": {n_skip}, \"failed\": {n_fail} }},\n",
+        summary.n_hc_active_proteins,
+        summary.n_hc_abstained_proteins,
     ));
     j.push_str(&format!(
-        "  \"macro_average\": {{ \"accuracy\": {:.6}, \"recall\": {:.6}, \"hc_precision\": {:.6}, \"hc_recall\": {:.6} }},\n",
+        "  \"macro_average\": {{ \"accuracy\": {:.6}, \"recall\": {:.6}, \"hc_precision\": {}, \"hc_recall\": {:.6}, \"hc_active_proteins\": {}, \"hc_abstained_proteins\": {} }},\n",
         summary.macro_accuracy,
         summary.macro_recall,
-        summary.macro_hc_precision,
+        macro_hcp_json,
         summary.macro_hc_recall,
+        summary.n_hc_active_proteins,
+        summary.n_hc_abstained_proteins,
     ));
     j.push_str(&format!(
-        "  \"micro_average\": {{ \"accuracy\": {:.6}, \"recall\": {:.6}, \"hc_precision\": {:.6}, \"hc_recall\": {:.6}, \"assignable\": {}, \"assigned\": {}, \"correct\": {}, \"hc_assigned\": {}, \"hc_correct\": {} }},\n",
+        "  \"micro_average\": {{ \"accuracy\": {:.6}, \"recall\": {:.6}, \"hc_precision\": {}, \"hc_recall\": {:.6}, \"assignable\": {}, \"assigned\": {}, \"correct\": {}, \"hc_assigned\": {}, \"hc_correct\": {} }},\n",
         summary.micro_accuracy,
         summary.micro_recall,
-        summary.micro_hc_precision,
+        micro_hcp_json,
         summary.micro_hc_recall,
         summary.micro_assignable,
         summary.micro_assigned,
         summary.micro_correct,
         summary.micro_hc_assigned,
         summary.micro_hc_correct,
+    ));
+    j.push_str(&format!(
+        "  \"calibration_summary\": {{\n    \"hc_active_proteins\": {},\n    \"hc_abstained_proteins\": {},\n    \"worst_protein_hc_precision\": {},\n    \"median_protein_hc_precision\": {},\n    \"mean_protein_ece\": {:.6},\n    \"pooled_reliability_curve\": {}\n  }},\n",
+        summary.n_hc_active_proteins,
+        summary.n_hc_abstained_proteins,
+        worst_hcp_json,
+        median_hcp_json,
+        summary.mean_protein_ece,
+        render_reliability_curve_json(&summary.pooled_reliability, 4),
     ));
     j.push_str("  \"entries\": [\n");
     for (idx, rec) in summary.records.iter().enumerate() {
@@ -2295,21 +2681,33 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let entry_hcp_json = match m.reliability.hc_precision {
+                    Some(v) => format!("{v:.6}"),
+                    None => "null".to_string(),
+                };
                 j.push_str(&format!(
-                    "      \"status\": \"OK\",\n      \"discovered_experiments\": [{}],\n      \"hsqc_roots\": {},\n      \"total_peaks\": {},\n      \"assignable_per_seed\": {},\n      \"accuracy\": {:.6},\n      \"recall\": {:.6},\n      \"hc_precision\": {:.6},\n      \"hc_recall\": {:.6},\n      \"global_offsets_ppm\": {{ \"H\": {:.4}, \"N\": {:.4}, \"CA\": {:.4}, \"CB\": {:.4}, \"C\": {:.4} }},\n      \"elapsed_secs\": {:.3}\n",
+                    "      \"status\": \"OK\",\n      \"qc_verdict\": \"{}\",\n      \"discovered_experiments\": [{}],\n      \"hsqc_roots\": {},\n      \"total_peaks\": {},\n      \"assignable_per_seed\": {},\n      \"accuracy\": {:.6},\n      \"recall\": {:.6},\n      \"hc_abstained\": {},\n      \"hc_precision\": {},\n      \"hc_status\": \"{}\",\n      \"hc_recall\": {:.6},\n      \"global_offsets_ppm\": {{ \"H\": {:.4}, \"N\": {:.4}, \"CA\": {:.4}, \"CB\": {:.4}, \"C\": {:.4} }},\n      \"detailed_offsets_compact\": \"{}\",\n      \"detailed_offsets\": {},\n      \"prior_detailed_offsets\": {},\n      \"qc_report\": {},\n      \"reliability_curve\": {},\n      \"elapsed_secs\": {:.3}\n",
+                    m.qc_report.verdict.as_str(),
                     exps_json,
                     m.n_hsqc_roots,
                     m.n_total_peaks,
                     m.assignable_per_seed,
                     m.mean_accuracy,
                     m.mean_recall,
-                    m.mean_hc_precision,
+                    m.reliability.is_abstained(),
+                    entry_hcp_json,
+                    json_escape(&m.reliability.hc_status),
                     m.mean_hc_recall,
                     m.global_offsets.h,
                     m.global_offsets.n,
                     m.global_offsets.ca,
                     m.global_offsets.cb,
                     m.global_offsets.c,
+                    json_escape(&m.detailed_offsets.format_compact()),
+                    render_detailed_offsets_json(&m.detailed_offsets, 6),
+                    render_detailed_offsets_json(&m.prior_detailed_offsets, 6),
+                    render_qc_report_json(&m.qc_report, 6),
+                    render_reliability_curve_json(&m.reliability, 6),
                     m.elapsed_secs,
                 ));
             }
@@ -2701,6 +3099,8 @@ mod tests {
                     "expected ~ -2.75 ppm unlabelled dCA offset, got {}",
                     m.global_offsets.ca
                 );
+                assert_eq!(m.detailed_offsets.ca.status, OffsetFitStatus::Fitted);
+                assert!(!m.reliability.is_abstained());
             }
             other => panic!("expected Succeeded, got {other:?}"),
         }
@@ -2820,5 +3220,224 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg_std.solver, SolverKind::Standard);
+    }
+
+    #[test]
+    fn test_calibration_summary_distinguishes_abstain_from_zero_percent_hc_and_detailed_offsets() {
+        use nmr_core::qc::DatasetQcVerdict;
+
+        let mk_entry = |id: &str, name: &str| RealManifestEntry {
+            bmrb_id: id.to_string(),
+            protein: name.to_string(),
+            residues: 70,
+            field_mhz: 600.0,
+            vendor: "Bruker".to_string(),
+            experiments: vec!["HSQC".into(), "HNCO".into(), "HNCACB".into()],
+            split: "dev".to_string(),
+        };
+
+        let det_mixed = DetailedReferenceOffsets {
+            h: NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: 0.01,
+                log_likelihood_gain: 0.4,
+                n_values: 60,
+            },
+            n: NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: -0.05,
+                log_likelihood_gain: 0.6,
+                n_values: 60,
+            },
+            ca: NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: -2.75,
+                candidate_ppm: -2.75,
+                log_likelihood_gain: 42.5,
+                n_values: 58,
+            },
+            cb: NucleusOffsetFit {
+                status: OffsetFitStatus::TooFewValues,
+                applied_ppm: 0.0,
+                candidate_ppm: 0.0,
+                log_likelihood_gain: 0.0,
+                n_values: 0,
+            },
+            c: NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: 0.08,
+                log_likelihood_gain: 1.1,
+                n_values: 55,
+            },
+        };
+
+        // 1. Clean high-accuracy protein (`PASS`, 19/20 = 95.0% HC precision)
+        let mut preds_good: Vec<(f64, bool)> = (0..19).map(|_| (0.95, true)).collect();
+        preds_good.push((0.85, false));
+        let rel_good = ProteinReliabilityCurve::from_predictions(&preds_good, 0.8);
+        let rec_good = EntryBenchmarkRecord {
+            manifest_entry: mk_entry("11111", "CleanProt"),
+            outcome: EntryBenchmarkOutcome::Succeeded(Box::new(EntrySuccessMetrics {
+                seeds: 1,
+                discovered_experiments: vec![("HSQC".into(), "1".into())],
+                n_hsqc_roots: 62,
+                n_total_peaks: 310,
+                assignable_per_seed: 20,
+                total_assignable: 20,
+                total_assigned: 20,
+                total_correct: 19,
+                total_hc_assigned: 20,
+                total_hc_correct: 19,
+                mean_accuracy: 0.95,
+                mean_recall: 0.95,
+                mean_hc_precision: 0.95,
+                mean_hc_recall: 0.95,
+                global_offsets: det_mixed.to_shift_offsets(),
+                detailed_offsets: det_mixed,
+                prior_detailed_offsets: det_mixed,
+                qc_report: DatasetQcReport {
+                    verdict: DatasetQcVerdict::Pass,
+                    detailed_offsets: det_mixed,
+                    ..DatasetQcReport::default()
+                },
+                reliability: rel_good,
+                predictions: preds_good,
+                elapsed_secs: 0.5,
+            })),
+        };
+
+        // 2. Abstained dataset (`ABSTAIN`, all confidences capped <= 0.45 -> 0 HC calls)
+        let preds_abstain: Vec<(f64, bool)> = (0..10).map(|i| (0.35, i < 2)).collect();
+        let rel_abstain = ProteinReliabilityCurve::from_predictions(&preds_abstain, 0.8);
+        assert!(rel_abstain.is_abstained());
+        let rec_abstain = EntryBenchmarkRecord {
+            manifest_entry: mk_entry("22222", "AbstainProt"),
+            outcome: EntryBenchmarkOutcome::Succeeded(Box::new(EntrySuccessMetrics {
+                seeds: 1,
+                discovered_experiments: vec![("HSQC".into(), "1".into())],
+                n_hsqc_roots: 60,
+                n_total_peaks: 80,
+                assignable_per_seed: 20,
+                total_assignable: 20,
+                total_assigned: 10,
+                total_correct: 2,
+                total_hc_assigned: 0,
+                total_hc_correct: 0,
+                mean_accuracy: 0.20,
+                mean_recall: 0.10,
+                mean_hc_precision: 0.0,
+                mean_hc_recall: 0.0,
+                global_offsets: ShiftOffsets::default(),
+                detailed_offsets: DetailedReferenceOffsets::default(),
+                prior_detailed_offsets: DetailedReferenceOffsets::default(),
+                qc_report: DatasetQcReport {
+                    verdict: DatasetQcVerdict::Abstain,
+                    confidence_scale: 0.0,
+                    confidence_cap: 0.45,
+                    reasons: vec!["catastrophic 3D strip support (12.0% < 25.0%)".into()],
+                    ..DatasetQcReport::default()
+                },
+                reliability: rel_abstain,
+                predictions: preds_abstain,
+                elapsed_secs: 0.3,
+            })),
+        };
+
+        // 3. Miscalibrated dataset with wrong HC calls (`WARN`, 0/5 = 0.0% HC precision, NOT abstained!)
+        let preds_wrong_hc: Vec<(f64, bool)> = (0..5).map(|_| (0.86, false)).collect();
+        let rel_wrong_hc = ProteinReliabilityCurve::from_predictions(&preds_wrong_hc, 0.8);
+        assert!(!rel_wrong_hc.is_abstained());
+        assert_eq!(rel_wrong_hc.hc_precision, Some(0.0));
+        let rec_wrong_hc = EntryBenchmarkRecord {
+            manifest_entry: mk_entry("33333", "WrongHcProt"),
+            outcome: EntryBenchmarkOutcome::Succeeded(Box::new(EntrySuccessMetrics {
+                seeds: 1,
+                discovered_experiments: vec![("HSQC".into(), "1".into())],
+                n_hsqc_roots: 60,
+                n_total_peaks: 200,
+                assignable_per_seed: 10,
+                total_assignable: 10,
+                total_assigned: 5,
+                total_correct: 0,
+                total_hc_assigned: 5,
+                total_hc_correct: 0,
+                mean_accuracy: 0.0,
+                mean_recall: 0.0,
+                mean_hc_precision: 0.0,
+                mean_hc_recall: 0.0,
+                global_offsets: ShiftOffsets::default(),
+                detailed_offsets: DetailedReferenceOffsets::default(),
+                prior_detailed_offsets: DetailedReferenceOffsets::default(),
+                qc_report: DatasetQcReport {
+                    verdict: DatasetQcVerdict::Warn,
+                    confidence_scale: 0.78,
+                    confidence_cap: 1.0,
+                    reasons: vec!["elevated HSQC root multiplicity (1.60x)".into()],
+                    ..DatasetQcReport::default()
+                },
+                reliability: rel_wrong_hc,
+                predictions: preds_wrong_hc,
+                elapsed_secs: 0.4,
+            })),
+        };
+
+        let summary = summarize_real_benchmark_records(
+            "dev",
+            "CPU (f64, evo-graph)".to_string(),
+            1,
+            0.8,
+            vec![rec_good, rec_abstain, rec_wrong_hc],
+        );
+
+        assert_eq!(summary.n_hc_active_proteins, 2);
+        assert_eq!(summary.n_hc_abstained_proteins, 1);
+        assert!(
+            (summary.macro_hc_precision - 0.475).abs() < 1e-9,
+            "macro HC precision must average over the 2 HC-active proteins (0.95 and 0.0 -> 0.475), got {}",
+            summary.macro_hc_precision
+        );
+        assert_eq!(
+            summary.worst_protein_hc_precision,
+            Some(("33333".to_string(), "WrongHcProt".to_string(), 0.0))
+        );
+        assert!(
+            (summary.median_protein_hc_precision.unwrap() - 0.475).abs() < 1e-9,
+            "got {:?}",
+            summary.median_protein_hc_precision
+        );
+
+        let table = format_real_benchmark_report(&summary);
+        assert!(table.contains("PASS") && table.contains("ABSTAIN") && table.contains("WARN"));
+        assert!(table.contains("dCA=-2.75(ΔLL=42.5)"), "table:\n{table}");
+        assert!(table.contains("dCB=n<5(0)"), "table:\n{table}");
+        assert!(table.contains("dC=ns(ΔLL=1.1)"), "table:\n{table}");
+        assert!(
+            table.contains("Abstained (0 HC calls)"),
+            "expected explicit abstained status in table:\n{table}"
+        );
+        assert!(
+            table.contains("0.0% (0/5)"),
+            "expected explicit 0.0% (0/5) wrong-HC status in table:\n{table}"
+        );
+        assert!(
+            table.contains("[0.0-0.5):")
+                && table.contains("[0.5-0.8):")
+                && table.contains("[0.8-0.9):")
+                && table.contains("[0.9-1.0]:"),
+            "expected 4-bin reliability curves in table:\n{table}"
+        );
+
+        let json = render_summary_json(&summary);
+        assert!(json.contains("\"hc_active_proteins\": 2"));
+        assert!(json.contains("\"hc_abstained_proteins\": 1"));
+        assert!(json.contains("\"hc_abstained\": true,\n      \"hc_precision\": null"));
+        assert!(json.contains("\"hc_abstained\": false,\n      \"hc_precision\": 0.000000"));
+        assert!(json.contains("\"status\": \"fitted\""));
+        assert!(json.contains("\"status\": \"not_significant\""));
+        assert!(json.contains("\"status\": \"too_few_values\""));
+        assert!(json.contains("\"calibration_summary\":"));
     }
 }
