@@ -1,13 +1,20 @@
 //! Score spin system placements and optimize the backbone assignment.
 //!
 //! Provenance: Original implementation of `docs/specs/03-assignment.md` section 3:
-//! log-likelihood-ratio typing scores with automatic marginal reference offset alignment,
-//! excess-root zero-`CA` / 1-peak noise placement protection, Gaussian sequential connectivity
-//! scores, simulated annealing with single, swap, and block moves, and multi-run consensus.
+//! log-likelihood-ratio typing scores with automatic marginal reference offset alignment and
+//! primary-sequence covalent neighbor corrections (Wishart et al., *J. Biomol. NMR* 1995, 5,
+//! 67–81; Wishart et al., *J. Biomol. NMR* 1995, 6, 135–140; Braun, Wider & Wüthrich,
+//! *J. Am. Chem. Soc.* 1994, 116, 8466–8469; Schwarzinger et al., *J. Am. Chem. Soc.* 2001, 123,
+//! 2970–2978; MacArthur & Thornton, *J. Mol. Biol.* 1991, 218, 397–412), excess-root zero-`CA` /
+//! 1-peak noise placement protection, Gaussian sequential connectivity scores, simulated annealing
+//! with single, swap, and block moves, and multi-run consensus.
 
 use std::f64::consts::TAU;
 
-pub use crate::priors::{estimate_reference_offsets, Priors, ShiftOffsets};
+pub use crate::priors::{
+    covalent_atom_offset, delta_covalent, estimate_reference_offsets,
+    expected_covalent_atom_offset, Priors, ShiftOffsets, COVALENT_COIL_WEIGHT,
+};
 use crate::rng::Rng;
 use crate::spinsystems::SpinSystem;
 
@@ -126,10 +133,23 @@ pub fn candidate_llr(
     cands: &[(f64, usize)],
     support_bonus: f64,
 ) -> (f64, usize) {
+    candidate_llr_shifted(priors, res, atom, cands, support_bonus, 0.0)
+}
+
+/// Same as [`candidate_llr`], shifting the residue expectation mean by `d_mu` ppm while keeping
+/// the residue-averaged background density fixed.
+pub fn candidate_llr_shifted(
+    priors: &Priors,
+    res: &str,
+    atom: &str,
+    cands: &[(f64, usize)],
+    support_bonus: f64,
+    d_mu: f64,
+) -> (f64, usize) {
     let mut best = f64::NEG_INFINITY;
     let mut best_i = 0usize;
     for (i, &(v, sup)) in cands.iter().enumerate() {
-        let sc = priors.llr(res, atom, v) + support_bonus * ((sup as f64) - 1.0);
+        let sc = priors.llr_shifted(res, atom, v, d_mu) + support_bonus * ((sup as f64) - 1.0);
         if sc > best {
             best = sc;
             best_i = i;
@@ -222,6 +242,8 @@ pub fn unary_matrix(
         if res == "PRO" {
             continue;
         }
+        let cov_k = delta_covalent(sequence, k);
+        let cov_km1 = delta_covalent(sequence, k - 1);
         for (s, ss) in systems.iter().enumerate() {
             if cfg.forbid_zero_carbons && !ss.has_observed_carbons() {
                 continue;
@@ -236,11 +258,25 @@ pub fn unary_matrix(
                 if cands.is_empty() {
                     continue;
                 }
-                let target_res = if *off == 0 { res } else { prev };
-                sc += candidate_llr(&eff_priors, target_res, atom, &cands, cfg.support_bonus).0;
+                let (target_res, cov) = if *off == 0 {
+                    (res, cov_k)
+                } else {
+                    (prev, cov_km1)
+                };
+                let d_cov = covalent_atom_offset(cov, atom);
+                sc += candidate_llr_shifted(
+                    &eff_priors,
+                    target_res,
+                    atom,
+                    &cands,
+                    cfg.support_bonus,
+                    d_cov,
+                )
+                .0;
             }
             if cfg.use_hn {
-                sc += eff_priors.llr(res, "N", ss.n) + eff_priors.llr(res, "H", ss.h);
+                sc += eff_priors.llr_shifted(res, "N", ss.n, cov_k.0)
+                    + eff_priors.llr(res, "H", ss.h);
             }
             if has_excess_roots
                 && multi_slot_dataset

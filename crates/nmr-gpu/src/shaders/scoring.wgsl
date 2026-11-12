@@ -33,11 +33,20 @@ struct CandEntry {
     support: u32,
 };
 
+struct SeqEntry {
+    res_idx: u32,
+    d_n: f32,
+    d_ca: f32,
+    d_cb: f32,
+    d_c: f32,
+    _pad: u32,
+};
+
 @group(0) @binding(0) var<uniform> params: ScoreParams;
 // 20 residues x 5 atoms (H=0, N=1, CA=2, CB=3, C=4)
 @group(0) @binding(1) var<storage, read> priors: array<PriorEntry>;
-// Sequence residue type index (0..19, 14 = PRO, 255 = UNK)
-@group(0) @binding(2) var<storage, read> seq_res: array<u32>;
+// Sequence residue entry per k (res_idx 0..19, 14 = PRO, 255 = UNK, plus covalent offsets)
+@group(0) @binding(2) var<storage, read> seq_res: array<SeqEntry>;
 // Root (H, N) per spin system: vec2<f32>(H, N)
 @group(0) @binding(3) var<storage, read> roots_hn: array<vec2<f32>>;
 // Candidates indexed [((s * 3 + atom_c) * 2 + off_idx) * max_cands + c]
@@ -52,13 +61,17 @@ const TAU: f32 = 6.283185307179586;
 const FORBID: f32 = -1e9;
 const GLY_IDX: u32 = 7u;
 const PRO_IDX: u32 = 14u;
+const NATURAL_PRO_FRACTION: f32 = 0.03628389; // 91.0 / 2508.0
+const COVALENT_COIL_WEIGHT: f32 = 0.85;
+const LN_COVALENT_COIL_WEIGHT: f32 = -0.16251893; // ln(0.85)
+const LN_COVALENT_STRUCT_WEIGHT: f32 = -1.8971200; // ln(0.15)
 
 fn logpdf(v: f32, mu: f32, sd: f32) -> f32 {
     let z = (v - mu) / sd;
     return -0.5 * z * z - log(sd * sqrt(TAU));
 }
 
-fn llr(res_idx: u32, atom_idx: u32, v: f32) -> f32 {
+fn llr(res_idx: u32, atom_idx: u32, v: f32, d_mu: f32) -> f32 {
     if (res_idx >= 20u) {
         return 0.0;
     }
@@ -66,7 +79,19 @@ fn llr(res_idx: u32, atom_idx: u32, v: f32) -> f32 {
     if (pe.present == 0u) {
         return params.gly_cb;
     }
-    let lp_res = logpdf(v, pe.mu, pe.sd);
+    var lp_res: f32;
+    if (abs(d_mu) < 1e-6) {
+        lp_res = logpdf(v, pe.mu, pe.sd);
+    } else if (abs(d_mu) < 0.09) {
+        lp_res = logpdf(v, pe.mu + d_mu, pe.sd);
+    } else {
+        let raw = d_mu / (COVALENT_COIL_WEIGHT * (1.0 - NATURAL_PRO_FRACTION));
+        let d_non = -COVALENT_COIL_WEIGHT * NATURAL_PRO_FRACTION * raw;
+        let a = LN_COVALENT_COIL_WEIGHT + logpdf(v, pe.mu + d_non + raw, pe.sd);
+        let b = LN_COVALENT_STRUCT_WEIGHT + logpdf(v, pe.mu + d_non, pe.sd);
+        let m = max(a, b);
+        lp_res = m + log(exp(a - m) + exp(b - m));
+    }
 
     var max_lp: f32 = -1e30;
     var count: u32 = 0u;
@@ -103,12 +128,14 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
         out_u[out_idx] = FORBID;
         return;
     }
-    let res = seq_res[k];
+    let cur = seq_res[k];
+    let res = cur.res_idx;
     if (res == PRO_IDX) {
         out_u[out_idx] = FORBID;
         return;
     }
-    let prev = seq_res[k - 1u];
+    let prev_e = seq_res[k - 1u];
+    let prev = prev_e.res_idx;
 
     var sc: f32 = 0.0;
     var total_pos_cands: u32 = 0u;
@@ -124,7 +151,9 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
                 continue;
             }
             let base = slot * params.max_cands;
-            let target_res = select(prev, res, off_idx == 0u);
+            let target_idx = select(k - 1u, k, off_idx == 0u);
+            let te = seq_res[target_idx];
+            let d_mu = select(select(te.d_c, te.d_cb, atom_c == 1u), te.d_ca, atom_c == 0u);
             var n_pos: u32 = 0u;
             var best: f32 = -1e30;
             for (var c: u32 = 0u; c < n_raw; c = c + 1u) {
@@ -134,7 +163,7 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (ce.support > max_sup) {
                         max_sup = ce.support;
                     }
-                    let term = llr(target_res, atom_idx, ce.val)
+                    let term = llr(te.res_idx, atom_idx, ce.val, d_mu)
                         + params.support_bonus * (f32(ce.support) - 1.0);
                     if (term > best) {
                         best = term;
@@ -163,7 +192,7 @@ fn compute_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (params.use_hn != 0u) {
         let hn = roots_hn[s];
-        sc = sc + llr(res, 1u, hn.y) + llr(res, 0u, hn.x);
+        sc = sc + llr(res, 1u, hn.y, cur.d_n) + llr(res, 0u, hn.x, 0.0);
     }
     if (params.has_excess_roots != 0u
         && params.multi_slot_dataset != 0u

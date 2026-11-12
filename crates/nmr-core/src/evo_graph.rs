@@ -20,6 +20,11 @@
 //!    parameterized via empirical conformational secondary shifts from Spera, S. & Bax, A.,
 //!    *J. Am. Chem. Soc.* 1991, 113(14), 5490–5492 and Wishart, D. S. et al., *J. Biomol. NMR*
 //!    1995, 5(1), 67–81.
+//! 5. **Primary-sequence covalent pre-Proline shift adjustments** (`delta_covalent` on `CA` and
+//!    `C'`): Wishart, D. S. et al., *J. Biomol. NMR* 1995, 5, 67–81; Wishart, D. S. et al.,
+//!    *J. Biomol. NMR* 1995, 6, 135–140; Braun, D., Wider, G. & Wüthrich, K., *J. Am. Chem. Soc.*
+//!    1994, 116, 8466–8469; Schwarzinger, S. et al., *J. Am. Chem. Soc.* 2001, 123, 2970–2978; and
+//!    MacArthur, M. W. & Thornton, J. M., *J. Mol. Biol.* 1991, 218, 397–412.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -27,10 +32,14 @@ use std::path::Path;
 use crate::dihedrals::{align_by_res_names, periodic_angle_diff_deg, random_coil_shifts};
 use crate::noesy::{compute_chain_torsions, parse_pdb_first_model, PdbChain};
 use crate::peaks::Peak;
-use crate::priors::{logpdf, one_to_three, Priors, STANDARD_RESIDUES};
+use crate::priors::{
+    covalent_atom_offset, delta_covalent, expected_covalent_atom_offset, logpdf, one_to_three,
+    Priors, STANDARD_RESIDUES,
+};
 use crate::rng::Rng;
 use crate::solver::{
-    candidate_llr, consensus_from_runs, pair_matrix, AssignResult, Matrix2D, ScoreConfig, FORBID,
+    candidate_llr_shifted, consensus_from_runs, pair_matrix, AssignResult, Matrix2D, ScoreConfig,
+    FORBID,
 };
 use crate::spinsystems::{SpinSystem, Tolerances};
 
@@ -1454,37 +1463,41 @@ fn resolve_stoichiometric_root(
 // ============================================================================
 
 fn sequence_atom_weights(seq: &[String], priors: &Priors, atom: &str) -> Vec<(f64, f64, f64)> {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut counts: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
     if seq.is_empty() {
         for &(res, _) in &STANDARD_RESIDUES {
             if priors.has(res, atom) {
-                counts.insert(res, 1);
+                counts.insert(res, (1, 0.0));
             }
         }
     } else {
         let start = usize::from(atom == "H" || atom == "N");
-        for r in &seq[start..] {
+        for (idx, r) in seq.iter().enumerate().skip(start) {
             if (atom == "H" || atom == "N") && r == "PRO" {
                 continue;
             }
             for &(std_r, _) in &STANDARD_RESIDUES {
                 if r == std_r && priors.has(std_r, atom) {
-                    *counts.entry(std_r).or_insert(0) += 1;
+                    let d_cov = expected_covalent_atom_offset(delta_covalent(seq, idx), atom);
+                    let entry = counts.entry(std_r).or_insert((0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += d_cov;
                 }
             }
         }
     }
-    let total: usize = counts.values().sum();
+    let total: usize = counts.values().map(|&(c, _)| c).sum();
     if total == 0 {
         return Vec::new();
     }
     let tf = total as f64;
     counts
         .into_iter()
-        .filter_map(|(res, cnt)| {
-            priors
-                .get(res, atom)
-                .map(|(mu, sd)| ((cnt as f64) / tf, mu, sd))
+        .filter_map(|(res, (cnt, cov_sum))| {
+            priors.get(res, atom).map(|(mu, sd)| {
+                let mean_cov = cov_sum / (cnt.max(1) as f64);
+                ((cnt as f64) / tf, mu + mean_cov, sd)
+            })
         })
         .collect()
 }
@@ -1746,8 +1759,8 @@ fn refine_anchor_reference_offsets_with_torsions(
         let ss = &systems[s];
         let rname = &norm_seq[k];
         let prev_name = &norm_seq[k - 1];
-        let next_pro_k = k + 1 < norm_seq.len() && norm_seq[k + 1] == "PRO";
-        let next_pro_km1 = rname == "PRO";
+        let cov_k = delta_covalent(&norm_seq, k);
+        let cov_km1 = delta_covalent(&norm_seq, k - 1);
         let (phi_k, psi_k) = structure_torsions
             .and_then(|t| t.get(k).copied())
             .unwrap_or((None, None));
@@ -1757,20 +1770,20 @@ fn refine_anchor_reference_offsets_with_torsions(
         let has_tors = structure_torsions.is_some();
 
         if let Some((mu_h, _)) = priors.get(rname, "H") {
-            let d_mu = if has_tors {
-                torsion_shift_adjustment(rname, "H", phi_k, psi_k, next_pro_k).0
+            let d_tors = if has_tors {
+                torsion_shift_adjustment(rname, "H", phi_k, psi_k).0
             } else {
                 0.0
             };
-            res_h.push(ss.h - (mu_h + d_mu));
+            res_h.push(ss.h - (mu_h + d_tors));
         }
         if let Some((mu_n, _)) = priors.get(rname, "N") {
-            let d_mu = if has_tors {
-                torsion_shift_adjustment(rname, "N", phi_k, psi_k, next_pro_k).0
+            let d_tors = if has_tors {
+                torsion_shift_adjustment(rname, "N", phi_k, psi_k).0
             } else {
                 0.0
             };
-            res_n.push(ss.n - (mu_n + d_mu));
+            res_n.push(ss.n - (mu_n + cov_k.0 + d_tors));
         }
         if let Some(cands) = ss.cands.get(&("CA".to_string(), 0)) {
             let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
@@ -1784,17 +1797,19 @@ fn refine_anchor_reference_offsets_with_torsions(
                             &obs,
                             0.7,
                             (phi_k, psi_k),
-                            next_pro_k,
+                            cov_k.1,
                         )
                     } else {
-                        candidate_llr(&init_priors, rname, "CA", &obs, 0.7)
+                        candidate_llr_shifted(&init_priors, rname, "CA", &obs, 0.7, cov_k.1)
                     };
-                    let d_mu = if has_tors {
-                        torsion_shift_adjustment(rname, "CA", phi_k, psi_k, next_pro_k).0
+                    let d_tors = if has_tors {
+                        torsion_shift_adjustment(rname, "CA", phi_k, psi_k).0
                     } else {
                         0.0
                     };
-                    res_ca.push(obs[idx].0 - (mu_ca + d_mu));
+                    res_ca.push(
+                        obs[idx].0 - (mu_ca + expected_covalent_atom_offset(cov_k, "CA") + d_tors),
+                    );
                 }
             }
         }
@@ -1811,17 +1826,20 @@ fn refine_anchor_reference_offsets_with_torsions(
                                 &obs,
                                 0.7,
                                 (phi_k, psi_k),
-                                next_pro_k,
+                                cov_k.2,
                             )
                         } else {
-                            candidate_llr(&init_priors, rname, "CB", &obs, 0.7)
+                            candidate_llr_shifted(&init_priors, rname, "CB", &obs, 0.7, cov_k.2)
                         };
-                        let d_mu = if has_tors {
-                            torsion_shift_adjustment(rname, "CB", phi_k, psi_k, next_pro_k).0
+                        let d_tors = if has_tors {
+                            torsion_shift_adjustment(rname, "CB", phi_k, psi_k).0
                         } else {
                             0.0
                         };
-                        res_cb.push(obs[idx].0 - (mu_cb + d_mu));
+                        res_cb.push(
+                            obs[idx].0
+                                - (mu_cb + expected_covalent_atom_offset(cov_k, "CB") + d_tors),
+                        );
                     }
                 }
             }
@@ -1838,17 +1856,19 @@ fn refine_anchor_reference_offsets_with_torsions(
                             &obs,
                             0.7,
                             (phi_km1, psi_km1),
-                            next_pro_km1,
+                            cov_km1.3,
                         )
                     } else {
-                        candidate_llr(&init_priors, prev_name, "C", &obs, 0.7)
+                        candidate_llr_shifted(&init_priors, prev_name, "C", &obs, 0.7, cov_km1.3)
                     };
-                    let d_mu = if has_tors {
-                        torsion_shift_adjustment(prev_name, "C", phi_km1, psi_km1, next_pro_km1).0
+                    let d_tors = if has_tors {
+                        torsion_shift_adjustment(prev_name, "C", phi_km1, psi_km1).0
                     } else {
                         0.0
                     };
-                    res_c.push(obs[idx].0 - (mu_c + d_mu));
+                    res_c.push(
+                        obs[idx].0 - (mu_c + expected_covalent_atom_offset(cov_km1, "C") + d_tors),
+                    );
                 }
             }
         } else if let Some(cands) = ss.cands.get(&("C".to_string(), 0)) {
@@ -1863,17 +1883,19 @@ fn refine_anchor_reference_offsets_with_torsions(
                             &obs,
                             0.7,
                             (phi_k, psi_k),
-                            next_pro_k,
+                            cov_k.3,
                         )
                     } else {
-                        candidate_llr(&init_priors, rname, "C", &obs, 0.7)
+                        candidate_llr_shifted(&init_priors, rname, "C", &obs, 0.7, cov_k.3)
                     };
-                    let d_mu = if has_tors {
-                        torsion_shift_adjustment(rname, "C", phi_k, psi_k, next_pro_k).0
+                    let d_tors = if has_tors {
+                        torsion_shift_adjustment(rname, "C", phi_k, psi_k).0
                     } else {
                         0.0
                     };
-                    res_c.push(obs[idx].0 - (mu_c + d_mu));
+                    res_c.push(
+                        obs[idx].0 - (mu_c + expected_covalent_atom_offset(cov_k, "C") + d_tors),
+                    );
                 }
             }
         }
@@ -1996,21 +2018,11 @@ fn torsion_shift_adjustment(
     atom: &str,
     phi_opt: Option<f64>,
     psi_opt: Option<f64>,
-    next_is_pro: bool,
 ) -> (f64, f64) {
-    let mut d_mu = 0.0;
-    // Sequence-known covalent pre-proline upfield CA/C' effect (Wishart et al., 1995, Table 3)
-    if next_is_pro {
-        match atom {
-            "CA" => d_mu -= if res == "GLY" { 0.7 } else { 1.25 },
-            "C" => d_mu -= 1.20,
-            _ => {}
-        }
-    }
-
     let (Some(phi), Some(psi)) = (phi_opt, psi_opt) else {
-        return (d_mu, 1.0);
+        return (0.0, 1.0);
     };
+    let mut d_mu = 0.0;
 
     let dphi_a = periodic_angle_diff_deg(phi, -63.0);
     let dpsi_a = periodic_angle_diff_deg(psi, -42.0);
@@ -2066,7 +2078,7 @@ fn residue_conditioned_llr(
     v: f64,
     phi_opt: Option<f64>,
     psi_opt: Option<f64>,
-    next_is_pro: bool,
+    d_cov: f64,
 ) -> f64 {
     if !priors.table.contains_key(res) {
         return 0.0;
@@ -2075,8 +2087,8 @@ fn residue_conditioned_llr(
         return 0.02_f64.ln();
     }
     let (mu_base, sd_base) = priors.table[res][atom];
-    let (d_mu, sd_scale) = torsion_shift_adjustment(res, atom, phi_opt, psi_opt, next_is_pro);
-    let mu = mu_base + d_mu;
+    let (d_tors, sd_scale) = torsion_shift_adjustment(res, atom, phi_opt, psi_opt);
+    let mu = mu_base + d_cov + d_tors;
     let sd = (sd_base * sd_scale).max(0.25);
     (logpdf(v, mu, sd) - priors.background(atom, v)).max(-12.0)
 }
@@ -2088,12 +2100,12 @@ fn conditioned_candidate_llr(
     cands: &[(f64, usize)],
     support_bonus: f64,
     torsion: ResidueTorsion,
-    next_is_pro: bool,
+    d_cov: f64,
 ) -> (f64, usize) {
     let mut best = f64::NEG_INFINITY;
     let mut best_i = 0usize;
     for (i, &(v, sup)) in cands.iter().enumerate() {
-        let sc = residue_conditioned_llr(priors, res, atom, v, torsion.0, torsion.1, next_is_pro)
+        let sc = residue_conditioned_llr(priors, res, atom, v, torsion.0, torsion.1, d_cov)
             + support_bonus * ((sup as f64) - 1.0);
         if sc > best {
             best = sc;
@@ -2132,8 +2144,8 @@ fn build_evo_unary_matrix(
         if res == "PRO" {
             continue;
         }
-        let next_pro_k = k + 1 < k_len && seq[k + 1] == "PRO";
-        let next_pro_km1 = res == "PRO";
+        let cov_k = delta_covalent(seq, k);
+        let cov_km1 = delta_covalent(seq, k - 1);
         let (phi_k, psi_k) = cfg
             .structure_torsions
             .and_then(|t| t.get(k).copied())
@@ -2176,11 +2188,12 @@ fn build_evo_unary_matrix(
                 if cands.is_empty() {
                     continue;
                 }
-                let (target_res, phi_t, psi_t, npro) = if *off == 0 {
-                    (res.as_str(), phi_k, psi_k, next_pro_k)
+                let (target_res, phi_t, psi_t, cov) = if *off == 0 {
+                    (res.as_str(), phi_k, psi_k, cov_k)
                 } else {
-                    (prev.as_str(), phi_km1, psi_km1, next_pro_km1)
+                    (prev.as_str(), phi_km1, psi_km1, cov_km1)
                 };
+                let d_cov = covalent_atom_offset(cov, atom);
                 if cfg.structure_torsions.is_some() {
                     sc += conditioned_candidate_llr(
                         shifted_priors,
@@ -2189,16 +2202,17 @@ fn build_evo_unary_matrix(
                         &cands,
                         cfg.score_cfg.support_bonus,
                         (phi_t, psi_t),
-                        npro,
+                        d_cov,
                     )
                     .0;
                 } else {
-                    sc += candidate_llr(
+                    sc += candidate_llr_shifted(
                         shifted_priors,
                         target_res,
                         atom,
                         &cands,
                         cfg.score_cfg.support_bonus,
+                        d_cov,
                     )
                     .0;
                 }
@@ -2212,7 +2226,7 @@ fn build_evo_unary_matrix(
                         ss.n,
                         phi_k,
                         psi_k,
-                        next_pro_k,
+                        cov_k.0,
                     ) + residue_conditioned_llr(
                         shifted_priors,
                         res,
@@ -2220,10 +2234,11 @@ fn build_evo_unary_matrix(
                         ss.h,
                         phi_k,
                         psi_k,
-                        next_pro_k,
+                        0.0,
                     );
                 } else {
-                    sc += shifted_priors.llr(res, "N", ss.n) + shifted_priors.llr(res, "H", ss.h);
+                    sc += shifted_priors.llr_shifted(res, "N", ss.n, cov_k.0)
+                        + shifted_priors.llr(res, "H", ss.h);
                 }
             }
             sc -= effective_assign_cost;
@@ -2595,6 +2610,7 @@ fn apply_graph_self_consistency(
         let rname = &seq[k];
         let next_pro = k + 1 < k_len && seq[k + 1] == "PRO";
         let rc = random_coil_shifts(rname, false, next_pro);
+        let cov_k = delta_covalent(seq, k);
 
         let mut dca = 0.0;
         let mut dcb = 0.0;
@@ -2604,7 +2620,8 @@ fn apply_graph_self_consistency(
         if let Some(cands) = ss.cands.get(&("CA".to_string(), 0)) {
             let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
             if !obs.is_empty() {
-                let (_, idx) = candidate_llr(shifted_priors, rname, "CA", &obs, 0.7);
+                let (_, idx) =
+                    candidate_llr_shifted(shifted_priors, rname, "CA", &obs, 0.7, cov_k.1);
                 dca = (obs[idx].0 - offsets.d_ca) - rc.ca;
                 cnt += 1;
             }
@@ -2613,7 +2630,8 @@ fn apply_graph_self_consistency(
             if let Some(cands) = ss.cands.get(&("CB".to_string(), 0)) {
                 let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
                 if !obs.is_empty() {
-                    let (_, idx) = candidate_llr(shifted_priors, rname, "CB", &obs, 0.7);
+                    let (_, idx) =
+                        candidate_llr_shifted(shifted_priors, rname, "CB", &obs, 0.7, cov_k.2);
                     dcb = (obs[idx].0 - offsets.d_cb) - rc.cb;
                     cnt += 1;
                 }
@@ -2624,7 +2642,8 @@ fn apply_graph_self_consistency(
         if let Some(cands) = ss.cands.get(&("C".to_string(), 0)) {
             let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
             if !obs.is_empty() {
-                let (_, idx) = candidate_llr(shifted_priors, rname, "C", &obs, 0.7);
+                let (_, idx) =
+                    candidate_llr_shifted(shifted_priors, rname, "C", &obs, 0.7, cov_k.3);
                 dc = (obs[idx].0 - offsets.d_c) - rc.c;
                 cnt += 1;
             }
@@ -2633,7 +2652,8 @@ fn apply_graph_self_consistency(
             if let Some(cands) = systems[ns].cands.get(&("C".to_string(), -1)) {
                 let obs: Vec<(f64, usize)> = cands.iter().copied().filter(|c| c.1 > 0).collect();
                 if !obs.is_empty() {
-                    let (_, idx) = candidate_llr(shifted_priors, rname, "C", &obs, 0.7);
+                    let (_, idx) =
+                        candidate_llr_shifted(shifted_priors, rname, "C", &obs, 0.7, cov_k.3);
                     dc = (obs[idx].0 - offsets.d_c) - rc.c;
                     cnt += 1;
                 }

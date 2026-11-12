@@ -1,15 +1,18 @@
 //! WebGPU (`wgpu` + WGSL) compute engine for NMR scoring matrices and multi-replica annealing.
 //!
 //! Provenance: Original GPU compute implementation of `docs/specs/03-assignment.md` section 3,
-//! executing unary typing `U(s, k)`, sequential connectivity `P(s, t)`, and massively parallel
-//! Metropolis-Hastings simulated annealing replicas on Metal / Vulkan / DX12 / WebGPU.
+//! executing unary typing `U(s, k)` (including primary-sequence covalent neighbor corrections per
+//! Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81 & 6, 135–140; Braun et al., *J. Am. Chem. Soc.*
+//! 1994, 116, 8466–8469; Schwarzinger et al., *J. Am. Chem. Soc.* 2001, 123, 2970–2978),
+//! sequential connectivity `P(s, t)`, and massively parallel Metropolis-Hastings simulated
+//! annealing replicas on Metal / Vulkan / DX12 / WebGPU.
 
 use std::sync::mpsc;
 
 pub mod neural_gpu;
 
 use bytemuck::{Pod, Zeroable};
-use nmr_core::priors::{Priors, ATOMS, STANDARD_RESIDUES};
+use nmr_core::priors::{delta_covalent, Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
 use nmr_core::solver::{
     consensus_from_runs, prepare_scoring_priors, AnnealConfig, AssignResult, Matrix2D, ScoreConfig,
@@ -45,6 +48,17 @@ struct PriorEntryGpu {
     mu: f32,
     sd: f32,
     present: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SeqEntryGpu {
+    res_idx: u32,
+    d_n: f32,
+    d_ca: f32,
+    d_cb: f32,
+    d_c: f32,
     _pad: u32,
 }
 
@@ -384,7 +398,7 @@ impl GpuEngine {
         let cands_bytes = (s_len as u64) * 6 * (max_cands as u64) * 8;
         let roots_bytes = (s_len as u64) * 8;
         let counts_bytes = (s_len as u64) * 6 * 4;
-        let seq_bytes = (k_len as u64) * 4;
+        let seq_bytes = (k_len as u64) * (std::mem::size_of::<SeqEntryGpu>() as u64);
         let max_req = u_bytes
             .max(p_bytes)
             .max(cands_bytes)
@@ -472,14 +486,24 @@ impl GpuEngine {
             }
         }
 
-        let seq_res: Vec<u32> = sequence
+        let seq_res: Vec<SeqEntryGpu> = sequence
             .iter()
-            .map(|r| {
-                STANDARD_RESIDUES
+            .enumerate()
+            .map(|(k, r)| {
+                let res_idx = STANDARD_RESIDUES
                     .iter()
                     .position(|&(three, _)| three == r.as_str())
                     .map(|i| i as u32)
-                    .unwrap_or(255)
+                    .unwrap_or(255);
+                let (d_n, d_ca, d_cb, d_c) = delta_covalent(sequence, k);
+                SeqEntryGpu {
+                    res_idx,
+                    d_n: d_n as f32,
+                    d_ca: d_ca as f32,
+                    d_cb: d_cb as f32,
+                    d_c: d_c as f32,
+                    _pad: 0,
+                }
             })
             .collect();
 

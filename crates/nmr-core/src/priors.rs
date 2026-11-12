@@ -1,4 +1,5 @@
-//! Empirical BMRB chemical shift priors per residue type and atom, plus automatic reference alignment.
+//! Empirical BMRB chemical shift priors per residue type and atom, plus automatic reference alignment
+//! and deterministic covalent primary-sequence neighbor corrections.
 //!
 //! Provenance: Clean-room original implementation of `docs/specs/03-assignment.md` section 3,
 //! shipping empirical `(mean, sd)` priors in ppm computed from 21 DSS-referenced public
@@ -8,6 +9,12 @@
 //! *J. Biomol. NMR* 2003, 25, 173–195; Wang, Wishart et al., *J. Biomol. NMR* 2005, 31, 143–148),
 //! strictly disjoint from the benchmark suite (`data/benchmark/manifest.tsv`), with literature
 //! fallback strictly when `N < 5` (Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81).
+//! Primary-sequence covalent neighbor chemical shift adjustments (`delta_covalent`) are derived
+//! strictly from peer-reviewed random-coil host-guest peptide and proline conformational studies:
+//! Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81; Wishart et al., *J. Biomol. NMR* 1995, 6,
+//! 135–140; Braun, Wider & Wüthrich, *J. Am. Chem. Soc.* 1994, 116, 8466–8469; Schwarzinger et
+//! al., *J. Am. Chem. Soc.* 2001, 123, 2970–2978; and MacArthur & Thornton, *J. Mol. Biol.* 1991,
+//! 218, 397–412.
 
 use std::collections::BTreeMap;
 use std::f64::consts::TAU;
@@ -454,6 +461,49 @@ impl Priors {
         (self.logpdf(res, atom, v) - self.background(atom, v)).max(floor)
     }
 
+    /// Log-likelihood ratio with deterministic zero-mean primary-sequence covalent shift `d_mu`
+    /// (`delta_covalent`), modeled on pre-Proline positions as a two-state conformational mixture
+    /// (`0.85 * N(v | mu_non + raw, sd) + 0.15 * N(v | mu_non, sd)`, where `mu_non` removes the
+    /// `91 / 2508` BMRB training pre-Proline background) and on non-pre-Proline positions as
+    /// `N(v | mu_non, sd)`, while keeping `background(atom, v)` slot-independent.
+    pub fn llr_shifted(&self, res: &str, atom: &str, v: f64, d_mu: f64) -> f64 {
+        self.llr_shifted_with(res, atom, v, d_mu, -12.0, 0.02_f64.ln())
+    }
+
+    pub fn llr_shifted_with(
+        &self,
+        res: &str,
+        atom: &str,
+        v: f64,
+        d_mu: f64,
+        floor: f64,
+        gly_cb: f64,
+    ) -> f64 {
+        if !self.table.contains_key(res) {
+            return 0.0;
+        }
+        if !self.has(res, atom) {
+            return gly_cb;
+        }
+        if d_mu.abs() < 1e-12 {
+            return (self.logpdf(res, atom, v) - self.background(atom, v)).max(floor);
+        }
+        let (mu, sd) = self.table[res][atom];
+        // Pre-Proline expected shifts have |d_mu| >= 0.81 ppm (CA/C); non-pre-Proline background
+        // centering has |d_mu| <= 0.061 ppm and evaluates a single background-debiased Gaussian.
+        let lp = if d_mu.abs() >= 0.09 {
+            let raw = d_mu / (COVALENT_COIL_WEIGHT * (1.0 - NATURAL_PRO_FRACTION));
+            let d_non = -COVALENT_COIL_WEIGHT * NATURAL_PRO_FRACTION * raw;
+            let a = COVALENT_COIL_WEIGHT.ln() + logpdf(v, mu + d_non + raw, sd);
+            let b = (1.0 - COVALENT_COIL_WEIGHT).ln() + logpdf(v, mu + d_non, sd);
+            let m = a.max(b);
+            m + ((a - m).exp() + (b - m).exp()).ln()
+        } else {
+            logpdf(v, mu + d_mu, sd)
+        };
+        (lp - self.background(atom, v)).max(floor)
+    }
+
     /// Return a copy of `self` with backbone prior means shifted by `offsets` (`mu_shifted = mu + offset`),
     /// leaving standard deviations untouched so scoring matches the experimental spectrum's referencing frame.
     pub fn with_offsets(&self, offsets: &ShiftOffsets) -> Self {
@@ -518,40 +568,109 @@ impl fmt::Display for ShiftOffsets {
     }
 }
 
+/// Empirical BMRB training-set Proline occurrence fraction (`91 / 2508 ≈ 3.63%`, from
+/// `data/priors/PROVENANCE.md`) already absorbed into pooled BMRB prior means.
+const NATURAL_PRO_FRACTION: f64 = 91.0 / 2508.0;
+
+/// Mixture weight (`0.85`) for the sterically upfield coil/turn/PPII pre-Proline state in
+/// [`Priors::llr_shifted`], paired with `0.15` weight on the unshifted globular state (consistent
+/// with the ~85% non-helical vs ~15% kinked alpha-helical distribution of proline-preceding
+/// residues in globular proteins per MacArthur & Thornton, *J. Mol. Biol.* 1991, 218, 397–412) so
+/// kinked alpha-helical pre-Proline residues do not suffer unbounded quadratic tail penalties.
+pub const COVALENT_COIL_WEIGHT: f64 = 0.85;
+
+/// Deterministic zero-mean primary-sequence covalent tripeptide `(seq[k-1], seq[k], seq[k+1])`
+/// expected shift adjustments `(d_n, d_ca, d_cb, d_c)` in ppm for residue index `k`:
+/// - **Pre-Proline (`seq[k+1] == "PRO"`) vs non-pre-Proline (`seq[k+1] != "PRO"`)**: steric and
+///   tertiary-imide electronic upfield shifts on `CA(k)` and `C'(k)` (`(-1.95, -1.80) ppm` for
+///   standard `X-PRO`, `(-1.00, -1.50) ppm` for `GLY-PRO`, `(-1.75, -1.70) ppm` for `PRO-PRO` per
+///   Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81 & 6, 135–140; Schwarzinger et al., *J. Am.
+///   Chem. Soc.* 2001, 123, 2970–2978), weighted by `COVALENT_COIL_WEIGHT = 0.85` (MacArthur &
+///   Thornton, *J. Mol. Biol.* 1991, 218, 397–412) and centered relative to the empirical BMRB
+///   training Proline occurrence `p = 91 / 2508` (`scale = 0.85 * (1 - p)` when `k+1 == PRO`,
+///   `scale = -0.85 * p` otherwise) so `p * d_pre + (1 - p) * d_non == 0.0` identically and global
+///   `13C` reference offset estimation remains unbiased.
+/// - **`CB(k)` (`d_cb = 0.0`) & `15N(k)` (`d_n = 0.0`)**: unfolded pentapeptide `CB` pre-Proline
+///   (`+0.25 ppm`) and `i-1` `15N` substituent offsets (Braun, Wider & Wüthrich, *J. Am. Chem.
+///   Soc.* 1994, 116, 8466–8469; Schwarzinger et al., 2001) are dominated and inverted by folded
+///   backbone `(phi, psi)` and hydrogen-bonding dispersion, and are kept at `0.0` per empirical
+///   ablation.
+#[inline]
+pub fn delta_covalent(sequence: &[String], k: usize) -> (f64, f64, f64, f64) {
+    if k + 1 >= sequence.len() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let res = sequence[k].as_str();
+    if !STANDARD_RESIDUES.iter().any(|&(r, _)| r == res) {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let scale = if sequence[k + 1] == "PRO" {
+        COVALENT_COIL_WEIGHT * (1.0 - NATURAL_PRO_FRACTION)
+    } else {
+        -COVALENT_COIL_WEIGHT * NATURAL_PRO_FRACTION
+    };
+    let (raw_ca, raw_c) = match res {
+        "GLY" => (-1.00, -1.50),
+        "PRO" => (-1.75, -1.70),
+        _ => (-1.95, -1.80),
+    };
+    (0.0, scale * raw_ca, 0.0, scale * raw_c)
+}
+
+/// Extract the covalent shift adjustment in ppm for a named backbone atom (`"N"`, `"CA"`, `"CB"`, `"C"`).
+#[inline]
+pub fn covalent_atom_offset(cov: (f64, f64, f64, f64), atom: &str) -> f64 {
+    match atom {
+        "N" => cov.0,
+        "CA" => cov.1,
+        "CB" => cov.2,
+        "C" => cov.3,
+        _ => 0.0,
+    }
+}
+
+/// Expected mean shift of the two-state pre-Proline mixture for a named backbone atom
+/// (`delta_covalent` already returns the mixture expectation `COVALENT_COIL_WEIGHT * scale * raw`).
+#[inline]
+pub fn expected_covalent_atom_offset(cov: (f64, f64, f64, f64), atom: &str) -> f64 {
+    covalent_atom_offset(cov, atom)
+}
+
 fn build_sequence_mixture(
     sequence: &[String],
     priors: &Priors,
     atom: &str,
     is_im1: bool,
 ) -> Vec<(f64, f64, f64)> {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut counts: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
     for k in 1..sequence.len() {
         if sequence[k] == "PRO" {
             continue;
         }
-        let target = if is_im1 {
-            &sequence[k - 1]
-        } else {
-            &sequence[k]
-        };
+        let target_idx = if is_im1 { k - 1 } else { k };
+        let target = &sequence[target_idx];
         if priors.has(target, atom) {
-            *counts.entry(target.as_str()).or_insert(0) += 1;
+            let d_cov = covalent_atom_offset(delta_covalent(sequence, target_idx), atom);
+            let entry = counts.entry(target.as_str()).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += d_cov;
         }
     }
     if counts.is_empty() {
         for &(res, _) in &STANDARD_RESIDUES {
             if priors.has(res, atom) {
-                counts.insert(res, 1);
+                counts.insert(res, (1, 0.0));
             }
         }
     }
-    let total = counts.values().sum::<usize>().max(1) as f64;
+    let total = counts.values().map(|&(c, _)| c).sum::<usize>().max(1) as f64;
     counts
         .into_iter()
-        .filter_map(|(res, cnt)| {
-            priors
-                .get(res, atom)
-                .map(|(mu, sd)| (mu, sd, (cnt as f64) / total))
+        .filter_map(|(res, (cnt, cov_sum))| {
+            priors.get(res, atom).map(|(mu, sd)| {
+                let mean_cov = cov_sum / (cnt.max(1) as f64);
+                (mu + mean_cov, sd, (cnt as f64) / total)
+            })
         })
         .collect()
 }
@@ -1025,5 +1144,68 @@ mod tests {
         assert!((off_tms.ca - (-2.75)).abs() <= 0.55, "dCA={}", off_tms.ca);
         assert!((off_tms.cb - (-2.75)).abs() <= 0.55, "dCB={}", off_tms.cb);
         assert!((off_tms.c - (-2.75)).abs() <= 0.55, "dC={}", off_tms.c);
+    }
+
+    #[test]
+    fn test_delta_covalent_pre_proline_and_two_state_mixture() {
+        let seq: Vec<String> = ["MET", "GLU", "PRO", "GLY", "PRO", "PRO", "ASP", "VAL"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // Standard residue before non-Pro (MET before GLU) vs before Pro (GLU before PRO)
+        let non_pro = delta_covalent(&seq, 0);
+        let pre_pro = delta_covalent(&seq, 1);
+        let p = NATURAL_PRO_FRACTION;
+        let a = COVALENT_COIL_WEIGHT;
+        assert_eq!(non_pro.0, 0.0);
+        assert_eq!(non_pro.2, 0.0);
+        assert!((non_pro.1 - (-a * p * (-1.95))).abs() < 1e-12);
+        assert!((non_pro.3 - (-a * p * (-1.80))).abs() < 1e-12);
+        assert_eq!(pre_pro.0, 0.0);
+        assert!((pre_pro.1 - (a * (1.0 - p) * (-1.95))).abs() < 1e-12);
+        assert_eq!(pre_pro.2, 0.0);
+        assert!((pre_pro.3 - (a * (1.0 - p) * (-1.80))).abs() < 1e-12);
+        // Exact zero-mean centering across natural BMRB proline occurrence p = 91 / 2508
+        assert!((p * pre_pro.1 + (1.0 - p) * non_pro.1).abs() < 1e-12);
+        assert!((p * pre_pro.3 + (1.0 - p) * non_pro.3).abs() < 1e-12);
+
+        // GLY before PRO (k = 3) and PRO before PRO (k = 4)
+        let gly_pro = delta_covalent(&seq, 3);
+        assert!((gly_pro.1 - (-a * (1.0 - p))).abs() < 1e-12);
+        assert_eq!(gly_pro.2, 0.0);
+        assert!((gly_pro.3 - (a * (1.0 - p) * (-1.50))).abs() < 1e-12);
+
+        let pro_pro = delta_covalent(&seq, 4);
+        assert!((pro_pro.1 - (a * (1.0 - p) * (-1.75))).abs() < 1e-12);
+        assert_eq!(pro_pro.2, 0.0);
+        assert!((pro_pro.3 - (a * (1.0 - p) * (-1.70))).abs() < 1e-12);
+
+        // C-terminal residue (k = 7) and out-of-bounds return exact zeros
+        assert_eq!(delta_covalent(&seq, 7), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(delta_covalent(&seq, 99), (0.0, 0.0, 0.0, 0.0));
+
+        // Priors::llr_shifted preserves exact background cancellation across competing slots
+        // and protects helical pre-Proline outliers (e.g. Calmodulin Phe65 CA = 63.59 ppm)
+        let priors = Priors::bmrb();
+        assert!(
+            (priors.llr_shifted("GLU", "CA", 55.4, 0.0) - priors.llr("GLU", "CA", 55.4)).abs()
+                < 1e-12
+        );
+        assert_eq!(
+            priors.llr_shifted("GLY", "CB", 30.0, -1.0),
+            priors.llr("GLY", "CB", 30.0)
+        );
+        // Upfield pre-Proline CA (54.2 ppm on GLU) receives a strong LLR boost vs non-pre-Proline GLU
+        assert!(
+            priors.llr_shifted("GLU", "CA", 54.2, pre_pro.1)
+                > priors.llr_shifted("GLU", "CA", 54.2, non_pro.1) + 0.65
+        );
+        // Strongly helical pre-Proline CA (63.59 ppm on PHE) has penalty bounded by ~ -ln(0.15) ≈ 1.90 nats
+        // instead of ~5.0 nats under a rigid single-Gaussian pre-Proline shift
+        let phe_pro_ca = a * (1.0 - p) * (-1.95);
+        let hel_drop =
+            priors.llr("PHE", "CA", 63.59) - priors.llr_shifted("PHE", "CA", 63.59, phe_pro_ca);
+        assert!(hel_drop < 1.95, "hel_drop={hel_drop}");
     }
 }

@@ -732,3 +732,63 @@ fn test_gpu_annealer_above_256_and_above_1024_spin_systems() {
         "expected explicit GPU binding limit Err on S=6000 (144 MiB P > 128 MiB strict limit)"
     );
 }
+
+#[test]
+fn test_gpu_covalent_pre_proline_unary_parity() {
+    let seq: Vec<String> = [
+        "MET", "ALA", "GLU", "PRO", "SER", "GLY", "PRO", "VAL", "PRO", "PRO", "ASP", "LYS",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let mut systems = Vec::new();
+    for (i, &(h, n, ca0, cb0, c0, cam1, cbm1, cm1)) in [
+        (8.41, 118.5, 55.4, 30.4, 175.2, 53.3, 19.2, 177.8),
+        (7.92, 116.2, 58.9, 64.0, 174.5, 63.5, 32.1, 177.0),
+        (8.15, 109.4, 44.5, 0.0, 172.6, 58.9, 64.0, 174.5),
+        (8.62, 121.4, 60.1, 33.4, 173.6, 63.5, 32.1, 177.0),
+        (8.05, 121.6, 54.3, 41.2, 176.3, 63.5, 32.1, 177.0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut ss = SpinSystem::new(h, n);
+        ss.cands.insert(("CA".to_string(), 0), vec![(ca0, 2)]);
+        if i != 2 {
+            ss.cands.insert(("CB".to_string(), 0), vec![(cb0, 2)]);
+        }
+        ss.cands.insert(("C".to_string(), 0), vec![(c0, 1)]);
+        ss.cands.insert(("CA".to_string(), -1), vec![(cam1, 2)]);
+        ss.cands.insert(("CB".to_string(), -1), vec![(cbm1, 2)]);
+        ss.cands.insert(("C".to_string(), -1), vec![(cm1, 2)]);
+        systems.push(ss);
+    }
+
+    let priors = Priors::bmrb();
+    let scfg = ScoreConfig {
+        auto_reference: false,
+        ..ScoreConfig::default()
+    };
+    let u_cpu = unary_matrix(&systems, &seq, &priors, &scfg);
+    let gpu = GpuEngine::new_headless().expect("headless wgpu adapter");
+    let (u_gpu, _) = gpu
+        .score_matrices_gpu(&systems, &seq, &priors, &scfg)
+        .expect("GPU covalent scoring");
+
+    let mut max_diff = 0.0_f64;
+    for idx in 0..u_cpu.data.len() {
+        let a = u_cpu.data[idx];
+        let b = u_gpu.data[idx];
+        if a < -1e8 {
+            assert!(b < -1e8, "expected FORBID at {idx}: cpu={a}, gpu={b}");
+        } else {
+            let d = (a - b).abs();
+            max_diff = max_diff.max(d);
+            assert!(
+                d < 1e-3,
+                "covalent U parity exceeded 1e-3 at {idx}: cpu={a}, gpu={b} (diff={d})"
+            );
+        }
+    }
+    println!("Covalent pre-Proline U-matrix max_abs_diff = {max_diff:.3e}");
+}

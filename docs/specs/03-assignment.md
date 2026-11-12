@@ -58,15 +58,50 @@ in the experimental spectrum's ppm frame.
 
 Typing score of spin system s at residue k, summed over observed atoms:
 
-    U(s,k) = sum_X LLR(type(k),   X, shift_X(i))
-           + sum_X LLR(type(k-1), X, shift_X(i-1))
-           + LLR(type(k), N, root_N) + LLR(type(k), H, root_H)
+    U(s,k) = sum_X LLR(k,   X, shift_X(i))
+           + sum_X LLR(k-1, X, shift_X(i-1))
+           + LLR(k, N, root_N) + LLR(k, H, root_H)
            - assign_cost
 
-    LLR(t, X, v) = max( log N(v | mu_tX + d_X, sd_tX) - log B_X(v), floor )
+    LLR(j, X, v) = max( log P_cov(v | j, X) - log B_X(v), floor )
 
-where B_X is the residue-averaged background density, so an atom that does
-not discriminate contributes about zero. floor = -12 (PROVISIONAL).
+    P_cov(v | j, X) =
+      0.85 * N(v | mu_non(j,X) + d_X + Delta(j,X), sd_{type(j),X})
+    + 0.15 * N(v | mu_non(j,X) + d_X,              sd_{type(j),X})   if seq[j+1] == PRO (j < K-1)
+      N(v | mu_non(j,X) + d_X, sd_{type(j),X})                       if seq[j+1] != PRO (j < K-1)
+      N(v | mu_{type(j),X} + d_X, sd_{type(j),X})                    otherwise
+
+where `B_X(v)` is the sequence-slot-independent residue-averaged background
+density (so `log B_X(v)` cancels identically when comparing competing sequence
+positions for spin system `s`, and an atom that does not discriminate
+contributes about zero), `d_X` is the global chemical-shift reference offset,
+`mu_non(j, X) = mu_{type(j), X} - 0.85 * p_Pro * Delta(j, X)` removes the
+`p_Pro = 91 / 2508 ≈ 0.0363` pre-Proline background already absorbed into
+`bmrb_priors.json`, and `Delta(j, X)` is the deterministic primary-sequence
+covalent pre-Proline shift (`delta_covalent(seq, j)`) derived strictly from
+peer-reviewed random-coil host-guest peptide and proline conformational studies
+(Wishart et al., *J. Biomol. NMR* 1995, 5, 67–81; Wishart et al., *J. Biomol.
+NMR* 1995, 6, 135–140; Schwarzinger et al., *J. Am. Chem. Soc.* 2001, 123,
+2970–2978; MacArthur & Thornton, *J. Mol. Biol.* 1991, 218, 397–412):
+- **Pre-Proline (`seq[j+1] == "PRO"`, `j < K - 1`) vs non-pre-Proline**: steric
+  and tertiary-imide electronic upfield shifts `Delta = (-1.95, -1.80) ppm` on
+  `(CA, C)` for standard residues (`(-1.00, -1.50) ppm` for `GLY`,
+  `(-1.75, -1.70) ppm` for `PRO`), evaluated via the `0.85 / 0.15`
+  coil/PPII-vs-helical-kink mixture `P_cov` (MacArthur & Thornton, 1991) and
+  centered around `p_Pro = 91 / 2508` (`d_pre = 0.85 * (1 - p_Pro) * Delta`,
+  `d_non = -0.85 * p_Pro * Delta`) so `p_Pro * d_pre + (1 - p_Pro) * d_non == 0`
+  identically across natural sequences, coil/turn pre-Proline residues gain
+  strong upfield selectivity, and kinked alpha-helical pre-Proline residues have
+  bounded penalty (`<= -ln(0.15)` nats). Expected mixture shifts `delta_covalent`
+  are included in sequence-mixture and anchor reference-offset estimation.
+- **`CB` & `15N` (`d_cov(j, CB) = 0.0`, `d_cov(j, N) = 0.0`)**: unfolded
+  pentapeptide `CB` pre-Proline (`+0.25 ppm`) and `i-1` `15N` substituent
+  offsets (Braun, Wider & Wüthrich, *J. Am. Chem. Soc.* 1994, 116, 8466–8469;
+  Schwarzinger et al., 2001) were empirically ablated and excluded (`0.0 ppm`)
+  because folded-protein `(phi, psi)` and hydrogen-bond dispersion dominate and
+  invert those random-coil shifts.
+
+floor = -12 (PROVISIONAL).
 `assign_cost` = 0.0 (PROVISIONAL, configurable via `--assign-cost`) is an
 optional per-placement threshold relative to leaving a spin system unassigned.
 A CB observed for a glycine position contributes log(0.02) (PROVISIONAL).
