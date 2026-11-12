@@ -1010,8 +1010,10 @@ impl StripCube3D {
         if self.active_strips.is_empty() {
             return self.noise;
         }
-        let ix = self.axis_h.ppm_to_index(h).round().max(0.0) as usize;
-        let in_idx = self.axis_n.ppm_to_index(n).round().max(0.0) as usize;
+        let max_ix = (self.axis_h.size.saturating_sub(1)) as f64;
+        let max_in = (self.axis_n.size.saturating_sub(1)) as f64;
+        let ix = self.axis_h.ppm_to_index(h).round().clamp(0.0, max_ix) as usize;
+        let in_idx = self.axis_n.ppm_to_index(n).round().clamp(0.0, max_in) as usize;
         let mut best = self.noise;
         let mut best_d = usize::MAX;
         for s in &self.active_strips {
@@ -1043,18 +1045,22 @@ impl StripCube3D {
             return None;
         }
         let step_c = self.axis_c.step_ppm.abs();
-        let i0 = self
-            .axis_c
-            .ppm_to_index(c_target - win_ppm - step_c)
-            .floor() as isize;
-        let i1 = self.axis_c.ppm_to_index(c_target + win_ppm + step_c).ceil() as isize;
-        let ic_min_valid = (self.ic_store_lo + 1) as isize;
-        let ic_max_valid = (self.ic_store_lo + self.ic_store_len - 2) as isize;
-        let ic_lo = i0.min(i1).max(ic_min_valid) as usize;
-        let ic_hi = i0.max(i1).min(ic_max_valid) as usize;
-        if ic_lo > ic_hi {
+        let f0 = self.axis_c.ppm_to_index(c_target - win_ppm - step_c);
+        let f1 = self.axis_c.ppm_to_index(c_target + win_ppm + step_c);
+        if !f0.is_finite() || !f1.is_finite() {
             return None;
         }
+        let i0 = f0.floor() as isize;
+        let i1 = f1.ceil() as isize;
+        let ic_min_valid = (self.ic_store_lo + 1) as isize;
+        let ic_max_valid = (self.ic_store_lo + self.ic_store_len - 2) as isize;
+        let lo_isize = i0.min(i1).max(ic_min_valid);
+        let hi_isize = i0.max(i1).min(ic_max_valid);
+        if lo_isize < 0 || lo_isize > hi_isize {
+            return None;
+        }
+        let ic_lo = lo_isize as usize;
+        let ic_hi = hi_isize as usize;
 
         let snr_floor = min_local_snr.max(3.8);
         let mut best: Option<(Peak, f32, f64)> = None;

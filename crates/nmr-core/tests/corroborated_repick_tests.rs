@@ -682,3 +682,84 @@ fn test_real_ubiquitin_and_cisd3_two_pass_repick() {
         }
     }
 }
+
+#[test]
+fn corroborated_repick_handles_out_of_band_carbon_targets_on_both_ends_without_panic() {
+    let pcfg = PickerConfig {
+        snr_threshold: 5.5,
+        ..PickerConfig::default()
+    };
+    let repick_cfg = CorroboratedRepickConfig::default();
+    let roots = vec![
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 8.30,
+            n: 120.0,
+            c: None,
+            sign: 1,
+            height: Some(250.0),
+            volume: Some(1500.0),
+            h2: None,
+        },
+        Peak {
+            exp: "HSQC".to_string(),
+            h: 7.95,
+            n: 117.5,
+            c: None,
+            sign: 1,
+            height: Some(250.0),
+            volume: Some(1500.0),
+            h2: None,
+        },
+    ];
+
+    // Full-band CBCACONH (80..10 ppm) carries strong anchors both ABOVE (73.5 ppm > 66.0 ppm)
+    // and BELOW (39.5 ppm < 42.0 ppm) a narrower selective HNCA spectral window (66..42 ppm),
+    // plus an in-band corroborated 54.2 ppm anchor.
+    let cbcaconh = make_test_cube(
+        "CBCACONH",
+        80.0,
+        10.0,
+        &[
+            (8.30, 120.0, 73.5, 16.0),
+            (8.30, 120.0, 39.5, 16.0),
+            (7.95, 117.5, 54.2, 16.0),
+        ],
+    );
+    let hnca_narrow = make_test_cube(
+        "HNCA",
+        66.0,
+        42.0,
+        &[
+            (8.30, 120.0, 58.0, 14.0), // Pass-1 active peak so StripCube3D populates col_data
+            (7.95, 117.5, 54.2, 4.7),  // Sub-threshold Pass-1, corroborated in-band Pass-2 rescue
+        ],
+    );
+    let hnco = make_test_cube(
+        "HNCO",
+        182.0,
+        168.0,
+        &[(8.30, 120.0, 175.4, 15.0), (7.95, 117.5, 174.1, 15.0)],
+    );
+
+    let mut bank = StripBank3D::new();
+    let mut p1 = roots.clone();
+    p1.extend(bank.pick_and_record_3d(&cbcaconh, &roots, &pcfg));
+    p1.extend(bank.pick_and_record_3d(&hnca_narrow, &roots, &pcfg));
+    p1.extend(bank.pick_and_record_3d(&hnco, &roots, &pcfg));
+
+    let rescued = corroborated_re_pick_3d(&bank, &roots, &p1, &pcfg, &repick_cfg);
+    assert!(
+        rescued
+            .iter()
+            .any(|p| p.exp == "HNCA" && (p.c.unwrap_or(0.0) - 54.2).abs() < 0.20),
+        "expected in-band corroborated HNCA peak near 54.2 ppm to be rescued, got {rescued:?}"
+    );
+    assert!(
+        rescued.iter().all(|p| {
+            let c = p.c.unwrap_or(0.0);
+            p.exp != "HNCA" || (42.0..=66.0).contains(&c)
+        }),
+        "rescued HNCA peaks must stay strictly inside [42.0, 66.0] ppm: {rescued:?}"
+    );
+}
