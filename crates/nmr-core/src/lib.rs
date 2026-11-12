@@ -1,10 +1,10 @@
-//! Clean-room NMR resonance assignment, spectrum I/O, classical & neural peak picking,
+//! Clean-room NMR resonance assignment, raw FID & spectrum I/O, classical & neural peak picking,
 //! sidechain assignment, 3D NOESY / torsion structure folding, NEF v1.1 interchange,
 //! HTML/SVG quality reporting, HTTP job service, and Octet-Draw 2D chemical structure,
 //! reaction scheme & 1D NMR cheminformatics core.
 //!
 //! Provenance: Original implementation of `docs/specs/00-architecture.md` through
-//! `docs/specs/08-service.md`, plus small-molecule cheminformatics, analytical 1D NMR,
+//! `docs/specs/11-fid-processing.md`, plus small-molecule cheminformatics, analytical 1D NMR,
 //! and publication vector rendering ported/adapted from Octet-Draw by Sam Ellis
 //! (<https://github.com/SamChemMan/Octet-Draw>, Apache-2.0).
 
@@ -14,6 +14,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod dihedrals;
 pub mod evaluate;
 pub mod evo_graph;
+pub mod fid;
 pub mod nef;
 pub mod neural_picker;
 pub mod nmrstar;
