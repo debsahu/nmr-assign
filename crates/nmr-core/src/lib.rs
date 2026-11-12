@@ -22,6 +22,7 @@ pub mod noesy;
 pub mod octet_analyt;
 pub mod octet_mol;
 pub mod octet_render;
+pub mod ops;
 pub mod peaks;
 pub mod picker;
 pub mod priors;
