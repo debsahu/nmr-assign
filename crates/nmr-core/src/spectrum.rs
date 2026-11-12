@@ -145,6 +145,10 @@ impl Spectrum3D {
         self.data[(iz * ny + iy) * nx + ix]
     }
 
+    pub fn max_abs(&self) -> f32 {
+        self.data.iter().fold(0.0_f32, |m, &v| m.max(v.abs()))
+    }
+
     /// Extract a 2D `(1H strip_width x 13C full_axis)` strip around `(h_ppm, n_ppm)`.
     /// Output has `axis_x` = 1H window and `axis_y` = 13C axis for vertical strip plotting.
     pub fn extract_strip(&self, h_ppm: f64, n_ppm: f64, half_width_h_ppm: f64) -> Spectrum2D {
@@ -515,6 +519,56 @@ pub fn read_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, exp: &str) -> Result<Sp
     })
 }
 
+/// Write a Bruker TopSpin 3D processed directory (`procs`, `proc2s`, `proc3s`, `3rrr`) for round-trip export.
+pub fn write_bruker_pdata_3d(pdata_dir: impl AsRef<Path>, spec: &Spectrum3D) -> Result<(), String> {
+    let dir = pdata_dir.as_ref();
+    fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+
+    let max_abs = spec.max_abs().max(1e-12) as f64;
+    let target_max = 1.0e8_f64;
+    let nc_proc = (max_abs / target_max).log2().ceil() as i32;
+    let inv_scale = 1.0 / 2.0_f64.powi(nc_proc);
+
+    let write_proc = |path: &Path, ax: &AxisPpm| -> Result<(), String> {
+        let sw_hz = ax.sw_ppm() * ax.obs_mhz;
+        let content = format!(
+            "##TITLE= nmrassign pdata\n\
+             ##$SI= {}\n\
+             ##$XDIM= {}\n\
+             ##$SW_p= {:.6}\n\
+             ##$SF= {:.6}\n\
+             ##$OFFSET= {:.6}\n\
+             ##$AXNUC= <{}>\n\
+             ##$BYTORDP= 0\n\
+             ##$DTYPP= 0\n\
+             ##$NC_proc= {}\n\
+             ##END=\n",
+            ax.size, ax.size, sw_hz, ax.obs_mhz, ax.first_ppm, ax.label, nc_proc
+        );
+        fs::write(path, content).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    };
+
+    write_proc(&dir.join("procs"), &spec.axis_x)?;
+    write_proc(&dir.join("proc2s"), &spec.axis_y)?;
+    write_proc(&dir.join("proc3s"), &spec.axis_z)?;
+
+    let out_path = dir.join("3rrr");
+    let file = File::create(&out_path)
+        .map_err(|e| format!("failed to create {}: {e}", out_path.display()))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    for &v in &spec.data {
+        let q = ((v as f64) * inv_scale)
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        writer
+            .write_all(&q.to_le_bytes())
+            .map_err(|e| format!("failed to write 3rrr: {e}"))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("failed to flush 3rrr: {e}"))
+}
+
 // ============================================================================
 // NMRPipe .ft2 / .ft3 reader & writer (512-float 2048-byte header)
 // ============================================================================
@@ -748,6 +802,78 @@ pub fn read_nmrpipe_3d(path: impl AsRef<Path>, exp: &str) -> Result<Spectrum3D, 
         axis_z,
         data,
     })
+}
+
+/// Write a single-stream NMRPipe 3D file (`.ft3`) with complete frequency referencing.
+pub fn write_nmrpipe_3d(path: impl AsRef<Path>, spec: &Spectrum3D) -> Result<(), String> {
+    let p = path.as_ref();
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+    }
+
+    let mut hdr = [0.0f32; PIPE_HEADER_FLOATS];
+    hdr[0] = 0.0;
+    hdr[1] = f32::from_bits(0xeeee_eeee);
+    hdr[2] = 2.345;
+    hdr[9] = 3.0; // FDDIMCOUNT
+    hdr[24] = 2.0; // dim 0 -> F2 (slot 0)
+    hdr[25] = 1.0; // dim 1 -> F1 (slot 1)
+    hdr[26] = 3.0; // dim 2 -> F3 (slot 2)
+    hdr[27] = 4.0;
+    hdr[57] = 1.0; // FDPIPEFLAG: single-stream 3D pipe
+    hdr[56] = 1.0; // FDQUADFLAG: real
+    hdr[106] = 1.0; // FDF2QUADFLAG: real
+    hdr[55] = 1.0; // FDF1QUADFLAG: real
+    hdr[51] = 1.0; // FDF3QUADFLAG: real
+    hdr[99] = spec.nx() as f32; // FDSIZE
+    hdr[219] = spec.ny() as f32; // FDSPECNUM
+    hdr[15] = spec.nz() as f32; // FDZSIZE
+
+    let set_slot = |hdr: &mut [f32; PIPE_HEADER_FLOATS], slot: usize, ax: &AxisPpm| {
+        let n = ax.size.max(1) as f64;
+        let sw_hz = ax.sw_ppm() * ax.obs_mhz;
+        let last_ppm = ax.index_to_ppm(n - 1.0);
+        let orig_hz = last_ppm * ax.obs_mhz;
+        hdr[PIPE_SW_IDX[slot]] = sw_hz as f32;
+        hdr[PIPE_ORIG_IDX[slot]] = orig_hz as f32;
+        hdr[PIPE_OBS_IDX[slot]] = ax.obs_mhz as f32;
+    };
+    set_slot(&mut hdr, 0, &spec.axis_x);
+    set_slot(&mut hdr, 1, &spec.axis_y);
+    set_slot(&mut hdr, 2, &spec.axis_z);
+
+    let mut hdr_bytes = [0u8; PIPE_HEADER_BYTES];
+    for (i, &w) in hdr.iter().enumerate() {
+        hdr_bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    let write_label = |buf: &mut [u8], slot: usize, label: &str| {
+        let start = PIPE_LABEL_IDX[slot] * 4;
+        let mut raw = [0u8; 8];
+        let b = label.as_bytes();
+        let len = b.len().min(8);
+        raw[..len].copy_from_slice(&b[..len]);
+        buf[start..start + 8].copy_from_slice(&raw);
+    };
+    write_label(&mut hdr_bytes, 0, &spec.axis_x.label);
+    write_label(&mut hdr_bytes, 1, &spec.axis_y.label);
+    write_label(&mut hdr_bytes, 2, &spec.axis_z.label);
+
+    let file = File::create(p).map_err(|e| format!("failed to create {}: {e}", p.display()))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    writer
+        .write_all(&hdr_bytes)
+        .map_err(|e| format!("failed to write header to {}: {e}", p.display()))?;
+    for &v in &spec.data {
+        writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| format!("failed to write body to {}: {e}", p.display()))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("failed to flush {}: {e}", p.display()))
 }
 
 // ============================================================================

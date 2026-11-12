@@ -25,6 +25,7 @@ pub mod octet_render;
 pub mod peaks;
 pub mod picker;
 pub mod priors;
+pub mod process;
 pub mod report;
 pub mod rng;
 pub mod service;
