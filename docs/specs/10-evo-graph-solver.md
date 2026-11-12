@@ -38,7 +38,9 @@ All public types and entry points live in `nmr_core::evo_graph`:
   `min_assign_cost`, population/island topology (`64` individuals across `16`
   islands, `5` generations), fragment-crossover parameters, two-pass reference
   alignment (`auto_reference`), 2-layer graph consistency (`graph_consistency`),
-  and optional `structure_torsions: Option<&'a [(Option<f64>, Option<f64>)]>`.
+  user-locked `(spin_system_idx, seq_idx)` hard constraints
+  (`locked_assignments`), and optional
+  `structure_torsions: Option<&'a [(Option<f64>, Option<f64>)]>`.
 - `EvoGraphReport`: telemetry recording raw vs. retained peak and `HSQC` root
   counts, removed `NH2` sidechain roots, `kept_hsqc_indices`, per-experiment
   expected vs. retained counts, Pass-1 and Pass-2 `ReferenceOffsets`, Pass-2
@@ -172,14 +174,59 @@ occupying exchange-broadened backbone slots.
   into $B$ while cleanly evicting conflicting spin systems to `-1`, fills open
   high-affinity gaps, and anneals the offspring.
 - **Thermodynamic & Belief-Damped Fragment Confidence Calibration**: Pass 1 uses
-  local single-spin conditional Boltzmann calibration (`calibrate_boltzmann_confidence`)
-  over unassignment, competing free spin systems, open sequence slots, and
-  pairwise 2-swaps; Pass 2 (`calibrate_final_marginal_confidence`) adds
-  second-order quadratic neighbor-belief damping $w(b_1) = \min(1, b_1 / 0.85)^2$
-  plus rigid whole-stretch register translation $[a..b] \to [k_2 .. k_2 + L - 1]$
-  ($L = 2\dots 5$) for short stretches lacking a high-belief ($\ge 0.80$)
-  sequential anchor at either boundary so unanchored short islands cannot
-  inflate interior residues above $0.80$ via mutual clamping.
+  local single-spin conditional Boltzmann calibration (`calibrate_boltzmann_confidence`,
+  $T_{\text{cal}} = 1.65$) over unassignment, competing free spin systems, open
+  sequence slots, and pairwise 2-swaps; Pass 2 (`calibrate_final_marginal_confidence`,
+  $T_{\text{cal}} = 1.68$) adds second-order quadratic neighbor-belief damping
+  $w(b_1) = \min(1, b_1 / 0.85)^2$, rigid whole-stretch register translation
+  $[a..b] \to [k_2 .. k_2 + L - 1]$ ($L = 2\dots 5$) for short stretches lacking
+  a high-belief ($\ge 0.80$) sequential anchor at either boundary so unanchored
+  short islands cannot inflate interior residues above $0.80$ via mutual
+  clamping, and a sub-threshold ($< 0.80$) Fréchet copula blend toward
+  $\min(c_0, p_{\text{BP}}, p_{\text{Boltz1}})$ that corrects quadratic product
+  under-confidence on low-consensus sparse placements while leaving high-confidence
+  ($\ge 0.80$) calls strictly untouched (maintaining Expected Calibration Error
+  $\text{ECE} \le 0.06$ across development real-spectrum benchmarks).
+- **Sub-Stoichiometric Minor-Conformer Root Damping (`rel_root_height < 0.15`)**:
+  both `build_spin_systems` and `build_stoichiometric_spin_systems` record each
+  spin system's absolute root peak intensity `root_height` (`|HSQC height|`, or
+  max attached 3D `|height|` when HSQC lacks heights) and median-normalized
+  relative intensity $\tilde{I}_s = I_s / \operatorname{median}_{t \in \mathcal{C}}(I_t)$
+  (`rel_root_height`) across carbon-bearing spin systems $\mathcal{C}$ without
+  altering `docs/specs/03-assignment.md` Section 4 candidate clustering or
+  ranking. Inside `evo_graph`, sub-stoichiometric roots with $\tilde{I}_s < 0.15$
+  receive a smooth unary damping penalty parameterized by
+  $u_{\text{sub}} = (0.15 - \tilde{I}_s) / 0.15$, amplified by the population
+  log-ratio $\ln(\tilde{I}_{\text{maj}} / \tilde{I}_s)$ whenever a major-state
+  conformer ($\tilde{I}_{\text{maj}} \ge 0.45$) shares matching $i$ / $i-1$
+  $^{13}\text{C}$ shifts or when the sub-stoichiometric stub lacks intra-residue
+  `CA(0)` (plus a local slow-exchange clone satellite tie-breaker when a $\ge 3\times$
+  stronger nearby root within $0.20\text{ ppm } ^1\text{H} / 0.60\text{ ppm } ^{15}\text{N}$
+  reproduces $100\%$ of a $\ge 4$-slot satellite's $^{13}\text{C}$ shifts within
+  $0.25\text{ ppm}$). Moderate exchange-broadened amides ($\tilde{I}_s \ge 0.15$
+  with distinct carbon shifts) and unique multi-slot C-terminal or Glycine amides
+  are preserved while slow-exchange minor second-form roots such as Ubiquitin
+  `Gln2` ($\approx 9\text{--}12\%$ amplitude) cannot displace overlapped major-state
+  roots.
+- **User-Locked `(spin_system, residue)` Hard Constraints & Sparse-Data Proposals**:
+  `ScoreConfig::locked_assignments` and `EvoGraphConfig::locked_assignments`
+  accept injective `(spin_system_idx, seq_idx)` pairs on assignable non-Proline
+  residues ($k > 0$). When empty (default), $U(s, k)$ and $P(s, t)$ are
+  bit-for-bit identical to `docs/specs/03-assignment.md` Section 3. When locks
+  are active, $U(s_{\text{lock}}, k \neq k_{\text{lock}}) = \text{FORBID}$ and
+  $U(s \neq s_{\text{lock}}, k_{\text{lock}}) = \text{FORBID}$ across CPU
+  `standard`, GPU `standard` (`GpuEngine`), and `evo_graph` (preserving raw
+  locked `HSQC` roots through stoichiometric filtering, pinning locked pairs
+  throughout MCMC / evolutionary crossover, and reporting locked confidence
+  $1.0$). For sparse `CA`-only / `HNCACB`-absent datasets in `standard`
+  (`nmr_core::solver`), sparsity-adaptive Metropolis-Hastings annealing
+  supplements single-spin moves (with exact 1-step reversible eviction across
+  `FORBID` boundaries) with Hastings-corrected directed sequential chain-extension
+  proposals ($k_{\text{anc}} \pm 1$ using top-$P$ sequential partners),
+  symmetric contiguous segment register rotations ($\pm 1 \dots \pm 3$), and
+  partner-guided dipeptide/tripeptide block splices (with multi-replica
+  consensus bounded by local conditional Boltzmann margin at $T_{\text{cal}} = 1.55$)
+  without modifying $U(s, k)$ or $P(s, t)$.
 
 ### 3.4 Residue-Graph Self-Consistency and Optional 3D $(\phi, \psi)$ Conditioning
 

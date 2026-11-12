@@ -54,6 +54,10 @@ pub struct SpinSystem {
     pub h: f64,
     pub n: f64,
     pub cands: BTreeMap<(String, i32), Vec<(f64, usize)>>,
+    /// Absolute root intensity (`|HSQC height|`, or max attached 3D `|height|` when HSQC lacks heights).
+    pub root_height: Option<f64>,
+    /// Root intensity normalized by the median root intensity across carbon-bearing spin systems.
+    pub rel_root_height: Option<f64>,
 }
 
 impl SpinSystem {
@@ -62,6 +66,8 @@ impl SpinSystem {
             h,
             n,
             cands: BTreeMap::new(),
+            root_height: None,
+            rel_root_height: None,
         }
     }
 
@@ -383,10 +389,10 @@ pub fn build_spin_systems(
     let mut systems = Vec::with_capacity(roots.len());
     let mut lacks_ca_support = vec![false; roots.len()];
 
-    for (idx, (r, plist)) in roots.iter().copied().zip(attached).enumerate() {
+    for (idx, (&r, plist)) in roots.iter().zip(attached.iter()).enumerate() {
         let (ss, has_credible_ca) = resolve_root(
             r,
-            &plist,
+            plist,
             tol,
             max_cands,
             use_degenerate,
@@ -424,7 +430,55 @@ pub fn build_spin_systems(
         }
     }
 
+    populate_root_heights(&mut systems, &roots, &attached);
+
     Ok(systems)
+}
+
+/// Populate `root_height` and `rel_root_height` (`root_height / median_root_height`) on assembled
+/// `SpinSystem`s from HSQC peak heights (or max attached 3D peak height when HSQC lacks heights)
+/// without modifying candidate attachment, clustering, or ranking.
+pub(crate) fn populate_root_heights(
+    systems: &mut [SpinSystem],
+    roots: &[&Peak],
+    attached: &[Vec<&Peak>],
+) {
+    if systems.len() != roots.len() || systems.len() != attached.len() {
+        return;
+    }
+    let has_hsqc_heights = roots
+        .iter()
+        .any(|r| r.height.is_some_and(|h| h.is_finite() && h.abs() > 0.0));
+
+    for (j, ss) in systems.iter_mut().enumerate() {
+        ss.root_height = if has_hsqc_heights {
+            roots[j]
+                .height
+                .map(f64::abs)
+                .filter(|&h| h.is_finite() && h > 0.0)
+        } else {
+            attached[j]
+                .iter()
+                .filter_map(|p| p.height.map(f64::abs).filter(|&h| h.is_finite() && h > 0.0))
+                .fold(None, |acc: Option<f64>, h| {
+                    Some(acc.map_or(h, |a| a.max(h)))
+                })
+        };
+    }
+
+    let mut ref_heights: Vec<f64> = systems
+        .iter()
+        .filter(|ss| ss.has_observed_carbons())
+        .filter_map(|ss| ss.root_height)
+        .collect();
+    if ref_heights.is_empty() {
+        ref_heights = systems.iter().filter_map(|ss| ss.root_height).collect();
+    }
+    if let Some(med) = median_f64(ref_heights).filter(|&m| m > 0.0) {
+        for ss in systems.iter_mut() {
+            ss.rel_root_height = ss.root_height.map(|h| h / med);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -39,10 +39,10 @@ use crate::priors::{
 use crate::qc::{apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport};
 use crate::rng::Rng;
 use crate::solver::{
-    candidate_llr_shifted, consensus_from_runs, pair_matrix, AssignResult, Matrix2D, ScoreConfig,
-    FORBID,
+    candidate_llr_shifted, consensus_from_runs, pair_matrix, resolve_locked_assignments,
+    AssignResult, Matrix2D, ScoreConfig, FORBID,
 };
-use crate::spinsystems::{SpinSystem, Tolerances};
+use crate::spinsystems::{populate_root_heights, SpinSystem, Tolerances};
 
 /// Estimated uniform chemical-shift reference offsets `(obs_ppm - dss_prior_ppm)` per backbone nucleus.
 ///
@@ -124,6 +124,10 @@ pub struct EvoGraphConfig<'a> {
     pub apply_qc_calibration: bool,
     /// Optional 3D backbone `(phi_deg, psi_deg)` torsions aligned to `sequence` (`None` = sequence-only).
     pub structure_torsions: Option<&'a [(Option<f64>, Option<f64>)]>,
+    /// Optional user-locked `(spin_system_idx, seq_idx)` hard assignment constraints
+    /// (merged with `score_cfg.locked_assignments`; when calling `assign_evo_graph_from_peaks`,
+    /// `spin_system_idx` indexes raw `HSQC` roots in `peaks`).
+    pub locked_assignments: Vec<(usize, usize)>,
     /// Deterministic PRNG seed.
     pub seed: u64,
 }
@@ -160,9 +164,21 @@ impl Default for EvoGraphConfig<'_> {
             graph_consistency: true,
             apply_qc_calibration: true,
             structure_torsions: None,
+            locked_assignments: Vec::new(),
             seed: 0,
         }
     }
+}
+
+fn merged_config_locks(cfg: &EvoGraphConfig<'_>) -> Vec<(usize, usize)> {
+    if cfg.locked_assignments.is_empty() && cfg.score_cfg.locked_assignments.is_empty() {
+        return Vec::new();
+    }
+    let mut out =
+        Vec::with_capacity(cfg.locked_assignments.len() + cfg.score_cfg.locked_assignments.len());
+    out.extend_from_slice(&cfg.locked_assignments);
+    out.extend_from_slice(&cfg.score_cfg.locked_assignments);
+    out
 }
 
 /// Diagnostic telemetry produced by stoichiometric filtering, two-pass reference estimation,
@@ -401,6 +417,16 @@ fn filter_peaks_with_report(
         return peaks.to_vec();
     }
 
+    let raw_locks = merged_config_locks(cfg);
+    let locked_raw_ords: BTreeSet<usize> = if raw_locks.is_empty() {
+        BTreeSet::new()
+    } else {
+        resolve_locked_assignments(report.raw_hsqc_count, &norm_seq, &raw_locks)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    };
+
     // 1. Physical chemical-shift window gating
     let mut gated_hsqc: Vec<(usize, Peak)> = Vec::new();
     let mut gated_3d: BTreeMap<(&'static str, i32), Vec<Peak>> = BTreeMap::new();
@@ -411,10 +437,11 @@ fn filter_peaks_with_report(
         if p.exp == "HSQC" {
             let ord = raw_hsqc_ord;
             raw_hsqc_ord += 1;
-            if p.h >= cfg.hsqc_h_window.0
-                && p.h <= cfg.hsqc_h_window.1
-                && p.n >= 96.0
-                && p.n <= 142.0
+            if locked_raw_ords.contains(&ord)
+                || (p.h >= cfg.hsqc_h_window.0
+                    && p.h <= cfg.hsqc_h_window.1
+                    && p.n >= 96.0
+                    && p.n <= 142.0)
             {
                 gated_hsqc.push((ord, p.clone()));
             }
@@ -787,7 +814,11 @@ fn filter_peaks_with_report(
 
     let mut kept_roots_idx: Vec<usize> = Vec::with_capacity(gated_hsqc.len());
     for i in 0..gated_hsqc.len() {
-        let (_, ref rq) = gated_hsqc[i];
+        let (ord_q, ref rq) = gated_hsqc[i];
+        if locked_raw_ords.contains(&ord_q) {
+            kept_roots_idx.push(i);
+            continue;
+        }
         let hq = rq.height.map(f64::abs).unwrap_or(0.0);
         let norm_hq = hq / hsqc_ref_height;
         let q_sum = &summaries[i];
@@ -877,11 +908,14 @@ fn filter_peaks_with_report(
         }
     }
     report.nh2_removed_count = removed_nh2.len();
-    kept_roots_idx.retain(|idx| !removed_nh2.contains(idx));
+    kept_roots_idx
+        .retain(|&idx| locked_raw_ords.contains(&gated_hsqc[idx].0) || !removed_nh2.contains(&idx));
 
     // Drop roots that have zero 3D peaks when 3D experiments exist
     if has_any_3d {
-        kept_roots_idx.retain(|&idx| summaries[idx].distinct_exps > 0);
+        kept_roots_idx.retain(|&idx| {
+            locked_raw_ords.contains(&gated_hsqc[idx].0) || summaries[idx].distinct_exps > 0
+        });
     }
 
     // 8. Rank surviving HSQC roots by corroborated SNR + intra-CA presence and cap at post-NH2 budget
@@ -907,7 +941,17 @@ fn filter_peaks_with_report(
     let rem_expected_hsqc = n_exp_hsqc.saturating_sub(removed_nh2.len()).max(st.n_amide);
     let root_mult = (cfg.stoichiometry_budget_mult * 0.85).max(1.25);
     let hsqc_cap = ((root_mult * (rem_expected_hsqc as f64)).ceil() as usize).max(1);
-    kept_roots_idx.truncate(hsqc_cap);
+    if locked_raw_ords.is_empty() {
+        kept_roots_idx.truncate(hsqc_cap);
+    } else if kept_roots_idx.len() > hsqc_cap {
+        let mut preserved: Vec<usize> = Vec::with_capacity(hsqc_cap + locked_raw_ords.len());
+        for &idx in &kept_roots_idx {
+            if preserved.len() < hsqc_cap || locked_raw_ords.contains(&gated_hsqc[idx].0) {
+                preserved.push(idx);
+            }
+        }
+        kept_roots_idx = preserved;
+    }
     // Restore original HSQC peak order for deterministic SpinSystem indexing
     kept_roots_idx.sort_by_key(|&idx| gated_hsqc[idx].0);
 
@@ -1114,13 +1158,15 @@ pub fn build_stoichiometric_spin_systems(
         }
     }
 
-    roots
-        .into_iter()
-        .zip(attached)
-        .map(|(r, plist)| {
-            resolve_stoichiometric_root(r, &plist, tol, max_cands, heights_present, &chan_ref)
+    let mut systems: Vec<SpinSystem> = roots
+        .iter()
+        .zip(attached.iter())
+        .map(|(&r, plist)| {
+            resolve_stoichiometric_root(r, plist, tol, max_cands, heights_present, &chan_ref)
         })
-        .collect()
+        .collect();
+    populate_root_heights(&mut systems, &roots, &attached);
+    systems
 }
 
 fn resolve_stoichiometric_root(
@@ -1275,12 +1321,45 @@ fn resolve_stoichiometric_root(
         }
     }
 
+    // Suppress uncorroborated negative HNCACB dispersive / F1-sinc undershoot lobes sitting
+    // inside the CB-empty pure-CA band (47.8..=56.5 ppm) within 1.35 ppm of a stronger CA peak
+    let ca_peaks_on_strip: Vec<(f64, f64)> = hncacb
+        .iter()
+        .filter(|e| e.atom == Some("CA"))
+        .map(|e| (e.val, e.norm_height.unwrap_or(0.0)))
+        .collect();
+    hncacb.retain(|e| {
+        if e.atom == Some("CB") && e.offset.is_none() && (47.8..=56.5).contains(&e.val) {
+            let eh = e.norm_height.unwrap_or(0.0);
+            let is_ca_undershoot = ca_peaks_on_strip
+                .iter()
+                .any(|&(cv, ch)| (e.val - cv).abs() <= 1.35 && eh < ch);
+            if is_ca_undershoot {
+                return false;
+            }
+        }
+        true
+    });
+
     // Disambiguate unmatched CBCACONH peaks (when weak 2J HNCACB peak dropped out!)
     let has_typed_cb_im1 = cbcaconh_entries.iter().any(|e| e.atom == Some("CB"));
-    let has_typed_ca_im1 = cbcaconh_entries.iter().any(|e| e.atom == Some("CA"));
+    let typed_ca_im1: Vec<(f64, f64)> = cbcaconh_entries
+        .iter()
+        .filter(|e| e.atom == Some("CA"))
+        .map(|e| (e.val, e.norm_height.unwrap_or(0.0)))
+        .collect();
+    let has_typed_ca_im1 = !typed_ca_im1.is_empty();
     for entry in &mut cbcaconh_entries {
         if entry.atom.is_none() {
             let v = entry.val;
+            let eh = entry.norm_height.unwrap_or(0.0);
+            let is_ca_sidelobe = heights_present
+                && typed_ca_im1
+                    .iter()
+                    .any(|&(cv, ch)| (v - cv).abs() <= 2.30 && ch > 0.0 && eh < 0.30 * ch);
+            if is_ca_sidelobe {
+                continue;
+            }
             // Check against other i-1 entries first (e.g. HNCOCA)
             let matched_ca = entries.iter().any(|x| {
                 x.atom == Some("CA") && x.offset == Some(-1) && (x.val - v).abs() <= tol.match_ca
@@ -2120,16 +2199,174 @@ fn conditioned_candidate_llr(
     (best - (cands.len() as f64).ln(), best_i)
 }
 
+/// Sub-stoichiometric minor-conformer threshold (`rel_root_height < 0.15`) and major-conformer
+/// reference threshold (`rel_root_height >= 0.45`).
+const MINOR_CONFORMER_REL_HEIGHT: f64 = 0.15;
+const MAJOR_CONFORMER_REL_HEIGHT: f64 = 0.45;
+
+/// Compute smooth sub-stoichiometric minor-conformer unary penalties (in nats) for roots with
+/// `rel_root_height < 0.15` while leaving all roots with `rel_root_height >= 0.15` (including
+/// moderate exchange-broadened amides) or `None` at exact `0.0`.
+///
+/// Sub-stoichiometric roots (`< 15%` median root height) that lack intra-residue `CA(0)` or whose
+/// observed `i`/`i-1` `13C` shifts duplicate a major-state root (`rel_root_height >= 0.45`, e.g.,
+/// slow-exchange minor second-form peaks such as Ubiquitin `Gln2` at `~9–12%` amplitude) receive
+/// a smooth population-weighted conformer log-prior penalty, whereas unique multi-slot C-terminal
+/// or flexible Glycine roots without a major-state carbon duplicate receive only a mild `< 0.8`-nat
+/// sub-stoichiometric prior.
+fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
+    let mut penalties = vec![0.0_f64; systems.len()];
+    let major_roots: Vec<(usize, f64)> = systems
+        .iter()
+        .enumerate()
+        .filter_map(|(m, ss)| {
+            let r = ss.rel_root_height?;
+            if r >= MAJOR_CONFORMER_REL_HEIGHT && ss.has_observed_carbons() {
+                Some((m, r))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if major_roots.is_empty() {
+        return penalties;
+    }
+
+    for (s, ss) in systems.iter().enumerate() {
+        let Some(r) = ss.rel_root_height else {
+            continue;
+        };
+        let has_ca_i = ss
+            .cands
+            .get(&("CA".to_string(), 0))
+            .is_some_and(|l| l.iter().any(|c| c.1 > 0));
+
+        let obs_slots: Vec<(&str, i32, Vec<f64>)> = ss
+            .cands
+            .iter()
+            .filter_map(|((atom, off), raw)| {
+                let vals: Vec<f64> = raw
+                    .iter()
+                    .filter(|&&(_, sup)| sup > 0)
+                    .map(|&(v, _)| v)
+                    .collect();
+                if vals.is_empty() {
+                    None
+                } else {
+                    Some((atom.as_str(), *off, vals))
+                }
+            })
+            .collect();
+        let n_slots = obs_slots.len();
+
+        if r < MINOR_CONFORMER_REL_HEIGHT {
+            let u_sub = ((MINOR_CONFORMER_REL_HEIGHT - r.max(0.0)) / MINOR_CONFORMER_REL_HEIGHT)
+                .clamp(0.0, 1.0);
+            let mut best_shadow_r_maj: Option<f64> = None;
+            let mut best_local_conf_r_maj: Option<f64> = None;
+            if n_slots > 0 {
+                let req_slots = if n_slots <= 2 {
+                    n_slots
+                } else {
+                    (n_slots * 2).div_ceil(3)
+                };
+                for &(m, r_maj) in &major_roots {
+                    if m == s {
+                        continue;
+                    }
+                    let sm = &systems[m];
+                    let mut matched_slots = 0usize;
+                    for (atom, off, s_vals) in &obs_slots {
+                        let tol_c = if *atom == "C" { 0.40 } else { 0.55 };
+                        if let Some(m_raw) = sm.cands.get(&(atom.to_string(), *off)) {
+                            let hit = s_vals.iter().any(|&vs| {
+                                m_raw
+                                    .iter()
+                                    .any(|&(vm, sup)| sup > 0 && (vs - vm).abs() <= tol_c)
+                            });
+                            if hit {
+                                matched_slots += 1;
+                            }
+                        }
+                    }
+                    let near_hn = (ss.h - sm.h).abs() <= 0.35 && (ss.n - sm.n).abs() <= 2.50;
+                    let hn_neighbor = near_hn && matched_slots >= 1;
+                    if matched_slots >= req_slots || hn_neighbor {
+                        best_shadow_r_maj =
+                            Some(best_shadow_r_maj.map_or(r_maj, |prev| prev.max(r_maj)));
+                    }
+                    if near_hn
+                        && n_slots >= 2
+                        && matched_slots >= req_slots
+                        && r_maj >= 6.0 * r.max(0.015)
+                    {
+                        best_local_conf_r_maj =
+                            Some(best_local_conf_r_maj.map_or(r_maj, |prev| prev.max(r_maj)));
+                    }
+                }
+            }
+
+            let mut pen = 0.75 * u_sub;
+            if !has_ca_i {
+                pen += 2.6 * (1.0 - (-6.0 * u_sub).exp());
+            }
+            if let Some(r_maj) = best_local_conf_r_maj {
+                let log_pop = (r_maj / r.max(0.015)).ln().max(0.0);
+                pen += 5.0 * log_pop * (1.0 - (-8.0 * u_sub).exp());
+            } else if let Some(r_maj) = best_shadow_r_maj {
+                let log_pop = (r_maj / r.max(0.015)).ln().max(0.0);
+                pen += 1.65 * log_pop * (1.0 - (-8.0 * u_sub).exp());
+            }
+            penalties[s] = pen;
+        } else if n_slots >= 4 && has_ca_i && obs_slots.iter().any(|(_, off, _)| *off == -1) {
+            // Local slow-exchange satellite / split-peak tie-breaker: only triggers when a >= 3x
+            // stronger major root (`r_maj >= 0.90`, `r <= 0.35 * r_maj`) sits within `(0.20 ppm 1H,
+            // 0.60 ppm 15N)` and reproduces 100% of `s`'s observed carbon peaks across all >= 4
+            // intra+sequential slots within 0.25 ppm (zero distinct carbon peaks on `s`).
+            let mut best_sat_ratio = 1.0_f64;
+            for &(m, r_maj) in &major_roots {
+                if m == s || r_maj < 0.90 || r > 0.35 * r_maj {
+                    continue;
+                }
+                let sm = &systems[m];
+                if (ss.h - sm.h).abs() > 0.20 || (ss.n - sm.n).abs() > 0.60 {
+                    continue;
+                }
+                let all_identical = obs_slots.iter().all(|(atom, off, s_vals)| {
+                    let Some(m_raw) = sm.cands.get(&(atom.to_string(), *off)) else {
+                        return false;
+                    };
+                    s_vals.iter().all(|&vs| {
+                        m_raw
+                            .iter()
+                            .any(|&(vm, sup)| sup > 0 && (vs - vm).abs() <= 0.25)
+                    })
+                });
+                if all_identical {
+                    best_sat_ratio = best_sat_ratio.max(r_maj / r.max(0.015));
+                }
+            }
+            if best_sat_ratio > 1.0 {
+                penalties[s] = 6.0 * best_sat_ratio.ln();
+            }
+        }
+    }
+
+    penalties
+}
+
 fn build_evo_unary_matrix(
     systems: &[SpinSystem],
     seq: &[String],
     shifted_priors: &Priors,
     cfg: &EvoGraphConfig<'_>,
     effective_assign_cost: f64,
+    locks: &[(usize, usize)],
 ) -> Matrix2D {
     let s_len = systems.len();
     let k_len = seq.len();
     let mut u = Matrix2D::filled(s_len, k_len, FORBID);
+    let minor_penalties = compute_minor_conformer_penalties(systems);
 
     let has_global_aliphatic = systems.iter().any(|ss| {
         ss.cands
@@ -2182,6 +2419,20 @@ fn build_evo_unary_matrix(
                     .is_some_and(|c| c.iter().any(|x| x.1 > 0));
 
             if has_global_aliphatic && surplus_roots && !has_ca_any && !has_cb_any {
+                continue;
+            }
+            let has_intra_any = ["CA", "CB", "C"].iter().any(|atom| {
+                ss.cands
+                    .get(&((*atom).to_string(), 0))
+                    .is_some_and(|c| c.iter().any(|x| x.1 > 0))
+            });
+            if has_global_aliphatic
+                && surplus_roots
+                && !has_ca_any
+                && !has_intra_any
+                && ss.h < 7.65
+                && ss.n < 115.5
+            {
                 continue;
             }
 
@@ -2246,10 +2497,37 @@ fn build_evo_unary_matrix(
                         + shifted_priors.llr(res, "H", ss.h);
                 }
             }
-            sc -= effective_assign_cost;
+            sc -= effective_assign_cost + minor_penalties[s];
             u.set(s, k, sc);
         }
     }
+
+    for &(s_lock, k_lock) in locks {
+        if s_lock >= s_len || k_lock == 0 || k_lock >= k_len || seq[k_lock] == "PRO" {
+            continue;
+        }
+        let mut lock_sc = u.get(s_lock, k_lock);
+        if lock_sc <= FORBID * 0.5 || !lock_sc.is_finite() {
+            let ss = &systems[s_lock];
+            let res = &seq[k_lock];
+            let cov_k = delta_covalent(seq, k_lock);
+            let mut sc = 0.0;
+            if cfg.score_cfg.use_hn {
+                sc += shifted_priors.llr_shifted(res, "N", ss.n, cov_k.0)
+                    + shifted_priors.llr(res, "H", ss.h);
+            }
+            sc -= effective_assign_cost;
+            lock_sc = if sc.is_finite() { sc.max(-500.0) } else { 0.0 };
+        }
+        for k in 0..k_len {
+            u.set(s_lock, k, FORBID);
+        }
+        for s in 0..s_len {
+            u.set(s, k_lock, FORBID);
+        }
+        u.set(s_lock, k_lock, lock_sc);
+    }
+
     u
 }
 
@@ -2525,7 +2803,7 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
         }
     }
 
-    let t_cal = 1.65_f64;
+    let t_cal = 1.68_f64;
     for s in 0..s_len {
         let k_raw = res.position[s];
         if k_raw < 0 || b1[s] <= 0.0 {
@@ -2570,7 +2848,17 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
             }
         }
         let p_bp = 1.0 / (1.0 + alt_w);
-        res.confidence[s] = res.confidence[s].min(c0[s] * p_bp).clamp(0.0, 1.0);
+        let p_prod = b1[s].min(c0[s] * p_bp).clamp(0.0, 1.0);
+        let p_boltz1 = if c0[s] > 1e-9 {
+            (b1[s] / c0[s]).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let p_upper = c0[s].min(p_bp).min(p_boltz1);
+        // Fréchet copula blend below the 0.80 HC boundary: corrects quadratic c0*p_bp
+        // under-confidence for low/medium posteriors without ever promoting <0.80 above 0.80.
+        let sub_hc_taper = (1.0 - p_prod / 0.80).max(0.0);
+        res.confidence[s] = (p_prod + 0.56 * (p_upper - p_prod) * sub_hc_taper).clamp(0.0, 1.0);
     }
 }
 
@@ -2593,6 +2881,7 @@ fn apply_graph_self_consistency(
     shifted_priors: &Priors,
     offsets: &ReferenceOffsets,
     pass1: &AssignResult,
+    locks: &[(usize, usize)],
 ) -> (Vec<bool>, usize, usize) {
     let k_len = seq.len();
     let mut at = vec![-1i32; k_len];
@@ -2819,7 +3108,10 @@ fn apply_graph_self_consistency(
             // Soft-anchor verified sequential stretch
             u_pass2.set(s, k, cur_u + 1.8 * h2[k]);
             anchored_count += 1;
-        } else if (clash_left || clash_right || h2[k] < 0.28) && q0 < 0.45 {
+        } else if !locks.iter().any(|&(sl, kl)| sl == s || kl == k)
+            && (clash_left || clash_right || h2[k] < 0.28)
+            && q0 < 0.45
+        {
             // Prune/penalize low-consistency outlier clashing with anchored neighbors
             u_pass2.set(s, k, cur_u - 2.8);
             pruned_slot[k] = true;
@@ -2892,6 +3184,8 @@ struct LocalAnnealer<'a> {
     u: &'a Matrix2D,
     p: &'a Matrix2D,
     slots: &'a [Vec<usize>],
+    locked_s: Vec<bool>,
+    locked_k: Vec<bool>,
     s_len: usize,
     k_len: usize,
     edge_marks: Vec<u32>,
@@ -2899,11 +3193,26 @@ struct LocalAnnealer<'a> {
 }
 
 impl<'a> LocalAnnealer<'a> {
-    fn new(u: &'a Matrix2D, p: &'a Matrix2D, slots: &'a [Vec<usize>]) -> Self {
+    fn new(
+        u: &'a Matrix2D,
+        p: &'a Matrix2D,
+        slots: &'a [Vec<usize>],
+        locks: &[(usize, usize)],
+    ) -> Self {
+        let mut locked_s = vec![false; u.rows];
+        let mut locked_k = vec![false; u.cols];
+        for &(s_lock, k_lock) in locks {
+            if s_lock < u.rows && k_lock < u.cols {
+                locked_s[s_lock] = true;
+                locked_k[k_lock] = true;
+            }
+        }
         Self {
             u,
             p,
             slots,
+            locked_s,
+            locked_k,
             s_len: u.rows,
             k_len: u.cols,
             edge_marks: vec![0; u.cols],
@@ -3042,15 +3351,21 @@ impl<'a> LocalAnnealer<'a> {
             let r = rng.f64();
             if r < 0.65 {
                 let s = rng.usize(self.s_len);
-                if self.slots[s].is_empty() {
+                if self.slots[s].is_empty() || self.locked_s[s] {
                     continue;
                 }
                 let k = self.slots[s][rng.usize(self.slots[s].len())];
+                if self.locked_k[k] {
+                    continue;
+                }
                 let ks = ind.pos[s];
                 let t = ind.at[k];
                 if ks == k as i32 {
                     changes.push((k, -1));
                 } else {
+                    if t >= 0 && self.locked_s[t as usize] {
+                        continue;
+                    }
                     changes.push((k, s as i32));
                     if ks >= 0 {
                         let ks_u = ks as usize;
@@ -3075,6 +3390,10 @@ impl<'a> LocalAnnealer<'a> {
                 }
                 let mut valid = true;
                 for i in 0..l {
+                    if self.locked_k[k1 + i] || self.locked_k[k2 + i] {
+                        valid = false;
+                        break;
+                    }
                     let a = ind.at[k1 + i];
                     let b = ind.at[k2 + i];
                     if (b >= 0 && self.u.get(b as usize, k1 + i) <= FORBID * 0.5)
@@ -3091,7 +3410,7 @@ impl<'a> LocalAnnealer<'a> {
                 }
             } else {
                 let s = rng.usize(self.s_len);
-                if ind.pos[s] < 0 {
+                if ind.pos[s] < 0 || self.locked_s[s] {
                     continue;
                 }
                 changes.push((ind.pos[s] as usize, -1));
@@ -3249,12 +3568,32 @@ fn tournament_select(
     best_idx
 }
 
+fn enforce_locks_on_individual(ind: &mut Individual, locks: &[(usize, usize)]) {
+    for &(s_lock, k_lock) in locks {
+        if s_lock >= ind.pos.len() || k_lock >= ind.at.len() {
+            continue;
+        }
+        let prev_s = ind.at[k_lock];
+        if prev_s >= 0 && (prev_s as usize) != s_lock {
+            ind.pos[prev_s as usize] = -1;
+        }
+        let prev_k = ind.pos[s_lock];
+        if prev_k >= 0 && (prev_k as usize) != k_lock {
+            ind.at[prev_k as usize] = -1;
+        }
+        ind.at[k_lock] = s_lock as i32;
+        ind.pos[s_lock] = k_lock as i32;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn evolve_island(
     u: &Matrix2D,
     p: &Matrix2D,
     slots: &[Vec<usize>],
     island_pop_size: usize,
     cfg: &EvoGraphConfig<'_>,
+    locks: &[(usize, usize)],
     warm_seed: Option<&[i32]>,
     seed: u64,
 ) -> Individual {
@@ -3262,7 +3601,7 @@ fn evolve_island(
     let k_len = u.cols;
     let pop_m = island_pop_size.max(2);
     let mut rng = Rng::new(seed);
-    let mut annealer = LocalAnnealer::new(u, p, slots);
+    let mut annealer = LocalAnnealer::new(u, p, slots, locks);
     let steps_gen0 = cfg.steps_per_system_per_gen.max(50) * s_len;
     let steps_gen = ((cfg.steps_per_system_per_gen * 4) / 5).max(40) * s_len;
 
@@ -3278,6 +3617,9 @@ fn evolve_island(
         } else {
             Individual::empty(s_len, k_len)
         };
+        if !locks.is_empty() {
+            enforce_locks_on_individual(&mut ind, locks);
+        }
         let t0 = if i == 0 && warm_seed.is_some() {
             (cfg.t_start * 0.45).max(1.5)
         } else {
@@ -3322,6 +3664,9 @@ fn evolve_island(
                     cfg.fragment_link_threshold,
                     &mut rng,
                 );
+                if !locks.is_empty() {
+                    enforce_locks_on_individual(&mut c, locks);
+                }
                 annealer.greedy_fill_gaps(&mut c, &mut rng);
                 c
             } else {
@@ -3350,6 +3695,7 @@ fn run_parallel_islands(
     p: &Matrix2D,
     u_eval: &Matrix2D,
     cfg: &EvoGraphConfig<'_>,
+    locks: &[(usize, usize)],
     warm_positions: Option<&[Vec<i32>]>,
     master_rng: &mut Rng,
 ) -> (Vec<Vec<i32>>, Vec<f64>) {
@@ -3379,7 +3725,9 @@ fn run_parallel_islands(
     if n_threads <= 1 || n_islands <= 1 {
         for (idx, &sd) in seeds.iter().enumerate() {
             let warm = warm_positions.and_then(|wp| wp.get(idx).map(Vec::as_slice));
-            winners.push(evolve_island(u, p, &slots, island_pop, cfg, warm, sd));
+            winners.push(evolve_island(
+                u, p, &slots, island_pop, cfg, locks, warm, sd,
+            ));
         }
     } else {
         #[cfg(not(target_arch = "wasm32"))]
@@ -3403,6 +3751,7 @@ fn run_parallel_islands(
                                 slots_ref,
                                 island_pop,
                                 cfg,
+                                locks,
                                 warm,
                                 seeds_ref[isl_idx],
                             ));
@@ -3432,6 +3781,15 @@ fn run_parallel_islands(
     (positions, scores)
 }
 
+fn apply_locked_result_overrides(res: &mut AssignResult, k_len: usize, locks: &[(usize, usize)]) {
+    for &(s_lock, k_lock) in locks {
+        if s_lock < res.position.len() && k_lock < k_len {
+            res.position[s_lock] = k_lock as i32;
+            res.confidence[s_lock] = 1.0;
+        }
+    }
+}
+
 /// Run the two-pass hybrid evolutionary fragment-crossover + local simulated annealing +
 /// 2-layer sequence-graph self-consistency solver on pre-built `SpinSystem`s.
 pub fn assign_evo_graph(
@@ -3456,7 +3814,11 @@ pub fn assign_evo_graph_with_report(
         kept_hsqc_indices: (0..systems.len()).collect(),
         ..Default::default()
     };
-    let mut result = assign_evo_graph_core(systems, sequence, priors, cfg, &mut report);
+    let norm_seq = normalize_sequence(sequence);
+    let raw_locks = merged_config_locks(cfg);
+    let valid_locks = resolve_locked_assignments(systems.len(), &norm_seq, &raw_locks);
+    let mut result =
+        assign_evo_graph_core(systems, sequence, priors, cfg, &valid_locks, &mut report);
     let mut qc = evaluate_dataset_qc(
         None,
         systems,
@@ -3470,6 +3832,7 @@ pub fn assign_evo_graph_with_report(
         apply_dataset_qc_to_assignments(&mut result, &qc);
         qc.already_applied = true;
     }
+    apply_locked_result_overrides(&mut result, norm_seq.len(), &valid_locks);
     report.qc_report = qc;
     (result, report)
 }
@@ -3479,6 +3842,7 @@ fn assign_evo_graph_core(
     sequence: &[String],
     priors: &Priors,
     cfg: &EvoGraphConfig<'_>,
+    locks: &[(usize, usize)],
     report: &mut EvoGraphReport,
 ) -> AssignResult {
     let norm_seq = normalize_sequence(sequence);
@@ -3515,13 +3879,15 @@ fn assign_evo_graph_core(
         &priors_pass1,
         cfg,
         effective_assign_cost,
+        locks,
     );
     let p = pair_matrix(systems, &cfg.score_cfg);
 
     let mut master_rng = Rng::new(cfg.seed);
-    let (pos1, scores1) = run_parallel_islands(&u1, &p, &u1, cfg, None, &mut master_rng);
+    let (pos1, scores1) = run_parallel_islands(&u1, &p, &u1, cfg, locks, None, &mut master_rng);
     let mut res1 = consensus_from_runs(&pos1, scores1);
     calibrate_boltzmann_confidence(&mut res1, &u1, &p);
+    apply_locked_result_overrides(&mut res1, norm_seq.len(), locks);
     report.pass1_best_score = res1.score;
 
     // Pass 2: High-consensus anchor reference offset refinement + 2-layer graph self-consistency
@@ -3548,6 +3914,7 @@ fn assign_evo_graph_core(
         &priors_pass2,
         cfg,
         effective_assign_cost,
+        locks,
     );
     let mut u2_guided = u2_phys.clone();
 
@@ -3562,6 +3929,7 @@ fn assign_evo_graph_core(
             &priors_pass2,
             &final_offsets,
             &res1,
+            locks,
         );
         report.graph_anchored_count = n_anc;
         report.graph_pruned_count = n_prn;
@@ -3583,11 +3951,13 @@ fn assign_evo_graph_core(
         &p,
         &u2_phys,
         cfg,
+        locks,
         Some(&warm_pos2),
         &mut master_rng,
     );
     let mut res2 = consensus_from_runs(&pos2, scores2);
     calibrate_final_marginal_confidence(&mut res2, &u2_phys, &p);
+    apply_locked_result_overrides(&mut res2, norm_seq.len(), locks);
     report.final_best_score = res2.score;
     res2
 }
@@ -3604,7 +3974,32 @@ pub fn assign_evo_graph_from_peaks(
     let mut report = EvoGraphReport::default();
     let filtered = filter_peaks_with_report(peaks, sequence, cfg, &mut report);
     let systems = build_stoichiometric_spin_systems(&filtered, &cfg.tolerances, cfg.max_cands);
-    let mut result = assign_evo_graph_core(&systems, sequence, priors, cfg, &mut report);
+    let norm_seq = normalize_sequence(sequence);
+    let raw_locks = merged_config_locks(cfg);
+    let remapped_locks: Vec<(usize, usize)> = if raw_locks.is_empty() {
+        Vec::new()
+    } else {
+        let valid_raw = resolve_locked_assignments(report.raw_hsqc_count, &norm_seq, &raw_locks);
+        let mapped: Vec<(usize, usize)> = valid_raw
+            .into_iter()
+            .filter_map(|(raw_s, k)| {
+                report
+                    .kept_hsqc_indices
+                    .iter()
+                    .position(|&orig| orig == raw_s)
+                    .map(|filt_s| (filt_s, k))
+            })
+            .collect();
+        resolve_locked_assignments(systems.len(), &norm_seq, &mapped)
+    };
+    let mut result = assign_evo_graph_core(
+        &systems,
+        sequence,
+        priors,
+        cfg,
+        &remapped_locks,
+        &mut report,
+    );
     let mut qc = evaluate_dataset_qc(
         Some(peaks),
         &systems,
@@ -3618,6 +4013,7 @@ pub fn assign_evo_graph_from_peaks(
         apply_dataset_qc_to_assignments(&mut result, &qc);
         qc.already_applied = true;
     }
+    apply_locked_result_overrides(&mut result, norm_seq.len(), &remapped_locks);
     report.qc_report = qc;
     (systems, result, report)
 }

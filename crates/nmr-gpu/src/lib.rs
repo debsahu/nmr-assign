@@ -15,8 +15,8 @@ use bytemuck::{Pod, Zeroable};
 use nmr_core::priors::{delta_covalent, Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
 use nmr_core::solver::{
-    consensus_from_runs, prepare_scoring_priors, AnnealConfig, AssignResult, Matrix2D, ScoreConfig,
-    FORBID,
+    apply_locked_assignments_to_unary, consensus_from_runs, prepare_scoring_priors,
+    resolve_locked_assignments, AnnealConfig, AssignResult, Matrix2D, ScoreConfig, FORBID,
 };
 use nmr_core::spinsystems::SpinSystem;
 use wgpu::util::DeviceExt;
@@ -636,18 +636,21 @@ impl GpuEngine {
         let u_f32: Vec<f32> = self.read_buffer_vec(&b_out_u, u_bytes)?;
         let p_f32: Vec<f32> = self.read_buffer_vec(&b_out_p, p_bytes)?;
 
-        Ok((
-            Matrix2D {
-                rows: s_len,
-                cols: k_len,
-                data: u_f32.into_iter().map(|v| v as f64).collect(),
-            },
-            Matrix2D {
-                rows: s_len,
-                cols: s_len,
-                data: p_f32.into_iter().map(|v| v as f64).collect(),
-            },
-        ))
+        let mut u_mat = Matrix2D {
+            rows: s_len,
+            cols: k_len,
+            data: u_f32.into_iter().map(|v| v as f64).collect(),
+        };
+        if !cfg.locked_assignments.is_empty() {
+            apply_locked_assignments_to_unary(&mut u_mat, systems, sequence, &eff_priors, cfg);
+        }
+        let p_mat = Matrix2D {
+            rows: s_len,
+            cols: s_len,
+            data: p_f32.into_iter().map(|v| v as f64).collect(),
+        };
+
+        Ok((u_mat, p_mat))
     }
 
     /// Run multi-replica Simulated Annealing on the GPU across `cfg.runs` parallel replicas.
@@ -660,7 +663,9 @@ impl GpuEngine {
         cfg: &AnnealConfig,
     ) -> Result<AssignResult, String> {
         let (u, p) = self.score_matrices_gpu(systems, sequence, priors, score_cfg)?;
-        self.anneal_from_matrices_gpu(&u, &p, cfg)
+        let locks =
+            resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
+        self.anneal_from_matrices_with_locks_gpu(&u, &p, cfg, &locks)
     }
 
     /// Run GPU simulated annealing directly from precomputed `(U, P)` matrices.
@@ -676,6 +681,18 @@ impl GpuEngine {
         u: &Matrix2D,
         p: &Matrix2D,
         cfg: &AnnealConfig,
+    ) -> Result<AssignResult, String> {
+        self.anneal_from_matrices_with_locks_gpu(u, p, cfg, &[])
+    }
+
+    /// Run GPU simulated annealing from precomputed `(U, P)` matrices while pinning any
+    /// user-locked `(spin_system_idx, seq_idx)` pairs across all replicas.
+    pub fn anneal_from_matrices_with_locks_gpu(
+        &self,
+        u: &Matrix2D,
+        p: &Matrix2D,
+        cfg: &AnnealConfig,
+        locks: &[(usize, usize)],
     ) -> Result<AssignResult, String> {
         let s_len = u.rows;
         let k_len = u.cols;
@@ -737,8 +754,36 @@ impl GpuEngine {
         let max_reps_by_bind = (max_bind / per_rep_max_bytes) as usize;
         let max_batch_replicas = max_reps_by_wg.min(max_reps_by_bind).min(replicas).max(1);
 
-        let u_f32: Vec<f32> = u.data.iter().map(|&v| v as f32).collect();
+        let mut u_f32: Vec<f32> = u.data.iter().map(|&v| v as f32).collect();
         let p_f32: Vec<f32> = p.data.iter().map(|&v| v as f32).collect();
+        const LOCK_PIN_OFFSET_F32: f32 = 8000.0;
+        let mut init_single_at = vec![-1i32; k_len];
+        let mut init_single_pos = vec![-1i32; s_len];
+        for &(s_lock, k_lock) in locks {
+            if s_lock < s_len && k_lock < k_len {
+                u_f32[s_lock * k_len + k_lock] += LOCK_PIN_OFFSET_F32;
+                init_single_at[k_lock] = s_lock as i32;
+                init_single_pos[s_lock] = k_lock as i32;
+            }
+        }
+        let init_rep_score_f32 = if locks.is_empty() {
+            0.0f32
+        } else {
+            let mut sc = 0.0f32;
+            for (k, &s) in init_single_at.iter().enumerate() {
+                if s >= 0 {
+                    sc += u_f32[(s as usize) * k_len + k];
+                }
+            }
+            for e in 0..k_len.saturating_sub(1) {
+                let a = init_single_at[e];
+                let b = init_single_at[e + 1];
+                if a >= 0 && b >= 0 {
+                    sc += p_f32[(a as usize) * s_len + (b as usize)];
+                }
+            }
+            sc
+        };
 
         let mut seeder = Rng::new(cfg.seed);
         let mut rng_init_all = Vec::with_capacity(replicas);
@@ -801,9 +846,17 @@ impl GpuEngine {
             let batch_reps = (replicas - rep_offset).min(max_batch_replicas);
             let at_bytes = 2 * (batch_reps as u64) * (k_len as u64) * 4;
             // [0 .. batch_reps*k_len) = current `at`, [batch_reps*k_len .. 2*batch_reps*k_len) = `best_at`
-            let init_at_both = vec![-1i32; 2 * batch_reps * k_len];
-            let init_pos = vec![-1i32; batch_reps * s_len];
-            let init_scores = vec![[0.0f32, 0.0f32]; batch_reps];
+            let mut init_at_both = vec![-1i32; 2 * batch_reps * k_len];
+            let mut init_pos = vec![-1i32; batch_reps * s_len];
+            let init_scores = vec![[init_rep_score_f32, init_rep_score_f32]; batch_reps];
+            if !locks.is_empty() {
+                for r in 0..batch_reps {
+                    init_at_both[r * k_len..(r + 1) * k_len].copy_from_slice(&init_single_at);
+                    init_at_both[(batch_reps + r) * k_len..(batch_reps + r + 1) * k_len]
+                        .copy_from_slice(&init_single_at);
+                    init_pos[r * s_len..(r + 1) * s_len].copy_from_slice(&init_single_pos);
+                }
+            }
             let rng_slice = &rng_init_all[rep_offset..rep_offset + batch_reps];
 
             let b_at = mk_buf("anneal-at-both", bytemuck::cast_slice(&init_at_both), rw);
@@ -917,6 +970,104 @@ impl GpuEngine {
             rep_offset += batch_reps;
         }
 
-        Ok(consensus_from_runs(&positions, exact_scores))
+        let mut result = consensus_from_runs(&positions, exact_scores);
+        for &(s_lock, k_lock) in locks {
+            if s_lock < result.position.len() && k_lock < k_len {
+                result.position[s_lock] = k_lock as i32;
+                result.confidence[s_lock] = 1.0;
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod curation_gpu_tests {
+    use super::*;
+    use nmr_core::solver::{pair_matrix, unary_matrix};
+
+    #[test]
+    fn gpu_locked_assignments_unary_parity_and_pinning() {
+        let Ok(engine) = GpuEngine::new_headless() else {
+            return;
+        };
+        let sequence: Vec<String> = ["MET", "GLN", "ILE", "PHE", "PRO", "ALA", "GLY"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let priors = Priors::bmrb();
+
+        let mut systems = Vec::new();
+        for &(h, n, ca0, cb0, cam1) in &[
+            (8.42, 120.5, 56.2, Some(29.1), 55.8),
+            (8.25, 121.8, 60.9, Some(38.4), 56.2),
+            (8.51, 119.3, 57.6, Some(39.5), 60.9),
+            (8.05, 123.1, 52.4, Some(19.1), 62.8),
+            (8.33, 109.4, 45.1, None, 52.4),
+        ] {
+            let mut ss = SpinSystem::new(h, n);
+            ss.cands.insert(("CA".to_string(), 0), vec![(ca0, 2)]);
+            ss.cands.insert(("CA".to_string(), -1), vec![(cam1, 2)]);
+            if let Some(cb) = cb0 {
+                ss.cands.insert(("CB".to_string(), 0), vec![(cb, 2)]);
+            }
+            systems.push(ss);
+        }
+
+        // 1. Unlocked matrices must match CPU within float32 tolerance (< 1e-4)
+        let cfg_free = ScoreConfig::default();
+        let u_cpu_free = unary_matrix(&systems, &sequence, &priors, &cfg_free);
+        let p_cpu_free = pair_matrix(&systems, &cfg_free);
+        let (u_gpu_free, p_gpu_free) = engine
+            .score_matrices_gpu(&systems, &sequence, &priors, &cfg_free)
+            .unwrap();
+        for (&a, &b) in u_cpu_free.data.iter().zip(&u_gpu_free.data) {
+            assert!((a - b).abs() < 1e-4, "free U diff: {a} vs {b}");
+        }
+        for (&a, &b) in p_cpu_free.data.iter().zip(&p_gpu_free.data) {
+            assert!((a - b).abs() < 1e-4, "free P diff: {a} vs {b}");
+        }
+
+        // 2. Deliberately lock s=0 onto non-optimal assignable slot k=5 ("ALA") and s=4 onto k=6 ("GLY")
+        let cfg_locked = ScoreConfig {
+            locked_assignments: vec![(0, 5), (4, 6), (1, 4)], // (1, 4) is PRO -> ignored on both CPU & GPU
+            ..ScoreConfig::default()
+        };
+        let u_cpu_lock = unary_matrix(&systems, &sequence, &priors, &cfg_locked);
+        let (u_gpu_lock, _) = engine
+            .score_matrices_gpu(&systems, &sequence, &priors, &cfg_locked)
+            .unwrap();
+
+        for (idx, (&a, &b)) in u_cpu_lock.data.iter().zip(&u_gpu_lock.data).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "locked U CPU/GPU parity violation at flat idx {idx}: cpu={a} gpu={b}"
+            );
+        }
+        for k in 0..sequence.len() {
+            if k != 5 {
+                assert_eq!(u_gpu_lock.get(0, k), FORBID);
+            }
+        }
+        for s in 0..systems.len() {
+            if s != 0 {
+                assert_eq!(u_gpu_lock.get(s, 5), FORBID);
+            }
+        }
+
+        // 3. GPU multi-replica annealing must honor all valid locks with confidence == 1.0
+        let anneal_cfg = AnnealConfig {
+            runs: 16,
+            steps_per_system: 1500,
+            seed: 42,
+            ..AnnealConfig::default()
+        };
+        let res_gpu = engine
+            .assign_gpu(&systems, &sequence, &priors, &cfg_locked, &anneal_cfg)
+            .unwrap();
+        assert_eq!(res_gpu.position[0], 5);
+        assert_eq!(res_gpu.confidence[0], 1.0);
+        assert_eq!(res_gpu.position[4], 6);
+        assert_eq!(res_gpu.confidence[4], 1.0);
     }
 }
