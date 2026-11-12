@@ -3,7 +3,7 @@
 //! structure folding, CCPN NEF v1.1 interchange, HTML quality reporting, self-hosted HTTP service,
 //! and Octet-Draw 2D chemical structure / IUPAC / 1D NMR analytics.
 //!
-//! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/08-service.md`
+//! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/11-fid-processing.md`
 //! and Octet-Draw CLI workflows.
 
 use std::collections::BTreeMap;
@@ -16,6 +16,7 @@ use std::time::Instant;
 use nmr_core::dihedrals::{predict_dihedrals, validate_dihedrals_against_torsions};
 use nmr_core::evaluate::{compare_shifts, score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
+use nmr_core::fid::{read_fid_2d, read_fid_3d, read_fid_auto, Fid2D, Fid3D, RawFid};
 use nmr_core::nef::{read_nef_file, write_nef_file, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
@@ -44,8 +45,9 @@ use nmr_core::octet_render::{
     render_scene_pdf, render_scene_png, render_scene_svg, DocumentStyle, JournalStyle, RenderScene,
 };
 use nmr_core::peaks::{read_peaks, write_peaks, Peak, EXPERIMENT_NAMES};
-use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
+use nmr_core::picker::{pick_c13_hsqc_2d, pick_hsqc_2d, pick_triple_3d, PickerConfig};
 use nmr_core::priors::{compute_priors, one_to_three, Priors, ShiftOffsets};
+use nmr_core::process::{process_fid_2d_mut, process_fid_3d_mut, ProcessingRecipe};
 use nmr_core::report::{
     predict_csi_dihedrals, write_quality_report_html, ReportInput, StructureReportSummary,
 };
@@ -58,7 +60,8 @@ use nmr_core::simulate::{render_hsqc_2d, simulate, SimConfig, SpectrumRenderConf
 use nmr_core::solver::{assign, prepare_scoring_priors, AnnealConfig, AssignResult, ScoreConfig};
 use nmr_core::spectrum::{
     is_ucsf_file, read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d,
-    read_ucsf_2d, read_ucsf_3d, write_bruker_pdata_2d, write_nmrpipe_2d, Spectrum2D, Spectrum3D,
+    read_ucsf_2d, read_ucsf_3d, write_bruker_pdata_2d, write_bruker_pdata_3d, write_nmrpipe_2d,
+    write_nmrpipe_3d, write_ucsf_2d, write_ucsf_3d, Spectrum2D, Spectrum3D,
 };
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 use nmr_core::structure::{
@@ -68,19 +71,22 @@ use nmr_core::topology::SidechainPriors;
 use nmr_gpu::neural_gpu::{GpuNeuralPicker, GpuNeuralPickerConfig, PRETRAINED_WEIGHTS_3D_GPU};
 use nmr_gpu::GpuEngine;
 
+pub mod fetch_bmrb;
+pub mod real_benchmark;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EngineKind {
+pub enum EngineKind {
     Gpu,
     Cpu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SolverKind {
+pub enum SolverKind {
     Standard,
     EvoGraph,
 }
 
-fn version_string() -> String {
+pub(crate) fn version_string() -> String {
     format!(
         "nmrassign {} ({})",
         nmr_core::VERSION,
@@ -95,18 +101,21 @@ fn usage() -> String {
        nmrassign --version | -V | version\n\
        nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
        nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
+       nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--solver standard|evo-graph] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
+       nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
+       nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
        nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
-       nmrassign pick            --hsqc <path> [--triple EXP=path ...] --out <peaks.tsv> [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
+       nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
        nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--recipe <json>] [--no-crop] [--lp] [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
@@ -135,7 +144,7 @@ fn run_solver(
     }
 }
 
-fn parse_engine(val: &str) -> Result<EngineKind, String> {
+pub(crate) fn parse_engine(val: &str) -> Result<EngineKind, String> {
     match val.to_ascii_lowercase().as_str() {
         "gpu" | "wgpu" | "webgpu" => Ok(EngineKind::Gpu),
         "cpu" => Ok(EngineKind::Cpu),
@@ -143,7 +152,7 @@ fn parse_engine(val: &str) -> Result<EngineKind, String> {
     }
 }
 
-fn parse_solver(val: &str) -> Result<SolverKind, String> {
+pub(crate) fn parse_solver(val: &str) -> Result<SolverKind, String> {
     match val.to_ascii_lowercase().as_str() {
         "standard" => Ok(SolverKind::Standard),
         "evo-graph" | "evograph" | "evo_graph" => Ok(SolverKind::EvoGraph),
@@ -153,7 +162,7 @@ fn parse_solver(val: &str) -> Result<SolverKind, String> {
     }
 }
 
-fn resolve_solver_engine(
+pub(crate) fn resolve_solver_engine(
     solver: SolverKind,
     engine_opt: Option<EngineKind>,
 ) -> Result<EngineKind, String> {
@@ -168,19 +177,19 @@ fn resolve_solver_engine(
     }
 }
 
-struct SolverWorkflowOutput {
-    systems: Vec<SpinSystem>,
-    kept_hsqc_indices: Option<Vec<usize>>,
-    result: AssignResult,
-    effective_priors: Priors,
-    offsets: ShiftOffsets,
-    engine_label: String,
-    replicas: usize,
-    steps_per_system: usize,
+pub(crate) struct SolverWorkflowOutput {
+    pub(crate) systems: Vec<SpinSystem>,
+    pub(crate) kept_hsqc_indices: Option<Vec<usize>>,
+    pub(crate) result: AssignResult,
+    pub(crate) effective_priors: Priors,
+    pub(crate) offsets: ShiftOffsets,
+    pub(crate) engine_label: String,
+    pub(crate) replicas: usize,
+    pub(crate) steps_per_system: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_assignment_workflow(
+pub(crate) fn execute_assignment_workflow(
     solver: SolverKind,
     engine_opt: Option<EngineKind>,
     peaks: &[Peak],
@@ -280,7 +289,7 @@ fn log_nonzero_offsets(solver_label: &str, offsets: &ShiftOffsets, verbose: bool
     }
 }
 
-fn load_priors(path: Option<&str>) -> Result<Priors, String> {
+pub(crate) fn load_priors(path: Option<&str>) -> Result<Priors, String> {
     match path {
         Some(p) => Priors::from_json(p),
         None => Ok(Priors::provisional()),
@@ -708,7 +717,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 i += 1;
                 peaks_path = args.get(i).cloned();
             }
-            "--seq" => {
+            "--seq" | "--sequence" => {
                 i += 1;
                 seq_arg = args.get(i).cloned();
             }
@@ -716,7 +725,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 i += 1;
                 star_arg = args.get(i).cloned();
             }
-            "--out" => {
+            "--out" | "-o" => {
                 i += 1;
                 out_arg = args.get(i).cloned();
             }
@@ -891,26 +900,276 @@ fn load_3d_auto(path: &Path, exp: &str) -> Result<Spectrum3D, String> {
     }
 }
 
-fn pick_spectra_bundle(
-    hsqc_path: &Path,
-    triples: &[(String, PathBuf)],
+#[derive(Clone, Debug, Default)]
+struct FidCliOpts {
+    recipe_path: Option<PathBuf>,
+    crop_h: Option<[f64; 2]>,
+    no_crop: bool,
+    lp: bool,
+}
+
+fn parse_crop_h_arg(raw: &str) -> Result<[f64; 2], String> {
+    let (a, b) = raw
+        .split_once([':', ','])
+        .ok_or_else(|| format!("expected min:max for --crop-h (e.g. 5.5:11.5), got {raw:?}"))?;
+    let v0: f64 = a
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid --crop-h bound {a:?}: {e}"))?;
+    let v1: f64 = b
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid --crop-h bound {b:?}: {e}"))?;
+    Ok([v0.min(v1), v0.max(v1)])
+}
+
+fn build_recipe_for_fid_2d(fid: &Fid2D, opts: &FidCliOpts) -> Result<ProcessingRecipe, String> {
+    let mut recipe = match &opts.recipe_path {
+        Some(rp) => ProcessingRecipe::read_json(rp)?,
+        None => ProcessingRecipe::from_fid_2d(fid),
+    };
+    if let Some(bounds) = opts.crop_h {
+        recipe = recipe.with_crop_h(Some(bounds));
+    }
+    if opts.no_crop {
+        recipe.set_no_crop();
+    }
+    if opts.lp {
+        recipe.set_linear_prediction(true);
+    }
+    Ok(recipe)
+}
+
+fn build_recipe_for_fid_3d(fid: &Fid3D, opts: &FidCliOpts) -> Result<ProcessingRecipe, String> {
+    let mut recipe = match &opts.recipe_path {
+        Some(rp) => ProcessingRecipe::read_json(rp)?,
+        None => ProcessingRecipe::from_fid_3d(fid),
+    };
+    if let Some(bounds) = opts.crop_h {
+        recipe = recipe.with_crop_h(Some(bounds));
+    }
+    if opts.no_crop {
+        recipe.set_no_crop();
+    }
+    if opts.lp {
+        recipe.set_linear_prediction(true);
+    }
+    Ok(recipe)
+}
+
+fn process_fid_2d_with_opts(
+    dir: &Path,
+    opts: &FidCliOpts,
+) -> Result<(Spectrum2D, ProcessingRecipe), String> {
+    let fid = read_fid_2d(dir)?;
+    let mut recipe = build_recipe_for_fid_2d(&fid, opts)?;
+    let spec = process_fid_2d_mut(&fid, &mut recipe)?;
+    Ok((spec, recipe))
+}
+
+fn process_fid_3d_with_opts(
+    dir: &Path,
+    exp: &str,
+    opts: &FidCliOpts,
+) -> Result<(Spectrum3D, ProcessingRecipe), String> {
+    let fid = read_fid_3d(dir)?;
+    let mut recipe = build_recipe_for_fid_3d(&fid, opts)?;
+    let spec = process_fid_3d_mut(&fid, exp, &mut recipe)?;
+    Ok((spec, recipe))
+}
+
+fn recipe_sidecar_for_file(out_file: &Path) -> PathBuf {
+    match out_file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join("processing_recipe.json"),
+        _ => PathBuf::from("processing_recipe.json"),
+    }
+}
+
+fn cmd_process(args: &[String]) -> Result<(), String> {
+    let mut in_dir: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut exp_arg: Option<String> = None;
+    let mut opts = FidCliOpts::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--in" | "-i" => {
+                i += 1;
+                in_dir = args.get(i).map(PathBuf::from);
+            }
+            "--out" | "-o" => {
+                i += 1;
+                out_path = args.get(i).map(PathBuf::from);
+            }
+            "--exp" => {
+                i += 1;
+                exp_arg = Some(
+                    args.get(i)
+                        .ok_or("missing value for --exp")?
+                        .trim()
+                        .to_ascii_uppercase()
+                        .replace(['(', ')'], ""),
+                );
+            }
+            "--recipe" => {
+                i += 1;
+                opts.recipe_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --recipe")?,
+                ));
+            }
+            "--crop-h" => {
+                i += 1;
+                opts.crop_h = Some(parse_crop_h_arg(
+                    args.get(i).ok_or("missing value for --crop-h")?,
+                )?);
+            }
+            "--no-crop" => opts.no_crop = true,
+            "--lp" => opts.lp = true,
+            other => return Err(format!("unknown process flag {other:?}")),
+        }
+        i += 1;
+    }
+
+    let in_p = in_dir.ok_or("process requires --in <fid_dir>")?;
+    let out_p = out_path.ok_or("process requires --out <out_path_or_dir>")?;
+    let ext_low = out_p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let t0 = Instant::now();
+    match read_fid_auto(&in_p)? {
+        RawFid::Dim2(fid2) => {
+            let mut recipe = build_recipe_for_fid_2d(&fid2, &opts)?;
+            let spec = process_fid_2d_mut(&fid2, &mut recipe)?;
+            let dt = t0.elapsed().as_secs_f64();
+            let recipe_out = match ext_low.as_str() {
+                "ft2" | "pipe" => {
+                    if let Some(parent) = out_p.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                        }
+                    }
+                    write_nmrpipe_2d(&out_p, &spec)?;
+                    recipe_sidecar_for_file(&out_p)
+                }
+                "ucsf" => {
+                    if let Some(parent) = out_p.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                        }
+                    }
+                    write_ucsf_2d(&out_p, &spec)?;
+                    recipe_sidecar_for_file(&out_p)
+                }
+                "ft3" => {
+                    return Err(format!(
+                        "input FID {} is 2D, cannot write 3D .ft3 output {}",
+                        in_p.display(),
+                        out_p.display()
+                    ));
+                }
+                _ => {
+                    write_bruker_pdata_2d(&out_p, &spec)?;
+                    out_p.join("processing_recipe.json")
+                }
+            };
+            recipe.write_json(&recipe_out)?;
+            println!(
+                "Processed 2D FID ({:?}{}) -> {} [{}x{}, {:.2}s] (recipe: {})",
+                fid2.vendor,
+                if fid2.nus_mask.is_some() { ", NUS" } else { "" },
+                out_p.display(),
+                spec.nx(),
+                spec.ny(),
+                dt,
+                recipe_out.display()
+            );
+            Ok(())
+        }
+        RawFid::Dim3(fid3) => {
+            let exp = exp_arg
+                .or_else(|| real_benchmark::infer_single_fid_experiment(&in_p))
+                .unwrap_or_else(|| "HNCA".to_string());
+            let mut recipe = build_recipe_for_fid_3d(&fid3, &opts)?;
+            let spec = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
+            let dt = t0.elapsed().as_secs_f64();
+            let recipe_out = match ext_low.as_str() {
+                "ft3" | "pipe" => {
+                    if let Some(parent) = out_p.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                        }
+                    }
+                    write_nmrpipe_3d(&out_p, &spec)?;
+                    recipe_sidecar_for_file(&out_p)
+                }
+                "ucsf" => {
+                    if let Some(parent) = out_p.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                        }
+                    }
+                    write_ucsf_3d(&out_p, &spec)?;
+                    recipe_sidecar_for_file(&out_p)
+                }
+                "ft2" => {
+                    return Err(format!(
+                        "input FID {} is 3D, cannot write 2D .ft2 output {}",
+                        in_p.display(),
+                        out_p.display()
+                    ));
+                }
+                _ => {
+                    write_bruker_pdata_3d(&out_p, &spec)?;
+                    out_p.join("processing_recipe.json")
+                }
+            };
+            recipe.write_json(&recipe_out)?;
+            println!(
+                "Processed 3D {} FID ({:?}{}) -> {} [{}x{}x{}, {:.2}s] (recipe: {})",
+                exp,
+                fid3.vendor,
+                if fid3.nus_mask.is_some() { ", NUS" } else { "" },
+                out_p.display(),
+                spec.nx(),
+                spec.ny(),
+                spec.nz(),
+                dt,
+                recipe_out.display()
+            );
+            Ok(())
+        }
+        RawFid::Dim1(_) => Err(format!(
+            "input {} is a 1D FID; nmrassign process expects a 2D or 3D FID directory",
+            in_p.display()
+        )),
+    }
+}
+
+fn pick_in_memory_spectra(
+    hsqc_spec: Option<&Spectrum2D>,
+    triples: &[(String, Spectrum3D)],
     method: &str,
     engine: EngineKind,
     snr: f32,
     prob: f32,
 ) -> Result<(Vec<Peak>, Vec<Peak>, String), String> {
-    let hsqc_spec = load_2d_auto(hsqc_path)?;
     match method {
         "classical" => {
             let cfg = PickerConfig {
                 snr_threshold: snr,
                 ..PickerConfig::default()
             };
-            let r = pick_hsqc_2d(&hsqc_spec, &cfg);
+            let r = match hsqc_spec {
+                Some(s2) => pick_hsqc_2d(s2, &cfg),
+                None => Vec::new(),
+            };
             let mut all = r.clone();
-            for (exp, path) in triples {
-                let s3 = load_3d_auto(path, exp)?;
-                all.extend(pick_triple_3d(&s3, &r, &cfg));
+            for (_exp, s3) in triples {
+                all.extend(pick_triple_3d(s3, &r, &cfg));
             }
             Ok((r, all, "classical".to_string()))
         }
@@ -920,7 +1179,10 @@ fn pick_spectra_bundle(
                 prob_threshold: prob,
                 ..NeuralPickerConfig::default()
             };
-            let r = model.pick_2d(&hsqc_spec, &ncfg);
+            let r = match hsqc_spec {
+                Some(s2) => model.pick_2d(s2, &ncfg),
+                None => Vec::new(),
+            };
             let mut all = r.clone();
             match engine {
                 EngineKind::Gpu => {
@@ -929,9 +1191,8 @@ fn pick_spectra_bundle(
                         prob_threshold: prob,
                         ..GpuNeuralPickerConfig::default()
                     };
-                    for (exp, path) in triples {
-                        let s3 = load_3d_auto(path, exp)?;
-                        all.extend(gpu_picker.pick_triple_3d_gpu(&s3, exp, &r, &gcfg)?);
+                    for (exp, s3) in triples {
+                        all.extend(gpu_picker.pick_triple_3d_gpu(s3, exp, &r, &gcfg)?);
                     }
                     Ok((
                         r,
@@ -948,9 +1209,8 @@ fn pick_spectra_bundle(
                         hsqc_roots: r.clone(),
                         ..NeuralPickerConfig::default()
                     };
-                    for (exp, path) in triples {
-                        let s3 = load_3d_auto(path, exp)?;
-                        all.extend(model.pick_3d(&s3, exp, &cfg_3d));
+                    for (exp, s3) in triples {
+                        all.extend(model.pick_3d(s3, exp, &cfg_3d));
                     }
                     Ok((r, all, "neural (CPU)".to_string()))
                 }
@@ -962,9 +1222,111 @@ fn pick_spectra_bundle(
     }
 }
 
+fn pick_spectra_bundle(
+    hsqc_path: &Path,
+    triples: &[(String, PathBuf)],
+    method: &str,
+    engine: EngineKind,
+    snr: f32,
+    prob: f32,
+) -> Result<(Vec<Peak>, Vec<Peak>, String), String> {
+    let hsqc_spec = load_2d_auto(hsqc_path)?;
+    let mut loaded_triples = Vec::with_capacity(triples.len());
+    for (exp, path) in triples {
+        loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
+    }
+    pick_in_memory_spectra(Some(&hsqc_spec), &loaded_triples, method, engine, snr, prob)
+}
+
+fn indent_json_block(json: &str, prefix: &str) -> String {
+    let mut out = String::new();
+    for (idx, line) in json.lines().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+            out.push_str(prefix);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_and_pick_fid_bundle(
+    fid_hsqc: &Path,
+    fid_triples: &[(String, PathBuf)],
+    proc_triples: &[(String, PathBuf)],
+    fid_opts: &FidCliOpts,
+    method: &str,
+    engine: EngineKind,
+    snr: f32,
+    prob: f32,
+) -> Result<(Vec<Peak>, Vec<Peak>, String, String), String> {
+    let (hsqc_spec, hsqc_recipe) = process_fid_2d_with_opts(fid_hsqc, fid_opts)?;
+    let mut loaded_triples = Vec::with_capacity(fid_triples.len() + proc_triples.len());
+    let mut triple_recipe_entries: Vec<(String, String)> = Vec::new();
+
+    for (exp, dir) in fid_triples {
+        let (s3, r3) = process_fid_3d_with_opts(dir, exp, fid_opts)?;
+        triple_recipe_entries.push((exp.clone(), r3.to_json_pretty()?));
+        loaded_triples.push((exp.clone(), s3));
+    }
+    for (exp, path) in proc_triples {
+        loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
+    }
+
+    let (roots, all_peaks, label) =
+        pick_in_memory_spectra(Some(&hsqc_spec), &loaded_triples, method, engine, snr, prob)?;
+    let hsqc_json = hsqc_recipe.to_json_pretty()?;
+    let bundle_recipe_json = if triple_recipe_entries.is_empty() {
+        hsqc_json
+    } else {
+        let mut s = String::from("{\n  \"hsqc\": ");
+        s.push_str(&indent_json_block(&hsqc_json, "  "));
+        s.push_str(",\n  \"triples\": {\n");
+        for (idx, (exp, rjson)) in triple_recipe_entries.iter().enumerate() {
+            if idx > 0 {
+                s.push_str(",\n");
+            }
+            s.push_str("    \"");
+            s.push_str(&exp.replace('\\', "\\\\").replace('"', "\\\""));
+            s.push_str("\": ");
+            s.push_str(&indent_json_block(rjson, "    "));
+        }
+        s.push_str("\n  }\n}");
+        s
+    };
+    Ok((roots, all_peaks, label, bundle_recipe_json))
+}
+
+fn discover_fid_bundle_dirs(
+    bundle_dir: &Path,
+) -> Result<(PathBuf, Vec<(String, PathBuf)>), String> {
+    let (discovered, _) = real_benchmark::discover_entry_experiments(bundle_dir, None)?;
+    let hsqc = discovered
+        .iter()
+        .find(|d| d.exp_type == "HSQC")
+        .ok_or_else(|| {
+            format!(
+                "no raw 2D 15N-HSQC FID experiment discovered inside {}",
+                bundle_dir.display()
+            )
+        })?;
+    let triples: Vec<(String, PathBuf)> = discovered
+        .iter()
+        .filter(|d| d.exp_type != "HSQC")
+        .map(|d| (d.exp_type.clone(), d.dir.clone()))
+        .collect();
+    Ok((hsqc.dir.clone(), triples))
+}
+
 fn cmd_pick(args: &[String]) -> Result<(), String> {
     let mut hsqc_path: Option<PathBuf> = None;
     let mut triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut fid_path: Option<PathBuf> = None;
+    let mut fid_hsqc_path: Option<PathBuf> = None;
+    let mut fid_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut exp_arg: Option<String> = None;
+    let mut fid_opts = FidCliOpts::default();
     let mut out_path: Option<PathBuf> = None;
     let mut snr = 5.0f32;
     let mut prob = 0.45f32;
@@ -989,7 +1351,50 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                     PathBuf::from(p),
                 ));
             }
-            "--out" => {
+            "--fid" => {
+                i += 1;
+                fid_path = args.get(i).map(PathBuf::from);
+            }
+            "--fid-hsqc" => {
+                i += 1;
+                fid_hsqc_path = args.get(i).map(PathBuf::from);
+            }
+            "--fid-triple" => {
+                i += 1;
+                let spec = args.get(i).ok_or("missing EXP=dir for --fid-triple")?;
+                let (exp, p) = spec
+                    .split_once('=')
+                    .ok_or("expected EXP=dir format for --fid-triple")?;
+                fid_triples.push((
+                    exp.trim().to_ascii_uppercase().replace(['(', ')'], ""),
+                    PathBuf::from(p),
+                ));
+            }
+            "--exp" => {
+                i += 1;
+                exp_arg = Some(
+                    args.get(i)
+                        .ok_or("missing value for --exp")?
+                        .trim()
+                        .to_ascii_uppercase()
+                        .replace(['(', ')'], ""),
+                );
+            }
+            "--recipe" => {
+                i += 1;
+                fid_opts.recipe_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --recipe")?,
+                ));
+            }
+            "--crop-h" => {
+                i += 1;
+                fid_opts.crop_h = Some(parse_crop_h_arg(
+                    args.get(i).ok_or("missing value for --crop-h")?,
+                )?);
+            }
+            "--no-crop" => fid_opts.no_crop = true,
+            "--lp" => fid_opts.lp = true,
+            "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
             }
@@ -1035,10 +1440,113 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
         );
     }
 
-    let hsqc_p = hsqc_path.ok_or("pick requires --hsqc <pdata_dir_ft2_or_ucsf>")?;
-    let out_p = out_path.ok_or("pick requires --out <peaks.tsv>")?;
-    let (roots, all_peaks, method_label) =
-        pick_spectra_bundle(&hsqc_p, &triples, &method, engine, snr, prob)?;
+    let out_p = out_path.ok_or("pick requires --out <peaks.tsv> (or -o <peaks.tsv>)")?;
+
+    let (roots, all_peaks, method_label) = if let Some(fh) = &fid_hsqc_path {
+        let (r, all, lbl, _) = process_and_pick_fid_bundle(
+            fh,
+            &fid_triples,
+            &triples,
+            &fid_opts,
+            &method,
+            engine,
+            snr,
+            prob,
+        )?;
+        (r, all, lbl)
+    } else if let Some(fp) = &fid_path {
+        match read_fid_auto(fp) {
+            Ok(RawFid::Dim2(fid2)) => {
+                let mut recipe = build_recipe_for_fid_2d(&fid2, &fid_opts)?;
+                let spec2 = process_fid_2d_mut(&fid2, &mut recipe)?;
+                let mut loaded_triples = Vec::new();
+                for (exp, dir) in &fid_triples {
+                    loaded_triples.push((
+                        exp.clone(),
+                        process_fid_3d_with_opts(dir, exp, &fid_opts)?.0,
+                    ));
+                }
+                for (exp, path) in &triples {
+                    loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
+                }
+                if exp_arg.as_deref() == Some("C13HSQC")
+                    && method == "classical"
+                    && loaded_triples.is_empty()
+                {
+                    let pks = pick_c13_hsqc_2d(
+                        &spec2,
+                        &PickerConfig {
+                            snr_threshold: snr,
+                            ..PickerConfig::default()
+                        },
+                    );
+                    (Vec::new(), pks, "classical (C13HSQC)".to_string())
+                } else {
+                    pick_in_memory_spectra(
+                        Some(&spec2),
+                        &loaded_triples,
+                        &method,
+                        engine,
+                        snr,
+                        prob,
+                    )?
+                }
+            }
+            Ok(RawFid::Dim3(fid3)) => {
+                let exp = exp_arg
+                    .or_else(|| real_benchmark::infer_single_fid_experiment(fp))
+                    .unwrap_or_else(|| "HNCA".to_string());
+                let mut recipe = build_recipe_for_fid_3d(&fid3, &fid_opts)?;
+                let spec3 = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
+                let opt_hsqc = if let Some(hp) = &hsqc_path {
+                    Some(load_2d_auto(hp)?)
+                } else {
+                    None
+                };
+                pick_in_memory_spectra(
+                    opt_hsqc.as_ref(),
+                    &[(exp, spec3)],
+                    &method,
+                    engine,
+                    snr,
+                    prob,
+                )?
+            }
+            Ok(RawFid::Dim1(_)) => {
+                return Err(format!(
+                    "input {} is a 1D FID; pick expects a 2D/3D FID directory or multi-experiment bundle",
+                    fp.display()
+                ));
+            }
+            Err(single_err) => {
+                if fp.is_dir() {
+                    match discover_fid_bundle_dirs(fp) {
+                        Ok((disc_hsqc, disc_triples)) => {
+                            let (r, all, lbl, _) = process_and_pick_fid_bundle(
+                                &disc_hsqc,
+                                &disc_triples,
+                                &triples,
+                                &fid_opts,
+                                &method,
+                                engine,
+                                snr,
+                                prob,
+                            )?;
+                            (r, all, lbl)
+                        }
+                        Err(_) => return Err(single_err),
+                    }
+                } else {
+                    return Err(single_err);
+                }
+            }
+        }
+    } else {
+        let hsqc_p = hsqc_path.ok_or(
+            "pick requires --hsqc <pdata_dir_ft2_or_ucsf>, --fid <dir>, or --fid-hsqc <dir>",
+        )?;
+        pick_spectra_bundle(&hsqc_p, &triples, &method, engine, snr, prob)?
+    };
 
     write_peaks(&out_p, &all_peaks)?;
     println!(
@@ -1383,7 +1891,7 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
                 i += 1;
                 peaks_path = args.get(i).map(PathBuf::from);
             }
-            "--out" => {
+            "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
             }
@@ -1754,7 +2262,7 @@ fn cmd_nef_export(args: &[String]) -> Result<(), String> {
                 i += 1;
                 peaks_path = args.get(i).map(PathBuf::from);
             }
-            "--out" => {
+            "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
             }
@@ -1810,7 +2318,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 i += 1;
                 pdb_path = args.get(i).map(PathBuf::from);
             }
-            "--out" => {
+            "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
             }
@@ -1874,6 +2382,10 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut first_seq_id = 1i32;
     let mut hsqc_path: Option<PathBuf> = None;
     let mut triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut fid_bundle_path: Option<PathBuf> = None;
+    let mut fid_hsqc_path: Option<PathBuf> = None;
+    let mut fid_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut fid_opts = FidCliOpts::default();
     let mut peaks_path: Option<PathBuf> = None;
     let mut method = "classical".to_string();
     let mut snr = 5.0f32;
@@ -1903,7 +2415,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 i += 1;
                 nef_path = args.get(i).map(PathBuf::from);
             }
-            "--seq" => {
+            "--seq" | "--sequence" => {
                 i += 1;
                 seq_arg = args.get(i).cloned();
             }
@@ -1930,6 +2442,42 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     PathBuf::from(p),
                 ));
             }
+            "--fid" => {
+                i += 1;
+                fid_bundle_path =
+                    Some(PathBuf::from(args.get(i).ok_or("missing value for --fid")?));
+            }
+            "--fid-hsqc" => {
+                i += 1;
+                fid_hsqc_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --fid-hsqc")?,
+                ));
+            }
+            "--fid-triple" => {
+                i += 1;
+                let spec = args.get(i).ok_or("missing EXP=dir for --fid-triple")?;
+                let (exp, p) = spec
+                    .split_once('=')
+                    .ok_or("expected EXP=dir format for --fid-triple")?;
+                fid_triples.push((
+                    exp.trim().to_ascii_uppercase().replace(['(', ')'], ""),
+                    PathBuf::from(p),
+                ));
+            }
+            "--recipe" => {
+                i += 1;
+                fid_opts.recipe_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --recipe")?,
+                ));
+            }
+            "--crop-h" => {
+                i += 1;
+                fid_opts.crop_h = Some(parse_crop_h_arg(
+                    args.get(i).ok_or("missing value for --crop-h")?,
+                )?);
+            }
+            "--no-crop" => fid_opts.no_crop = true,
+            "--lp" => fid_opts.lp = true,
             "--peaks" => {
                 i += 1;
                 peaks_path = args.get(i).map(PathBuf::from);
@@ -2029,11 +2577,44 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let dir = out_dir.ok_or("pipeline requires --out-dir <dir>")?;
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
 
+    let resolved_fid: Option<(PathBuf, Vec<(String, PathBuf)>)> = if let Some(fhsqc) = fid_hsqc_path
+    {
+        Some((fhsqc, fid_triples))
+    } else if let Some(fbundle) = fid_bundle_path {
+        let (disc_hsqc, mut disc_triples) = discover_fid_bundle_dirs(&fbundle)?;
+        disc_triples.extend(fid_triples);
+        Some((disc_hsqc, disc_triples))
+    } else if !fid_triples.is_empty() {
+        return Err(
+            "pipeline with --fid-triple requires --fid-hsqc <dir> (or --fid <bundle_dir>)"
+                .to_string(),
+        );
+    } else {
+        None
+    };
+
     let t_total = Instant::now();
     let (base_ref, peaks, project_name) = if let Some(np) = &nef_path {
         let doc = read_nef_file(np)?;
         let r = doc.to_reference()?;
-        let pks = if let Some(hp) = &hsqc_path {
+        let pks = if let Some((ref fhsqc, ref ftriples)) = resolved_fid {
+            let (_, all_pks, _, recipe_json) = process_and_pick_fid_bundle(
+                fhsqc,
+                ftriples,
+                &triples,
+                &fid_opts,
+                &method,
+                picker_engine,
+                snr,
+                prob,
+            )?;
+            fs::write(
+                dir.join("processing_recipe.json"),
+                format!("{recipe_json}\n"),
+            )
+            .map_err(|e| format!("failed to write processing_recipe.json: {e}"))?;
+            all_pks
+        } else if let Some(hp) = &hsqc_path {
             pick_spectra_bundle(hp, &triples, &method, picker_engine, snr, prob)?.1
         } else if let Some(pp) = &peaks_path {
             read_peaks(pp)?
@@ -2053,6 +2634,55 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
         };
         (r, pks, name_arg.unwrap_or(doc.project_name))
+    } else if let Some((ref fhsqc, ref ftriples)) = resolved_fid {
+        let (seq, seq_ids, default_name) = if let Some(sq) = &seq_arg {
+            let (s, ids) = parse_sequence_arg(sq, first_seq_id)?;
+            let nm = Path::new(sq)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|_| Path::new(sq).exists())
+                .unwrap_or("nmr_pipeline")
+                .to_string();
+            (s, ids, nm)
+        } else if let Some(sp) = &star_path {
+            let r = read_star(sp, None)?;
+            let nm = sp
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("nmr_pipeline")
+                .to_string();
+            (r.sequence, r.seq_ids, nm)
+        } else {
+            return Err(
+                "pipeline with --fid / --fid-hsqc requires --seq <SEQ|fasta> (or --star)"
+                    .to_string(),
+            );
+        };
+        let (roots, pks, method_label, recipe_json) = process_and_pick_fid_bundle(
+            fhsqc,
+            ftriples,
+            &triples,
+            &fid_opts,
+            &method,
+            picker_engine,
+            snr,
+            prob,
+        )?;
+        fs::write(
+            dir.join("processing_recipe.json"),
+            format!("{recipe_json}\n"),
+        )
+        .map_err(|e| format!("failed to write processing_recipe.json: {e}"))?;
+        println!(
+            "[{method_label}] processed raw FIDs and picked {} HSQC roots and {} total peaks",
+            roots.len(),
+            pks.len()
+        );
+        (
+            Reference::new(seq, seq_ids),
+            pks,
+            name_arg.unwrap_or(default_name),
+        )
     } else if let Some(hp) = &hsqc_path {
         let (seq, seq_ids, default_name) = if let Some(sq) = &seq_arg {
             let (s, ids) = parse_sequence_arg(sq, first_seq_id)?;
@@ -2129,7 +2759,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         (r, pks, name_arg.unwrap_or(nm))
     } else {
         return Err(
-            "pipeline requires (--seq <SEQ|fasta> + (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>)), --star <entry.str>, or --nef <project.nef>"
+            "pipeline requires (--seq <SEQ|fasta> + (--fid <dir> | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>)), --star <entry.str>, or --nef <project.nef>"
                 .to_string(),
         );
     };
@@ -2271,7 +2901,7 @@ fn normalize_residue_code(raw: &str) -> String {
 /// whitespace/CcpNmr backbone shift table (`seq# residue H N C CA ... xx.xx:Cb`),
 /// handling `-`/`.` missing entries and excluding any `?`-uncertain tokens.
 /// Returns `(Reference, excluded_uncertain_count, format_label)`.
-fn parse_truth_auto(path: &Path) -> Result<(Reference, usize, &'static str), String> {
+pub(crate) fn parse_truth_auto(path: &Path) -> Result<(Reference, usize, &'static str), String> {
     let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
 
@@ -2713,64 +3343,26 @@ fn fit_unlabelled_global_offsets(
     }
 }
 
-fn cmd_score(args: &[String]) -> Result<(), String> {
-    let mut pred_path: Option<PathBuf> = None;
-    let mut truth_path: Option<PathBuf> = None;
-    let mut peaks_path: Option<PathBuf> = None;
-    let mut assign_tsv_path: Option<PathBuf> = None;
-    let mut hc_threshold = 0.8f64;
-    let mut auto_offset = true;
-    let mut verbose = false;
+pub(crate) struct ScoreEvaluation {
+    pub(crate) pred_aligned: Reference,
+    pub(crate) truth_for_cmp: Reference,
+    pub(crate) global_offsets: ShiftOffsets,
+    pub(crate) assignable: usize,
+    pub(crate) assigned: usize,
+    pub(crate) correct: usize,
+    pub(crate) hc_assigned: usize,
+    pub(crate) hc_correct: usize,
+    pub(crate) misassigned: Vec<(Option<usize>, usize, i32, f64, f64, f64)>,
+}
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--pred" => {
-                i += 1;
-                pred_path = args.get(i).map(PathBuf::from);
-            }
-            "--truth" => {
-                i += 1;
-                truth_path = args.get(i).map(PathBuf::from);
-            }
-            "--peaks" => {
-                i += 1;
-                peaks_path = args.get(i).map(PathBuf::from);
-            }
-            "--assign-tsv" => {
-                i += 1;
-                assign_tsv_path = args.get(i).map(PathBuf::from);
-            }
-            "--hc" => {
-                i += 1;
-                hc_threshold = args
-                    .get(i)
-                    .ok_or("missing --hc")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
-            }
-            "--no-auto-offset" => {
-                auto_offset = false;
-            }
-            "-v" | "--verbose" => verbose = true,
-            other => return Err(format!("unknown score flag {other:?}")),
-        }
-        i += 1;
-    }
-
-    let pred_p = pred_path.ok_or("score requires --pred <pred.str>")?;
-    let truth_p = truth_path.ok_or("score requires --truth <truth.str|table.txt>")?;
-
-    let pred_raw = read_star(&pred_p, None)?;
-    let (truth_ref, excluded_q, truth_fmt) = parse_truth_auto(&truth_p)?;
-
-    let mut conf_by_seq_id = parse_star_confidences_by_seq_id(&pred_p);
-    if let Some(tsv_p) = &assign_tsv_path {
-        for (sid, c) in parse_assign_tsv_confidences(tsv_p)? {
-            conf_by_seq_id.insert(sid, c);
-        }
-    }
-
+pub(crate) fn evaluate_prediction_against_truth(
+    pred_raw: &Reference,
+    truth_ref: &Reference,
+    conf_by_seq_id: &BTreeMap<i32, f64>,
+    opt_systems: Option<&[SpinSystem]>,
+    hc_threshold: f64,
+    auto_offset: bool,
+) -> ScoreEvaluation {
     // Map Seq_ID -> residue index `k` in `truth_ref`
     let mut truth_idx_by_seq_id = BTreeMap::new();
     for (k, &sid) in truth_ref.seq_ids.iter().enumerate() {
@@ -2817,15 +3409,8 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
     let tol_h = 0.045f64;
     let tol_n = 0.45f64;
 
-    let opt_systems = if let Some(pp) = &peaks_path {
-        let pks = read_peaks(pp)?;
-        Some(build_spin_systems(&pks, &Tolerances::default(), 3, false)?)
-    } else {
-        None
-    };
-
     let global_offs = if auto_offset {
-        fit_unlabelled_global_offsets(&pred_aligned, &truth_ref, opt_systems.as_deref())
+        fit_unlabelled_global_offsets(&pred_aligned, truth_ref, opt_systems)
     } else {
         ShiftOffsets::default()
     };
@@ -2840,7 +3425,7 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
     // Determine true residue `true_k: i32` (`-1` if spurious) for each placed root.
     // When `--peaks` is provided, match ALL spin-system HSQC roots 1-to-1 against `true_roots`
     // first so a spurious ripple adjacent to an unassigned/displaced true root cannot steal its identity.
-    let placed_true_k: Vec<(Option<usize>, i32)> = if let Some(systems) = &opt_systems {
+    let placed_true_k: Vec<(Option<usize>, i32)> = if let Some(systems) = opt_systems {
         let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
         for (si, ss) in systems.iter().enumerate() {
             for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
@@ -2935,6 +3520,125 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         }
     }
 
+    let mut truth_for_cmp = truth_ref.clone();
+    if !global_offs.is_zero() {
+        for ((_, atom), val) in &mut truth_for_cmp.shifts {
+            match atom.as_str() {
+                "H" => *val += truth_dh,
+                "N" => *val += truth_dn,
+                "CA" => *val += truth_dca,
+                "CB" => *val += truth_dcb,
+                "C" => *val += truth_dc,
+                _ => {}
+            }
+        }
+    }
+
+    ScoreEvaluation {
+        pred_aligned,
+        truth_for_cmp,
+        global_offsets: global_offs,
+        assignable,
+        assigned,
+        correct,
+        hc_assigned,
+        hc_correct,
+        misassigned,
+    }
+}
+
+fn cmd_score(args: &[String]) -> Result<(), String> {
+    let mut pred_path: Option<PathBuf> = None;
+    let mut truth_path: Option<PathBuf> = None;
+    let mut peaks_path: Option<PathBuf> = None;
+    let mut assign_tsv_path: Option<PathBuf> = None;
+    let mut hc_threshold = 0.8f64;
+    let mut auto_offset = true;
+    let mut verbose = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pred" => {
+                i += 1;
+                pred_path = args.get(i).map(PathBuf::from);
+            }
+            "--truth" => {
+                i += 1;
+                truth_path = args.get(i).map(PathBuf::from);
+            }
+            "--peaks" => {
+                i += 1;
+                peaks_path = args.get(i).map(PathBuf::from);
+            }
+            "--assign-tsv" => {
+                i += 1;
+                assign_tsv_path = args.get(i).map(PathBuf::from);
+            }
+            "--hc" => {
+                i += 1;
+                hc_threshold = args
+                    .get(i)
+                    .ok_or("missing --hc")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--no-auto-offset" => {
+                auto_offset = false;
+            }
+            "-v" | "--verbose" => verbose = true,
+            other => return Err(format!("unknown score flag {other:?}")),
+        }
+        i += 1;
+    }
+
+    let pred_p = pred_path.ok_or("score requires --pred <pred.str>")?;
+    let truth_p = truth_path.ok_or("score requires --truth <truth.str|table.txt>")?;
+
+    let pred_raw = read_star(&pred_p, None)?;
+    let (truth_ref, excluded_q, truth_fmt) = parse_truth_auto(&truth_p)?;
+
+    let mut conf_by_seq_id = parse_star_confidences_by_seq_id(&pred_p);
+    if let Some(tsv_p) = &assign_tsv_path {
+        for (sid, c) in parse_assign_tsv_confidences(tsv_p)? {
+            conf_by_seq_id.insert(sid, c);
+        }
+    }
+
+    let opt_systems = if let Some(pp) = &peaks_path {
+        let pks = read_peaks(pp)?;
+        Some(build_spin_systems(&pks, &Tolerances::default(), 3, false)?)
+    } else {
+        None
+    };
+
+    let eval = evaluate_prediction_against_truth(
+        &pred_raw,
+        &truth_ref,
+        &conf_by_seq_id,
+        opt_systems.as_deref(),
+        hc_threshold,
+        auto_offset,
+    );
+    let ScoreEvaluation {
+        pred_aligned,
+        truth_for_cmp,
+        global_offsets: global_offs,
+        assignable,
+        assigned,
+        correct,
+        hc_assigned,
+        hc_correct,
+        misassigned,
+    } = eval;
+    let (truth_dh, truth_dn, truth_dca, truth_dcb, truth_dc) = (
+        global_offs.h,
+        global_offs.n,
+        global_offs.ca,
+        global_offs.cb,
+        global_offs.c,
+    );
+
     let acc = if assigned > 0 {
         (correct as f64) / (assigned as f64)
     } else {
@@ -2955,20 +3659,6 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
     } else {
         0.0
     };
-
-    let mut truth_for_cmp = truth_ref.clone();
-    if !global_offs.is_zero() {
-        for ((_, atom), val) in &mut truth_for_cmp.shifts {
-            match atom.as_str() {
-                "H" => *val += truth_dh,
-                "N" => *val += truth_dn,
-                "CA" => *val += truth_dca,
-                "CB" => *val += truth_dcb,
-                "C" => *val += truth_dc,
-                _ => {}
-            }
-        }
-    }
 
     println!(
         "truth format            : {} ({} residues, {} backbone shifts, {} uncertain '?' values excluded)",
@@ -3354,6 +4044,9 @@ fn main() {
     let res = match args[0].as_str() {
         "benchmark" => cmd_benchmark(&args[1..]),
         "benchmark-suite" => cmd_benchmark_suite(&args[1..]),
+        "real-benchmark" => real_benchmark::cmd_real_benchmark(&args[1..]),
+        "fetch-bmrb" => fetch_bmrb::cmd_fetch_bmrb(&args[1..]),
+        "process" => cmd_process(&args[1..]),
         "e2e-benchmark" => cmd_e2e_benchmark(&args[1..]),
         "simulate" => cmd_simulate(&args[1..]),
         "assign" => cmd_assign(&args[1..]),
@@ -3806,5 +4499,343 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             "unexpected version_string: {v}"
         );
         assert!(v.ends_with(')'), "missing git sha suffix in {v}");
+    }
+
+    fn write_synthetic_bruker_hsqc_2d(dir: &Path, peaks_hn: &[(f64, f64)]) {
+        fs::create_dir_all(dir.join("pdata/1")).unwrap();
+        let td_x = 256usize; // 128 complex points = exact 256 i32 words (1024 bytes) per trace
+        let n_x = td_x / 2;
+        let n_y = 32usize; // 32 complex indirect points -> TD_F1 = 64 real/imag traces (States)
+        let td_y = n_y * 2;
+        let bf1_h = 600.0f64;
+        let carrier_h = 4.7f64;
+        let sw_h_ppm = 12.0f64;
+        let sw_h_hz = sw_h_ppm * bf1_h;
+        let sfo1_h = bf1_h * (1.0 + carrier_h * 1e-6);
+
+        let bf1_n = 60.0f64;
+        let carrier_n = 118.0f64;
+        let sw_n_ppm = 30.0f64;
+        let sfo1_n = bf1_n * (1.0 + carrier_n * 1e-6);
+
+        fs::write(dir.join("pulseprogram"), "; synthetic hsqcetfpf3gpsi\n").unwrap();
+        fs::write(dir.join("pdata/1/title"), "2D 1H-15N HSQC\n").unwrap();
+        fs::write(
+            dir.join("pdata/1/procs"),
+            "##$PH_mod= 1\n##$PHC0= 0\n##$PHC1= 0\n##END=\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pdata/1/proc2s"),
+            "##$PH_mod= 1\n##$PHC0= 0\n##$PHC1= 0\n##END=\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("acqus"),
+            format!(
+                "##TITLE= synthetic HSQC\n##$TD= {td_x}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQ_mod= 3\n##$SFO1= {sfo1_h:.8}\n##$BF1= {bf1_h:.8}\n##$SW_h= {sw_h_hz:.4}\n##$NUC1= <1H>\n##$GRPDLY= 0.0\n##END=\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("acqu2s"),
+            format!(
+                "##TITLE= synthetic F1\n##$TD= {td_y}\n##$FnMODE= 4\n##$SFO1= {sfo1_n:.8}\n##$BF1= {bf1_n:.8}\n##$SW= {sw_n_ppm:.4}\n##$NUC1= <15N>\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        let mut ser = Vec::with_capacity(td_y * td_x * 4);
+        let two_pi = 2.0 * std::f64::consts::PI;
+        for ty in 0..td_y {
+            let ky = (ty / 2) as f64;
+            let is_sin_y = (ty % 2) == 1;
+            let dec_y = (-ky / 24.0).exp();
+            for kx in 0..n_x {
+                let kx_f = kx as f64;
+                let dec_x = (-kx_f / 64.0).exp();
+                let mut re = 0.0f64;
+                let mut im = 0.0f64;
+                for &(h_ppm, n_ppm) in peaks_hn {
+                    let fx = (carrier_h - h_ppm) / sw_h_ppm;
+                    let fy = (carrier_n - n_ppm) / sw_n_ppm;
+                    // Under conjugate_for_fft=true (`States` & `DQD`), raw trace `exp(-2pi i f k)`
+                    // conjugates to `exp(+2pi i f k)`, placing peak at `f_norm = +f`.
+                    let mod_y = if is_sin_y {
+                        -(two_pi * fy * ky).sin()
+                    } else {
+                        (two_pi * fy * ky).cos()
+                    };
+                    let amp = 50_000.0 * dec_x * dec_y * mod_y;
+                    re += amp * (two_pi * fx * kx_f).cos();
+                    im += -amp * (two_pi * fx * kx_f).sin();
+                }
+                ser.extend_from_slice(&(re.round() as i32).to_le_bytes());
+                ser.extend_from_slice(&(im.round() as i32).to_le_bytes());
+            }
+        }
+        fs::write(dir.join("ser"), &ser).unwrap();
+    }
+
+    fn write_synthetic_bruker_hnco_3d(dir: &Path, peaks_hnc: &[(f64, f64, f64)]) {
+        fs::create_dir_all(dir.join("pdata/1")).unwrap();
+        let td_x = 256usize; // 128 complex points = exact 1024-byte block
+        let n_x = td_x / 2;
+        let n_n = 16usize; // F2 = 15N (`acqu3s` outer or `acqu2s` inner; standard Bruker AQSEQ=0: outer F1=`acqu2s` 13C, inner F2=`acqu3s` 15N)
+        let n_c = 16usize;
+        let td_c = n_c * 2;
+        let td_n = n_n * 2;
+
+        let bf1_h = 600.0f64;
+        let carrier_h = 4.7f64;
+        let sw_h_ppm = 12.0f64;
+        let sw_h_hz = sw_h_ppm * bf1_h;
+        let sfo1_h = bf1_h * (1.0 + carrier_h * 1e-6);
+
+        let bf1_c = 150.0f64;
+        let carrier_c = 176.0f64;
+        let sw_c_ppm = 16.0f64;
+        let sfo1_c = bf1_c * (1.0 + carrier_c * 1e-6);
+
+        let bf1_n = 60.0f64;
+        let carrier_n = 118.0f64;
+        let sw_n_ppm = 30.0f64;
+        let sfo1_n = bf1_n * (1.0 + carrier_n * 1e-6);
+
+        fs::write(dir.join("pulseprogram"), "; synthetic hncogp3d\n").unwrap();
+        fs::write(dir.join("pdata/1/title"), "3D HNCO\n").unwrap();
+        for p in ["procs", "proc2s", "proc3s"] {
+            fs::write(
+                dir.join("pdata/1").join(p),
+                "##$PH_mod= 1\n##$PHC0= 0\n##$PHC1= 0\n##END=\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join("acqus"),
+            format!(
+                "##TITLE= synthetic HNCO\n##$AQSEQ= 0\n##$TD= {td_x}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQ_mod= 3\n##$SFO1= {sfo1_h:.8}\n##$BF1= {bf1_h:.8}\n##$SW_h= {sw_h_hz:.4}\n##$NUC1= <1H>\n##$GRPDLY= 0.0\n##END=\n"
+            ),
+        )
+        .unwrap();
+        // F1 (`acqu2s`): 13CO, F2 (`acqu3s`): 15N; under AQSEQ=0 outer loop = F1 (acqu2s), inner loop = F2 (acqu3s)?
+        // Wait: in Bruker AQSEQ=0 (3-2-1), outer loop is F1 (`acqu3s`) and inner loop is F2 (`acqu2s`)!
+        // Making `acqu2s` = 15N and `acqu3s` = 13C gives unambiguous 15N + 13C axes regardless of loop order when all peaks share distinct (H, N, C).
+        fs::write(
+            dir.join("acqu2s"),
+            format!(
+                "##TITLE= synthetic F2 15N\n##$TD= {td_n}\n##$FnMODE= 4\n##$SFO1= {sfo1_n:.8}\n##$BF1= {bf1_n:.8}\n##$SW= {sw_n_ppm:.4}\n##$NUC1= <15N>\n##END=\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("acqu3s"),
+            format!(
+                "##TITLE= synthetic F1 13C\n##$TD= {td_c}\n##$FnMODE= 4\n##$SFO1= {sfo1_c:.8}\n##$BF1= {bf1_c:.8}\n##$SW= {sw_c_ppm:.4}\n##$NUC1= <13C>\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        // Standard Bruker AQSEQ=0 (3-2-1): outer loop = F1 (`acqu3s`, C), inner loop = F2 (`acqu2s`, N)
+        let mut ser = Vec::with_capacity(td_c * td_n * td_x * 4);
+        let two_pi = 2.0 * std::f64::consts::PI;
+        for tc in 0..td_c {
+            let kc = (tc / 2) as f64;
+            let is_sin_c = (tc % 2) == 1;
+            let dec_c = (-kc / 14.0).exp();
+            for tn in 0..td_n {
+                let kn = (tn / 2) as f64;
+                let is_sin_n = (tn % 2) == 1;
+                let dec_n = (-kn / 14.0).exp();
+                for kx in 0..n_x {
+                    let kx_f = kx as f64;
+                    let dec_x = (-kx_f / 64.0).exp();
+                    let mut re = 0.0f64;
+                    let mut im = 0.0f64;
+                    for &(h_ppm, n_ppm, c_ppm) in peaks_hnc {
+                        let fx = (carrier_h - h_ppm) / sw_h_ppm;
+                        let fn_ = (carrier_n - n_ppm) / sw_n_ppm;
+                        let fc = (carrier_c - c_ppm) / sw_c_ppm;
+                        let mod_c = if is_sin_c {
+                            -(two_pi * fc * kc).sin()
+                        } else {
+                            (two_pi * fc * kc).cos()
+                        };
+                        let mod_n = if is_sin_n {
+                            -(two_pi * fn_ * kn).sin()
+                        } else {
+                            (two_pi * fn_ * kn).cos()
+                        };
+                        let amp = 40_000.0 * dec_x * dec_n * dec_c * mod_n * mod_c;
+                        re += amp * (two_pi * fx * kx_f).cos();
+                        im += -amp * (two_pi * fx * kx_f).sin();
+                    }
+                    ser.extend_from_slice(&(re.round() as i32).to_le_bytes());
+                    ser.extend_from_slice(&(im.round() as i32).to_le_bytes());
+                }
+            }
+        }
+        fs::write(dir.join("ser"), &ser).unwrap();
+    }
+
+    #[test]
+    fn test_raw_fid_process_pick_and_pipeline_cli() {
+        let dir = env::temp_dir().join(format!("nmr_cli_raw_fid_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let bundle = dir.join("bundle");
+        let hsqc_fid = bundle.join("10_hsqc");
+        let hnco_fid = bundle.join("20_hnco");
+        let peaks_hn = [(8.42, 120.5), (7.91, 115.2), (8.76, 124.8), (7.58, 111.4)];
+        let peaks_hnc = [
+            (8.42, 120.5, 175.2),
+            (7.91, 115.2, 177.6),
+            (8.76, 124.8, 173.4),
+            (7.58, 111.4, 178.9),
+        ];
+        write_synthetic_bruker_hsqc_2d(&hsqc_fid, &peaks_hn);
+        write_synthetic_bruker_hnco_3d(&hnco_fid, &peaks_hnc);
+
+        // 1. `nmrassign process` 2D -> `.ft2` + `processing_recipe.json` + `--recipe` replay into `pdata`
+        let out_2d_dir = dir.join("proc_2d");
+        fs::create_dir_all(&out_2d_dir).unwrap();
+        let ft2_path = out_2d_dir.join("hsqc.ft2");
+        cmd_process(&[
+            "--in".into(),
+            hsqc_fid.to_string_lossy().into_owned(),
+            "--out".into(),
+            ft2_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert!(ft2_path.exists());
+        let recipe_2d_path = out_2d_dir.join("processing_recipe.json");
+        assert!(recipe_2d_path.exists());
+
+        let pdata_2d_dir = dir.join("proc_2d_pdata");
+        cmd_process(&[
+            "--in".into(),
+            hsqc_fid.to_string_lossy().into_owned(),
+            "--out".into(),
+            pdata_2d_dir.to_string_lossy().into_owned(),
+            "--recipe".into(),
+            recipe_2d_path.to_string_lossy().into_owned(),
+            "--no-crop".into(),
+        ])
+        .unwrap();
+        assert!(pdata_2d_dir.join("2rr").exists());
+        assert!(pdata_2d_dir.join("processing_recipe.json").exists());
+
+        // 2. `nmrassign process` 3D -> `.ft3` + `processing_recipe.json`
+        let out_3d_dir = dir.join("proc_3d");
+        fs::create_dir_all(&out_3d_dir).unwrap();
+        let ft3_path = out_3d_dir.join("hnco.ft3");
+        cmd_process(&[
+            "--in".into(),
+            hnco_fid.to_string_lossy().into_owned(),
+            "--out".into(),
+            ft3_path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert!(ft3_path.exists());
+        assert!(out_3d_dir.join("processing_recipe.json").exists());
+
+        // 3. `nmrassign pick --fid <single_2d_dir>` and `nmrassign pick --fid <bundle_dir>`
+        let picked_2d_tsv = dir.join("picked_2d.tsv");
+        cmd_pick(&[
+            "--fid".into(),
+            hsqc_fid.to_string_lossy().into_owned(),
+            "--method".into(),
+            "classical".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--snr".into(),
+            "4.0".into(),
+            "-o".into(),
+            picked_2d_tsv.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let pks_2d = read_peaks(&picked_2d_tsv).unwrap();
+        assert!(
+            pks_2d.len() >= 4,
+            "expected >=4 picked 2D HSQC peaks from raw FID, got {}",
+            pks_2d.len()
+        );
+
+        let picked_bundle_tsv = dir.join("picked_bundle.tsv");
+        cmd_pick(&[
+            "--fid".into(),
+            bundle.to_string_lossy().into_owned(),
+            "--method".into(),
+            "classical".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--snr".into(),
+            "4.0".into(),
+            "-o".into(),
+            picked_bundle_tsv.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let pks_bundle = read_peaks(&picked_bundle_tsv).unwrap();
+        assert!(pks_bundle.iter().any(|p| p.exp == "HSQC"));
+        assert!(pks_bundle.iter().any(|p| p.exp == "HNCO"));
+
+        // 4. `nmrassign pipeline --fid-hsqc ... --fid-triple HNCO=...` AND `nmrassign pipeline --fid <bundle>`
+        let out_pipe_explicit = dir.join("pipe_explicit");
+        cmd_pipeline(&[
+            "--seq".into(),
+            "MQIFV".into(),
+            "--fid-hsqc".into(),
+            hsqc_fid.to_string_lossy().into_owned(),
+            "--fid-triple".into(),
+            format!("HNCO={}", hnco_fid.display()),
+            "--method".into(),
+            "classical".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "2".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out-dir".into(),
+            out_pipe_explicit.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        for fname in [
+            "processing_recipe.json",
+            "peaks.tsv",
+            "shifts.str",
+            "shifts.tsv",
+            "result.nef",
+            "report.html",
+        ] {
+            assert!(
+                out_pipe_explicit.join(fname).exists(),
+                "missing {fname} in --fid-hsqc pipeline out-dir"
+            );
+        }
+
+        let out_pipe_bundle = dir.join("pipe_bundle");
+        cmd_pipeline(&[
+            "--sequence".into(),
+            "MQIFV".into(),
+            "--fid".into(),
+            bundle.to_string_lossy().into_owned(),
+            "--method".into(),
+            "classical".into(),
+            "--engine".into(),
+            "cpu".into(),
+            "--runs".into(),
+            "2".into(),
+            "--steps".into(),
+            "200".into(),
+            "--out-dir".into(),
+            out_pipe_bundle.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert!(out_pipe_bundle.join("processing_recipe.json").exists());
+        assert!(out_pipe_bundle.join("shifts.str").exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

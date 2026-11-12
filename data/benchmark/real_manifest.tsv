@@ -1,0 +1,18 @@
+# Frozen Real Time-Domain Protein Benchmark Manifest (docs/specs/11-fid-processing.md §5.2)
+# Disjoint from all 21 empirical-prior entries (data/priors/PROVENANCE.md) and 12 Phase-1 entries (data/benchmark/manifest.tsv).
+# Governance: `heldout` is evaluated strictly cold for reporting; zero code, default, or threshold tuning may use `heldout` results.
+bmrb_id	protein	residues	field_mhz	vendor	experiments	split
+ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev
+51439	CISD3	93	900	Bruker	HSQC,HNCO,HNCA,HNCOCA,CBCACONH	dev
+53371	hDVL2_PDZ	102	600	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev
+18465	OR135	110	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH	dev
+15386	StR82	77	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev
+5329	WR41	94	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout
+5845	ZR31	102	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout
+6318	At3g51030	124	600	Bruker	HSQC,HNCO,HNCA,HNCACB,HNCOCA,HNCACO	heldout
+15476	SR384	54	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	heldout
+16385	PfR193A	114	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout
+17030	HR4694F	95	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout
+18145	OR126	83	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout
+51351	TSR3	75	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout
+53280	Ap3	60	850	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout
