@@ -125,11 +125,26 @@ pub struct JobRecord {
 
 struct SharedState {
     storage_dir: PathBuf,
+    inspect_root: Option<PathBuf>,
+    allowed_origins: Vec<String>,
     jobs: Mutex<BTreeMap<String, JobRecord>>,
     job_order: Mutex<Vec<String>>,
     job_tx: Mutex<Option<mpsc::Sender<String>>>,
     next_id: AtomicU64,
     shutdown: AtomicBool,
+}
+
+/// Security and sandbox configuration for `ServiceServer`.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceOptions {
+    /// Optional canonicalized root directory inside which `POST /api/v1/inspect` may inspect
+    /// server-side paths. When `None` (the default), server-side `path` inspection over HTTP is
+    /// disabled (`403 Forbidden`) and callers must upload `entries` or archive bytes (or use the
+    /// local CLI `nmrassign inspect <path>`).
+    pub inspect_root: Option<PathBuf>,
+    /// Explicit cross-origin allow-list (e.g. `["http://localhost:5173"]`). Empty by default
+    /// (strict same-origin only; `Access-Control-Allow-Origin: *` is never emitted).
+    pub allowed_origins: Vec<String>,
 }
 
 /// Handle to a background `ServiceServer` instance bound on a local `SocketAddr`.
@@ -180,9 +195,19 @@ impl Drop for ServiceHandle {
 pub struct ServiceServer;
 
 impl ServiceServer {
-    /// Start the HTTP server in the foreground (blocking until interrupted).
+    /// Start the HTTP server in the foreground with default security options (same-origin only,
+    /// server-side `path` inspection disabled).
     pub fn start_server(bind_addr: &str, storage_dir: PathBuf) -> Result<(), String> {
-        let mut handle = Self::spawn_background(bind_addr, storage_dir)?;
+        Self::start_server_with_options(bind_addr, storage_dir, ServiceOptions::default())
+    }
+
+    /// Start the HTTP server in the foreground with explicit `ServiceOptions`.
+    pub fn start_server_with_options(
+        bind_addr: &str,
+        storage_dir: PathBuf,
+        options: ServiceOptions,
+    ) -> Result<(), String> {
+        let mut handle = Self::spawn_background_with_options(bind_addr, storage_dir, options)?;
         if let Some(accept_join) = handle.accept_thread.take() {
             accept_join
                 .join()
@@ -191,10 +216,19 @@ impl ServiceServer {
         Ok(())
     }
 
-    /// Spawn the HTTP server + background solver worker on dedicated threads and return a `ServiceHandle`.
+    /// Spawn the HTTP server + background solver worker on dedicated threads with default security options.
     pub fn spawn_background(
         bind_addr: &str,
         storage_dir: PathBuf,
+    ) -> Result<ServiceHandle, String> {
+        Self::spawn_background_with_options(bind_addr, storage_dir, ServiceOptions::default())
+    }
+
+    /// Spawn the HTTP server + background solver worker on dedicated threads with explicit `ServiceOptions`.
+    pub fn spawn_background_with_options(
+        bind_addr: &str,
+        storage_dir: PathBuf,
+        options: ServiceOptions,
     ) -> Result<ServiceHandle, String> {
         fs::create_dir_all(&storage_dir).map_err(|e| {
             format!(
@@ -202,6 +236,32 @@ impl ServiceServer {
                 storage_dir.display()
             )
         })?;
+
+        let canon_inspect_root = match options.inspect_root {
+            Some(ref raw_root) => {
+                let canon = fs::canonicalize(raw_root).map_err(|e| {
+                    format!(
+                        "failed to canonicalize inspect_root {}: {e}",
+                        raw_root.display()
+                    )
+                })?;
+                if !canon.is_dir() {
+                    return Err(format!(
+                        "inspect_root {} must be an existing directory",
+                        canon.display()
+                    ));
+                }
+                Some(canon)
+            }
+            None => None,
+        };
+
+        let normalized_origins: Vec<String> = options
+            .allowed_origins
+            .into_iter()
+            .map(|o| o.trim().trim_end_matches('/').to_ascii_lowercase())
+            .filter(|o| !o.is_empty() && o != "*")
+            .collect();
 
         let listener = TcpListener::bind(bind_addr)
             .map_err(|e| format!("failed to bind HTTP listener on {bind_addr}: {e}"))?;
@@ -214,6 +274,8 @@ impl ServiceServer {
         let (existing_jobs, existing_order, max_num) = reload_existing_jobs(&storage_dir);
         let state = Arc::new(SharedState {
             storage_dir,
+            inspect_root: canon_inspect_root,
+            allowed_origins: normalized_origins,
             jobs: Mutex::new(existing_jobs),
             job_order: Mutex::new(existing_order),
             job_tx: Mutex::new(Some(tx)),
@@ -247,12 +309,30 @@ pub fn start_server(bind_addr: &str, storage_dir: PathBuf) -> Result<(), String>
     ServiceServer::start_server(bind_addr, storage_dir)
 }
 
+/// Start the hosted NMR pipeline HTTP server in the foreground with explicit `ServiceOptions`.
+pub fn start_server_with_options(
+    bind_addr: &str,
+    storage_dir: PathBuf,
+    options: ServiceOptions,
+) -> Result<(), String> {
+    ServiceServer::start_server_with_options(bind_addr, storage_dir, options)
+}
+
 /// Spawn the hosted NMR pipeline HTTP server in the background and return its bound address + shutdown handle.
 pub fn spawn_background_server(
     bind_addr: &str,
     storage_dir: PathBuf,
 ) -> Result<ServiceHandle, String> {
     ServiceServer::spawn_background(bind_addr, storage_dir)
+}
+
+/// Spawn the hosted NMR pipeline HTTP server in the background with explicit `ServiceOptions`.
+pub fn spawn_background_server_with_options(
+    bind_addr: &str,
+    storage_dir: PathBuf,
+    options: ServiceOptions,
+) -> Result<ServiceHandle, String> {
+    ServiceServer::spawn_background_with_options(bind_addr, storage_dir, options)
 }
 
 fn now_unix_ms() -> u64 {
@@ -320,6 +400,8 @@ fn accept_loop(listener: TcpListener, state: Arc<SharedState>) {
 struct HttpRequest {
     method: String,
     path: String,
+    host: String,
+    origin: Option<String>,
     content_type: String,
     body: Vec<u8>,
 }
@@ -344,6 +426,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
 
     let mut content_length = 0usize;
     let mut content_type = String::new();
+    let mut host = String::new();
+    let mut origin: Option<String> = None;
     loop {
         let mut line = String::new();
         let bytes = reader
@@ -353,7 +437,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("content-length") {
                 content_length = v
                     .trim()
                     .parse::<usize>()
@@ -361,8 +446,15 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
                 if content_length > MAX_HTTP_BODY_BYTES {
                     return Err("payload exceeds maximum size limit (64 MiB)".to_string());
                 }
-            } else if k.trim().eq_ignore_ascii_case("content-type") {
+            } else if key.eq_ignore_ascii_case("content-type") {
                 content_type = v.trim().to_ascii_lowercase();
+            } else if key.eq_ignore_ascii_case("host") {
+                host = v.trim().to_ascii_lowercase();
+            } else if key.eq_ignore_ascii_case("origin") {
+                let norm = v.trim().trim_end_matches('/').to_ascii_lowercase();
+                if !norm.is_empty() {
+                    origin = Some(norm);
+                }
             }
         }
     }
@@ -377,9 +469,55 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
     Ok(Some(HttpRequest {
         method,
         path,
+        host,
+        origin,
         content_type,
         body,
     }))
+}
+
+fn media_type_base(content_type: &str) -> &str {
+    content_type.split(';').next().unwrap_or("").trim()
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    media_type_base(content_type) == "application/json"
+}
+
+fn is_archive_content_type(content_type: &str) -> bool {
+    matches!(
+        media_type_base(content_type),
+        "application/gzip"
+            | "application/x-gzip"
+            | "application/x-tar"
+            | "application/tar"
+            | "application/octet-stream"
+    )
+}
+
+/// Validate `Origin` (when present): allows strict same-origin (`http(s)://<Host>`) or an explicit
+/// entry in `state.allowed_origins`. Returns `Ok(Some(origin))` only when an explicit cross-origin
+/// allow-list entry matched (so `Access-Control-Allow-Origin` can echo that specific origin);
+/// returns `Ok(None)` for same-origin or non-browser CLI requests (`Access-Control-Allow-Origin`
+/// omitted completely); returns `Err` for untrusted cross-origin requests.
+fn authorize_request_origin<'a>(
+    req: &'a HttpRequest,
+    state: &SharedState,
+) -> Result<Option<&'a str>, ()> {
+    let Some(ref orig) = req.origin else {
+        return Ok(None);
+    };
+    if !req.host.is_empty() {
+        let same_http = format!("http://{}", req.host);
+        let same_https = format!("https://{}", req.host);
+        if orig == &same_http || orig == &same_https {
+            return Ok(None);
+        }
+    }
+    if state.allowed_origins.iter().any(|allowed| allowed == orig) {
+        return Ok(Some(orig.as_str()));
+    }
+    Err(())
 }
 
 fn write_http_response(
@@ -394,9 +532,7 @@ fn write_http_response(
         "HTTP/1.1 {status_code} {status_text}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
+         X-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n",
         body.len()
     );
@@ -412,10 +548,11 @@ fn write_http_response(
         .map_err(|e| format!("failed to write HTTP response: {e}"))
 }
 
-fn write_json<T: Serialize>(
+fn write_json_with_headers<T: Serialize>(
     stream: &mut TcpStream,
     status_code: u16,
     status_text: &str,
+    extra_headers: &[(&str, &str)],
     payload: &T,
 ) -> Result<(), String> {
     let bytes = serde_json::to_vec(payload).unwrap_or_else(|_| b"{\"error\":\"json\"}".to_vec());
@@ -424,9 +561,18 @@ fn write_json<T: Serialize>(
         status_code,
         status_text,
         "application/json; charset=utf-8",
-        &[],
+        extra_headers,
         &bytes,
     )
+}
+
+fn write_json<T: Serialize>(
+    stream: &mut TcpStream,
+    status_code: u16,
+    status_text: &str,
+    payload: &T,
+) -> Result<(), String> {
+    write_json_with_headers(stream, status_code, status_text, &[], payload)
 }
 
 fn write_json_error(
@@ -459,8 +605,40 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
         }
     };
 
+    let matched_cors_origin = match authorize_request_origin(&req, state) {
+        Ok(c) => c,
+        Err(()) => {
+            return write_json_error(
+                &mut stream,
+                403,
+                "Forbidden",
+                "cross-origin request blocked by same-origin policy",
+            );
+        }
+    };
+
     if req.method == "OPTIONS" {
-        return write_http_response(&mut stream, 204, "No Content", "text/plain", &[], b"");
+        let mut cors_hdrs = Vec::new();
+        if let Some(orig) = matched_cors_origin {
+            cors_hdrs.push(("Access-Control-Allow-Origin", orig));
+            cors_hdrs.push(("Access-Control-Allow-Methods", "GET, POST, OPTIONS"));
+            cors_hdrs.push(("Access-Control-Allow-Headers", "Content-Type"));
+            cors_hdrs.push(("Vary", "Origin"));
+        }
+        return write_http_response(
+            &mut stream,
+            204,
+            "No Content",
+            "text/plain",
+            &cors_hdrs,
+            b"",
+        );
+    }
+
+    let mut cors_extra = Vec::new();
+    if let Some(orig) = matched_cors_origin {
+        cors_extra.push(("Access-Control-Allow-Origin", orig));
+        cors_extra.push(("Vary", "Origin"));
     }
 
     match (req.method.as_str(), req.path.as_str()) {
@@ -471,7 +649,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
                 200,
                 "OK",
                 "text/html; charset=utf-8",
-                &[],
+                &cors_extra,
                 html.as_bytes(),
             )
         }
@@ -481,33 +659,53 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
                 status: &'a str,
                 version: &'a str,
             }
-            write_json(
+            write_json_with_headers(
                 &mut stream,
                 200,
                 "OK",
+                &cors_extra,
                 &HealthResp {
                     status: "ok",
                     version: crate::VERSION,
                 },
             )
         }
-        ("GET", "/api/v1/demo/ubiquitin") => handle_demo_ubiquitin(&mut stream),
-        ("POST", "/api/v1/inspect") => handle_inspect(&mut stream, &req.content_type, &req.body),
-        ("POST", "/api/v1/jobs") => handle_submit_job(&mut stream, &req.body, state),
-        ("GET", "/api/v1/jobs") => handle_list_jobs(&mut stream, state),
+        ("GET", "/api/v1/demo/ubiquitin") => handle_demo_ubiquitin(&mut stream, &cors_extra),
+        ("POST", "/api/v1/inspect") => handle_inspect(
+            &mut stream,
+            &req.content_type,
+            &req.body,
+            state,
+            &cors_extra,
+        ),
+        ("POST", "/api/v1/jobs") => {
+            if !is_json_content_type(&req.content_type) {
+                return write_json_error(
+                    &mut stream,
+                    415,
+                    "Unsupported Media Type",
+                    "POST /api/v1/jobs requires Content-Type: application/json",
+                );
+            }
+            handle_submit_job(&mut stream, &req.body, state, &cors_extra)
+        }
+        ("GET", "/api/v1/jobs") => handle_list_jobs(&mut stream, state, &cors_extra),
         ("GET", path) if path.starts_with("/api/v1/jobs/") => {
             let tail = &path["/api/v1/jobs/".len()..];
             if let Some((job_id, artifact)) = tail.split_once('/') {
-                handle_get_artifact(&mut stream, job_id, artifact, state)
+                handle_get_artifact(&mut stream, job_id, artifact, state, &cors_extra)
             } else {
-                handle_get_job(&mut stream, tail, state)
+                handle_get_job(&mut stream, tail, state, &cors_extra)
             }
         }
         _ => write_json_error(&mut stream, 404, "Not Found", "endpoint not found"),
     }
 }
 
-fn handle_demo_ubiquitin(stream: &mut TcpStream) -> Result<(), String> {
+fn handle_demo_ubiquitin(
+    stream: &mut TcpStream,
+    cors_extra: &[(&str, &str)],
+) -> Result<(), String> {
     #[derive(Serialize)]
     struct DemoPayload {
         project_name: String,
@@ -530,10 +728,16 @@ fn handle_demo_ubiquitin(stream: &mut TcpStream) -> Result<(), String> {
         star_text: EMBEDDED_UBIQUITIN_STAR.to_string(),
         peaks_tsv,
     };
-    write_json(stream, 200, "OK", &payload)
+    write_json_with_headers(stream, 200, "OK", cors_extra, &payload)
 }
 
-fn handle_inspect(stream: &mut TcpStream, content_type: &str, body: &[u8]) -> Result<(), String> {
+fn handle_inspect(
+    stream: &mut TcpStream,
+    content_type: &str,
+    body: &[u8],
+    state: &Arc<SharedState>,
+    cors_extra: &[(&str, &str)],
+) -> Result<(), String> {
     if body.is_empty() {
         return write_json_error(
             stream,
@@ -543,18 +747,12 @@ fn handle_inspect(stream: &mut TcpStream, content_type: &str, body: &[u8]) -> Re
         );
     }
 
-    let is_binary_archive = content_type.contains("gzip")
-        || content_type.contains("x-tar")
-        || content_type.contains("octet-stream")
-        || (body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b)
-        || (body.len() >= 262 && &body[257..262] == b"ustar");
-
-    if is_binary_archive {
+    if is_archive_content_type(content_type) {
         match extract_archive_virtual_entries("archive_upload", body) {
             Ok(entries) => {
                 let mut inv: WorkspaceInventory = classify_nmr_entries(&entries);
                 inv.root_name = "archive_upload".to_string();
-                return write_json(stream, 200, "OK", &inv);
+                return write_json_with_headers(stream, 200, "OK", cors_extra, &inv);
             }
             Err(e) => {
                 return write_json_error(
@@ -565,6 +763,15 @@ fn handle_inspect(stream: &mut TcpStream, content_type: &str, body: &[u8]) -> Re
                 );
             }
         }
+    }
+
+    if !is_json_content_type(content_type) {
+        return write_json_error(
+            stream,
+            415,
+            "Unsupported Media Type",
+            "POST /api/v1/inspect requires Content-Type: application/json or application/gzip / application/x-tar",
+        );
     }
 
     let inspect_req: InspectRequest = match serde_json::from_slice(body) {
@@ -585,8 +792,35 @@ fn handle_inspect(stream: &mut TcpStream, content_type: &str, body: &[u8]) -> Re
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        match classify_nmr_workspace(Path::new(raw_path)) {
-            Ok(inv) => write_json(stream, 200, "OK", &inv),
+        let Some(ref canon_root) = state.inspect_root else {
+            return write_json_error(
+                stream,
+                403,
+                "Forbidden",
+                "server-side path inspection is disabled by default; configure --inspect-root or upload entries/archive",
+            );
+        };
+        let canon_target = match fs::canonicalize(raw_path) {
+            Ok(p) => p,
+            Err(_) => {
+                return write_json_error(
+                    stream,
+                    403,
+                    "Forbidden",
+                    "requested path does not exist or is outside allowed inspect_root",
+                );
+            }
+        };
+        if !canon_target.starts_with(canon_root) {
+            return write_json_error(
+                stream,
+                403,
+                "Forbidden",
+                "requested path is outside allowed inspect_root",
+            );
+        }
+        match classify_nmr_workspace(&canon_target) {
+            Ok(inv) => write_json_with_headers(stream, 200, "OK", cors_extra, &inv),
             Err(e) => write_json_error(stream, 400, "Bad Request", &e),
         }
     } else if let Some(entries) = inspect_req.entries {
@@ -594,13 +828,13 @@ fn handle_inspect(stream: &mut TcpStream, content_type: &str, body: &[u8]) -> Re
         if let Some(name) = inspect_req.root_name.filter(|s| !s.trim().is_empty()) {
             inv.root_name = name;
         }
-        write_json(stream, 200, "OK", &inv)
+        write_json_with_headers(stream, 200, "OK", cors_extra, &inv)
     } else {
         write_json_error(
             stream,
             400,
             "Bad Request",
-            "InspectRequest must specify either 'path' or 'entries'",
+            "InspectRequest must specify 'entries' (or 'path' when --inspect-root is enabled)",
         )
     }
 }
@@ -609,6 +843,7 @@ fn handle_submit_job(
     stream: &mut TcpStream,
     body: &[u8],
     state: &Arc<SharedState>,
+    cors_extra: &[(&str, &str)],
 ) -> Result<(), String> {
     let submit_req: JobSubmitRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -693,10 +928,11 @@ fn handle_submit_job(
         job_id: &'a str,
         status: &'a str,
     }
-    write_json(
+    write_json_with_headers(
         stream,
         202,
         "Accepted",
+        cors_extra,
         &AcceptedResp {
             job_id: &job_id,
             status: "queued",
@@ -704,7 +940,11 @@ fn handle_submit_job(
     )
 }
 
-fn handle_list_jobs(stream: &mut TcpStream, state: &Arc<SharedState>) -> Result<(), String> {
+fn handle_list_jobs(
+    stream: &mut TcpStream,
+    state: &Arc<SharedState>,
+    cors_extra: &[(&str, &str)],
+) -> Result<(), String> {
     #[derive(Serialize)]
     struct JobsListResp {
         jobs: Vec<JobRecord>,
@@ -717,13 +957,14 @@ fn handle_list_jobs(stream: &mut TcpStream, state: &Arc<SharedState>) -> Result<
             }
         }
     }
-    write_json(stream, 200, "OK", &JobsListResp { jobs: list })
+    write_json_with_headers(stream, 200, "OK", cors_extra, &JobsListResp { jobs: list })
 }
 
 fn handle_get_job(
     stream: &mut TcpStream,
     job_id: &str,
     state: &Arc<SharedState>,
+    cors_extra: &[(&str, &str)],
 ) -> Result<(), String> {
     if !is_safe_job_id(job_id) {
         return write_json_error(stream, 400, "Bad Request", "invalid job id");
@@ -734,7 +975,7 @@ fn handle_get_job(
         .ok()
         .and_then(|jobs| jobs.get(job_id).cloned());
     match rec_opt {
-        Some(rec) => write_json(stream, 200, "OK", &rec),
+        Some(rec) => write_json_with_headers(stream, 200, "OK", cors_extra, &rec),
         None => write_json_error(stream, 404, "Not Found", "job not found"),
     }
 }
@@ -744,6 +985,7 @@ fn handle_get_artifact(
     job_id: &str,
     artifact: &str,
     state: &Arc<SharedState>,
+    cors_extra: &[(&str, &str)],
 ) -> Result<(), String> {
     if !is_safe_job_id(job_id) {
         return write_json_error(stream, 400, "Bad Request", "invalid job id");
@@ -768,7 +1010,8 @@ fn handle_get_artifact(
         return write_json_error(stream, 404, "Not Found", "artifact not available yet");
     };
 
-    let extra: Vec<(&str, &str)> = disposition.into_iter().collect();
+    let mut extra: Vec<(&str, &str)> = disposition.into_iter().collect();
+    extra.extend_from_slice(cors_extra);
     write_http_response(stream, 200, "OK", content_type, &extra, &bytes)
 }
 

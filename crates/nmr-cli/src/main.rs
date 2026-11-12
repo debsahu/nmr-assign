@@ -63,7 +63,7 @@ use nmr_core::qc::{
 use nmr_core::report::{
     predict_csi_dihedrals, write_quality_report_html, ReportInput, StructureReportSummary,
 };
-use nmr_core::service::start_server;
+use nmr_core::service::{start_server_with_options, ServiceOptions};
 use nmr_core::sidechain::{
     evaluate_sidechain_shifts, simulate_sidechain_peaks, solve_joint_backbone_sidechain,
     synthesize_all_atom_reference, SidechainSimConfig, SidechainSolverConfig,
@@ -3870,6 +3870,7 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
 fn cmd_serve(args: &[String]) -> Result<(), String> {
     let mut bind_addr = "127.0.0.1:8080".to_string();
     let mut storage = PathBuf::from("./jobs");
+    let mut options = ServiceOptions::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -3882,6 +3883,17 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                 i += 1;
                 storage = PathBuf::from(args.get(i).ok_or("missing --storage")?);
             }
+            "--inspect-root" => {
+                i += 1;
+                options.inspect_root =
+                    Some(PathBuf::from(args.get(i).ok_or("missing --inspect-root")?));
+            }
+            "--cors-origin" => {
+                i += 1;
+                options
+                    .allowed_origins
+                    .push(args.get(i).ok_or("missing --cors-origin")?.clone());
+            }
             other => return Err(format!("unknown serve flag {other:?}")),
         }
         i += 1;
@@ -3891,7 +3903,7 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
         "Starting nmrassign HTTP service & browser dashboard at http://{bind_addr} (storage: {})",
         storage.display()
     );
-    start_server(&bind_addr, storage)
+    start_server_with_options(&bind_addr, storage, options)
 }
 
 fn cmd_chem(args: &[String]) -> Result<(), String> {

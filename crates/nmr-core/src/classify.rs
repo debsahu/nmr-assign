@@ -602,6 +602,31 @@ enum DeflatePhase {
     Done,
 }
 
+const MAX_IN_MEMORY_INFLATE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB anti-bomb bound for HTTP/WASM byte buffers
+const MAX_DISK_INFLATE_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB bound for local filesystem archives
+
+const fn build_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+const CRC32_TABLE: [u32; 256] = build_crc32_table();
+
 /// Streaming RFC 1952 GZIP + RFC 1951 DEFLATE reader using a fixed 32 KiB LZ77 ring buffer.
 struct GzipStreamDecoder<R: Read> {
     inner: BufReader<R>,
@@ -609,6 +634,10 @@ struct GzipStreamDecoder<R: Read> {
     bit_cnt: u8,
     window: [u8; 32768],
     win_pos: usize,
+    crc32_state: u32,
+    member_out_bytes: u64,
+    total_out_bytes: u64,
+    max_inflate_bytes: u64,
     phase: DeflatePhase,
     final_block_pending: bool,
     lit_table: HuffTable,
@@ -616,18 +645,41 @@ struct GzipStreamDecoder<R: Read> {
 }
 
 impl<R: Read> GzipStreamDecoder<R> {
-    fn new(reader: R) -> Self {
+    fn new(reader: R, max_inflate_bytes: u64) -> Self {
         Self {
             inner: BufReader::with_capacity(32 * 1024, reader),
             bit_buf: 0,
             bit_cnt: 0,
             window: [0u8; 32768],
             win_pos: 0,
+            crc32_state: 0xFFFF_FFFF,
+            member_out_bytes: 0,
+            total_out_bytes: 0,
+            max_inflate_bytes,
             phase: DeflatePhase::NeedGzipHeader,
             final_block_pending: false,
             lit_table: HuffTable::fixed_lit_len(),
             dist_table: HuffTable::fixed_dist(),
         }
+    }
+
+    #[inline]
+    fn push_out_byte(&mut self, out: &mut [u8], written: &mut usize, b: u8) -> io::Result<()> {
+        if self.total_out_bytes >= self.max_inflate_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compressed archive exceeds maximum uncompressed byte limit",
+            ));
+        }
+        self.window[self.win_pos] = b;
+        self.win_pos = (self.win_pos + 1) & 0x7FFF;
+        let idx = ((self.crc32_state ^ (b as u32)) & 0xFF) as usize;
+        self.crc32_state = (self.crc32_state >> 8) ^ CRC32_TABLE[idx];
+        self.member_out_bytes += 1;
+        self.total_out_bytes += 1;
+        out[*written] = b;
+        *written += 1;
+        Ok(())
     }
 
     fn next_raw_byte(&mut self) -> io::Result<Option<u8>> {
@@ -874,6 +926,8 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                 DeflatePhase::Done => break,
                 DeflatePhase::NeedGzipHeader => {
                     if self.parse_gzip_header()? {
+                        self.crc32_state = 0xFFFF_FFFF;
+                        self.member_out_bytes = 0;
                         self.phase = DeflatePhase::NeedBlockHeader;
                     } else {
                         self.phase = DeflatePhase::Done;
@@ -881,8 +935,19 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                 }
                 DeflatePhase::NeedGzipTrailer => {
                     self.align_byte();
-                    for _ in 0..8 {
-                        let _ = self.require_raw_byte()?;
+                    let mut tr = [0u8; 8];
+                    for slot in &mut tr {
+                        *slot = self.require_raw_byte()?;
+                    }
+                    let expected_crc = u32::from_le_bytes([tr[0], tr[1], tr[2], tr[3]]);
+                    let expected_isize = u32::from_le_bytes([tr[4], tr[5], tr[6], tr[7]]);
+                    let actual_crc = !self.crc32_state;
+                    let actual_isize = self.member_out_bytes as u32;
+                    if actual_crc != expected_crc || actual_isize != expected_isize {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "gzip trailer CRC32 or ISIZE mismatch",
+                        ));
                     }
                     // Support concatenated multi-member gzip streams
                     self.phase = DeflatePhase::NeedGzipHeader;
@@ -934,10 +999,7 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                 DeflatePhase::StoredBlock { mut remaining } => {
                     while remaining > 0 && written < out.len() {
                         let b = self.require_raw_byte()?;
-                        self.window[self.win_pos] = b;
-                        self.win_pos = (self.win_pos + 1) & 0x7FFF;
-                        out[written] = b;
-                        written += 1;
+                        self.push_out_byte(out, &mut written, b)?;
                         remaining -= 1;
                     }
                     if remaining == 0 {
@@ -958,10 +1020,7 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                     while remaining > 0 && written < out.len() {
                         let src = (self.win_pos.wrapping_sub(dist)) & 0x7FFF;
                         let b = self.window[src];
-                        self.window[self.win_pos] = b;
-                        self.win_pos = (self.win_pos + 1) & 0x7FFF;
-                        out[written] = b;
-                        written += 1;
+                        self.push_out_byte(out, &mut written, b)?;
                         remaining -= 1;
                     }
                     if remaining == 0 {
@@ -977,11 +1036,7 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                 DeflatePhase::CompressedBlock { final_block } => {
                     let sym = self.decode_sym_lit()?;
                     if sym < 256 {
-                        let b = sym as u8;
-                        self.window[self.win_pos] = b;
-                        self.win_pos = (self.win_pos + 1) & 0x7FFF;
-                        out[written] = b;
-                        written += 1;
+                        self.push_out_byte(out, &mut written, sym as u8)?;
                     } else if sym == 256 {
                         self.phase = if final_block {
                             DeflatePhase::NeedGzipTrailer
@@ -1007,6 +1062,12 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                         }
                         let extra_d = self.read_bits(FIXED_DIST_EXTRA[dsym])? as usize;
                         let dist = (FIXED_DIST_BASE[dsym] as usize) + extra_d;
+                        if dist == 0 || (dist as u64) > self.member_out_bytes {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "DEFLATE match distance exceeds output history",
+                            ));
+                        }
                         self.phase = DeflatePhase::CopyMatch {
                             dist,
                             remaining: match_len,
@@ -1225,6 +1286,27 @@ fn discard_bytes_read<R: Read>(r: &mut R, mut count: u64) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_tar_header_checksum(hdr: &[u8; 512]) -> bool {
+    let chk_field = &hdr[148..156];
+    let s = std::str::from_utf8(chk_field).unwrap_or("");
+    let clean = s.trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace());
+    let Ok(stored) = i64::from_str_radix(clean, 8) else {
+        return false;
+    };
+    let mut unsigned_sum = 0i64;
+    let mut signed_sum = 0i64;
+    for (idx, &b) in hdr.iter().enumerate() {
+        if (148..156).contains(&idx) {
+            unsigned_sum += 0x20;
+            signed_sum += 0x20;
+        } else {
+            unsigned_sum += b as i64;
+            signed_sum += (b as i8) as i64;
+        }
+    }
+    stored == unsigned_sum || stored == signed_sum
+}
+
 /// Walk a POSIX.1-1988 `ustar` stream using `skip_fn` to advance over unread payload tails
 /// (`Seek::seek` on `.tar` files/cursors in `O(1)`, or bounded scratch discard on `.tar.gz`).
 fn scan_tar_with_skipper<R, S>(
@@ -1257,11 +1339,18 @@ where
         }
         zero_blocks = 0;
 
+        if !validate_tar_header_checksum(&hdr) {
+            return Err("invalid POSIX tar header checksum".to_string());
+        }
+
         let typeflag = hdr[156];
         let raw_size = pax_size
             .take()
             .unwrap_or_else(|| parse_tar_size(&hdr[124..136]));
-        let padded_size = (raw_size + 511) & !511;
+        let padded_size = raw_size
+            .checked_add(511)
+            .ok_or_else(|| "tar entry size overflow".to_string())?
+            & !511;
 
         if typeflag == b'L' {
             // GNU LongLink path override for next entry
@@ -1313,8 +1402,10 @@ where
             g
         } else {
             let base = parse_tar_cstr(&hdr[0..100]);
-            let is_ustar = &hdr[257..262] == b"ustar";
-            let prefix = if is_ustar {
+            // Strictly require POSIX.1-1988 `ustar\0` before reading `hdr[345..500]` as prefix,
+            // since GNU tar (`ustar  \0`) stores binary `atime`/`ctime` at offsets 345..369.
+            let is_posix_ustar = &hdr[257..263] == b"ustar\0";
+            let prefix = if is_posix_ustar {
                 parse_tar_cstr(&hdr[345..500])
             } else {
                 String::new()
@@ -1380,13 +1471,24 @@ fn scan_tar_seekable<R: Read + Seek>(
     )
 }
 
-fn scan_targz_reader<R: Read>(reader: R, out: &mut Vec<VirtualEntry>) -> Result<(), String> {
-    let mut gz = GzipStreamDecoder::new(reader);
-    scan_tar_with_skipper(&mut gz, discard_bytes_read, out)
+fn scan_targz_reader<R: Read>(
+    reader: R,
+    max_inflate_bytes: u64,
+    out: &mut Vec<VirtualEntry>,
+) -> Result<(), String> {
+    let mut gz = GzipStreamDecoder::new(reader, max_inflate_bytes);
+    scan_tar_with_skipper(&mut gz, discard_bytes_read, out)?;
+    let mut scratch = [0u8; 4096];
+    while gz
+        .read(&mut scratch)
+        .map_err(|e| format!("gzip trailer verification error: {e}"))?
+        > 0
+    {}
+    Ok(())
 }
 
 /// Inspect an in-memory `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
-/// without retaining bulk binary signal payloads.
+/// without retaining bulk binary signal payloads (bounded to `128 MiB` decompressed bytes).
 pub fn extract_archive_virtual_entries(
     archive_name: &str,
     archive_bytes: &[u8],
@@ -1396,7 +1498,11 @@ pub fn extract_archive_virtual_entries(
         || (archive_bytes.len() >= 2 && archive_bytes[0] == 0x1f && archive_bytes[1] == 0x8b);
     let mut entries = Vec::new();
     if is_gz {
-        scan_targz_reader(Cursor::new(archive_bytes), &mut entries)?;
+        scan_targz_reader(
+            Cursor::new(archive_bytes),
+            MAX_IN_MEMORY_INFLATE_BYTES,
+            &mut entries,
+        )?;
     } else {
         let mut cur = Cursor::new(archive_bytes);
         scan_tar_seekable(&mut cur, &mut entries)?;
@@ -4149,7 +4255,7 @@ pub fn classify_nmr_workspace(path: &Path) -> Result<WorkspaceInventory, String>
                     if is_targz_path_lower(&alow) {
                         let f = File::open(&arch)
                             .map_err(|e| format!("failed to open {}: {e}", arch.display()))?;
-                        scan_targz_reader(f, &mut entries)?;
+                        scan_targz_reader(f, MAX_DISK_INFLATE_BYTES, &mut entries)?;
                     } else if is_tar_path_lower(&alow) {
                         let mut f = File::open(&arch)
                             .map_err(|e| format!("failed to open {}: {e}", arch.display()))?;
@@ -4162,7 +4268,7 @@ pub fn classify_nmr_workspace(path: &Path) -> Result<WorkspaceInventory, String>
             if is_targz_path_lower(&lower) {
                 let f = File::open(path)
                     .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;
-                scan_targz_reader(f, &mut entries)?;
+                scan_targz_reader(f, MAX_DISK_INFLATE_BYTES, &mut entries)?;
             } else if is_tar_path_lower(&lower) {
                 let mut f = File::open(path)
                     .map_err(|e| format!("failed to open archive {}: {e}", path.display()))?;

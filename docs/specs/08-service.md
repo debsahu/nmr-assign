@@ -8,8 +8,9 @@ assignments (`NMR-STAR v3`, `TSV`, `NEF v1.1`), optional 3D structures, and a
 self-contained HTML+SVG quality report.
 
 ## Components
-- Job API (`nmrassign serve`): upload, validate (format, referencing, experiment
-  type), queue, status, results download.
+- Job & Inspection API (`nmrassign serve [--bind <addr>] [--storage <dir>] [--inspect-root <dir>] [--cors-origin <origin>]`):
+  - Upload, validate (format, referencing, experiment type), queue, status, results download, and header-only workspace classification (`POST /api/v1/inspect`).
+  - **Browser Security & Origin Boundary**: Responses enforce same-origin access by default (`Access-Control-Allow-Origin` is omitted unless the request `Origin` matches `--cors-origin` or same-origin `Host`, and untrusted cross-origin requests return `403 Forbidden`) with `X-Content-Type-Options: nosniff`. JSON `POST` routes require `Content-Type: application/json` (`415 Unsupported Media Type` on `text/plain` or form payloads to block preflight-free browser CSRF). Server-side `"path"` inspection on `POST /api/v1/inspect` is disabled (`403 Forbidden`) unless `--inspect-root <dir>` is explicitly supplied and the canonicalized target resides under `--inspect-root`; arbitrary local folder inspection uses `nmrassign inspect <path>` on the CLI.
 - Workers: run pipeline stages 2 to 5 on CPU/GPU.
 - Report (`nmrassign report`): per-stage metrics, confidence plots, strip plots
   for checking assignments, structure validation summary.

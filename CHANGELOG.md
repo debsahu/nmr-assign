@@ -4,6 +4,47 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
+## `[0.5.0]` — 2026-11-12 — Phase 9: Zero-Friction Workspace Classifier, Drag-and-Drop Ingest, Guided Workbench UX, Multi-Spectrum GPU Overlays, Lossless `NEF v1.1` Sessions, Solver Curation & HTTP Security Hardening (`nmr-core`, `nmr-gpu`, `nmr-cli`, `nmr-gui`, `docs`)
+
+- **Tag:** `v0.5.0`
+- **Architectural Summary:**
+  - **Spectrometer Folder & Archive Auto-Classifier + HTTP `/api/v1/inspect` Security Hardening (`nmr-core::classify`, `nmr-core::service`, `nmr-cli::inspect_cmd`, `docs/specs/12-workbench-ux.md` — `T09.1`, `P1-1`, `P2-2`, `P2-3`):**
+    - Added `classify_nmr_workspace` (native directories, files, `.tar`, `.tar.gz`/`.tgz`) and `wasm32`-compatible `classify_nmr_entries` / `extract_archive_virtual_entries` covering 25 `PulseSequenceClass` variants and 7 `ProblemRegime`s without loading binary signal payloads (`< 50 ms` on unpacked folders and seekable `.tar` streams; compressed `.tar.gz` archives inflate sequentially with IEEE 802.3 CRC-32 + `ISIZE` trailer verification, POSIX/GNU `ustar` header checksum checks, strict `ustar\0` prefix checking, LZ77 distance bounds, and a `128 MiB` in-memory decompression cap).
+    - Added `nmrassign inspect <path> [--json]` and hardened `POST /api/v1/inspect` + `nmrassign serve`: removed wildcard `Access-Control-Allow-Origin: *` (enforcing same-origin by default with optional `--cors-origin <origin>`), rejected non-JSON `Content-Type` on JSON `POST` routes (`415 Unsupported Media Type`, blocking `text/plain` browser simple-request CSRF), and disabled server-side `"path"` inspection by default (`403 Forbidden`) unless `--inspect-root <dir>` is explicitly configured and matches canonicalized prefix.
+  - **Drag-and-Drop Loader & Editable Experiment Selection Matrix (`nmr-gui::ingest_panel` — `T09.2`):** Native path + `wasm32` byte-slice drag-and-drop for folders, `.tar`/`.tar.gz` archives, and `.nef` sessions, with auto-excluded 1D calibration decoys, per-row `PulseSequenceClass` override dropdowns, sequence extraction from `.fasta`/`.str`/`.nef`, and 1-click **"Process, Pick & Run"**.
+  - **Guided 6-Stage Workflow Stepper, 9-Menu Bar, `< 1 ms` `Cmd/Ctrl+K` Palette & Modal Two-Key Chords (`nmr-gui::workflow_bar`, `command_palette`, `keymap` — `T09.3`, `T09.4`):** 75 typed `WorkbenchAction` commands across 9 menus, persistent 6-stage workflow stepper + `DatasetQcVerdict` pill + contextual **"What Next?"** action, fuzzy command palette, and 14 clean-room two-key NMR chord accelerators (`vt`, `pa`, `pd`, `pc`, `pl`, `oz`, `zi`, `zo`, `ct`, `cb`, `st`, `at`, `Space`, `?`) with text-input and Octet 2D focus suppression.
+  - **Multi-Spectrum WebGPU Contour Overlays & `i-1 / i / i+1` Candidate Match-Finder Strips (`nmr-gui::contour_painter`, `strip_tiler` — `T09.5`):** Alpha-blended `OverlayLayerSpec` compositor (`>= 60 fps` cached `f32` storage buffers, independent pos/neg RGBA palettes, `ppm_nudge`, `SyncCrosshair`) and `pair_matrix`-ranked `i-1 / i / i+1` strip columns with `CA`/`CB`/`C'` alignment guides (`98.41%` = `124/126` top-3 sequential neighbor recovery on real Ubiquitin `.ucsf`).
+  - **Bounded `256`-Step Undo/Redo & Lossless `NEF v1.1` Session Persistence (`nmr-core::session`, `nef`, `nmr-gui::session_io` — `T09.6`):** Algebraic `CommandHistory` (`apply -> undo == identity` across 16-seed $\times$ 200-step property tests) and single-file `.nef` save/load preserving standard `NEF v1.1` saveframes plus vendor `save_nmrassign_workbench` state.
+  - **Backbone Solver Curation (`nmr-core::spinsystems`, `solver`, `evo_graph`, `nmr-gpu` — `T09.7`):**
+    - Added hard `locked_assignments: Vec<(usize, usize)>` across CPU & WebGPU `standard` (`max |U_cpu - U_gpu| < 1e-4`) and `evo-graph` (`0` changes to `docs/specs/03-assignment.md` §§3–4; bit-identical `U` & `P` when locks are empty).
+    - Added `< 15%`-median sub-stoichiometric minor-conformer damping in `evo_graph` (resolving Ubiquitin `Gln2` 9% minor root on Bruker `pdata` and `.ucsf`; scheduled for volume-based refinement and `dev` weak-amide audit in Phase 10).
+    - Added sparsity-adaptive MCMC proposals in CPU `solver.rs` (exact `MoveHastings` proposal ratios; `reservoir_weight` targets $\pi'(x) \propto \exp(U/T)\prod_{s\text{ unassigned}} w(s)$ while returning best-$U$; note CPU and WebGPU `standard` now differ by proposal algorithm).
+- **Verified Metrics & Honest Out-of-Sample Evaluation:**
+  - **Realistic Bruker 5-Seed Benchmark Gate (`nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5`):**
+    - `--solver evo-graph` (default): **`98.4%` accuracy** (`314/319`, `0.0%` delta), **`90.8%` recall** (`-0.5%` vs `v0.4.0` `91.3%`), **`98.4% (306/311)` HC precision** (`0.0%` delta).
+    - `--solver standard --engine cpu`: **`89.2%` accuracy** (`+5.8%` vs `83.4%`), **`71.4%` recall** (`+6.1%`), **`96.8%` HC precision** (`+0.6%`).
+    - `--solver standard --engine gpu`: **`88.4%` accuracy** (`243/275`), **`70.2%` recall**, **`95.9%` HC precision**.
+  - **Real Bruker Ubiquitin `pdata` & `CISD3` (`BMRB 51439`) 5-Seed Gates:**
+    - Ubiquitin `pdata` (`evo-graph`): **`98.51%` accuracy** (`+4.48%` vs `94.03%`, +3/67 residues), **`94.29%` recall** (`+4.29%`), **`100.00% (61/61)` HC precision**.
+    - `CISD3` (`BMRB 51439`, missing `HNCACB`): `standard` CPU `pdata` **`53.33%` accuracy** (`+5.55%` vs `47.78%`); `evo-graph` `pdata` **`56.57%` accuracy / `100.00%` HC precision** (`62.5%` acc / `100.0%` HC-prec on raw FID + 3D NUS).
+  - **7-Entry `--split dev --seeds 5` (`--solver evo-graph`):**
+    - Macro **`70.7%` acc** (`+1.3%` vs `v0.4.0` `69.4%`), **`58.7%` rec** (`+1.3%`), **`94.2%` HC-prec** (`+0.1%`), **`47.2%` HC-rec** (`+2.2%`); Micro **`69.5%` acc (`1629/2345`)**, **`94.6%` HC-prec (`1273/1345`)**.
+    - Calibration (`dev`, via hand-tuned `T_cal = 1.65 / 1.68` in `evo_graph.rs` and `1.55` in `solver.rs`): mean per-protein `ECE = 0.059`, pooled `ECE = 0.037`, `[0.8, 0.9)` bin `77.1%` (`108/140`). Note: `standard` CPU macro HC-prec on `dev` is `73.6%` (`87.6%` micro) and requires dedicated calibration in Phase 10.
+  - **9-Entry `--split heldout --seeds 5` (`--solver evo-graph`; `2` Genuinely Cold Entries + `7` Shared with Phase 8):**
+    - Macro **`79.1%` acc**, **`71.6%` rec**, **`95.6%` HC-prec** across 7 HC-active proteins (`2` abstained), **`44.7%` HC-rec** (down from `49.4%` in Phase 8); Micro **`80.0%` acc (`2327/2907`)**, **`94.7%` HC-prec (`1442/1522`)**, `[0.9–1.0]` bin **`97.0% (1335/1376)`**.
+    - **Out-of-sample calibration (`ECE <= 0.06` gate FAILED on `heldout`)**: mean per-protein **`ECE = 0.095`**, pooled **`ECE = 0.073`**, `[0.8, 0.9)` bin **`73.3% (107/146)`**.
+    - **2 genuinely cold entries**: `16099` (Kazal-1, 74 aa, Bruker) **`87.1%` acc / `81.8%` rec / `93.2%` HC-prec** (`87.7%` acc on `standard` CPU); `18489` (NFU1, 107 aa, Bruker) **`55.4%` acc / `42.7%` rec / `98.0% (98/100)` HC-prec** (`ECE = 0.059`).
+    - **7 shared Phase 8 $\to$ Phase 9 entries (reporting QC abstention regression plainly)**:
+      - `15476` (SR384): HC-prec `97.1%` $\to$ **abstained** (`91.9%` acc; false pre-solver QC offset mismatch warning dropped `170/170` correct calls below `0.80`)
+      - `16385` (PfR193A): HC-prec `96.9%` $\to$ **abstained** (`91.9%` acc; false pre-solver QC offset mismatch warning dropped `407/430` correct calls below `0.80`)
+      - `17030` (HR4694F): HC-prec `94.8%` $\to$ `91.0%` (`83.4%` acc)
+      - `51351` (TSR3): acc `87.7%` $\to$ `85.3%` (`98.4%` HC-prec)
+      - `53280` (Ap3): HC-prec `82.1%` $\to$ `91.2%` (`84.6%` acc; not cold — motivated Phase 8 post-review `qc.rs`)
+      - `5845` (ZR31): acc `90.7%` $\to$ `91.8%` (`97.4%` HC-prec)
+      - `18145` (OR126): acc `40.5%` $\to$ `40.8%` (`100.0%` HC-prec)
+
+---
+
 ## `[0.4.0]` — 2026-11-12 — Phase 8 Post-Review Remediation: Dataset QC Calibration, FID/DSP Hardening, Detailed Offset States, 3D-to-HSQC Registration, `evo-graph` Default Solver, and Expanded Benchmark Governance (`nmr-core`, `nmr-cli`, `nmr-gui`, `docs`)
 
 - **Tag:** `v0.4.0`

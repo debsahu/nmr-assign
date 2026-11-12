@@ -28,7 +28,9 @@ use nmr_core::classify::{
     ExperimentDimensionality, ExperimentVendor, ProblemRegime, PulseSequenceClass, QuadratureKind,
     VirtualEntry, WorkspaceInventory,
 };
-use nmr_core::service::spawn_background_server;
+use nmr_core::service::{
+    spawn_background_server, spawn_background_server_with_options, ServiceOptions,
+};
 
 static NEXT_TMP_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -722,6 +724,21 @@ fn append_tar_entry(tar: &mut Vec<u8>, name: &str, payload: &[u8]) {
     }
 }
 
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 /// Encode bytes as a valid RFC 1952 GZIP stream using RFC 1951 stored blocks (`BTYPE=00`).
 fn gzip_stored(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -742,7 +759,7 @@ fn gzip_stored(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(chunk);
     }
     // CRC32 + ISIZE (8-byte trailer)
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&crc32_ieee(data).to_le_bytes());
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out
 }
@@ -823,7 +840,7 @@ fn gzip_fixed_huffman_rle_zeros(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(18 + deflate.len());
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 255]);
     out.extend_from_slice(&deflate);
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&crc32_ieee(data).to_le_bytes());
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out
 }
@@ -910,17 +927,22 @@ fn test_tar_and_targz_archive_streaming_and_wasm_entries_parity() {
     let _ = fs::remove_dir_all(&root);
 }
 
-fn send_http_post(
+fn send_http_post_with_headers(
     addr: std::net::SocketAddr,
     path: &str,
     ctype: &str,
+    extra_headers: &[(&str, &str)],
     body: &[u8],
-) -> (u16, Vec<u8>) {
+) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(addr).expect("connect to service");
-    let req_hdr = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut req_hdr = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
         body.len()
     );
+    for (k, v) in extra_headers {
+        req_hdr.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req_hdr.push_str("Connection: close\r\n\r\n");
     stream.write_all(req_hdr.as_bytes()).unwrap();
     stream.write_all(body).unwrap();
     stream.flush().unwrap();
@@ -931,7 +953,7 @@ fn send_http_post(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .expect("HTTP header separator");
-    let hdr_str = String::from_utf8_lossy(&raw[..sep]);
+    let hdr_str = String::from_utf8_lossy(&raw[..sep]).into_owned();
     let status: u16 = hdr_str
         .lines()
         .next()
@@ -941,11 +963,27 @@ fn send_http_post(
         .unwrap()
         .parse()
         .unwrap();
-    (status, raw[sep + 4..].to_vec())
+    (status, hdr_str, raw[sep + 4..].to_vec())
+}
+
+fn send_http_post(
+    addr: std::net::SocketAddr,
+    path: &str,
+    ctype: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let (status, hdrs, resp) = send_http_post_with_headers(addr, path, ctype, &[], body);
+    assert!(
+        !hdrs
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin: *"),
+        "wildcard CORS must never be emitted: {hdrs}"
+    );
+    (status, resp)
 }
 
 #[test]
-fn test_service_post_api_v1_inspect_modes() {
+fn test_service_post_api_v1_inspect_modes_and_security_guards() {
     let root = make_temp_dir("service_inspect");
     let ws_dir = root.join("sample_ws");
     write_text(
@@ -960,27 +998,35 @@ fn test_service_post_api_v1_inspect_modes() {
     );
     write_bytes(&ws_dir, "1_hsqc/ser", &[0u8; 128]);
 
+    let outside_dir = root.join("outside_secret");
+    write_text(
+        &outside_dir,
+        "1_secret/acqus",
+        &bruker_acqus("hsqcetfpf3gpsi", "1H", 800.13, 14.0, 2048, 0),
+    );
+
     let storage_dir = root.join("srv_storage");
     let mut srv =
         spawn_background_server("127.0.0.1:0", storage_dir).expect("spawn background server");
     let addr = srv.local_addr();
 
-    // Mode 1: JSON `{ "path": ... }`
+    // Security Guard 1: Default server rejects `{ "path": ... }` with 403 Forbidden
     let body_path = serde_json::json!({
         "path": ws_dir.to_string_lossy()
     });
-    let (st1, resp1) = send_http_post(
+    let body_path_bytes = serde_json::to_vec(&body_path).unwrap();
+    let (st_forbidden, _) = send_http_post(
         addr,
         "/api/v1/inspect",
         "application/json",
-        &serde_json::to_vec(&body_path).unwrap(),
+        &body_path_bytes,
     );
-    assert_eq!(st1, 200, "got: {}", String::from_utf8_lossy(&resp1));
-    let inv1: WorkspaceInventory = serde_json::from_slice(&resp1).unwrap();
-    assert_eq!(inv1.experiments.len(), 1);
-    assert_eq!(inv1.experiments[0].pulse_class, PulseSequenceClass::N15Hsqc);
+    assert_eq!(
+        st_forbidden, 403,
+        "server-side path must be disabled by default"
+    );
 
-    // Mode 2: JSON `{ "root_name": "browser_drop", "entries": [...] }`
+    // Security Guard 2: Browser simple-request `text/plain` POST is rejected with 415
     let entries = vec![
         VirtualEntry::new(
             "drop/acqus",
@@ -1000,11 +1046,32 @@ fn test_service_post_api_v1_inspect_modes() {
         "root_name": "browser_drop",
         "entries": entries
     });
+    let body_entries_bytes = serde_json::to_vec(&body_entries).unwrap();
+    let (st_plain, _) = send_http_post(addr, "/api/v1/inspect", "text/plain", &body_entries_bytes);
+    assert_eq!(
+        st_plain, 415,
+        "text/plain JSON CSRF bypass must be rejected"
+    );
+
+    // Security Guard 3: Untrusted cross-origin `Origin` header is rejected with 403
+    let (st_evil_origin, hdr_evil, _) = send_http_post_with_headers(
+        addr,
+        "/api/v1/inspect",
+        "application/json",
+        &[("Origin", "https://evil.example")],
+        &body_entries_bytes,
+    );
+    assert_eq!(st_evil_origin, 403);
+    assert!(!hdr_evil
+        .to_ascii_lowercase()
+        .contains("access-control-allow-origin"));
+
+    // Mode 2: JSON `{ "root_name": "browser_drop", "entries": [...] }` (`application/json`)
     let (st2, resp2) = send_http_post(
         addr,
         "/api/v1/inspect",
         "application/json",
-        &serde_json::to_vec(&body_entries).unwrap(),
+        &body_entries_bytes,
     );
     assert_eq!(st2, 200);
     let inv2: WorkspaceInventory = serde_json::from_slice(&resp2).unwrap();
@@ -1034,7 +1101,162 @@ fn test_service_post_api_v1_inspect_modes() {
     assert_eq!(inv3.experiments[0].pulse_class, PulseSequenceClass::Con2D);
 
     srv.shutdown();
+
+    // Mode 1 (Scoped): Explicit `inspect_root` allows inside-root and rejects outside-root
+    let storage_dir2 = root.join("srv_storage_scoped");
+    let mut srv_scoped = spawn_background_server_with_options(
+        "127.0.0.1:0",
+        storage_dir2,
+        ServiceOptions {
+            inspect_root: Some(ws_dir.clone()),
+            allowed_origins: vec!["https://workbench.local".to_string()],
+        },
+    )
+    .expect("spawn scoped background server");
+    let addr_scoped = srv_scoped.local_addr();
+
+    let (st_ok, hdr_ok, resp_ok) = send_http_post_with_headers(
+        addr_scoped,
+        "/api/v1/inspect",
+        "application/json",
+        &[("Origin", "https://workbench.local")],
+        &body_path_bytes,
+    );
+    assert_eq!(st_ok, 200, "got: {}", String::from_utf8_lossy(&resp_ok));
+    assert!(hdr_ok.contains("Access-Control-Allow-Origin: https://workbench.local"));
+    let inv1: WorkspaceInventory = serde_json::from_slice(&resp_ok).unwrap();
+    assert_eq!(inv1.experiments.len(), 1);
+    assert_eq!(inv1.experiments[0].pulse_class, PulseSequenceClass::N15Hsqc);
+
+    let body_outside = serde_json::json!({
+        "path": outside_dir.to_string_lossy()
+    });
+    let (st_out, _) = send_http_post(
+        addr_scoped,
+        "/api/v1/inspect",
+        "application/json",
+        &serde_json::to_vec(&body_outside).unwrap(),
+    );
+    assert_eq!(st_out, 403, "path outside inspect_root must be rejected");
+
+    srv_scoped.shutdown();
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_archive_hardening_gnu_tar_crc32_checksum_and_bomb_limits() {
+    let acqus = bruker_acqus("hncogp3d", "1H", 700.13, 14.0, 2048, 0);
+    let acqu2s = bruker_indirect_acqus("13C", 176.05, 14.0, 96, 5);
+    let acqu3s = bruker_indirect_acqus("15N", 70.95, 32.0, 64, 6);
+
+    // 1. GNU tar header (`ustar  \0`) with non-zero atime/ctime bytes in 345..369 must NOT corrupt path
+    let mut gnu_tar = Vec::new();
+    for (name, payload) in [
+        ("gnu_ws/10/acqus", acqus.as_bytes()),
+        ("gnu_ws/10/acqu2s", acqu2s.as_bytes()),
+        ("gnu_ws/10/acqu3s", acqu3s.as_bytes()),
+    ] {
+        let mut hdr = [0u8; 512];
+        hdr[..name.len()].copy_from_slice(name.as_bytes());
+        hdr[100..107].copy_from_slice(b"0000644");
+        hdr[108..115].copy_from_slice(b"0001000");
+        hdr[116..123].copy_from_slice(b"0001000");
+        hdr[124..135].copy_from_slice(format!("{:011o}", payload.len()).as_bytes());
+        hdr[136..147].copy_from_slice(b"14600000000");
+        hdr[148..156].fill(b' ');
+        hdr[156] = b'0';
+        hdr[257..265].copy_from_slice(b"ustar  \0"); // GNU magic, NOT POSIX ustar\0
+        hdr[345..357].copy_from_slice(b"14600012345\0"); // GNU atime in POSIX prefix slot!
+        hdr[357..369].copy_from_slice(b"14600012346\0"); // GNU ctime
+        let csum: u32 = hdr.iter().map(|&b| b as u32).sum();
+        hdr[148..156].copy_from_slice(format!("{csum:06o}\0 ").as_bytes());
+        gnu_tar.extend_from_slice(&hdr);
+        gnu_tar.extend_from_slice(payload);
+        let rem = payload.len() % 512;
+        if rem != 0 {
+            gnu_tar.extend(std::iter::repeat_n(0u8, 512 - rem));
+        }
+    }
+    gnu_tar.extend(std::iter::repeat_n(0u8, 1024));
+
+    let gnu_entries = extract_archive_virtual_entries("gnu.tar", &gnu_tar).expect("parse GNU tar");
+    assert_eq!(gnu_entries[0].relative_path, "gnu_ws/10/acqus");
+    let gnu_inv = classify_nmr_entries(&gnu_entries);
+    assert_eq!(gnu_inv.experiments.len(), 1);
+    assert_eq!(gnu_inv.experiments[0].pulse_class, PulseSequenceClass::Hnco);
+
+    // 2. Corrupted tar header checksum must return Err
+    let mut bad_tar = gnu_tar.clone();
+    bad_tar[0] ^= 0xFF;
+    assert!(extract_archive_virtual_entries("bad.tar", &bad_tar).is_err());
+
+    // 3. Corrupted gzip CRC32 trailer must return Err
+    let mut bad_gz = gzip_stored(&gnu_tar);
+    let crc_pos = bad_gz.len() - 8;
+    bad_gz[crc_pos] ^= 0x01;
+    assert!(extract_archive_virtual_entries("bad.tar.gz", &bad_gz).is_err());
+
+    // 4. Out-of-history DEFLATE LZ77 distance (match before any literal) must return Err
+    // BFINAL=1, BTYPE=01 (0b011), length 258 (0xC5 8-bit MSB), dist 1 (00000 5-bit MSB), EOB (0000000)
+    let bad_deflate_gz: [u8; 21] = [
+        0x1f,
+        0x8b,
+        0x08,
+        0x00,
+        0,
+        0,
+        0,
+        0,
+        0,
+        255, // header
+        0b1010_0011,
+        0b0000_0001,
+        0x00, // match258 dist=1 at pos 0 + EOB
+        0,
+        0,
+        0,
+        0,
+        2,
+        1,
+        0,
+        0, // trailer
+    ];
+    assert!(extract_archive_virtual_entries("bad_dist.tgz", &bad_deflate_gz).is_err());
+
+    // 5. > 128 MiB gzip bomb on `extract_archive_virtual_entries` must abort cleanly
+    let mut bomb_tar = Vec::new();
+    let bomb_hdr_only = {
+        let mut hdr = [0u8; 512];
+        let name = b"bomb/ser";
+        hdr[..name.len()].copy_from_slice(name);
+        hdr[100..107].copy_from_slice(b"0000644");
+        hdr[108..115].copy_from_slice(b"0001000");
+        hdr[116..123].copy_from_slice(b"0001000");
+        let sz = 130usize * 1024 * 1024; // 130 MiB > 128 MiB cap
+        hdr[124..135].copy_from_slice(format!("{sz:011o}").as_bytes());
+        hdr[136..147].copy_from_slice(b"14600000000");
+        hdr[148..156].fill(b' ');
+        hdr[156] = b'0';
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263..265].copy_from_slice(b"00");
+        let csum: u32 = hdr.iter().map(|&b| b as u32).sum();
+        hdr[148..156].copy_from_slice(format!("{csum:06o}\0 ").as_bytes());
+        hdr
+    };
+    bomb_tar.extend_from_slice(&bomb_hdr_only);
+    bomb_tar.resize(512 + 130 * 1024 * 1024, 0u8);
+    let bomb_tgz = gzip_fixed_huffman_rle_zeros(&bomb_tar);
+    assert!(
+        bomb_tgz.len() < 1_000_000,
+        "RLE-compressed 130 MiB bomb should be < 1 MB, got {}",
+        bomb_tgz.len()
+    );
+    let bomb_err = extract_archive_virtual_entries("bomb.tgz", &bomb_tgz)
+        .expect_err("130 MiB gzip bomb must be rejected in-memory");
+    assert!(
+        bomb_err.contains("maximum uncompressed byte limit"),
+        "unexpected error: {bomb_err}"
+    );
 }
 
 fn find_real_data_dir() -> Option<PathBuf> {
