@@ -24,6 +24,7 @@ use nmr_core::peaks::Peak;
 use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
 use nmr_core::priors::{one_to_three, Priors};
 use nmr_core::simulate::{simulate, SimConfig};
+use nmr_core::solver::prepare_scoring_priors;
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d};
 use nmr_core::spinsystems::{build_spin_systems, Tolerances};
 
@@ -40,9 +41,7 @@ fn workspace_root() -> PathBuf {
 fn resolve_local_real_data_dir() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("NMR_REAL_DATA_DIR") {
         let p = PathBuf::from(custom);
-        if p.join("ubiquitin").is_dir() {
-            return Some(p);
-        }
+        return p.is_dir().then_some(p);
     }
     let ws_data = workspace_root().join("data");
     if ws_data.join("ubiquitin").is_dir() {
@@ -636,4 +635,185 @@ fn real_bruker_ubiquitin_5seed_classical_pick_sequence_only() {
         let _ = apply_offsets_to_priors;
         let _ = refine_anchor_reference_offsets;
     }
+}
+
+/// Fit global unlabelled `(dH, dN)` reference offset (`systems - truth_ref`) by 2D Gaussian
+/// marginal log-likelihood over the unlabelled empirical `(H, N)` sets (zero residue-label use).
+fn fit_unlabelled_hn_offset(
+    systems: &[nmr_core::spinsystems::SpinSystem],
+    truth_ref: &Reference,
+) -> (f64, f64) {
+    let mut t_hn = Vec::new();
+    for k in 1..truth_ref.sequence.len() {
+        if let (Some(&h), Some(&n)) = (
+            truth_ref.shifts.get(&(k, "H".to_string())),
+            truth_ref.shifts.get(&(k, "N".to_string())),
+        ) {
+            t_hn.push((h, n));
+        }
+    }
+    if systems.len() < 5 || t_hn.len() < 5 {
+        return (0.0, 0.0);
+    }
+    let eval_ll = |dh: f64, dn: f64| -> f64 {
+        let mut ll = -0.5 * ((dh / 0.35).powi(2) + (dn / 2.50).powi(2));
+        for ss in systems {
+            let mut max_lp = -4.5_f64;
+            for &(th, tn) in &t_hn {
+                let lp =
+                    -0.5 * (((ss.h - dh - th) / 0.045).powi(2) + ((ss.n - dn - tn) / 0.40).powi(2));
+                if lp > max_lp {
+                    max_lp = lp;
+                }
+            }
+            let mut sum_exp = (-4.5 - max_lp).exp();
+            for &(th, tn) in &t_hn {
+                let lp =
+                    -0.5 * (((ss.h - dh - th) / 0.045).powi(2) + ((ss.n - dn - tn) / 0.40).powi(2));
+                sum_exp += (lp - max_lp).exp();
+            }
+            ll += max_lp + sum_exp.ln();
+        }
+        ll
+    };
+    let ll0 = eval_ll(0.0, 0.0);
+    let mut best = (0.0_f64, 0.0_f64, ll0);
+    for ih in -20..=20 {
+        let dh = (ih as f64) * 0.025;
+        for jn in -30..=30 {
+            let dn = (jn as f64) * 0.10;
+            let v = eval_ll(dh, dn);
+            if v > best.2 {
+                best = (dh, dn, v);
+            }
+        }
+    }
+    let (c_dh, c_dn, _) = best;
+    for ih in -10..=10 {
+        let dh = c_dh + (ih as f64) * 0.003;
+        for jn in -10..=10 {
+            let dn = c_dn + (jn as f64) * 0.015;
+            let v = eval_ll(dh, dn);
+            if v > best.2 {
+                best = (dh, dn, v);
+            }
+        }
+    }
+    if best.2 - ll0 >= 4.0 && (best.0.abs() >= 0.05 || best.1.abs() >= 0.35) {
+        (best.0, best.1)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+#[test]
+fn real_bruker_cisd3_5seed_development_gate() {
+    let Some(data_dir) = resolve_local_real_data_dir() else {
+        eprintln!("Skipping CISD3 5-seed gate: local data directory not present");
+        return;
+    };
+    let cisd3_dir = data_dir.join("private/bmrb51439_cisd3");
+    let fasta_path = cisd3_dir.join("cisd3.fasta");
+    let star_path = cisd3_dir.join("bmr51439_3.str");
+    if !fasta_path.is_file() || !star_path.is_file() {
+        eprintln!("Skipping CISD3 5-seed gate: private/bmrb51439_cisd3 not present");
+        return;
+    }
+
+    let sequence = parse_fasta_sequence(&fasta_path);
+    assert_eq!(sequence.len(), 93);
+    let mut truth_ref = read_star(&star_path, None).expect("read BMRB 51439 STAR");
+    let assignable_amides = (1..sequence.len())
+        .filter(|&k| {
+            sequence[k] != "PRO"
+                && truth_ref.shifts.contains_key(&(k, "H".to_string()))
+                && truth_ref.shifts.contains_key(&(k, "N".to_string()))
+        })
+        .count();
+    assert_eq!(assignable_amides, 51);
+
+    let pcfg = PickerConfig::default();
+    let hsqc_spec = read_bruker_pdata_2d(cisd3_dir.join("CISD3_15N_HSQC_diamagnetic/pdata/1"))
+        .expect("read CISD3 HSQC");
+    let hsqc_roots = pick_hsqc_2d(&hsqc_spec, &pcfg);
+    let mut raw_peaks = hsqc_roots.clone();
+    for (rel_path, exp_name) in [
+        ("CISD3_HNCA/pdata/1", "HNCA"),
+        ("CISD3_HNCOCA/pdata/1", "HNCOCA"),
+        ("CISD3_CBCACONH/pdata/1", "CBCACONH"),
+        ("CISD3_HNCO/pdata/1", "HNCO"),
+    ] {
+        let spec3d = read_bruker_pdata_3d(cisd3_dir.join(rel_path), exp_name).expect("read 3D");
+        raw_peaks.extend(pick_triple_3d(&spec3d, &hsqc_roots, &pcfg));
+    }
+
+    let priors = Priors::bmrb();
+    let scfg = nmr_core::solver::ScoreConfig::default();
+    let probe_systems =
+        build_spin_systems(&raw_peaks, &Tolerances::default(), 3, false).expect("spin systems");
+    let (dh, dn) = fit_unlabelled_hn_offset(&probe_systems, &truth_ref);
+    for ((_, atom), val) in truth_ref.shifts.iter_mut() {
+        if atom == "H" {
+            *val += dh;
+        } else if atom == "N" {
+            *val += dn;
+        }
+    }
+
+    // 1. Standard CPU solver 5-seed baseline check
+    let (eff_priors, _) = prepare_scoring_priors(&probe_systems, &sequence, &priors, &scfg);
+    let std_truth = map_spin_systems_to_truth(&probe_systems, &truth_ref);
+    let mut std_accs = Vec::new();
+    for seed in 0..5u64 {
+        let acfg = nmr_core::solver::AnnealConfig {
+            seed,
+            ..Default::default()
+        };
+        let res = nmr_core::solver::assign(&probe_systems, &sequence, &eff_priors, &scfg, &acfg);
+        let mut m = score(&res, &std_truth, 0.8);
+        m.assignable = assignable_amides;
+        std_accs.push(m.accuracy() * 100.0);
+    }
+    let std_mean_acc = std_accs.iter().sum::<f64>() / 5.0;
+    println!("CISD3 5-seed standard CPU mean accuracy: {std_mean_acc:.2}% ({std_accs:?})");
+    assert!(
+        std_mean_acc >= 35.0,
+        "CISD3 5-seed standard mean accuracy {std_mean_acc:.2}% regressed below 35.0%"
+    );
+
+    // 2. Evo-graph solver 5-seed accuracy & calibrated HC precision gate
+    let mut evo_accs = Vec::new();
+    let mut evo_recs = Vec::new();
+    let mut evo_hcps = Vec::new();
+    for seed in 0..5u64 {
+        let cfg = EvoGraphConfig {
+            structure_torsions: None,
+            seed,
+            ..Default::default()
+        };
+        let (systems, res, _) = assign_evo_graph_from_peaks(&raw_peaks, &sequence, &priors, &cfg);
+        let sys_truth = map_spin_systems_to_truth(&systems, &truth_ref);
+        let mut m = score(&res, &sys_truth, 0.8);
+        m.assignable = assignable_amides;
+        evo_accs.push(m.accuracy() * 100.0);
+        evo_recs.push(m.recall() * 100.0);
+        evo_hcps.push(m.hc_precision() * 100.0);
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / (v.len() as f64);
+    println!(
+        "CISD3 5-seed evo-graph MEAN: acc={:.2}%, rec={:.2}%, HC_prec={:.2}% (per-seed HC_prec={evo_hcps:?})",
+        mean(&evo_accs),
+        mean(&evo_recs),
+        mean(&evo_hcps),
+    );
+    assert!(
+        mean(&evo_accs) >= 55.0,
+        "CISD3 5-seed evo-graph mean accuracy {:.2}% < 55.0%",
+        mean(&evo_accs)
+    );
+    assert!(
+        mean(&evo_hcps) >= 94.0,
+        "CISD3 5-seed evo-graph mean HC precision {:.2}% < 94.0%",
+        mean(&evo_hcps)
+    );
 }

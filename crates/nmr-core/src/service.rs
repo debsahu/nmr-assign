@@ -437,14 +437,17 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
     }
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => write_http_response(
-            &mut stream,
-            200,
-            "OK",
-            "text/html; charset=utf-8",
-            &[],
-            DASHBOARD_HTML.as_bytes(),
-        ),
+        ("GET", "/") | ("GET", "/index.html") => {
+            let html = DASHBOARD_HTML.replace("__NMR_VERSION__", crate::VERSION);
+            write_http_response(
+                &mut stream,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                &[],
+                html.as_bytes(),
+            )
+        }
         ("GET", "/api/v1/health") => {
             #[derive(Serialize)]
             struct HealthResp<'a> {
@@ -457,7 +460,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
                 "OK",
                 &HealthResp {
                     status: "ok",
-                    version: "0.2.0",
+                    version: crate::VERSION,
                 },
             )
         }
@@ -1237,7 +1240,7 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <body>
 <header>
   <div class="brand">
-    <span class="brand-badge">NMR v0.2</span>
+    <span class="brand-badge">NMR v__NMR_VERSION__</span>
     <h1>Automated Protein NMR Backbone Assignment &amp; NEF Pipeline</h1>
   </div>
   <button class="demo-btn" id="btn-demo" type="button">Load Synthetic Ubiquitin Demo</button>

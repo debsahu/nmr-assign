@@ -2353,6 +2353,207 @@ fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matr
     }
 }
 
+/// Final reported marginal confidence calibration (Pass 2):
+/// combines Pass-1/2 consensus `c0` with single-spin Boltzmann beliefs `b1` and second-order
+/// belief-weighted sequential damping (`clamp_w = (b1 / 0.85)^2`), including rigid register
+/// translation `[a..=b] -> [k2 .. k2 + L]` (`L = 2..=5`) for short stretches lacking a high-belief
+/// (`>= 0.80`) sequential anchor at either boundary so unanchored short islands cannot inflate
+/// interior residues above `0.80` via mutual clamping.
+fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matrix2D) {
+    let c0 = res.confidence.clone();
+    calibrate_boltzmann_confidence(res, u, p);
+
+    let k_len = u.cols;
+    let s_len = u.rows;
+    if k_len <= 1 || s_len == 0 {
+        return;
+    }
+
+    let mut at = vec![-1i32; k_len];
+    for (s, &k) in res.position.iter().enumerate() {
+        if k >= 0 && (k as usize) < k_len {
+            at[k as usize] = s as i32;
+        }
+    }
+
+    let b1 = res.confidence.clone();
+    let clamp_w = |spin_idx: usize| -> f64 {
+        let r = (b1[spin_idx] / 0.85).clamp(0.0, 1.0);
+        r * r
+    };
+    let weighted_site = |spin: usize, slot: usize| -> f64 {
+        let mut sc = u.get(spin, slot);
+        if slot > 0 && at[slot - 1] >= 0 {
+            let sl = at[slot - 1] as usize;
+            sc += clamp_w(sl) * p.get(sl, spin);
+        }
+        if slot + 1 < k_len && at[slot + 1] >= 0 {
+            let sr = at[slot + 1] as usize;
+            sc += clamp_w(sr) * p.get(spin, sr);
+        }
+        sc
+    };
+
+    let mut bp_unassign = vec![f64::NEG_INFINITY; s_len];
+    let mut bp_frag_dest = vec![vec![f64::NEG_INFINITY; k_len]; s_len];
+    let max_island_len = 5usize.min(k_len.saturating_sub(1));
+
+    for a in 1..k_len {
+        if at[a] < 0 {
+            continue;
+        }
+        let left_anchored = a > 0
+            && at[a - 1] >= 0
+            && b1[at[a - 1] as usize] >= 0.80
+            && p.get(at[a - 1] as usize, at[a] as usize) >= 1.5;
+        if left_anchored {
+            continue;
+        }
+        for len in 2..=max_island_len {
+            let b = a + len - 1;
+            if b >= k_len || at[b] < 0 {
+                break;
+            }
+            let right_anchored = b + 1 < k_len
+                && at[b + 1] >= 0
+                && b1[at[b + 1] as usize] >= 0.80
+                && p.get(at[b] as usize, at[b + 1] as usize) >= 1.5;
+            if right_anchored {
+                continue;
+            }
+
+            let mut u_self_sum = 0.0;
+            let mut internal_p = 0.0;
+            for off in 0..len {
+                u_self_sum += u.get(at[a + off] as usize, a + off);
+                if off + 1 < len {
+                    internal_p += p.get(at[a + off] as usize, at[a + off + 1] as usize);
+                }
+            }
+            let mut bnd_self = 0.0;
+            if a > 0 && at[a - 1] >= 0 {
+                let sl = at[a - 1] as usize;
+                bnd_self += clamp_w(sl) * p.get(sl, at[a] as usize);
+            }
+            if b + 1 < k_len && at[b + 1] >= 0 {
+                let sr = at[b + 1] as usize;
+                bnd_self += clamp_w(sr) * p.get(at[b] as usize, sr);
+            }
+            let e_frag_self = u_self_sum + bnd_self;
+            let delta_un = -(e_frag_self + internal_p);
+            for &spin_raw in &at[a..=b] {
+                let sj = spin_raw as usize;
+                if delta_un > bp_unassign[sj] {
+                    bp_unassign[sj] = delta_un;
+                }
+            }
+
+            for k2 in 1..=(k_len - len) {
+                if k2 == a {
+                    continue;
+                }
+                if !(0..len).all(|off| u.get(at[a + off] as usize, k2 + off) > FORBID * 0.5) {
+                    continue;
+                }
+                let mut u_alt_sum = 0.0;
+                let mut occ_cost = 0.0;
+                let in_src = |idx: usize| idx >= a && idx <= b;
+                let in_dst = |idx: usize| idx >= k2 && idx < k2 + len;
+                for off in 0..len {
+                    let q = k2 + off;
+                    u_alt_sum += u.get(at[a + off] as usize, q);
+                    if !in_src(q) && at[q] >= 0 {
+                        let occ = at[q] as usize;
+                        let mut e_occ = u.get(occ, q);
+                        // Count external left edge only when `q - 1` is neither moved nor evicted
+                        if q > 0 && !in_src(q - 1) && !in_dst(q - 1) && at[q - 1] >= 0 {
+                            let sl = at[q - 1] as usize;
+                            e_occ += clamp_w(sl) * p.get(sl, occ);
+                        }
+                        // Count internal evicted edge `(q, q + 1)` once, and skip moved `[a..=b]`
+                        // since `bnd_self` already accounts for `(a - 1, a)` and `(b, b + 1)`
+                        if q + 1 < k_len && !in_src(q + 1) && at[q + 1] >= 0 {
+                            let sr = at[q + 1] as usize;
+                            let edge_w = if in_dst(q + 1) {
+                                clamp_w(occ).min(clamp_w(sr))
+                            } else {
+                                clamp_w(occ) * clamp_w(sr)
+                            };
+                            occ_cost += edge_w * p.get(occ, sr).max(0.0);
+                        }
+                        occ_cost += clamp_w(occ) * e_occ.max(0.0);
+                    }
+                }
+                let mut bnd_alt = 0.0;
+                if k2 > 0 && (k2 - 1 < a || k2 - 1 > b) && at[k2 - 1] >= 0 {
+                    let sl = at[k2 - 1] as usize;
+                    bnd_alt += clamp_w(sl) * p.get(sl, at[a] as usize);
+                }
+                if k2 + len < k_len && (k2 + len < a || k2 + len > b) && at[k2 + len] >= 0 {
+                    let sr = at[k2 + len] as usize;
+                    bnd_alt += clamp_w(sr) * p.get(at[b] as usize, sr);
+                }
+                let delta_frag = (u_alt_sum + bnd_alt - occ_cost) - e_frag_self;
+                for off in 0..len {
+                    let sj = at[a + off] as usize;
+                    let k_dest = k2 + off;
+                    if delta_frag > bp_frag_dest[sj][k_dest] {
+                        bp_frag_dest[sj][k_dest] = delta_frag;
+                    }
+                }
+            }
+        }
+    }
+
+    let t_cal = 1.65_f64;
+    for s in 0..s_len {
+        let k_raw = res.position[s];
+        if k_raw < 0 || b1[s] <= 0.0 {
+            continue;
+        }
+        let k = k_raw as usize;
+        let e_self_w = weighted_site(s, k);
+        let un_w = (-e_self_w).max(bp_unassign[s]);
+        let mut alt_w = (un_w / t_cal).clamp(-40.0, 20.0).exp();
+
+        for t in 0..s_len {
+            if t != s && res.position[t] < 0 && u.get(t, k) > FORBID * 0.5 {
+                let delta = weighted_site(t, k) - e_self_w;
+                alt_w += (delta / t_cal).clamp(-40.0, 20.0).exp();
+            }
+        }
+        for k2 in 1..k_len {
+            if k2 == k {
+                continue;
+            }
+            let mut best_k2 = bp_frag_dest[s][k2];
+            if u.get(s, k2) > FORBID * 0.5 {
+                let mut e_k2 = u.get(s, k2);
+                if k2 > 0 && k2 - 1 != k && at[k2 - 1] >= 0 {
+                    let sl = at[k2 - 1] as usize;
+                    e_k2 += clamp_w(sl) * p.get(sl, s);
+                }
+                if k2 + 1 < k_len && k2 + 1 != k && at[k2 + 1] >= 0 {
+                    let sr = at[k2 + 1] as usize;
+                    e_k2 += clamp_w(sr) * p.get(s, sr);
+                }
+                let occ_cost = if at[k2] >= 0 {
+                    let t = at[k2] as usize;
+                    clamp_w(t) * weighted_site(t, k2).max(0.0)
+                } else {
+                    0.0
+                };
+                best_k2 = best_k2.max(e_k2 - occ_cost - e_self_w);
+            }
+            if best_k2 > f64::NEG_INFINITY * 0.5 {
+                alt_w += (best_k2 / t_cal).clamp(-40.0, 20.0).exp();
+            }
+        }
+        let p_bp = 1.0 / (1.0 + alt_w);
+        res.confidence[s] = res.confidence[s].min(c0[s] * p_bp).clamp(0.0, 1.0);
+    }
+}
+
 // ============================================================================
 // Component 4A: 2-Layer Sequence-Graph Self-Consistency Check
 // ============================================================================
@@ -3347,7 +3548,7 @@ fn assign_evo_graph_core(
         &mut master_rng,
     );
     let mut res2 = consensus_from_runs(&pos2, scores2);
-    calibrate_boltzmann_confidence(&mut res2, &u2_phys, &p);
+    calibrate_final_marginal_confidence(&mut res2, &u2_phys, &p);
     report.final_best_score = res2.score;
     res2
 }

@@ -2444,7 +2444,10 @@ impl eframe::App for NmrWorkbenchApp {
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("nmr-assign — WebGPU Protein NMR & Octet Chemical Studio")
+            .with_title(format!(
+                "nmr-assign v{} — WebGPU Protein NMR & Octet Chemical Studio",
+                nmr_core::VERSION
+            ))
             .with_inner_size([1380.0, 860.0])
             .with_min_inner_size([960.0, 620.0]),
         ..Default::default()

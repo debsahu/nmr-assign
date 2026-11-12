@@ -1,12 +1,34 @@
 # Changelog
 
-All notable architectural changes, algorithm milestones, and verified benchmark results for `nmr-assign` are documented in this file (newest entries first).
+All notable architectural changes, algorithm milestones, and verified benchmark results for `nmr-assign` are documented in this file using Semantic Versioning (`vX.Y.Z` annotated git tags, newest releases first).
 
 ---
 
-## `04b1769` — 2026-11-11 — Out-of-Sample Cold Validation (`BMRB 51439` `CISD3`), Hz-Scaled $^3J_{\text{HNH}\alpha}$ Doublet Coalescing, Removal of `tripeptide` & CLI `--pdb`, and CI Verification (`nmr-core`, `nmr-cli`, `docs`)
+## `[0.3.0]` — 2026-11-11 — Workspace SemVer Versioning (`v0.3.0`), Realistic Bruker 5-Seed CI Gate, Permutation-Invariant Unlabelled `score` Referencing, and Calibrated `evo-graph` Confidence (`nmr-core`, `nmr-cli`, `nmr-gui`, `ci`, `docs`)
 
-- **Commit:** `04b1769`
+- **Tag:** `v0.3.0`
+- **Architectural Summary:**
+  - **Single-Source SemVer Versioning & Git Provenance (`Cargo.toml`, `crates/nmr-core/src/lib.rs`, `crates/nmr-cli/build.rs`, `crates/nmr-cli/src/main.rs`, `nef.rs`, `report.rs`, `service.rs`, `nmr-gui`):** Established `[workspace.package] version = "0.3.0"` (`nmr_core::VERSION`) as the single source of truth across `nmrassign --version` / `-V` / `version` (with compile-time short git SHA `NMRASSIGN_GIT_SHA`), generated `.str` provenance headers, CCPN NEF `program_version`, HTML quality reports, `/api/v1/health` JSON, and the desktop GUI title, paired with annotated git tags (`v0.1.0`..`v0.3.0`).
+  - **Realistic-Physics 5-Seed Benchmark Gate (`crates/nmr-cli/src/main.rs`, `.github/workflows/ci.yml`, `AGENTS.md`, `crates/nmr-core/tests/evo_graph_tests.rs`):** Replaced the saturated `100.0%` synthetic Ubiquitin CI benchmark gate with `SimConfig::realistic_bruker()` (`--realistic --seeds 5` on `nmrassign benchmark` and `--realistic` on `nmrassign simulate`), enforcing 5-seed accuracy and high-confidence precision gates on both `--solver standard` and `--solver evo-graph` in CI, plus an automatic 5-seed `CISD3` (`BMRB 51439`) regression gate (`real_bruker_cisd3_5seed_development_gate`) whenever `data/private/bmrb51439_cisd3/` is present locally.
+  - **Strictly Unlabelled Global Marginal Offset Fitting in `nmrassign score` (`crates/nmr-cli/src/main.rs`):** Replaced the `04b1769` matched-pair `(pred_k, truth_k)` carbon residual median (which inflated `CA`/`CB`/`C` shift agreement by fitting on paired predictions) with `fit_unlabelled_global_offsets` + `--no-auto-offset`: fits one global shift per nucleus `(dH, dN, dCA, dCB, dC)` strictly from sorted unlabelled empirical shift sets via 2D/1D Gaussian log-sum-exp marginal likelihood, verified bit-for-bit invariant (`< 1e-12`) under arbitrary residue-label permutations in `test_score_unlabelled_global_offset_is_permutation_invariant`.
+  - **Pass-2 Belief-Damped Fragment Confidence Calibration (`crates/nmr-core/src/evo_graph.rs`, `docs/specs/10-evo-graph-solver.md`):** Added `calibrate_final_marginal_confidence` on Pass 2 combining single-spin Boltzmann margins with quadratic neighbor-belief damping `(b1 / 0.85)^2` and rigid whole-stretch register translation `[a..=b] -> [k2 .. k2 + L]` (`L = 2..=5`) for short stretches lacking a `>= 0.80` boundary anchor, preventing floating short islands (such as chimeric `ARG59`/`ALA62` in `CISD3`) from inflating interior residues above `0.80`.
+  - **Documentation & Case-Sensitivity Fixes (`README.md`, `docs/specs/08-service.md`, `docs/specs/10-evo-graph-solver.md`, `crates/nmr-cli/src/main.rs`):** Fixed `.ucsf` pipeline paths in docs and CLI tests to exact uppercase filenames (`HSQC.ucsf`, `HNCACB.ucsf`, `CBCACONH.ucsf`, `HNCO.ucsf`, `HNCACO.ucsf`) for Linux/CI case-sensitive filesystems; corrected the Ubiquitin `090309` (`2009-09-03`) vs `111909` (`2009-11-25/27`) batch interval to `2.8` months (`MM-DD-YY`); used `"minor second form"` without unverified oxidation claims; and reclassified `CISD3` (`BMRB 51439`) as a development benchmark rather than an untouched cold dataset.
+- **Verified Metrics:**
+  - **Realistic Bruker 5-Seed Benchmark Gate (`nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5`):**
+    - `--solver standard --engine cpu`: **`85.4%` accuracy** (`234/274`), **`67.6%` recall**, **`93.2% (151/162)` HC precision** (`0.31 s`, CI gate: `>= 82.0%` acc / `>= 90.0%` HC prec).
+    - `--solver standard --engine gpu`: **`83.0%` accuracy** (`224/270`), **`64.7%` recall**, **`96.6% (142/147)` HC precision** (`7.02 s`).
+    - `--solver evo-graph`: **`98.1%` accuracy** (`314/320`), **`90.8%` recall**, **`98.4% (306/311)` HC precision** (`0.74 s`, CI gate: `>= 95.0%` acc / `>= 96.0%` HC prec).
+  - **Development Real Bruker `CISD3` (`BMRB 51439`, `700.13 MHz`, 93 aa, missing `HNCACB`, 51 deposited amides / 38 picked roots, 5-Seed Mean `0..4`, Unlabelled Global `score` Offset `dH=+0.003, dN=-0.97, dCA=-2.65, dCB=-2.33, dC=-2.56 ppm`):**
+    - `--solver standard --engine gpu`: **`43.9%` mean accuracy** (`36.1%–50.0%`), **`31.0%` mean recall**, **`100.0% (2/2..3/3)` HC precision**, **`5.1%` mean HC recall**.
+    - `--solver evo-graph` (sequence-only): **`59.4%` mean accuracy** (`65.7%` on 3/5 seeds), **`40.8%` mean recall**, **`95.5%` mean HC precision** (`42/44` pooled, **`100.0%` on 3/5 seeds**, up from `88.9%`), **`16.5%` mean HC recall** (`0.31 s`).
+  - **Real 5-Spectrum Ubiquitin `.ucsf` (`500.13 MHz`, Uppercase Paths, Sequence-Only):**
+    - `--solver evo-graph`: **`95.7% (66/69)` accuracy**, **`94.3%` recall**, **`97.0% (64/66)` HC precision**, **`91.4%` HC recall** (`0.57 s`).
+
+---
+
+## `[0.2.2]` (`04b1769` / `a93f578`) — 2026-11-11 — Second Real-Protein Evaluation (`BMRB 51439` `CISD3`, Now Development Benchmark), Hz-Scaled $^3J_{\text{HNH}\alpha}$ Doublet Coalescing, Removal of `tripeptide` & CLI `--pdb`, and CI Verification (`nmr-core`, `nmr-cli`, `docs`)
+
+- **Tag / Commit:** `v0.2.2` (`a93f578` / `04b1769`)
 - **Architectural Summary:**
   - **Field-Independent Hz Doublet Threshold (`crates/nmr-core/src/picker.rs`, `docs/specs/02-peak-picking.md`):** Replaced the hardcoded `0.019 ppm` $^{15}\text{N}$-HSQC $^3J_{\text{HNH}\alpha}$ doublet coalescing cutoff (`~9.5 Hz` only at `500 MHz`) and `0.008 ppm` grid step check with `PickerConfig::max_j_hnha_hz: f64` (default `9.5 Hz`), converted dynamically to ppm via `spec.axis_x.obs_mhz` (`max_j_ppm = max_j_hnha_hz / obs_mhz`), paired with Hz-scaled digital-resolution gating (`|step_ppm| * obs_mhz <= 6.5 Hz/pt`, covering `SI = 2048, SW = 14 ppm` up to `950 MHz`) and direct-dimension sinc-sidelobe lower spacing (`max(12.0 / obs_mhz, max_j_ppm)`). Verified at `500 MHz` vs `800 MHz` in `test_hsqc_j_doublet_threshold_scales_with_spectrometer_mhz`.
   - **Solver Consolidation & Structural-Leakage Elimination (`crates/nmr-core`, `crates/nmr-cli`, `docs/specs/`):** Removed `nmr_core::tripeptide` (`tripeptide.rs`, `tripeptide_tests.rs`, `09-tripeptide-solver.md`) after out-of-sample evaluation showed miscalibrated high-confidence false positives on gapped chains without outperforming `standard` on complete data, while retaining `--solver standard|evo-graph`. Removed `--pdb` from all backbone assignment and benchmark CLI commands (`assign`, `pipeline`, `benchmark`, `benchmark-suite`) and removed `1d3z.pdb` from `evo_graph_tests.rs` so every assignment benchmark runs strictly sequence-only.
@@ -17,7 +39,7 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
     - `--solver standard --engine cpu`: **`100.0% (68/68)` accuracy**, **`100.0%` recall**, **`100.0% (50/50)` HC precision** (`0.06 s`, CI gate: `>=95.0%` acc / `>=97.0%` HC prec).
     - `--solver standard --engine gpu`: **`100.0% (68/68)` accuracy**, **`100.0%` recall**, **`100.0% (52/52)` HC precision** (`0.90 s`).
     - `--solver evo-graph`: **`98.5% (66/67)` accuracy**, **`97.1%` recall**, **`98.5% (66/67)` HC precision** (`0.15 s`).
-  - **Cold Out-of-Sample Real Bruker Dataset — Human Mitochondrial `CISD3` (`BMRB 51439` / `BMRbig 82`, `700.13 MHz`, 93 aa, `HSQC` + `HNCA` + `HNCOCA` + `CBCACONH` + `HNCO`, no `HNCACB`, `51` BMRB amides / `38` picked roots, zero parameter tuning):**
+  - **Second Real Bruker Dataset — Human Mitochondrial `CISD3` (`BMRB 51439` / `BMRbig 82`, `700.13 MHz`, 93 aa, `HSQC` + `HNCA` + `HNCOCA` + `CBCACONH` + `HNCO`, no `HNCACB`, `51` BMRB amides / `38` picked roots; subsequently reclassified as a development benchmark once solver retention and `score` offset alignment inspected its results):**
     - `--solver standard --engine gpu`: **`38.9% (14/36)` accuracy** on `seed 0` (**`43.9%` 5-seed mean**, range `36.1%–50.0%`), **`27.5%` recall** vs all `51` BMRB amides (**`31.0%` 5-seed mean**, `41.6%` of `38` picked roots), **`100.0% (2/2..3/3)` HC precision**, **`5.1%` mean HC recall** (`0.73 s` pipeline).
     - `--solver evo-graph` (sequence-only): **`65.7% (23/35)` accuracy** on `seed 0` (**`59.4%` 5-seed mean**, `65.7%` on 3/5 seeds), **`45.1%` recall** vs all `51` BMRB amides (`60.5%` of `38` picked roots on `seed 0`, **`40.8%` 5-seed mean**), **`92.9% (13/14)` HC precision** on `seed 0` (**`88.9%` 5-seed mean**), **`25.5%` HC recall** (`4.5×–6.5×` more high-confidence correct residues than `standard`, `0.31 s` pipeline).
   - **Real 5-Spectrum Ubiquitin `.ucsf` (`500.13 MHz`, Sequence-Only):**
@@ -172,9 +194,9 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## `2414e25` — 2026-11-11 — Complete Phase 1–7 NMR pipeline, WebGPU 3D CNN picker, structure folding, NEF/HTTP service, and Octet Chemical Studio
+## `[0.2.1]` (`2414e25`) — 2026-11-11 — Complete Phase 1–7 NMR pipeline, WebGPU 3D CNN picker, structure folding, NEF/HTTP service, and Octet Chemical Studio
 
-- **Commit:** `2414e25e70dc76ab738cce940b3abf84232497de`
+- **Tag / Commit:** `v0.2.1` (`2414e25e70dc76ab738cce940b3abf84232497de`)
 - **Architectural Summary:**
   - **Phase 1 (Priors, Benchmarks & Intensity Disambiguation):** Rebuilt empirical backbone and all-atom chemical-shift priors from 36 public BMRB entries (`data/priors/`), assembled the 12-protein BMRB benchmark suite spanning $\alpha$, $\beta$, $\alpha/\beta$, and IDP folds (`data/benchmark/manifest.tsv`), added intensity-aware $i$ vs. $i-1$ candidate disambiguation, and added WASM (`wasm32-unknown-unknown`) + CI workflows.
   - **Phase 3 (Neural 2D/3D CNN Peak Picker):** Implemented a clean-room 2D/3D separable dilated residual CNN peak picker (`nmr-core::neural_picker`) with analytical backpropagation, Adam + focal-loss training, WebGPU WGSL compute execution (`nmr-gpu::neural_gpu`), and blind volumetric end-to-end benchmarking (`nmrassign e2e-benchmark`).
@@ -189,9 +211,9 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## `5adb55c` — 2026-11-11 — Rewrite nmr-assign v0.2 in pure Rust + WebGPU with interactive GUI workbench
+## `[0.2.0]` (`5adb55c`) — 2026-11-11 — Rewrite nmr-assign v0.2 in pure Rust + WebGPU with interactive GUI workbench
 
-- **Commit:** `5adb55c911a185ce7b71f7b294e1899f30bdb09a`
+- **Tag / Commit:** `v0.2.0` (`5adb55c911a185ce7b71f7b294e1899f30bdb09a`)
 - **Architectural Summary:**
   - Replaced the initial Python/Julia prototype with a 4-crate pure-Rust + WebGPU workspace (`nmr-core`, `nmr-gpu`, `nmr-cli`, `nmr-gui`).
   - `nmr-core`: NMR-STAR v3/v2.1 & TSV peak I/O, Bruker TopSpin `pdata` (`2rr`/`3rrr`) & NMRPipe (`.ft2`/`.ft3`) spectrum readers, robust MAD + sub-voxel log-Gaussian 2D/3D peak picker, shared-ellipse spin-system builder with proximity tie-breaking and 0-carbon decoy exclusion, configurable `assign_cost`, and multi-threaded `f64` simulated annealing solver.
@@ -202,9 +224,9 @@ All notable architectural changes, algorithm milestones, and verified benchmark 
 
 ---
 
-## `710b733` — 2026-11-11 — Move agent rules to AGENTS.md for tool-agnostic agents
+## `[0.1.0]` (`01a52e1` / `710b733`) — 2026-11-11 — Initial open NMR pipeline scaffold, agent rules, and backbone assignment v0.1
 
-- **Commit:** `710b733a1dd319de603778aeb0b8641dbe2bb02c`
+- **Tag / Commit:** `v0.1.0` (`710b733a1dd319de603778aeb0b8641dbe2bb02c`)
 - **Architectural Summary:**
   - Consolidated clean-room provenance rules, permissive dependency allowlists (`MIT`/`BSD`/`Apache-2.0`/`ISC`/`Zlib`), data hygiene policies, and benchmark regression gates into `AGENTS.md`, with `CLAUDE.md` and `GEMINI.md` referencing `AGENTS.md` as the single source of truth.
 - **Verified Metrics:**

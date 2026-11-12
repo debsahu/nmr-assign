@@ -50,8 +50,8 @@ Requires **Rust 1.85+** (`cargo`). Automatically uses **Metal** on macOS, **Vulk
 # 1. Launch the dual-mode interactive WebGPU GUI (Protein 2D/3D NMR + Octet Chemical Studio)
 cargo run --release -p nmr-gui
 
-# 2. Single-protein & 12-protein BMRB blind assignment benchmarks
-cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine gpu -v
+# 2. Realistic Bruker 5-seed physics benchmark & 12-protein BMRB suite
+cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5 --engine gpu -v
 cargo run --release -p nmr-cli -- benchmark-suite --manifest data/benchmark/manifest.tsv --engine gpu
 
 # 3. End-to-end blind volumetric spectra -> neural 3D CNN peak picking -> assignment benchmark
@@ -80,12 +80,12 @@ cargo run --release -p nmr-cli -- pipeline --star data/fixtures/synthetic_ubiqui
 
 #    Real 2D/3D spectra (Bruker pdata/1, NMRPipe .ft2/.ft3, or Sparky .ucsf) -> pipeline & score:
 cargo run --release -p nmr-cli -- pipeline \
-  --seq path/to/protein.fasta \
-  --hsqc path/to/hsqc_pdata_or_ucsf \
-  --triple HNCACB=path/to/hncacb \
-  --triple CBCACONH=path/to/cbcaconh \
-  --triple HNCO=path/to/hnco \
-  --triple HNCACO=path/to/hncaco \
+  --seq path/to/1ubq.fasta.txt \
+  --hsqc path/to/HSQC.ucsf \
+  --triple HNCACB=path/to/HNCACB.ucsf \
+  --triple CBCACONH=path/to/CBCACONH.ucsf \
+  --triple HNCO=path/to/HNCO.ucsf \
+  --triple HNCACO=path/to/HNCACO.ucsf \
   --solver evo-graph \
   --out-dir ./out_assigned
 cargo run --release -p nmr-cli -- score \
@@ -107,15 +107,18 @@ cargo test --release --workspace
 
 ## Representative Benchmarks
 
-- **76-aa Ubiquitin Backbone Assignment (`data/fixtures/synthetic_ubiquitin.str`, 6% missing, 4% spurious + 18 $\text{NH}_2$ decoys)**:
-  - **WebGPU (Metal, 64 replicas)**: **97.1%** accuracy, **97.1%** recall, **100.0%** high-confidence ($\ge 0.80$) precision.
-  - **Multi-core CPU (`f64`, 12 replicas)**: **97.1%** accuracy, **97.1%** recall, **98.0%–100.0%** high-confidence precision in `~0.03 s`.
-- **12-Protein Public BMRB Suite (`data/benchmark/manifest.tsv`, 55–148 aa across $\alpha$, $\beta$, $\alpha/\beta$, and 140-aa IDP $\alpha$-synuclein)**:
-  - **99.4%** mean high-confidence ($\ge 0.80$) precision (10 of 12 proteins at **100.0%** HC precision) and **86.1%** overall mean accuracy (**95.3%** mean accuracy across globular proteins $\le 80$ aa).
-- **3D Neural Peak Picker (`nmrassign e2e-benchmark`)**:
-  - Beats the classical MAD picker across volumetric 2D/3D cubes containing $t_1/t_2$ ridges, baseline roll, and overlapped shoulders while matching WebGPU `conv3d.wgsl` logits within `< 1e-4`.
-- **De Novo NMR Structure Folding (`nmrassign structure`)**:
-  - Folds Engrailed Homeodomain (`1ENH`, 61 aa) and Human Ubiquitin (`1D3Z`, 76 aa) from chemical shifts + simulated 3D NOESY peaks to **< 3.0 Å** ordered backbone RMSD with **> 94%** Ramachandran favored+allowed geometry.
+- **Sparse Real Bruker Spectra — Development Benchmark `CISD3` (`BMRB 51439`, 700.13 MHz, 93 aa, missing `HNCACB`, 51 deposited amides / 38 picked roots, 5-seed mean)**:
+  - **`--solver standard --engine gpu`**: **43.9%** accuracy, **31.0%** recall of deposited amides, **100.0%** high-confidence ($\ge 0.80$) precision (**5.1%** HC recall).
+  - **`--solver evo-graph` (sequence-only)**: **59.4%** accuracy (**65.7%** on 3/5 seeds), **40.8%** recall of deposited amides, **95.5%** high-confidence ($\ge 0.80$) precision (**16.5%** HC recall) in `0.31 s`. (`CISD3` now counts as a development dataset because solver retention and confidence calibration inspected it; the next untouched real protein is the true cold test.)
+- **Realistic Bruker Physics Gate (`nmrassign benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5`, TMS $-2.75\text{ ppm}$ $^{13}\text{C}$ offset, $t_1$ ridges, water bleaching, broadening & minor-form satellites)**:
+  - **`--solver standard`**: **85.4%** accuracy / **67.6%** recall / **93.2%** HC precision on CPU (`0.31 s`), and **83.0%** accuracy / **64.7%** recall / **96.6%** HC precision on WebGPU.
+  - **`--solver evo-graph`**: **98.1%** accuracy, **90.8%** recall, **98.4%** HC precision (`306/311`) in `0.74 s`.
+- **Complete 5-Spectrum 500 MHz Human Ubiquitin (Best-Case Globular Protein, `.ucsf` & Bruker `pdata`)**:
+  - **95.7%–97.1%** accuracy, **94.3%–95.7%** recall, and **97.0%–98.3%** high-confidence ($\ge 0.80$) precision on `HSQC.ucsf` + `HNCACB.ucsf` + `CBCACONH.ucsf` + `HNCO.ucsf` + `HNCACO.ucsf` (**95.2%** 5-seed mean accuracy / **98.0%** HC precision directly from `24,562` raw Bruker `pdata` classical peaks across two batches recorded 2.8 months apart on `2009-09-03` and `2009-11-25/27`).
+- **12-Protein Public BMRB Peak-List Suite (`data/benchmark/manifest.tsv`, 55–148 aa across $\alpha$, $\beta$, $\alpha/\beta$, and 140-aa IDP $\alpha$-synuclein)**:
+  - **98.9%–99.4%** mean high-confidence ($\ge 0.80$) precision and **86.1%–88.1%** overall mean accuracy.
+- **3D Neural Peak Picker (`nmrassign e2e-benchmark`) & De Novo Structure Folding (`nmrassign structure`)**:
+  - Matches WebGPU `conv3d.wgsl` logits within `< 1e-4` and folds `1ENH` (61 aa) and `1D3Z` (76 aa) from shifts + simulated 3D NOESY peaks to **< 3.0 Å** ordered backbone RMSD.
 
 ---
 

@@ -8,6 +8,9 @@
 //! and publication vector rendering ported/adapted from Octet-Draw by Sam Ellis
 //! (<https://github.com/SamChemMan/Octet-Draw>, Apache-2.0).
 
+/// Canonical SemVer release version inherited from `[workspace.package]` in `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod dihedrals;
 pub mod evaluate;
 pub mod evo_graph;

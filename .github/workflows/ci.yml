@@ -48,32 +48,37 @@ jobs:
       - name: Run workspace release test suite (nmr-core + nmr-gpu parity)
         run: cargo test --release --workspace
 
-      - name: Synthetic Ubiquitin Benchmark Gate (Accuracy >= 95%, HC Precision >= 97%)
+      - name: Realistic Bruker 5-Seed Benchmark Gate (standard >= 82% Acc / >= 90% HC Prec; evo-graph >= 95% Acc / >= 96% HC Prec)
         shell: bash
         run: |
           set -euo pipefail
-          OUT="$(CARGO_TERM_COLOR=never cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --engine cpu)"
-          echo "$OUT"
-          OUT_TEXT="$OUT" python3 - <<'PY'
+          OUT_STD="$(CARGO_TERM_COLOR=never cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5 --solver standard --engine cpu)"
+          echo "=== standard (--realistic --seeds 5) ==="
+          echo "$OUT_STD"
+          OUT_EVO="$(CARGO_TERM_COLOR=never cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5 --solver evo-graph)"
+          echo "=== evo-graph (--realistic --seeds 5) ==="
+          echo "$OUT_EVO"
+          OUT_STD_TEXT="$OUT_STD" OUT_EVO_TEXT="$OUT_EVO" python3 - <<'PY'
           import os, re, sys
 
-          out = os.environ["OUT_TEXT"]
-          acc_m = re.search(r"accuracy\s*\(correct/assigned\)\s*:\s*([0-9]+(?:\.[0-9]+)?)%", out)
-          hcp_m = re.search(r"high-confidence\s*\(>=0\.8\)\s*precision\s*:\s*([0-9]+(?:\.[0-9]+)?)%", out)
-          if not acc_m or not hcp_m:
-              print("ERROR: failed to parse benchmark metrics from nmr-cli output", file=sys.stderr)
-              sys.exit(1)
+          def check_gate(label, out, min_acc, min_hcp):
+              acc_m = re.search(r"accuracy\s*\(correct/assigned\)\s*:\s*([0-9]+(?:\.[0-9]+)?)%", out)
+              hcp_m = re.search(r"high-confidence\s*\(>=0\.8\)\s*precision\s*:\s*([0-9]+(?:\.[0-9]+)?)%", out)
+              if not acc_m or not hcp_m:
+                  print(f"ERROR: failed to parse {label} benchmark metrics from nmr-cli output", file=sys.stderr)
+                  sys.exit(1)
+              acc = float(acc_m.group(1))
+              hcp = float(hcp_m.group(1))
+              print(f"Parsed {label} realistic 5-seed gate -> accuracy={acc:.1f}% (min {min_acc:.1f}%), hc_precision={hcp:.1f}% (min {min_hcp:.1f}%)")
+              if acc < min_acc:
+                  print(f"FAIL: {label} accuracy {acc:.1f}% regressed below {min_acc:.1f}% gate", file=sys.stderr)
+                  sys.exit(1)
+              if hcp < min_hcp:
+                  print(f"FAIL: {label} high-confidence precision {hcp:.1f}% regressed below {min_hcp:.1f}% gate", file=sys.stderr)
+                  sys.exit(1)
 
-          acc = float(acc_m.group(1))
-          hcp = float(hcp_m.group(1))
-          print(f"Parsed benchmark gate -> accuracy={acc:.1f}% (min 95.0%), hc_precision={hcp:.1f}% (min 97.0%)")
-
-          if acc < 95.0:
-              print(f"FAIL: accuracy {acc:.1f}% regressed below 95.0% gate", file=sys.stderr)
-              sys.exit(1)
-          if hcp < 97.0:
-              print(f"FAIL: high-confidence precision {hcp:.1f}% regressed below 97.0% gate", file=sys.stderr)
-              sys.exit(1)
+          check_gate("standard", os.environ["OUT_STD_TEXT"], 82.0, 90.0)
+          check_gate("evo-graph", os.environ["OUT_EVO_TEXT"], 95.0, 96.0)
           PY
 
   wasm-check:

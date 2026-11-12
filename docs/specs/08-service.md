@@ -19,12 +19,12 @@ self-contained HTML+SVG quality report.
 
 ```bash
 nmrassign pipeline \
-  --seq path/to/sequence.fasta \
-  --hsqc path/to/hsqc \
-  --triple HNCACB=path/to/hncacb \
-  --triple CBCACONH=path/to/cbcaconh \
-  --triple HNCO=path/to/hnco \
-  --triple HNCACO=path/to/hncaco \
+  --seq path/to/1ubq.fasta.txt \
+  --hsqc path/to/HSQC.ucsf \
+  --triple HNCACB=path/to/HNCACB.ucsf \
+  --triple CBCACONH=path/to/CBCACONH.ucsf \
+  --triple HNCO=path/to/HNCO.ucsf \
+  --triple HNCACO=path/to/HNCACO.ucsf \
   --solver evo-graph \
   --out-dir ./out_assigned
 
@@ -33,8 +33,10 @@ nmrassign score \
   --truth path/to/reference.str -v
 ```
 
-Note: 3D experiments use `--triple EXP=path` (`=` separator), and `pipeline`
-writes a multi-artifact directory via `--out-dir <dir>` (not `-o`).
+Note: 3D experiments use `--triple EXP=path` (`=` separator), `pipeline`
+writes a multi-artifact directory via `--out-dir <dir>` (not `-o`), and file
+paths must match exact filesystem case (`HSQC.ucsf`, `HNCACB.ucsf`, etc.) for
+case-sensitive Linux filesystems and CI.
 
 ## Principles
 - Runs fully self-hosted; no data leaves the user's infrastructure unless

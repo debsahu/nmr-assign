@@ -111,7 +111,7 @@ impl Default for NefMetaData {
             format_name: "nmr_exchange_format".to_string(),
             format_version: "1.1".to_string(),
             program_name: "nmr_assign".to_string(),
-            program_version: "0.2.0".to_string(),
+            program_version: crate::VERSION.to_string(),
             creation_date: "2026-01-01T00:00:00Z".to_string(),
             uuid: "nmr_assign-1.1-0001".to_string(),
             coordinate_file_name: None,

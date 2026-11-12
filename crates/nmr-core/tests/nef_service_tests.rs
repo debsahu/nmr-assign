@@ -507,7 +507,7 @@ fn test_http_service_end_to_end_ubiquitin_job_and_dashboard() {
     assert!(ctype.contains("application/json"));
     let health: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(health["status"], "ok");
-    assert_eq!(health["version"], "0.2.0");
+    assert_eq!(health["version"], nmr_core::VERSION);
 
     // 2. Browser dashboard UI (`GET /`)
     let (code_ui, ctype_ui, ui_html) = raw_http_request(addr, "GET", "/", None);

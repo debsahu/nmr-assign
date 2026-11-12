@@ -3,8 +3,8 @@
 Open source automated protein NMR backbone resonance assignment and interactive WebGPU spectrum workbench.
 Working name; rename freely before first release.
 
-## Scope (v0.2)
-Processed spectra (Bruker `pdata`, NMRPipe) or peak lists in; picked peaks, backbone chemical shifts (H, N, CA, CB, C), confidences, and interactive 2D/3D strip inspection out.
+## Scope (v0.3)
+Processed spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf`) or peak lists in; picked peaks, backbone chemical shifts (H, N, CA, CB, C), confidences, and interactive 2D/3D strip inspection out.
 Supported experiments: HSQC, HNCA, HN(CO)CA, HNCACB, CBCA(CO)NH, HNCO, HN(CA)CO.
 Planned next: neural 3D CNN peak picker, sidechains, NOESY, structure.
 
@@ -40,7 +40,14 @@ List every dependency and its licence in `THIRD_PARTY.md`.
 - Test fixtures are synthetic or derived from public BMRB entries, with the BMRB ID recorded in the fixture header.
 
 ## Definition of done for any solver change
-`cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str` and `cargo test --release --workspace` must not regress accuracy or high-confidence precision. Report both numbers in the PR.
+1. `cargo run --release -p nmr-cli -- benchmark --star data/fixtures/synthetic_ubiquitin.str --realistic --seeds 5` (realistic Bruker 5-spectrum physics simulator from `84e1ea8`, not the saturated 7-spectrum synthetic preset) and `cargo test --release --workspace` must not regress accuracy or high-confidence precision.
+2. When `data/private/bmrb51439_cisd3/` is present locally, run 5-seed (`0..4`) evaluation on `CISD3` (`BMRB 51439`) for both `--solver standard` and `--solver evo-graph` and verify no regression in accuracy or high-confidence precision.
+3. Report both the 5-seed `--realistic` benchmark numbers and the 5-seed `CISD3` numbers in the PR / `CHANGELOG.md`.
 
 ## Scientific ownership
 The maintainer (an NMR scientist) owns `docs/specs/03-assignment.md` sections 3 and 4 (scoring and experiment rules). Agents implement the spec; they do not change scoring semantics without the maintainer's approval.
+
+## Versioning & Releases
+- Single source of truth: `[workspace.package] version` in `Cargo.toml` (exposed as `nmr_core::VERSION`, `nmrassign --version` / `-V` with short git SHA via `crates/nmr-cli/build.rs`, NEF metadata, HTML reports, and `/api/v1/health`).
+- Pre-1.0 Semantic Versioning (`0.MINOR.PATCH`): bump `MINOR` for new capabilities, CLI/interchange changes, or benchmark-gate upgrades; bump `PATCH` for bug fixes, calibration, and documentation fixes.
+- Every release bumps `[workspace.package] version`, adds a `## [X.Y.Z] — YYYY-MM-DD` section to `CHANGELOG.md`, and creates an annotated git tag `vX.Y.Z`.

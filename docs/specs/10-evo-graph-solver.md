@@ -171,11 +171,15 @@ occupying exchange-broadened backbone slots.
   bond satisfies $P(a_k, a_{k+1}) \ge \tau_{\text{link}}$, splices the fragment
   into $B$ while cleanly evicting conflicting spin systems to `-1`, fills open
   high-affinity gaps, and anneals the offspring.
-- **Thermodynamic Boltzmann Confidence Calibration**: combines cross-island
-  consensus frequency with the local conditional Boltzmann probability margin
-  over unassignment, competing free spin systems, alternative open slots, and
-  pairwise 2-swaps so near-degenerate placements receive conservative
-  confidence below $0.80$.
+- **Thermodynamic & Belief-Damped Fragment Confidence Calibration**: Pass 1 uses
+  local single-spin conditional Boltzmann calibration (`calibrate_boltzmann_confidence`)
+  over unassignment, competing free spin systems, open sequence slots, and
+  pairwise 2-swaps; Pass 2 (`calibrate_final_marginal_confidence`) adds
+  second-order quadratic neighbor-belief damping $w(b_1) = \min(1, b_1 / 0.85)^2$
+  plus rigid whole-stretch register translation $[a..b] \to [k_2 .. k_2 + L - 1]$
+  ($L = 2\dots 5$) for short stretches lacking a high-belief ($\ge 0.80$)
+  sequential anchor at either boundary so unanchored short islands cannot
+  inflate interior residues above $0.80$ via mutual clamping.
 
 ### 3.4 Residue-Graph Self-Consistency and Optional 3D $(\phi, \psi)$ Conditioning
 
@@ -202,15 +206,18 @@ occupying exchange-broadened backbone slots.
 ## 4. Verification Benchmarks
 
 Verified sequence-only via `cargo test --release -p nmr-core --test evo_graph_tests`
-and cold out-of-sample CLI evaluation:
+and multi-seed CLI evaluation (note: `CISD3` `BMRB 51439` is classified as a
+development benchmark because solver retention, `score` reference-offset
+alignment, and Pass-2 confidence calibration inspected its results):
 
 | Dataset / Mode | Assignable | Assigned | Accuracy | Recall | HC Precision ($\ge 0.8$) | HC Recall | Runtime |
 |---|---:|---:|---:|---:|---:|---:|---:|
+| Realistic Bruker Ubiquitin Simulator (`--realistic --seeds 5` aggregate) | 346 | 320 | **98.1%** (314/320) | **90.8%** | **98.4%** (306/311) | **88.4%** | 0.74 s |
 | Synthetic Ubiquitin (`7`-exp, `assign_evo_graph`) | 68 | 68 | **97.1%** (66/68) | **97.1%** | **100.0%** (66/66) | **97.1%** | ~0.22 s |
 | Synthetic Ubiquitin (`7`-exp, `assign_evo_graph_from_peaks`) | 68 | 67 | **98.5%** (66/67) | **97.1%** | **98.5%** (66/67) | **97.1%** | ~0.22 s |
 | Synthetic Ubiquitin (`5`-exp without `HNCA`/`HNCOCA`) | 71 | 68 | **98.5%** (67/68) | **94.4%** | **98.5%** (66/67) | **93.0%** | ~0.22 s |
 | Real Bruker Ubiquitin (`24,562` raw classical peaks, sequence-only, 5-seed mean) | 70 | 63.0 | **95.24%** | **85.71%** | **98.02%** | **70.86%** | **0.24 s** |
-| Cold Out-of-Sample Bruker `CISD3` (`BMRB 51439`, `700.13 MHz`, 93 aa, missing `HNCACB`, `seed 0` / 5-seed mean) | 51 (38 picked) | 35 | **65.7%** (23/35) / **59.4%** | **45.1%** (60.5% of picked) / **40.8%** | **92.9%** (13/14) / **88.9%** | **25.5%** / **22.7%** | **0.31 s** |
+| Development Real Bruker `CISD3` (`BMRB 51439`, `700.13 MHz`, 93 aa, missing `HNCACB`, `seed 0` / 5-seed mean) | 51 (38 picked) | 35 | **65.7%** (23/35) / **59.4%** | **45.1%** (60.5% of picked) / **40.8%** | **100.0%** (10/10) / **95.5%** | **19.6%** / **16.5%** | **0.31 s** |
 
 On the 5-spectrum Bruker TopSpin ubiquitin dataset (`HSQC`, `HNCACB`,
 `CBCACONH`, `HNCO`, `HNCACO`; `24,562` raw classical local-maxima peaks across

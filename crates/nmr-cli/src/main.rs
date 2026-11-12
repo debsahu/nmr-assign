@@ -80,15 +80,25 @@ enum SolverKind {
     EvoGraph,
 }
 
-fn usage() -> &'static str {
-    "nmrassign (Rust + WebGPU)\n\
+fn version_string() -> String {
+    format!(
+        "nmrassign {} ({})",
+        nmr_core::VERSION,
+        env!("NMRASSIGN_GIT_SHA")
+    )
+}
+
+fn usage() -> String {
+    format!(
+        "{} — Rust + WebGPU\n\
      Usage:\n\
-       nmrassign benchmark       --star <ref.str> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
+       nmrassign --version | -V | version\n\
+       nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
        nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
        nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
-       nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [-v]\n\
-       nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
+       nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
+       nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            --hsqc <path> [--triple EXP=path ...] --out <peaks.tsv> [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
        nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
@@ -98,7 +108,9 @@ fn usage() -> &'static str {
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
        nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
-       nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}>] [--solvent CDCl3] [--mhz 400]\n"
+       nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
+        version_string()
+    )
 }
 
 fn run_solver(
@@ -254,7 +266,8 @@ fn execute_assignment_workflow(
 fn format_star_offset_header(solver_label: &str, offsets: &ShiftOffsets) -> Option<String> {
     (!offsets.is_zero()).then(|| {
         format!(
-            "nmrassign solver={solver_label} | fitted_prior_reference_offsets (experimental - DSS prior): {offsets} | emitted chemical shifts remain in experimental spectrum ppm frame"
+            "{} | solver={solver_label} | fitted_prior_reference_offsets (experimental - DSS prior): {offsets} | emitted chemical shifts remain in experimental spectrum ppm frame",
+            version_string()
         )
     })
 }
@@ -278,14 +291,16 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     let mut star: Option<String> = None;
     let mut experiments: Option<String> = None;
     let mut priors_path: Option<String> = None;
-    let mut missing = 0.06f64;
-    let mut spurious = 0.04f64;
+    let mut missing_opt: Option<f64> = None;
+    let mut spurious_opt: Option<f64> = None;
+    let mut realistic = false;
     let mut solver = SolverKind::Standard;
     let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
     let mut seed = 0u64;
+    let mut num_seeds = 1usize;
     let mut verbose = false;
 
     let mut i = 0;
@@ -303,25 +318,30 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
                 i += 1;
                 priors_path = args.get(i).cloned();
             }
+            "--realistic" => {
+                realistic = true;
+            }
             "--solver" => {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing value for --solver")?)?;
             }
             "--missing" => {
                 i += 1;
-                missing = args
-                    .get(i)
-                    .ok_or("missing value for --missing")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                missing_opt = Some(
+                    args.get(i)
+                        .ok_or("missing value for --missing")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
             }
             "--spurious" => {
                 i += 1;
-                spurious = args
-                    .get(i)
-                    .ok_or("missing value for --spurious")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                spurious_opt = Some(
+                    args.get(i)
+                        .ok_or("missing value for --spurious")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
             }
             "--engine" => {
                 i += 1;
@@ -363,6 +383,15 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?;
             }
+            "--seeds" => {
+                i += 1;
+                num_seeds = args
+                    .get(i)
+                    .ok_or("missing value for --seeds")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("{e}"))?
+                    .max(1);
+            }
             "-v" | "--verbose" => verbose = true,
             other => return Err(format!("unknown benchmark flag {other:?}")),
         }
@@ -371,114 +400,187 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
 
     let star_path = star.ok_or("benchmark requires --star <ref.str>")?;
     let ref_data = read_star(&star_path, None)?;
+    let base_sim = if realistic {
+        SimConfig::realistic_bruker()
+    } else {
+        SimConfig::default()
+    };
     let exps: Vec<String> = match experiments {
         Some(s) => s
             .split(',')
             .map(|x| x.trim().to_ascii_uppercase().replace(['(', ')'], ""))
             .collect(),
-        None => EXPERIMENT_NAMES.iter().map(|s| (*s).to_string()).collect(),
+        None => base_sim.experiments.clone(),
     };
-
-    let (peaks, truth) = simulate(
-        &ref_data,
-        &SimConfig {
-            experiments: exps.clone(),
-            p_missing_peak: missing,
-            spurious_rate: spurious,
-            seed,
-            ..SimConfig::default()
-        },
-    );
 
     let pri = load_priors(priors_path.as_deref())?;
     let score_cfg = ScoreConfig {
         assign_cost,
         ..ScoreConfig::default()
     };
-    let t0 = Instant::now();
-    let wf = execute_assignment_workflow(
-        solver,
-        engine_opt,
-        &peaks,
-        &ref_data.sequence,
-        &pri,
-        &score_cfg,
-        runs,
-        steps,
-        12,
-        seed,
-    )?;
-    let elapsed = t0.elapsed().as_secs_f64();
 
-    log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+    let mut total_assignable = 0usize;
+    let mut total_assigned = 0usize;
+    let mut total_correct = 0usize;
+    let mut total_hc_assigned = 0usize;
+    let mut total_hc_correct = 0usize;
+    let mut total_peaks = 0usize;
+    let mut total_systems = 0usize;
+    let mut total_elapsed = 0.0f64;
+    let mut shift_totals: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut engine_label = String::new();
+    let mut replicas = 0usize;
+    let mut steps_per_system = 0usize;
 
-    let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
-        Some(kept) => kept
-            .iter()
-            .map(|&idx| truth.get(idx).copied().unwrap_or(-1))
-            .collect(),
-        None => truth.clone(),
+    for s_idx in 0..num_seeds {
+        let cur_seed = seed + (s_idx as u64);
+        let sim_cfg = SimConfig {
+            experiments: exps.clone(),
+            p_missing_peak: missing_opt.unwrap_or(base_sim.p_missing_peak),
+            spurious_rate: spurious_opt.unwrap_or(base_sim.spurious_rate),
+            seed: cur_seed,
+            ..base_sim.clone()
+        };
+        let (peaks, truth) = simulate(&ref_data, &sim_cfg);
+
+        let t0 = Instant::now();
+        let wf = execute_assignment_workflow(
+            solver,
+            engine_opt,
+            &peaks,
+            &ref_data.sequence,
+            &pri,
+            &score_cfg,
+            runs,
+            steps,
+            12,
+            cur_seed,
+        )?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        total_elapsed += elapsed;
+        total_peaks += peaks.len();
+        total_systems += wf.systems.len();
+        engine_label = wf.engine_label.clone();
+        replicas = wf.replicas;
+        steps_per_system = wf.steps_per_system;
+
+        log_nonzero_offsets(&wf.engine_label, &wf.offsets, verbose);
+
+        let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
+            Some(kept) => kept
+                .iter()
+                .map(|&idx| truth.get(idx).copied().unwrap_or(-1))
+                .collect(),
+            None => truth.clone(),
+        };
+        let m = Metrics {
+            assignable: truth.iter().filter(|&&t| t >= 0).count(),
+            ..score(&wf.result, &eval_truth, 0.8)
+        };
+        total_assignable += m.assignable;
+        total_assigned += m.assigned;
+        total_correct += m.correct;
+        total_hc_assigned += m.hc_assigned;
+        total_hc_correct += m.hc_correct;
+
+        if num_seeds > 1 {
+            println!(
+                "  seed {cur_seed}: acc={:.1}% ({}/{}), rec={:.1}% ({}/{}), hc_prec={:.1}% ({}/{})",
+                m.accuracy() * 100.0,
+                m.correct,
+                m.assigned,
+                m.recall() * 100.0,
+                m.correct,
+                m.assignable,
+                m.hc_precision() * 100.0,
+                m.hc_correct,
+                m.hc_assigned,
+            );
+        }
+
+        let (pred, _) = to_reference(
+            &wf.result,
+            &wf.systems,
+            &ref_data.sequence,
+            &ref_data.seq_ids,
+            0.0,
+            Some(&wf.effective_priors),
+        );
+        // Compare emitted experimental-frame shifts against simulated experimental-frame truth
+        let mut ref_for_cmp = ref_data.clone();
+        for ((_, atom), val) in &mut ref_for_cmp.shifts {
+            match atom.as_str() {
+                "H" => *val += sim_cfg.ref_offset_h,
+                "N" => *val += sim_cfg.ref_offset_n,
+                "CA" => *val += sim_cfg.ref_offset_ca,
+                "CB" => *val += sim_cfg.ref_offset_cb,
+                "C" => *val += sim_cfg.ref_offset_c,
+                _ => {}
+            }
+        }
+        for (atom, (ok, n)) in compare_shifts(&pred, &ref_for_cmp) {
+            let entry = shift_totals.entry(atom).or_insert((0, 0));
+            entry.0 += ok;
+            entry.1 += n;
+        }
+
+        if verbose {
+            let mut wrong = Vec::new();
+            for (s, &k) in wf.result.position.iter().enumerate() {
+                if k >= 0 && k != eval_truth[s] {
+                    wrong.push((s, k as usize, eval_truth[s]));
+                }
+            }
+            if !wrong.is_empty() {
+                println!("misassigned spin systems [seed {cur_seed}] (placed, true, confidence):");
+                for (s, k, t) in wrong {
+                    let tl = if t >= 0 {
+                        format!(
+                            "{}{}",
+                            ref_data.sequence[t as usize], ref_data.seq_ids[t as usize]
+                        )
+                    } else {
+                        "none".to_string()
+                    };
+                    println!(
+                        "  {}{:<5} {:<8} {:.2}",
+                        ref_data.sequence[k], ref_data.seq_ids[k], tl, wf.result.confidence[s]
+                    );
+                }
+            }
+        }
+    }
+
+    let agg = Metrics {
+        assignable: total_assignable,
+        assigned: total_assigned,
+        correct: total_correct,
+        hc_assigned: total_hc_assigned,
+        hc_correct: total_hc_correct,
     };
-    let m = Metrics {
-        assignable: truth.iter().filter(|&&t| t >= 0).count(),
-        ..score(&wf.result, &eval_truth, 0.8)
+    let mode_tag = if realistic {
+        "realistic_bruker"
+    } else {
+        "default"
     };
     println!(
-        "protein: {} residues, {} peaks, {} spin systems",
+        "protein: {} residues, {:.0} avg peaks, {:.0} avg spin systems (sim={mode_tag}, seeds={num_seeds})",
         ref_data.sequence.len(),
-        peaks.len(),
-        wf.systems.len()
+        (total_peaks as f64) / (num_seeds as f64),
+        (total_systems as f64) / (num_seeds as f64)
     );
-    println!(
-        "engine: {} ({} replicas, {} steps/system)",
-        wf.engine_label, wf.replicas, wf.steps_per_system
-    );
+    println!("engine: {engine_label} ({replicas} replicas, {steps_per_system} steps/system)");
     println!("experiments: {}", exps.join(", "));
-    println!("{}", m.report());
-
-    let (pred, _) = to_reference(
-        &wf.result,
-        &wf.systems,
-        &ref_data.sequence,
-        &ref_data.seq_ids,
-        0.0,
-        Some(&wf.effective_priors),
-    );
+    println!("{}", agg.report());
     println!("shift agreement with reference (within tolerance / predicted):");
     for atom in ["H", "N", "CA", "CB", "C"] {
-        if let Some(&(ok, n)) = compare_shifts(&pred, &ref_data).get(atom) {
+        if let Some(&(ok, n)) = shift_totals.get(atom) {
             if n > 0 {
                 println!("  {atom:2} {ok}/{n}");
             }
         }
     }
-    println!("solver time: {:.3} s", elapsed);
-
-    if verbose {
-        let mut wrong = Vec::new();
-        for (s, &k) in wf.result.position.iter().enumerate() {
-            if k >= 0 && k != eval_truth[s] {
-                wrong.push((s, k as usize, eval_truth[s]));
-            }
-        }
-        if !wrong.is_empty() {
-            println!("misassigned spin systems (placed, true, confidence):");
-            for (s, k, t) in wrong {
-                let tl = if t >= 0 {
-                    format!(
-                        "{}{}",
-                        ref_data.sequence[t as usize], ref_data.seq_ids[t as usize]
-                    )
-                } else {
-                    "none".to_string()
-                };
-                println!(
-                    "  {}{:<5} {:<8} {:.2}",
-                    ref_data.sequence[k], ref_data.seq_ids[k], tl, wf.result.confidence[s]
-                );
-            }
-        }
-    }
+    println!("solver time: {:.3} s", total_elapsed);
     Ok(())
 }
 
@@ -487,6 +589,7 @@ fn cmd_simulate(args: &[String]) -> Result<(), String> {
     let mut out: Option<String> = None;
     let mut experiments: Option<String> = None;
     let mut spectra_dir: Option<String> = None;
+    let mut realistic = false;
     let mut seed = 0u64;
 
     let mut i = 0;
@@ -508,6 +611,9 @@ fn cmd_simulate(args: &[String]) -> Result<(), String> {
                 i += 1;
                 spectra_dir = args.get(i).cloned();
             }
+            "--realistic" => {
+                realistic = true;
+            }
             "--seed" => {
                 i += 1;
                 seed = args
@@ -524,12 +630,17 @@ fn cmd_simulate(args: &[String]) -> Result<(), String> {
     let star_path = star.ok_or("simulate requires --star <ref.str>")?;
     let out_path = PathBuf::from(out.ok_or("simulate requires --out <peaks.tsv>")?);
     let ref_data = read_star(&star_path, None)?;
+    let base_sim = if realistic {
+        SimConfig::realistic_bruker()
+    } else {
+        SimConfig::default()
+    };
     let exps: Vec<String> = match experiments {
         Some(s) => s
             .split(',')
             .map(|x| x.trim().to_ascii_uppercase().replace(['(', ')'], ""))
             .collect(),
-        None => EXPERIMENT_NAMES.iter().map(|s| (*s).to_string()).collect(),
+        None => base_sim.experiments.clone(),
     };
 
     let (peaks, truth) = simulate(
@@ -537,7 +648,7 @@ fn cmd_simulate(args: &[String]) -> Result<(), String> {
         &SimConfig {
             experiments: exps,
             seed,
-            ..SimConfig::default()
+            ..base_sim
         },
     );
     write_peaks(&out_path, &peaks)?;
@@ -557,10 +668,12 @@ fn cmd_simulate(args: &[String]) -> Result<(), String> {
     if let Some(dir_str) = spectra_dir {
         let dir = Path::new(&dir_str);
         fs::create_dir_all(dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
-        let rcfg = SpectrumRenderConfig {
-            seed,
-            ..SpectrumRenderConfig::default()
+        let base_rcfg = if realistic {
+            SpectrumRenderConfig::realistic_bruker()
+        } else {
+            SpectrumRenderConfig::default()
         };
+        let rcfg = SpectrumRenderConfig { seed, ..base_rcfg };
         let hsqc = render_hsqc_2d(&peaks, &rcfg);
         write_nmrpipe_2d(dir.join("hsqc.ft2"), &hsqc)?;
         write_bruker_pdata_2d(dir.join("bruker_hsqc_pdata"), &hsqc)?;
@@ -2397,12 +2510,216 @@ fn parse_assign_tsv_confidences(path: &Path) -> Result<BTreeMap<i32, f64>, Strin
     Ok(out)
 }
 
+/// Fit one global chemical-shift reference offset per atom type `(dH, dN, dCA, dCB, dC)`
+/// (`pred - truth`, in ppm) strictly from **unlabelled** empirical distributions — discarding all
+/// residue indices `k` so the fitted offset is invariant to any permutation of predicted assignments
+/// and never uses matched `(pred_k, truth_k)` pairs.
+fn fit_unlabelled_global_offsets(
+    pred: &Reference,
+    truth: &Reference,
+    opt_systems: Option<&[SpinSystem]>,
+) -> ShiftOffsets {
+    let collect_sorted_atom = |r: &Reference, atom_name: &str| -> Vec<f64> {
+        let mut vals: Vec<f64> = r
+            .shifts
+            .iter()
+            .filter_map(|((_, a), &v)| (a == atom_name).then_some(v))
+            .collect();
+        vals.sort_by(|a, b| a.total_cmp(b));
+        vals
+    };
+
+    let fit_1d_marginal = |p_vals: &[f64], t_vals: &[f64], sigma: f64| -> f64 {
+        if p_vals.len() < 5 || t_vals.len() < 5 {
+            return 0.0;
+        }
+        let inv2 = 1.0 / (2.0 * sigma * sigma);
+        let nt = t_vals.len() as f64;
+        let eval_ll = |d: f64| -> f64 {
+            let mut tot = 0.0;
+            for &pv in p_vals {
+                let mut mx = f64::NEG_INFINITY;
+                for &tv in t_vals {
+                    let z = -(pv - tv - d).powi(2) * inv2;
+                    if z > mx {
+                        mx = z;
+                    }
+                }
+                let mut acc = 0.0;
+                for &tv in t_vals {
+                    acc += (-(pv - tv - d).powi(2) * inv2 - mx).exp();
+                }
+                let lse = mx + (acc / nt).ln();
+                tot += lse.max(-8.0);
+            }
+            tot - 0.5 * (d / 8.0).powi(2)
+        };
+
+        let s0 = eval_ll(0.0);
+        let mut best_d = 0.0;
+        let mut best_s = s0;
+        for step in -250..=250 {
+            let d = (step as f64) * 0.02;
+            let sc = eval_ll(d);
+            if sc > best_s {
+                best_s = sc;
+                best_d = d;
+            }
+        }
+        for step in -20..=20 {
+            let d = best_d + (step as f64) * 0.002;
+            let sc = eval_ll(d);
+            if sc > best_s {
+                best_s = sc;
+                best_d = d;
+            }
+        }
+        let min_gain = (0.12 * (p_vals.len() as f64)).max(2.5);
+        if best_d.abs() < 0.35 || (best_s - s0) < min_gain {
+            0.0
+        } else {
+            best_d
+        }
+    };
+
+    // Unlabelled 2D `(H, N)` point clouds sorted lexicographically (independent of residue labels)
+    let mut probe_hn: Vec<(f64, f64)> = if let Some(systems) = opt_systems {
+        systems.iter().map(|s| (s.h, s.n)).collect()
+    } else {
+        (0..pred.sequence.len())
+            .filter_map(|k| {
+                let h = *pred.shifts.get(&(k, "H".to_string()))?;
+                let n = *pred.shifts.get(&(k, "N".to_string()))?;
+                Some((h, n))
+            })
+            .collect()
+    };
+    probe_hn.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
+    let mut true_hn: Vec<(f64, f64)> = (0..truth.sequence.len())
+        .filter(|&k| k > 0 && truth.sequence[k] != "PRO")
+        .filter_map(|k| {
+            let h = *truth.shifts.get(&(k, "H".to_string()))?;
+            let n = *truth.shifts.get(&(k, "N".to_string()))?;
+            Some((h, n))
+        })
+        .collect();
+    true_hn.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
+    let (dh, dn) = if probe_hn.len() >= 5 && true_hn.len() >= 5 {
+        let sh = 0.035_f64;
+        let sn = 0.35_f64;
+        let invh = 1.0 / (2.0 * sh * sh);
+        let invn = 1.0 / (2.0 * sn * sn);
+        let nt = true_hn.len() as f64;
+        let eval_2d = |dh_try: f64, dn_try: f64| -> f64 {
+            let mut tot = 0.0;
+            for &(ph, pn) in &probe_hn {
+                let mut mx = f64::NEG_INFINITY;
+                for &(th, tn) in &true_hn {
+                    let z =
+                        -((ph - th - dh_try).powi(2) * invh + (pn - tn - dn_try).powi(2) * invn);
+                    if z > mx {
+                        mx = z;
+                    }
+                }
+                let mut acc = 0.0;
+                for &(th, tn) in &true_hn {
+                    let z =
+                        -((ph - th - dh_try).powi(2) * invh + (pn - tn - dn_try).powi(2) * invn);
+                    acc += (z - mx).exp();
+                }
+                tot += (mx + (acc / nt).ln()).max(-9.0);
+            }
+            tot
+        };
+
+        // Check whether unshifted clouds already overlap (`>= 50%` within wide 2D kernel)
+        let min_pool = probe_hn.len().min(true_hn.len());
+        let zero_near = probe_hn
+            .iter()
+            .filter(|&&(ph, pn)| {
+                true_hn
+                    .iter()
+                    .any(|&(th, tn)| (ph - th).abs() <= 0.05 && (pn - tn).abs() <= 0.50)
+            })
+            .count();
+        if zero_near * 2 >= min_pool {
+            (0.0, 0.0)
+        } else {
+            let s0 = eval_2d(0.0, 0.0);
+            let mut best_dh = 0.0;
+            let mut best_dn = 0.0;
+            let mut best_s = s0;
+            for &(ph, pn) in &probe_hn {
+                for &(th, tn) in &true_hn {
+                    let cdh = ph - th;
+                    let cdn = pn - tn;
+                    if cdh.abs() <= 0.50 && cdn.abs() <= 4.00 {
+                        let sc = eval_2d(cdh, cdn);
+                        if sc > best_s {
+                            best_s = sc;
+                            best_dh = cdh;
+                            best_dn = cdn;
+                        }
+                    }
+                }
+            }
+            for ih in -8..=8 {
+                for jn in -8..=8 {
+                    let cdh = best_dh + (ih as f64) * 0.003;
+                    let cdn = best_dn + (jn as f64) * 0.03;
+                    let sc = eval_2d(cdh, cdn);
+                    if sc > best_s {
+                        best_s = sc;
+                        best_dh = cdh;
+                        best_dn = cdn;
+                    }
+                }
+            }
+            let min_gain = (0.35 * (min_pool as f64)).max(6.0);
+            if (best_dh.abs() < 0.05 && best_dn.abs() < 0.45) || (best_s - s0) < min_gain {
+                (0.0, 0.0)
+            } else {
+                (best_dh, best_dn)
+            }
+        }
+    } else {
+        (0.0, 0.0)
+    };
+
+    let ca = fit_1d_marginal(
+        &collect_sorted_atom(pred, "CA"),
+        &collect_sorted_atom(truth, "CA"),
+        0.55,
+    );
+    let cb = fit_1d_marginal(
+        &collect_sorted_atom(pred, "CB"),
+        &collect_sorted_atom(truth, "CB"),
+        0.55,
+    );
+    let c = fit_1d_marginal(
+        &collect_sorted_atom(pred, "C"),
+        &collect_sorted_atom(truth, "C"),
+        0.55,
+    );
+
+    ShiftOffsets {
+        h: dh,
+        n: dn,
+        ca,
+        cb,
+        c,
+    }
+}
+
 fn cmd_score(args: &[String]) -> Result<(), String> {
     let mut pred_path: Option<PathBuf> = None;
     let mut truth_path: Option<PathBuf> = None;
     let mut peaks_path: Option<PathBuf> = None;
     let mut assign_tsv_path: Option<PathBuf> = None;
     let mut hc_threshold = 0.8f64;
+    let mut auto_offset = true;
     let mut verbose = false;
 
     let mut i = 0;
@@ -2431,6 +2748,9 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --hc")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+            }
+            "--no-auto-offset" => {
+                auto_offset = false;
             }
             "-v" | "--verbose" => verbose = true,
             other => return Err(format!("unknown score flag {other:?}")),
@@ -2497,44 +2817,6 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
     let tol_h = 0.045f64;
     let tol_n = 0.45f64;
 
-    // Detect global systematic reference offset `(dH, dN)` (`pred - truth`) when comparing
-    // experimental-frame predictions against DSS/liquid-NH3 BMRB depositions.
-    let greedy_hn_matches =
-        |probes: &[(f64, f64)], dh_off: f64, dn_off: f64| -> Vec<(usize, usize)> {
-            let mut cands: Vec<(f64, usize, usize)> = Vec::new();
-            for (pi, &(ph, pn)) in probes.iter().enumerate() {
-                for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
-                    let dh = (ph - (th + dh_off)).abs();
-                    let dn = (pn - (tn + dn_off)).abs();
-                    if dh <= tol_h && dn <= tol_n {
-                        cands.push(((dh / tol_h).powi(2) + (dn / tol_n).powi(2), pi, ti));
-                    }
-                }
-            }
-            cands.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let mut up = vec![false; probes.len()];
-            let mut ut = vec![false; true_roots.len()];
-            let mut matched = Vec::new();
-            for &(_, pi, ti) in &cands {
-                if !up[pi] && !ut[ti] {
-                    up[pi] = true;
-                    ut[ti] = true;
-                    matched.push((pi, ti));
-                }
-            }
-            matched
-        };
-
-    let median_f64 = |vals: &mut [f64]| -> f64 {
-        vals.sort_by(|a, b| a.total_cmp(b));
-        let m = vals.len() / 2;
-        if vals.len().is_multiple_of(2) {
-            0.5 * (vals[m - 1] + vals[m])
-        } else {
-            vals[m]
-        }
-    };
-
     let opt_systems = if let Some(pp) = &peaks_path {
         let pks = read_peaks(pp)?;
         Some(build_spin_systems(&pks, &Tolerances::default(), 3, false)?)
@@ -2542,47 +2824,18 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         None
     };
 
-    let probe_hn: Vec<(f64, f64)> = if let Some(ref systems) = opt_systems {
-        systems.iter().map(|s| (s.h, s.n)).collect()
+    let global_offs = if auto_offset {
+        fit_unlabelled_global_offsets(&pred_aligned, &truth_ref, opt_systems.as_deref())
     } else {
-        placed_roots
-            .iter()
-            .map(|&(_, ph, pn, _)| (ph, pn))
-            .collect()
+        ShiftOffsets::default()
     };
-
-    let zero_hn = greedy_hn_matches(&probe_hn, 0.0, 0.0);
-    let min_pool = probe_hn.len().min(true_roots.len());
-    let (truth_dh, truth_dn) = if min_pool >= 5 && zero_hn.len() * 2 < min_pool {
-        let mut best_m = zero_hn;
-        for &(ph, pn) in &probe_hn {
-            for &(_, th, tn) in &true_roots {
-                let cdh = ph - th;
-                let cdn = pn - tn;
-                if cdh.abs() <= 0.50 && cdn.abs() <= 4.00 {
-                    let m = greedy_hn_matches(&probe_hn, cdh, cdn);
-                    if m.len() > best_m.len() {
-                        best_m = m;
-                    }
-                }
-            }
-        }
-        if best_m.len() >= 5 && best_m.len() >= greedy_hn_matches(&probe_hn, 0.0, 0.0).len() + 4 {
-            let mut dhs: Vec<f64> = best_m
-                .iter()
-                .map(|&(pi, ti)| probe_hn[pi].0 - true_roots[ti].1)
-                .collect();
-            let mut dns: Vec<f64> = best_m
-                .iter()
-                .map(|&(pi, ti)| probe_hn[pi].1 - true_roots[ti].2)
-                .collect();
-            (median_f64(&mut dhs), median_f64(&mut dns))
-        } else {
-            (0.0, 0.0)
-        }
-    } else {
-        (0.0, 0.0)
-    };
+    let (truth_dh, truth_dn, truth_dca, truth_dcb, truth_dc) = (
+        global_offs.h,
+        global_offs.n,
+        global_offs.ca,
+        global_offs.cb,
+        global_offs.c,
+    );
 
     // Determine true residue `true_k: i32` (`-1` if spurious) for each placed root.
     // When `--peaks` is provided, match ALL spin-system HSQC roots 1-to-1 against `true_roots`
@@ -2703,51 +2956,19 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         0.0
     };
 
-    // Detect systematic 13C reference offset (`pred - truth`) across CA, CB, C when comparing
-    // experimental-frame predictions against DSS-referenced BMRB truth files.
     let mut truth_for_cmp = truth_ref.clone();
-    if truth_dh != 0.0 || truth_dn != 0.0 {
+    if !global_offs.is_zero() {
         for ((_, atom), val) in &mut truth_for_cmp.shifts {
-            if atom == "H" {
-                *val += truth_dh;
-            } else if atom == "N" {
-                *val += truth_dn;
+            match atom.as_str() {
+                "H" => *val += truth_dh,
+                "N" => *val += truth_dn,
+                "CA" => *val += truth_dca,
+                "CB" => *val += truth_dcb,
+                "C" => *val += truth_dc,
+                _ => {}
             }
         }
     }
-    let mut carbon_offs = [
-        ("CA", 0.0f64, 0.30f64),
-        ("CB", 0.0f64, 0.40f64),
-        ("C", 0.0f64, 0.30f64),
-    ];
-    for (atom_name, off_slot, atom_tol) in &mut carbon_offs {
-        let mut diffs: Vec<f64> = (0..truth_ref.sequence.len())
-            .filter_map(|k| {
-                let pv = pred_aligned.shifts.get(&(k, (*atom_name).to_string()))?;
-                let tv = truth_ref.shifts.get(&(k, (*atom_name).to_string()))?;
-                Some(*pv - *tv)
-            })
-            .collect();
-        if diffs.len() >= 5 {
-            let zero_ok = diffs.iter().filter(|&&d| d.abs() <= *atom_tol).count();
-            let med = median_f64(&mut diffs);
-            if med.abs() > 0.35 && med.abs() <= 5.0 {
-                let shifted_ok = diffs
-                    .iter()
-                    .filter(|&&d| (d - med).abs() <= *atom_tol)
-                    .count();
-                if shifted_ok >= zero_ok + 4 {
-                    *off_slot = med;
-                    for ((_, a), val) in &mut truth_for_cmp.shifts {
-                        if a == *atom_name {
-                            *val += med;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let (truth_dca, truth_dcb, truth_dc) = (carbon_offs[0].1, carbon_offs[1].1, carbon_offs[2].1);
 
     println!(
         "truth format            : {} ({} residues, {} backbone shifts, {} uncertain '?' values excluded)",
@@ -2756,10 +2977,9 @@ fn cmd_score(args: &[String]) -> Result<(), String> {
         truth_ref.shifts.len(),
         excluded_q
     );
-    if truth_dh != 0.0 || truth_dn != 0.0 || truth_dca != 0.0 || truth_dcb != 0.0 || truth_dc != 0.0
-    {
+    if !global_offs.is_zero() {
         println!(
-            "truth reference offset  : dH={truth_dh:+.3}, dN={truth_dn:+.2}, dCA={truth_dca:+.2}, dCB={truth_dcb:+.2}, dC={truth_dc:+.2} ppm (pred - truth)"
+            "truth reference offset  : dH={truth_dh:+.3}, dN={truth_dn:+.2}, dCA={truth_dca:+.2}, dCB={truth_dcb:+.2}, dC={truth_dc:+.2} ppm (pred - truth, unlabelled global fit)"
         );
     }
     println!("assignable spin systems : {assignable}");
@@ -3127,6 +3347,10 @@ fn main() {
         print!("{}", usage());
         return;
     }
+    if args[0] == "-V" || args[0] == "--version" || args[0] == "version" {
+        println!("{}", version_string());
+        return;
+    }
     let res = match args[0].as_str() {
         "benchmark" => cmd_benchmark(&args[1..]),
         "benchmark-suite" => cmd_benchmark_suite(&args[1..]),
@@ -3237,9 +3461,9 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         let hncacb = render_triple_3d("HNCACB", &sim_peaks, &rcfg);
         let cbcaconh = render_triple_3d("CBCACONH", &sim_peaks, &rcfg);
 
-        let hsqc_ucsf = dir.join("hsqc.ucsf");
-        let hncacb_ucsf = dir.join("hncacb.ucsf");
-        let cbcaconh_ucsf = dir.join("cbcaconh.ucsf");
+        let hsqc_ucsf = dir.join("HSQC.ucsf");
+        let hncacb_ucsf = dir.join("HNCACB.ucsf");
+        let cbcaconh_ucsf = dir.join("CBCACONH.ucsf");
         write_ucsf_2d_tiled(&hsqc_ucsf, &hsqc, 30, 70).unwrap();
         write_ucsf_3d_tiled(&hncacb_ucsf, &hncacb, 25, 19, 60).unwrap();
         write_ucsf_3d_tiled(&cbcaconh_ucsf, &cbcaconh, 25, 19, 60).unwrap();
@@ -3503,5 +3727,84 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_score_unlabelled_global_offset_is_permutation_invariant() {
+        let star = fixture_star_path();
+        let truth = read_star(&star, None).unwrap();
+
+        // 1. Unshifted reference must yield exact 0.0 global offsets across all atoms
+        let zero_offs = fit_unlabelled_global_offsets(&truth, &truth, None);
+        assert!(
+            zero_offs.is_zero(),
+            "expected zero offsets on unshifted truth, got {zero_offs}"
+        );
+
+        // 2. Apply known global offsets: dH=+0.11, dN=-1.20, dCA=-2.75, dCB=-2.75, dC=-2.75 ppm
+        let mut pred_true = truth.clone();
+        for ((_, atom), val) in &mut pred_true.shifts {
+            match atom.as_str() {
+                "H" => *val += 0.11,
+                "N" => *val -= 1.20,
+                "CA" | "CB" | "C" => *val -= 2.75,
+                _ => {}
+            }
+        }
+        let offs_true = fit_unlabelled_global_offsets(&pred_true, &truth, None);
+        assert!((offs_true.h - 0.11).abs() < 0.02, "got {offs_true}");
+        assert!((offs_true.n + 1.20).abs() < 0.08, "got {offs_true}");
+        assert!((offs_true.ca + 2.75).abs() < 0.05, "got {offs_true}");
+        assert!((offs_true.cb + 2.75).abs() < 0.05, "got {offs_true}");
+        assert!((offs_true.c + 2.75).abs() < 0.05, "got {offs_true}");
+
+        // 3. Permute every predicted residue index `k -> perm[k]` so 0% of labels match truth:
+        //    fitted offsets MUST remain bit-for-bit identical, proving zero matched-pair leakage!
+        let n_res = truth.sequence.len();
+        let mut pred_scrambled = Reference::new(truth.sequence.clone(), truth.seq_ids.clone());
+        for (&(k, ref atom), &val) in &pred_true.shifts {
+            let scrambled_k = (k * 17 + 29) % n_res;
+            pred_scrambled
+                .shifts
+                .insert((scrambled_k, atom.clone()), val);
+        }
+        let offs_scrambled = fit_unlabelled_global_offsets(&pred_scrambled, &truth, None);
+        assert!(
+            (offs_scrambled.h - offs_true.h).abs() < 1e-12
+                && (offs_scrambled.n - offs_true.n).abs() < 1e-12
+                && (offs_scrambled.ca - offs_true.ca).abs() < 1e-12
+                && (offs_scrambled.cb - offs_true.cb).abs() < 1e-12
+                && (offs_scrambled.c - offs_true.c).abs() < 1e-12,
+            "offset fitting must be strictly permutation-invariant: true={offs_true} vs scrambled={offs_scrambled}"
+        );
+
+        // Verify scrambled shift agreement stays near random chance (< 25%), never inflated
+        let mut truth_shifted = truth.clone();
+        for ((_, atom), val) in &mut truth_shifted.shifts {
+            match atom.as_str() {
+                "H" => *val += offs_scrambled.h,
+                "N" => *val += offs_scrambled.n,
+                "CA" => *val += offs_scrambled.ca,
+                "CB" => *val += offs_scrambled.cb,
+                "C" => *val += offs_scrambled.c,
+                _ => {}
+            }
+        }
+        let cmp_scrambled = compare_shifts(&pred_scrambled, &truth_shifted);
+        let (ca_ok, ca_n) = cmp_scrambled["CA"];
+        assert!(
+            (ca_ok as f64) / (ca_n as f64) < 0.25,
+            "scrambled CA agreement should remain random (<25%), got {ca_ok}/{ca_n}"
+        );
+    }
+
+    #[test]
+    fn test_version_string_matches_workspace_semver() {
+        let v = version_string();
+        assert!(
+            v.starts_with(&format!("nmrassign {} (", nmr_core::VERSION)),
+            "unexpected version_string: {v}"
+        );
+        assert!(v.ends_with(')'), "missing git sha suffix in {v}");
     }
 }
