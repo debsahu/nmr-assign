@@ -1,14 +1,23 @@
-//! Classical baseline 2D and 3D NMR peak picker with real-spectrum artifact hygiene.
+//! Classical baseline 2D and 3D NMR peak picker with real-spectrum artifact hygiene
+//! and two-pass experiment-corroborated 3D strip rescue.
 //!
-//! Provenance: Original clean-room implementation of `docs/specs/02-peak-picking.md` Stage A:
-//! two-pass outlier-trimmed MAD noise estimation (`1.4826 * median(|x - median(x)|)`),
-//! amide `1H` and experiment-specific `13C` spectral window gating, local indirect-axis column/strip
-//! MAD `t1`-ridge thresholding and FT truncation sinc-sidelobe suppression, automatic `180°` phase
-//! polarity detection for single-sign 3D triple-resonance spectra, resolved `^3J_HNHa` `1H` doublet
-//! coalescing, local extrema detection, and 3-point log-Gaussian / parabolic sub-voxel refinement.
+//! Provenance: Original clean-room implementation of `docs/specs/02-peak-picking.md` Stages A & A2:
+//! - Pass 1 (Stage A): two-pass outlier-trimmed MAD noise estimation (`1.4826 * median(|x - median(x)|)`),
+//!   amide `1H` and experiment-specific `13C` spectral window gating, local indirect-axis column/strip
+//!   MAD `t1`-ridge thresholding and FT truncation sinc-sidelobe suppression, automatic `180°` phase
+//!   polarity detection for single-sign 3D triple-resonance spectra, resolved `^3J_HNHa` `1H` doublet
+//!   coalescing, local extrema detection, and 3-point log-Gaussian / parabolic sub-voxel refinement.
+//! - Pass 2 (Stage A2, `StripBank3D` + `corroborated_re_pick_3d`): original clean-room two-pass
+//!   experiment-guided corroborated re-picking in compact 3D `(H, N)` halo strip cubes, exploiting
+//!   complementary triple-resonance coherence-transfer pathways (`HNCA`/`HN(CO)CA`,
+//!   `HNCACB`/`CBCA(CO)NH`, `HNCO`/`HN(CA)CO`; Kay, Ikura, Tschudin & Bax, *J. Magn. Reson.* 1990,
+//!   89, 496–514; Grzesiek & Bax, *J. Am. Chem. Soc.* 1992, 114, 6291–6293) strictly without
+//!   sequence or chemical-shift prior inputs.
+
+use std::collections::BTreeMap;
 
 use crate::peaks::Peak;
-use crate::spectrum::{Spectrum2D, Spectrum3D};
+use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
 #[derive(Clone, Debug)]
 pub struct PickerConfig {
@@ -707,6 +716,1039 @@ pub fn pick_triple_3d(spec: &Spectrum3D, hsqc_roots: &[Peak], cfg: &PickerConfig
     }
 
     out
+}
+
+/// Configuration for Pass-2 experiment-corroborated 3D strip rescue (`corroborated_re_pick_3d`).
+///
+/// Guard against confirmation bias: Pass 2 accepts no sequence or prior shift inputs and inspects
+/// raw 3D strips strictly inside narrow `+-ca_cb_window_ppm` (`0.15 ppm`) or `+-co_window_ppm`
+/// (`0.12 ppm`) windows pinned by high-SNR (`>= min_anchor_snr`, default `5.5 sigma`) Pass-1
+/// experimental peaks.
+#[derive(Clone, Debug)]
+pub struct CorroboratedRepickConfig {
+    /// Minimum local-strip MAD SNR (`height / strip_mad`) required for a Pass-1 peak to serve
+    /// as a corroborating anchor (default `5.5`).
+    pub min_anchor_snr: f32,
+    /// Conservative local-strip MAD floor (`k * strip_mad`, default `3.8`) for intra-strip
+    /// cross-experiment rescue at a single pinned carbon shift within the same `(H, N)` strip.
+    pub intra_strip_snr_floor: f32,
+    /// Conservative local-strip MAD floor (`k * strip_mad`, default `4.2`) for cross-strip
+    /// `0`-peak sequential pool rescue on multi-experiment validated backbone strips.
+    pub cross_strip_snr_floor: f32,
+    /// Half-width of the `13CA` / `13CB` corroboration window in ppm (default `0.15`).
+    pub ca_cb_window_ppm: f64,
+    /// Half-width of the `13C'` carbonyl corroboration window in ppm (default `0.12`).
+    pub co_window_ppm: f64,
+    /// Enable cross-strip sequential pool rescue on `0`-peak channels of validated backbone strips
+    /// (default `true`).
+    pub enable_cross_strip: bool,
+}
+
+impl Default for CorroboratedRepickConfig {
+    fn default() -> Self {
+        Self {
+            min_anchor_snr: 5.5,
+            intra_strip_snr_floor: 3.8,
+            cross_strip_snr_floor: 4.2,
+            ca_cb_window_ppm: 0.15,
+            co_window_ppm: 0.12,
+            enable_cross_strip: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveStripCol {
+    ix: usize,
+    in_idx: usize,
+    smad: f32,
+    smax: f32,
+}
+
+/// Compact 1-voxel `(H, N)` halo strip representation of a 3D triple-resonance cube around
+/// `hsqc_roots`, retaining bit-exact `3x3x3` local-extremum, sub-voxel refinement, volume, and
+/// local-strip MAD statistics in ~1–5% of the memory of a full `Spectrum3D`.
+#[derive(Clone, Debug)]
+pub struct StripCube3D {
+    exp: String,
+    axis_h: AxisPpm,
+    axis_n: AxisPpm,
+    axis_c: AxisPpm,
+    noise: f32,
+    allow_neg: bool,
+    invert_polarity: bool,
+    high_dr: bool,
+    far_sinc_frac: f32,
+    c_bounds: Option<(f64, f64)>,
+    ic_store_lo: usize,
+    ic_store_len: usize,
+    active_strips: Vec<ActiveStripCol>,
+    halo_keys: Vec<u64>,
+    col_data: Vec<f32>,
+}
+
+impl StripCube3D {
+    /// Extract a compact `(H, N)` halo strip cube around `hsqc_roots` from a full `Spectrum3D`.
+    pub fn from_spectrum_3d(spec: &Spectrum3D, hsqc_roots: &[Peak], cfg: &PickerConfig) -> Self {
+        let (nx, ny, nz) = (spec.nx(), spec.ny(), spec.nz());
+        let noise = estimate_noise_mad(&spec.data);
+        let thresh = cfg.snr_threshold * noise;
+        let allow_neg = cfg.allow_negative || spec.exp == "HNCACB";
+        let c_bounds = carbon_bounds_for_exp(&spec.exp);
+
+        let y_is_n = spec.axis_y.label.contains('N')
+            || (spec.axis_y.max_ppm() > 95.0
+                && spec.axis_y.min_ppm() < 145.0
+                && !spec.axis_z.label.contains('N'));
+        let (n_n, n_c) = if y_is_n { (ny, nz) } else { (nz, ny) };
+        let axis_n = if y_is_n {
+            spec.axis_y.clone()
+        } else {
+            spec.axis_z.clone()
+        };
+        let axis_c = if y_is_n {
+            spec.axis_z.clone()
+        } else {
+            spec.axis_y.clone()
+        };
+
+        if nx < 3 || ny < 3 || nz < 3 || hsqc_roots.is_empty() {
+            return Self {
+                exp: spec.exp.clone(),
+                axis_h: spec.axis_x.clone(),
+                axis_n,
+                axis_c,
+                noise,
+                allow_neg,
+                invert_polarity: false,
+                high_dr: false,
+                far_sinc_frac: (cfg.sinc_frac * 0.4).min(0.012),
+                c_bounds,
+                ic_store_lo: 0,
+                ic_store_len: 0,
+                active_strips: Vec::new(),
+                halo_keys: Vec::new(),
+                col_data: Vec::new(),
+            };
+        }
+
+        let step_c = axis_c.step_ppm.abs();
+        let mut active_c = Vec::with_capacity(n_c);
+        for ic in 1..n_c - 1 {
+            let cp = axis_c.index_to_ppm(ic as f64);
+            if let Some((clo, chi)) = c_bounds {
+                if cp < clo - step_c || cp > chi + step_c {
+                    continue;
+                }
+            }
+            active_c.push(ic);
+        }
+
+        let mut raw_active: Vec<(usize, usize)> = Vec::new();
+        for in_idx in 1..n_n - 1 {
+            let np = axis_n.index_to_ppm(in_idx as f64);
+            if !hsqc_roots
+                .iter()
+                .any(|r| (r.n - np).abs() <= cfg.strip_tol_n)
+            {
+                continue;
+            }
+            for ix in 1..nx - 1 {
+                let hp = spec.axis_x.index_to_ppm(ix as f64);
+                if hsqc_roots.iter().any(|r| {
+                    (r.h - hp).abs() <= cfg.strip_tol_h && (r.n - np).abs() <= cfg.strip_tol_n
+                }) {
+                    raw_active.push((ix, in_idx));
+                }
+            }
+        }
+
+        if active_c.is_empty() || raw_active.is_empty() {
+            return Self {
+                exp: spec.exp.clone(),
+                axis_h: spec.axis_x.clone(),
+                axis_n,
+                axis_c,
+                noise,
+                allow_neg,
+                invert_polarity: false,
+                high_dr: false,
+                far_sinc_frac: (cfg.sinc_frac * 0.4).min(0.012),
+                c_bounds,
+                ic_store_lo: 0,
+                ic_store_len: 0,
+                active_strips: Vec::new(),
+                halo_keys: Vec::new(),
+                col_data: Vec::new(),
+            };
+        }
+
+        let get_voxel = |ix: usize, in_idx: usize, ic: usize| -> f32 {
+            if y_is_n {
+                spec.get(ix, in_idx, ic)
+            } else {
+                spec.get(ix, ic, in_idx)
+            }
+        };
+
+        let mut max_pos = 0.0f32;
+        let mut max_neg = 0.0f32;
+        for &(ix, in_idx) in &raw_active {
+            for &ic in &active_c {
+                let v = get_voxel(ix, in_idx, ic);
+                if v > max_pos {
+                    max_pos = v;
+                } else if -v > max_neg {
+                    max_neg = -v;
+                }
+            }
+        }
+        let single_sign_backbone = !allow_neg
+            && matches!(
+                spec.exp.as_str(),
+                "HNCA" | "HNCOCA" | "CBCACONH" | "HNCO" | "HNCACO"
+            );
+        let invert_polarity = single_sign_backbone && max_neg > 2.5 * max_pos.max(thresh);
+        let spec_max_abs = if invert_polarity {
+            max_neg
+        } else if allow_neg {
+            max_pos.max(max_neg)
+        } else {
+            max_pos
+        };
+        let high_dr = spec_max_abs > 40.0 * noise;
+        let far_sinc_frac = (cfg.sinc_frac * 0.4).min(0.012);
+
+        // Compute full-column outlier-trimmed MAD & max identically to Pass 1 before cropping 13C storage
+        let mut strip_buf = Vec::with_capacity(n_c);
+        let mut scratch = Vec::with_capacity(n_c);
+        let mut active_strips = Vec::with_capacity(raw_active.len());
+        for &(ix, in_idx) in &raw_active {
+            strip_buf.clear();
+            for ic in 0..n_c {
+                strip_buf.push(get_voxel(ix, in_idx, ic));
+            }
+            let (smad, smax) = slice_trimmed_mad_and_max(&strip_buf, &mut scratch, noise);
+            active_strips.push(ActiveStripCol {
+                ix,
+                in_idx,
+                smad,
+                smax,
+            });
+        }
+
+        let ic_min = *active_c.first().unwrap_or(&1);
+        let ic_max = *active_c.last().unwrap_or(&(n_c - 2));
+        let ic_store_lo = ic_min.saturating_sub(1);
+        let ic_store_hi = (ic_max + 1).min(n_c - 1);
+        let ic_store_len = ic_store_hi - ic_store_lo + 1;
+
+        let mut halo_keys = Vec::with_capacity(raw_active.len() * 4);
+        for &(ix, in_idx) in &raw_active {
+            for dn in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let jx = (ix as isize + dx) as u64;
+                    let jn = (in_idx as isize + dn) as u64;
+                    halo_keys.push((jx << 32) | jn);
+                }
+            }
+        }
+        halo_keys.sort_unstable();
+        halo_keys.dedup();
+
+        let mut col_data = Vec::with_capacity(halo_keys.len() * ic_store_len);
+        for &key in &halo_keys {
+            let ix = (key >> 32) as usize;
+            let in_idx = (key & 0xFFFF_FFFF) as usize;
+            for ic in ic_store_lo..=ic_store_hi {
+                col_data.push(get_voxel(ix, in_idx, ic));
+            }
+        }
+
+        Self {
+            exp: spec.exp.clone(),
+            axis_h: spec.axis_x.clone(),
+            axis_n,
+            axis_c,
+            noise,
+            allow_neg,
+            invert_polarity,
+            high_dr,
+            far_sinc_frac,
+            c_bounds,
+            ic_store_lo,
+            ic_store_len,
+            active_strips,
+            halo_keys,
+            col_data,
+        }
+    }
+
+    /// Experiment identifier (e.g. `"HNCACB"`, `"CBCACONH"`, `"HNCA"`, `"HNCOCA"`, `"HNCO"`, `"HNCACO"`).
+    pub fn exp(&self) -> &str {
+        &self.exp
+    }
+
+    /// Approximate heap footprint of the extracted strip cube in bytes.
+    pub fn byte_size(&self) -> usize {
+        self.col_data.len() * std::mem::size_of::<f32>()
+            + self.halo_keys.len() * std::mem::size_of::<u64>()
+            + self.active_strips.len() * std::mem::size_of::<ActiveStripCol>()
+    }
+
+    #[inline]
+    fn get(&self, ix: usize, in_idx: usize, ic: usize) -> f32 {
+        let key = ((ix as u64) << 32) | (in_idx as u64);
+        let slot = self
+            .halo_keys
+            .binary_search(&key)
+            .expect("1-voxel halo column present in StripCube3D");
+        self.col_data[slot * self.ic_store_len + (ic - self.ic_store_lo)]
+    }
+
+    fn strip_mad_at(&self, h: f64, n: f64) -> f32 {
+        if self.active_strips.is_empty() {
+            return self.noise;
+        }
+        let ix = self.axis_h.ppm_to_index(h).round().max(0.0) as usize;
+        let in_idx = self.axis_n.ppm_to_index(n).round().max(0.0) as usize;
+        let mut best = self.noise;
+        let mut best_d = usize::MAX;
+        for s in &self.active_strips {
+            let d = s.ix.abs_diff(ix) + s.in_idx.abs_diff(in_idx);
+            if d < best_d {
+                best_d = d;
+                best = s.smad;
+                if d == 0 {
+                    break;
+                }
+            }
+        }
+        best
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_corroborated_window(
+        &self,
+        h_r: f64,
+        n_r: f64,
+        c_target: f64,
+        win_ppm: f64,
+        sign_req: Option<i32>,
+        min_local_snr: f32,
+        existing_exp_peaks: &[&Peak],
+        cfg: &PickerConfig,
+    ) -> Option<(Peak, f32)> {
+        if self.ic_store_len < 3 || self.active_strips.is_empty() {
+            return None;
+        }
+        let step_c = self.axis_c.step_ppm.abs();
+        let i0 = self
+            .axis_c
+            .ppm_to_index(c_target - win_ppm - step_c)
+            .floor() as isize;
+        let i1 = self.axis_c.ppm_to_index(c_target + win_ppm + step_c).ceil() as isize;
+        let ic_min_valid = (self.ic_store_lo + 1) as isize;
+        let ic_max_valid = (self.ic_store_lo + self.ic_store_len - 2) as isize;
+        let ic_lo = i0.min(i1).max(ic_min_valid) as usize;
+        let ic_hi = i0.max(i1).min(ic_max_valid) as usize;
+        if ic_lo > ic_hi {
+            return None;
+        }
+
+        let snr_floor = min_local_snr.max(3.8);
+        let mut best: Option<(Peak, f32, f64)> = None;
+
+        for scol in &self.active_strips {
+            let hp_grid = self.axis_h.index_to_ppm(scol.ix as f64);
+            let np_grid = self.axis_n.index_to_ppm(scol.in_idx as f64);
+            if (hp_grid - h_r).abs() > cfg.strip_tol_h || (np_grid - n_r).abs() > cfg.strip_tol_n {
+                continue;
+            }
+            // Strictly enforce local-strip MAD floor (scol.smad >= self.noise) regardless of high_dr
+            let base_thr = snr_floor * scol.smad;
+            let loc_thr = if self.high_dr {
+                base_thr.max(self.far_sinc_frac * scol.smax)
+            } else {
+                base_thr
+            };
+
+            for ic in ic_lo..=ic_hi {
+                let raw_v = self.get(scol.ix, scol.in_idx, ic);
+                let eff_v = if self.invert_polarity { -raw_v } else { raw_v };
+                if eff_v.abs() < loc_thr || (!self.allow_neg && eff_v < 0.0) {
+                    continue;
+                }
+                let sign = if self.invert_polarity || raw_v >= 0.0 {
+                    1
+                } else {
+                    -1
+                };
+                if let Some(sr) = sign_req {
+                    if sign != sr {
+                        continue;
+                    }
+                }
+
+                let raw_sign = if raw_v >= 0.0 { 1 } else { -1 };
+                let mut is_extremum = true;
+                'nbr: for dc in -1isize..=1 {
+                    for dn in -1isize..=1 {
+                        for dx in -1isize..=1 {
+                            if dx == 0 && dn == 0 && dc == 0 {
+                                continue;
+                            }
+                            let nv = self.get(
+                                (scol.ix as isize + dx) as usize,
+                                (scol.in_idx as isize + dn) as usize,
+                                (ic as isize + dc) as usize,
+                            );
+                            if (raw_sign > 0 && nv >= raw_v) || (raw_sign < 0 && nv <= raw_v) {
+                                is_extremum = false;
+                                break 'nbr;
+                            }
+                        }
+                    }
+                }
+                if !is_extremum {
+                    continue;
+                }
+
+                let dx = subvoxel_offset(
+                    self.get(scol.ix - 1, scol.in_idx, ic),
+                    raw_v,
+                    self.get(scol.ix + 1, scol.in_idx, ic),
+                );
+                let dn = subvoxel_offset(
+                    self.get(scol.ix, scol.in_idx - 1, ic),
+                    raw_v,
+                    self.get(scol.ix, scol.in_idx + 1, ic),
+                );
+                let dc = subvoxel_offset(
+                    self.get(scol.ix, scol.in_idx, ic - 1),
+                    raw_v,
+                    self.get(scol.ix, scol.in_idx, ic + 1),
+                );
+
+                let h = self.axis_h.index_to_ppm(scol.ix as f64 + dx);
+                let n = self.axis_n.index_to_ppm(scol.in_idx as f64 + dn);
+                let c = self.axis_c.index_to_ppm(ic as f64 + dc);
+
+                if (c - c_target).abs() > win_ppm {
+                    continue;
+                }
+                if let Some((clo, chi)) = self.c_bounds {
+                    if c < clo || c > chi {
+                        continue;
+                    }
+                }
+                // Require tight centering on the target HSQC root so neighbor bleed is never rescued
+                let hd = ((h - h_r) / 0.028).hypot((n - n_r) / 0.28);
+                if hd > 1.0 {
+                    continue;
+                }
+
+                let hti = (raw_v.abs()) as f64;
+                if self.high_dr {
+                    let min_parent = (40.0 * self.noise) as f64;
+                    let half_sinc = 0.5 * (cfg.sinc_frac as f64);
+                    let mut is_sidelobe = false;
+                    for pj in existing_exp_peaks {
+                        let Some(cj) = pj.c else { continue };
+                        let htj = pj.height.unwrap_or(0.0);
+                        if htj <= hti || htj < min_parent {
+                            continue;
+                        }
+                        let dhp = (h - pj.h).abs();
+                        let dnp = (n - pj.n).abs();
+                        let dcp = (c - cj).abs();
+                        if dhp <= 0.025 && dnp <= 0.30 && dcp > 0.25 && dcp <= 6.0 {
+                            let env = half_sinc + 0.16 / (1.0 + (dcp / 0.85).powi(2));
+                            if hti < htj * env {
+                                is_sidelobe = true;
+                                break;
+                            }
+                        }
+                        if dhp <= 0.020
+                            && dcp <= 0.25
+                            && dnp > 0.20
+                            && dnp <= 4.0
+                            && sign == pj.sign
+                        {
+                            let env = half_sinc + 0.14 / (1.0 + (dnp / 0.70).powi(2));
+                            if hti < htj * env {
+                                is_sidelobe = true;
+                                break;
+                            }
+                        }
+                        // Cross-sign F1 truncation sinc sidelobe guard in phase-sensitive HNCACB
+                        if self.allow_neg
+                            && sign != pj.sign
+                            && dhp <= 0.035
+                            && dnp <= 0.35
+                            && dcp <= 0.65
+                            && hti < 0.16 * htj
+                        {
+                            is_sidelobe = true;
+                            break;
+                        }
+                    }
+                    if is_sidelobe {
+                        continue;
+                    }
+                }
+
+                // Skip if Pass 1 already picked this extremum
+                if existing_exp_peaks.iter().any(|pj| {
+                    pj.sign == sign
+                        && (pj.h - h).abs() <= 0.030
+                        && (pj.n - n).abs() <= 0.30
+                        && (pj.c.unwrap_or(0.0) - c).abs() <= 0.20
+                }) {
+                    continue;
+                }
+
+                let mut vol = 0.0f64;
+                for wc in -1isize..=1 {
+                    for wn in -1isize..=1 {
+                        for wx in -1isize..=1 {
+                            let sv = self.get(
+                                (scol.ix as isize + wx) as usize,
+                                (scol.in_idx as isize + wn) as usize,
+                                (ic as isize + wc) as usize,
+                            );
+                            if sv.signum() == raw_v.signum() {
+                                vol += (sv.abs()) as f64;
+                            }
+                        }
+                    }
+                }
+
+                let lsnr = eff_v.abs() / scol.smad.max(1e-12);
+                let rank = (lsnr as f64) * (-0.35 * hd * hd).exp();
+                if best.as_ref().is_none_or(|b| rank > b.2) {
+                    best = Some((
+                        Peak {
+                            exp: self.exp.clone(),
+                            h,
+                            n,
+                            c: Some(c),
+                            sign,
+                            height: Some(hti),
+                            volume: Some(vol),
+                            h2: None,
+                        },
+                        lsnr,
+                        rank,
+                    ));
+                }
+            }
+        }
+        best.map(|(pk, lsnr, _)| (pk, lsnr))
+    }
+}
+
+/// Multi-experiment bank of compact 3D strip cubes (`StripCube3D`) accumulated during streaming
+/// Pass-1 3D picking so Pass 2 (`corroborated_re_pick_3d`) can inspect all experiments jointly
+/// without keeping full 3D cubes (`~130–540 MB` each) in memory simultaneously.
+#[derive(Clone, Debug, Default)]
+pub struct StripBank3D {
+    cubes: BTreeMap<String, StripCube3D>,
+}
+
+impl StripBank3D {
+    /// Create an empty multi-experiment strip bank.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or replace a pre-extracted `StripCube3D` keyed by its experiment name.
+    pub fn insert_cube(&mut self, cube: StripCube3D) {
+        self.cubes.insert(cube.exp.clone(), cube);
+    }
+
+    /// Run Pass-1 `pick_triple_3d` on `spec` and store its compact `StripCube3D` in this bank.
+    pub fn pick_and_record_3d(
+        &mut self,
+        spec: &Spectrum3D,
+        hsqc_roots: &[Peak],
+        cfg: &PickerConfig,
+    ) -> Vec<Peak> {
+        let p1 = pick_triple_3d(spec, hsqc_roots, cfg);
+        if !hsqc_roots.is_empty() {
+            self.insert_cube(StripCube3D::from_spectrum_3d(spec, hsqc_roots, cfg));
+        }
+        p1
+    }
+
+    /// Look up the strip cube for an experiment name (e.g. `"HNCACB"`).
+    pub fn get(&self, exp: &str) -> Option<&StripCube3D> {
+        self.cubes.get(exp)
+    }
+
+    /// Number of 3D experiments stored in this bank.
+    pub fn len(&self) -> usize {
+        self.cubes.len()
+    }
+
+    /// Whether no 3D strip cubes have been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.cubes.is_empty()
+    }
+
+    /// Total heap memory used across all stored strip cubes in bytes.
+    pub fn byte_size(&self) -> usize {
+        self.cubes.values().map(StripCube3D::byte_size).sum()
+    }
+}
+
+/// Pass-2 experiment-corroborated 3D strip rescue (`docs/specs/02-peak-picking.md` Stage A2).
+///
+/// Returns ONLY the newly rescued Pass-2 3D peaks (caller may extend `pass1_peaks` with the result).
+/// Never uses amino-acid sequence or chemical-shift priors; every search window is pinned by a
+/// high-SNR (`>= repick_cfg.min_anchor_snr`) Pass-1 experimental peak.
+pub fn corroborated_re_pick_3d(
+    bank: &StripBank3D,
+    hsqc_roots: &[Peak],
+    pass1_peaks: &[Peak],
+    cfg: &PickerConfig,
+    repick_cfg: &CorroboratedRepickConfig,
+) -> Vec<Peak> {
+    if bank.is_empty() || hsqc_roots.is_empty() {
+        return Vec::new();
+    }
+
+    let tol_h = 0.030;
+    let tol_n = 0.30;
+    let anchor_min_snr = repick_cfg.min_anchor_snr.max(4.5);
+    let intra_snr = repick_cfg.intra_strip_snr_floor.max(3.8);
+    let cross_snr = repick_cfg.cross_strip_snr_floor.max(3.8);
+    let ca_cb_win = repick_cfg.ca_cb_window_ppm.clamp(0.05, 0.25);
+    let co_win = repick_cfg.co_window_ppm.clamp(0.04, 0.20);
+    let min_amide_h = cfg
+        .amide_h_window
+        .map(|(a, b)| a.min(b).max(6.0))
+        .unwrap_or(0.0);
+
+    // Identify paired sidechain NH2 doublets (`|dN| <= 0.12 ppm`, `0.30 <= |dH| <= 1.20 ppm`)
+    let mut is_nh2_pair = vec![false; hsqc_roots.len()];
+    for i in 0..hsqc_roots.len() {
+        for j in (i + 1)..hsqc_roots.len() {
+            let dn = (hsqc_roots[i].n - hsqc_roots[j].n).abs();
+            let dh = (hsqc_roots[i].h - hsqc_roots[j].h).abs();
+            if dn <= 0.12 && (0.30..=1.20).contains(&dh) {
+                is_nh2_pair[i] = true;
+                is_nh2_pair[j] = true;
+            }
+        }
+    }
+
+    let mut by_exp: BTreeMap<String, Vec<&Peak>> = BTreeMap::new();
+    for p in pass1_peaks {
+        if p.exp != "HSQC" && p.c.is_some() {
+            by_exp.entry(p.exp.clone()).or_default().push(p);
+        }
+    }
+
+    #[derive(Clone)]
+    struct RootPeak {
+        exp: String,
+        c: f64,
+        sign: i32,
+        lsnr: f32,
+    }
+
+    let mut root_peaks: Vec<Vec<RootPeak>> = vec![Vec::new(); hsqc_roots.len()];
+    for p in pass1_peaks {
+        let Some(c) = p.c else { continue };
+        if p.exp == "HSQC" {
+            continue;
+        }
+        let Some(cube) = bank.get(&p.exp) else {
+            continue;
+        };
+        let smad = cube.strip_mad_at(p.h, p.n);
+        let lsnr = (p.height.unwrap_or(0.0).abs() as f32) / smad.max(1e-12);
+        for (ri, r) in hsqc_roots.iter().enumerate() {
+            let d = ((r.h - p.h) / tol_h).hypot((r.n - p.n) / tol_n);
+            if d <= 1.0 {
+                root_peaks[ri].push(RootPeak {
+                    exp: p.exp.clone(),
+                    c,
+                    sign: p.sign,
+                    lsnr,
+                });
+            }
+        }
+    }
+
+    let has_hncoca_cube = bank.get("HNCOCA").is_some();
+    let mut rescued: Vec<Peak> = Vec::new();
+
+    let has_near = |ri: usize, exp: &str, c0: f64, sgn: Option<i32>, dc: f64, extra: &[Peak]| {
+        root_peaks[ri]
+            .iter()
+            .any(|rp| rp.exp == exp && sgn.is_none_or(|s| rp.sign == s) && (rp.c - c0).abs() <= dc)
+            || extra.iter().any(|ep| {
+                ep.exp == exp
+                    && sgn.is_none_or(|s| ep.sign == s)
+                    && ((ep.h - hsqc_roots[ri].h) / tol_h).hypot((ep.n - hsqc_roots[ri].n) / tol_n)
+                        <= 1.0
+                    && (ep.c.unwrap_or(0.0) - c0).abs() <= dc
+            })
+    };
+
+    // Pass 2A: Intra-strip cross-experiment corroboration at the same HSQC root
+    for (ri, r) in hsqc_roots.iter().enumerate() {
+        if r.h < min_amide_h
+            || (is_nh2_pair[ri]
+                && !root_peaks[ri].iter().any(|rp| {
+                    (rp.exp == "HNCA" || rp.exp == "HNCACB") && rp.lsnr >= anchor_min_snr
+                }))
+        {
+            continue;
+        }
+
+        let n_hnca = root_peaks[ri].iter().filter(|rp| rp.exp == "HNCA").count();
+
+        // 1a. HNCOCA (>= anchor_min_snr) -> HNCACB(+1), and -> HNCA(+1) when strip has 0 HNCA peaks
+        let hncoca_anchors: Vec<f64> = root_peaks[ri]
+            .iter()
+            .filter(|rp| {
+                rp.exp == "HNCOCA" && rp.lsnr >= anchor_min_snr && (35.0..=76.0).contains(&rp.c)
+            })
+            .map(|rp| rp.c)
+            .collect();
+        for c0 in hncoca_anchors {
+            if let Some(cube) = bank.get("HNCACB") {
+                if !has_near(ri, "HNCACB", c0, Some(1), 0.30, &rescued) {
+                    let existing = by_exp.get("HNCACB").map(Vec::as_slice).unwrap_or(&[]);
+                    if let Some((pk, _)) = cube.search_corroborated_window(
+                        r.h,
+                        r.n,
+                        c0,
+                        ca_cb_win,
+                        Some(1),
+                        intra_snr,
+                        existing,
+                        cfg,
+                    ) {
+                        rescued.push(pk);
+                    }
+                }
+            }
+            if n_hnca == 0 {
+                if let Some(cube) = bank.get("HNCA") {
+                    if !has_near(ri, "HNCA", c0, Some(1), 0.30, &rescued) {
+                        let existing = by_exp.get("HNCA").map(Vec::as_slice).unwrap_or(&[]);
+                        if let Some((pk, _)) = cube.search_corroborated_window(
+                            r.h,
+                            r.n,
+                            c0,
+                            ca_cb_win,
+                            Some(1),
+                            intra_snr,
+                            existing,
+                            cfg,
+                        ) {
+                            rescued.push(pk);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1b. CBCACONH (>= anchor_min_snr) -> HNCACB (+CA / -CB typing), and -> HNCA when HNCOCA is absent or 0 HNCA
+        let cbca_anchors: Vec<f64> = root_peaks[ri]
+            .iter()
+            .filter(|rp| rp.exp == "CBCACONH" && rp.lsnr >= anchor_min_snr)
+            .map(|rp| rp.c)
+            .collect();
+        for c0 in cbca_anchors {
+            if let Some(cube) = bank.get("HNCACB") {
+                if !has_near(ri, "HNCACB", c0, None, 0.30, &rescued) {
+                    let hncoca_match = root_peaks[ri]
+                        .iter()
+                        .any(|rp| rp.exp == "HNCOCA" && (rp.c - c0).abs() <= 0.25);
+                    let sign_req = if hncoca_match || c0 > 73.0 {
+                        Some(1)
+                    } else if c0 < 38.0 {
+                        Some(-1)
+                    } else {
+                        None
+                    };
+                    let existing = by_exp.get("HNCACB").map(Vec::as_slice).unwrap_or(&[]);
+                    if let Some((pk, _)) = cube.search_corroborated_window(
+                        r.h, r.n, c0, ca_cb_win, sign_req, intra_snr, existing, cfg,
+                    ) {
+                        rescued.push(pk);
+                    }
+                }
+            }
+            if (!has_hncoca_cube || n_hnca == 0) && (38.5..=76.0).contains(&c0) {
+                if let Some(cube) = bank.get("HNCA") {
+                    if !has_near(ri, "HNCA", c0, Some(1), 0.30, &rescued) {
+                        let existing = by_exp.get("HNCA").map(Vec::as_slice).unwrap_or(&[]);
+                        if let Some((pk, _)) = cube.search_corroborated_window(
+                            r.h,
+                            r.n,
+                            c0,
+                            ca_cb_win,
+                            Some(1),
+                            intra_snr,
+                            existing,
+                            cfg,
+                        ) {
+                            rescued.push(pk);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1c. HNCA / HNCACB(+1) (>= anchor_min_snr) -> HNCOCA when strip has 0 HNCOCA peaks
+        if !root_peaks[ri].iter().any(|rp| rp.exp == "HNCOCA") {
+            if let Some(cube) = bank.get("HNCOCA") {
+                let existing = by_exp.get("HNCOCA").map(Vec::as_slice).unwrap_or(&[]);
+                let mut best_cand: Option<(Peak, f32)> = None;
+                let floor_ca_to_im1 = intra_snr.max(4.0);
+                for rp in &root_peaks[ri] {
+                    if (rp.exp == "HNCA" || (rp.exp == "HNCACB" && rp.sign > 0))
+                        && rp.lsnr >= anchor_min_snr
+                        && (38.0..=76.0).contains(&rp.c)
+                    {
+                        if let Some(cand) = cube.search_corroborated_window(
+                            r.h,
+                            r.n,
+                            rp.c,
+                            ca_cb_win,
+                            Some(1),
+                            floor_ca_to_im1,
+                            existing,
+                            cfg,
+                        ) {
+                            if best_cand.as_ref().is_none_or(|b| cand.1 > b.1) {
+                                best_cand = Some(cand);
+                            }
+                        }
+                    }
+                }
+                if let Some((pk, _)) = best_cand {
+                    rescued.push(pk);
+                }
+            }
+        }
+
+        // 2a. HNCO (>= anchor_min_snr) -> HNCACO (corroborates C'(i-1) in HNCACO)
+        if let Some(cube) = bank.get("HNCACO") {
+            for rp in &root_peaks[ri] {
+                if rp.exp == "HNCO"
+                    && rp.lsnr >= anchor_min_snr
+                    && !has_near(ri, "HNCACO", rp.c, Some(1), 0.18, &rescued)
+                {
+                    let existing = by_exp.get("HNCACO").map(Vec::as_slice).unwrap_or(&[]);
+                    if let Some((pk, _)) = cube.search_corroborated_window(
+                        r.h,
+                        r.n,
+                        rp.c,
+                        co_win,
+                        Some(1),
+                        intra_snr,
+                        existing,
+                        cfg,
+                    ) {
+                        rescued.push(pk);
+                    }
+                }
+            }
+        }
+
+        // 2b. HNCACO (>= anchor_min_snr) -> HNCO when strip has 0 HNCO peaks
+        if !root_peaks[ri].iter().any(|rp| rp.exp == "HNCO") {
+            if let Some(cube) = bank.get("HNCO") {
+                let existing = by_exp.get("HNCO").map(Vec::as_slice).unwrap_or(&[]);
+                let mut best_cand: Option<(Peak, f32)> = None;
+                for rp in &root_peaks[ri] {
+                    if rp.exp == "HNCACO" && rp.lsnr >= anchor_min_snr {
+                        if let Some(cand) = cube.search_corroborated_window(
+                            r.h,
+                            r.n,
+                            rp.c,
+                            co_win,
+                            Some(1),
+                            intra_snr,
+                            existing,
+                            cfg,
+                        ) {
+                            if best_cand.as_ref().is_none_or(|b| cand.1 > b.1) {
+                                best_cand = Some(cand);
+                            }
+                        }
+                    }
+                }
+                if let Some((pk, _)) = best_cand {
+                    rescued.push(pk);
+                }
+            }
+        }
+    }
+
+    if !repick_cfg.enable_cross_strip {
+        return rescued;
+    }
+
+    // Build global high-SNR experimental pools strictly from Pass-1 non-NH2 backbone peaks
+    let mut pool_co_im1: Vec<f64> = Vec::new();
+    let mut pool_ca_im1: Vec<f64> = Vec::new();
+    for (ri, rps) in root_peaks.iter().enumerate() {
+        if hsqc_roots[ri].h < min_amide_h || is_nh2_pair[ri] {
+            continue;
+        }
+        for rp in rps {
+            if rp.lsnr < anchor_min_snr {
+                continue;
+            }
+            match rp.exp.as_str() {
+                "HNCO" => pool_co_im1.push(rp.c),
+                "HNCOCA" => pool_ca_im1.push(rp.c),
+                "CBCACONH" if (38.5..=76.0).contains(&rp.c) => {
+                    let is_cb = rps
+                        .iter()
+                        .any(|q| q.exp == "HNCACB" && q.sign < 0 && (q.c - rp.c).abs() <= 0.25);
+                    if !is_cb {
+                        pool_ca_im1.push(rp.c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let dedup_shifts = |mut v: Vec<f64>, min_sep: f64| -> Vec<f64> {
+        v.sort_by(|a, b| a.total_cmp(b));
+        let mut out: Vec<f64> = Vec::new();
+        for x in v {
+            if out.last().is_none_or(|&last| (x - last) > min_sep) {
+                out.push(x);
+            }
+        }
+        out
+    };
+    let pool_co_im1 = dedup_shifts(pool_co_im1, 0.05);
+    let pool_ca_im1 = dedup_shifts(pool_ca_im1, 0.06);
+
+    // Pass 2B: Cross-strip 0-peak rescue on multi-experiment validated backbone strips
+    for (ri, r) in hsqc_roots.iter().enumerate() {
+        if r.h < min_amide_h || is_nh2_pair[ri] {
+            continue;
+        }
+        let mut distinct_exps: Vec<&str> = root_peaks[ri]
+            .iter()
+            .filter(|rp| rp.lsnr >= anchor_min_snr)
+            .map(|rp| rp.exp.as_str())
+            .collect();
+        distinct_exps.sort_unstable();
+        distinct_exps.dedup();
+        let has_intra_backbone =
+            distinct_exps.contains(&"HNCA") || distinct_exps.contains(&"HNCACB");
+        if distinct_exps.len() < 2 || (!has_intra_backbone && !distinct_exps.contains(&"HNCO")) {
+            continue;
+        }
+
+        // Cross-strip CA(i) rescue ONLY when HNCA or HNCACB(+1) has 0 positive peaks
+        for target_exp in ["HNCA", "HNCACB"] {
+            let Some(cube) = bank.get(target_exp) else {
+                continue;
+            };
+            let n_pos = root_peaks[ri]
+                .iter()
+                .filter(|rp| rp.exp == target_exp && rp.sign > 0)
+                .count()
+                + rescued
+                    .iter()
+                    .filter(|ep| {
+                        ep.exp == target_exp
+                            && ep.sign > 0
+                            && ((ep.h - r.h) / tol_h).hypot((ep.n - r.n) / tol_n) <= 1.0
+                    })
+                    .count();
+            if n_pos == 0 {
+                let existing = by_exp.get(target_exp).map(Vec::as_slice).unwrap_or(&[]);
+                let mut best_cand: Option<(Peak, f32)> = None;
+                for &c_cand in &pool_ca_im1 {
+                    if let Some(cand) = cube.search_corroborated_window(
+                        r.h,
+                        r.n,
+                        c_cand,
+                        ca_cb_win,
+                        Some(1),
+                        cross_snr,
+                        existing,
+                        cfg,
+                    ) {
+                        if best_cand.as_ref().is_none_or(|b| cand.1 > b.1) {
+                            best_cand = Some(cand);
+                        }
+                    }
+                }
+                if let Some((pk, _)) = best_cand {
+                    rescued.push(pk);
+                }
+            }
+        }
+
+        // Cross-strip HNCO rescue ONLY when strip has 0 HNCO peaks and >= 2 aliphatic backbone anchors
+        if has_intra_backbone
+            && !root_peaks[ri].iter().any(|rp| rp.exp == "HNCO")
+            && !rescued.iter().any(|ep| {
+                ep.exp == "HNCO" && ((ep.h - r.h) / tol_h).hypot((ep.n - r.n) / tol_n) <= 1.0
+            })
+        {
+            if let Some(cube) = bank.get("HNCO") {
+                let existing = by_exp.get("HNCO").map(Vec::as_slice).unwrap_or(&[]);
+                let mut best_cand: Option<(Peak, f32)> = None;
+                for &c_cand in &pool_co_im1 {
+                    if let Some(cand) = cube.search_corroborated_window(
+                        r.h,
+                        r.n,
+                        c_cand,
+                        co_win,
+                        Some(1),
+                        cross_snr,
+                        existing,
+                        cfg,
+                    ) {
+                        if best_cand.as_ref().is_none_or(|b| cand.1 > b.1) {
+                            best_cand = Some(cand);
+                        }
+                    }
+                }
+                if let Some((pk, _)) = best_cand {
+                    rescued.push(pk);
+                }
+            }
+        }
+    }
+
+    rescued
+}
+
+/// Convenience two-pass 3D triple-resonance peak picker across a bundle of in-memory 3D cubes:
+/// runs Pass 1 (`pick_triple_3d`) on every cube while recording a compact `StripBank3D`, then
+/// appends Pass-2 corroborated rescues (`corroborated_re_pick_3d`).
+pub fn pick_triple_3d_two_pass(
+    spectra: &[&Spectrum3D],
+    hsqc_roots: &[Peak],
+    cfg: &PickerConfig,
+    repick_cfg: &CorroboratedRepickConfig,
+) -> Vec<Peak> {
+    let mut bank = StripBank3D::new();
+    let mut peaks = Vec::new();
+    for spec in spectra {
+        peaks.extend(bank.pick_and_record_3d(spec, hsqc_roots, cfg));
+    }
+    let rescued = corroborated_re_pick_3d(&bank, hsqc_roots, &peaks, cfg, repick_cfg);
+    peaks.extend(rescued);
+    peaks
 }
 
 #[cfg(test)]
