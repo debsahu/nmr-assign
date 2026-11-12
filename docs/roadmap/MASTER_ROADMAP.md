@@ -33,42 +33,42 @@ Every task is scoped with **strictly disjoint file ownership**, **peer-reviewed 
 - **Quantitative Done Gate**: Spec committed with zero forbidden tool names and unambiguous mathematical equations for every quadrature, DSP, NUS, and referencing step.
 
 ### T08.2 — Raw Time-Domain FID & NUS Readers (`Bruker` & `Varian/Agilent`)
-- **Task ID**: `T08.2` (Status: `[x]` verified on `swarm-spec-fid`, pending final merge)
+- **Task ID**: `T08.2` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-core/src/fid.rs`, `crates/nmr-core/tests/fid_tests.rs`, `docs/specs/11-fid-processing.md` (§1)
 - **Clean-Room Literature Citations**: States et al. (*J. Magn. Reson.* 1982); Marion et al. (*J. Magn. Reson.* 1989); Kay, Keifer & Saarinen (*JACS* 1992); Moskau (*Concepts Magn. Reson.* 2002); Westler & Abildgaard (1996 public DSPFVS/DECIM table); Wishart et al. (*J. Biomol. NMR* 1995); public Bruker JCAMP-DX v5.0 & Varian/Agilent VnmrJ binary header specifications.
 - **User/CLI/GUI Contract**: `read_fid_auto`, `read_fid_2d`, `read_fid_3d`, `Fid1D`/`Fid2D`/`Fid3D` with `nus_mask: Option<Vec<bool>>`, Linux `ext4` case-insensitive child lookup (`find_child_ci`), TopSpin 4 `FnTYPE=0` uniform guard vs `FnTYPE=2` `NusTD` + `nuslist`, Varian `sampling='s'` uniform vs `'sparse'` + `sampling.sch`, 3D `f1coef` precedence over stale 2D `fcoef`, and loud errors on unsupported `FnMODE`/`phase` or missing schedules.
 - **Quantitative Done Gate**: `11/11` release `fid_tests` pass (1D/2D/3D uniform & NUS, uppercase Linux filenames, real Ubiquitin `Echo-Antiecho` & `CISD3` 3D NUS `States-TPPI`); zero new dependencies; `wasm32-unknown-unknown` clean.
 
 ### T08.3 — Deterministic Processing Engine, Hypercomplex IST/FISTA NUS & Part 3 TopSpin Validation
-- **Task ID**: `T08.3` (Status: `[x]` verified on `swarm-proc-engine`, pending final merge)
+- **Task ID**: `T08.3` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-core/src/process.rs`, `crates/nmr-core/src/spectrum.rs` (3D `.ft3` / `3rrr` writers), `crates/nmr-core/tests/process_tests.rs`
 - **Clean-Room Literature Citations**: Cooley & Tukey (*Math. Comput.* 1965); Bluestein (*IEEE Trans. Audio Electroacoust.* 1970); Otting et al. (*J. Magn. Reson.* 1986); Marion, Ikura & Bax (*J. Magn. Reson.* 1989); Zhu & Bax (*J. Magn. Reson.* 1990); Hoch & Stern (1996); Chen et al. (*J. Magn. Reson.* 2002); Stern, Donoho & Hoch (*J. Magn. Reson.* 2007); Beck & Teboulle (*SIAM J. Imaging Sci.* 2009); Hyberts et al. (*J. Biomol. NMR* 2012).
 - **User/CLI/GUI Contract**: `ProcessingRecipe` JSON round-trip, `process_fid_1d`/`2d`/`3d`, `process_fid_dir_2d`/`3d`, 9-step deterministic pipeline (digital filter shift + sub-sample linear phase, Gaussian solvent filter, 1D/2D bicomplex quaternion FISTA/IST NUS reconstruction, apodization, opt-in `--lp` `false` by default, radix-2/Bluestein FFT + `REVERSE=yes` support, stored phases with Chen 2002 fallback only when absent, Legendre polynomial baseline, `1H` ROI crop), and `write_nmrpipe_3d` / `write_bruker_pdata_3d`.
 - **Quantitative Done Gate**: Local 5-spectrum Ubiquitin raw `ser` end-to-end `evo-graph` assignment within `+-2.0` percentage points of TopSpin `pdata/1` (`95.45%` acc / `90.00%` rec achieved, `+1.42` / `+0.00` pts) with **zero** picker or solver edits; `CISD3` 3D NUS `CBCACONH` processed in `< 3 s` with `>= 59.4%` 5-seed `evo-graph` accuracy (`62.50%` / `100.0%` HC prec achieved).
 
 ### T08.4 — Composable Multidimensional DSP Operator Suite & Blind 1D/2D/3D Autophasing
-- **Task ID**: `T08.4` (Status: `[ ]` in progress on `swarm-dsp-ops`)
+- **Task ID**: `T08.4` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-core/src/ops.rs`, `crates/nmr-core/tests/ops_tests.rs`
 - **Clean-Room Literature Citations**: Delaglio et al. (*J. Biomol. NMR* 1995, 6, 277–293 — composable multidimensional vector-stream DSP operators); Bartholdi & Ernst (*J. Magn. Reson.* 1973 — Hilbert transform imaginary reconstruction); Ernst, Bodenhausen & Wokaun (1987 — Lorentz-to-Gauss `GM`, trapezoid `TM`, `J`-modulation windows); Zhu & Bax (*J. Magn. Reson.* 1990 — forward/backward/mirror-image LP); Friedrichs (*J. Biomol. NMR* 1995 — median baseline); Chen et al. (*J. Magn. Reson.* 2002 — entropy autophasing extended to biphasic `HNCACB` indirect axes).
 - **User/CLI/GUI Contract**: Composable `DspOp` pipeline (`SineWindow`, `ExpWindow`, `LorentzToGauss`, `Trapezoid`, `JModulation`, `SolventFilter` Gaussian/SineBell/Boxcar, `LinearPredict` Forward/Backward/MirrorImage, `HilbertTransform`, `Phase`, `DeleteImaginary`, `ReverseAxis`, `CircularShiftPpm`, `PolyBaseline`, `MedianBaseline`), `.ft1` & plane-series `test%03d.ft3` readers/writers, and blind `auto_phase_direct_nd` + `auto_phase_indirect_nd` (including `Biphasic` `+-` mode for `HNCACB`).
 - **Quantitative Done Gate**: `HilbertTransform -> Phase -> DeleteImaginary` matches complex phasing to `< 1e-3` relative error; blind autophase on raw Ubiquitin `ser` (ignoring `procs` `PHC0`/`PHC1`) recovers `(p0, p1)` within `<= 5 deg` of `procs` and preserves positive/negative `CA`/`CB` polarity on `HNCACB`.
 
 ### T08.5 — Two-Pass Experiment-Guided Corroborated 3D Strip Re-Picking
-- **Task ID**: `T08.5` (Status: `[x]` verified on `swarm-repick-3d`, pending final merge)
+- **Task ID**: `T08.5` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-core/src/picker.rs`, `crates/nmr-core/tests/corroborated_repick_tests.rs`, `docs/specs/02-peak-picking.md`
 - **Clean-Room Literature Citations**: Kay, Ikura, Tschudin & Bax (*J. Magn. Reson.* 1990); Grzesiek & Bax (*JACS* 1992 — intra/inter-residue triple-resonance pathway sharing).
 - **User/CLI/GUI Contract**: Streaming `StripBank3D` (`~1–8 MB`/cube vs `500 MB` full 3D volume) + `corroborated_re_pick_3d` rescuing `3.8–4.2 sigma` local 3D maxima strictly inside narrow `+-0.15 ppm` (`CA`/`CB`) / `+-0.12 ppm` (`CO`) windows anchored by already-observed `>= 5.5 sigma` experimental peaks (zero sequence/prior inputs, zero confirmation bias).
 - **Quantitative Done Gate**: Zero regression on 5-seed `--realistic` Ubiquitin, real Ubiquitin `pdata`/`.ucsf`, and 5-seed `CISD3` (`0` decoy/`NH2` false positives; rescues corroborated weak `i-1` peaks such as Ubiquitin `GLY75` `CA(i-1)`).
 
 ### T08.6 — Rate-Limited Public BMRB Fetcher & Frozen 14-Entry `dev`/`heldout` Manifest
-- **Task ID**: `T08.6` (Status: `[ ]` implemented on `swarm-cli-bench`, pending final wiring)
+- **Task ID**: `T08.6` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-cli/src/fetch_bmrb.rs`, `data/benchmark/real_manifest.tsv`
 - **Clean-Room Literature Citations**: Ulrich et al. (*Nucleic Acids Res.* 2008 — BMRB public CC0 archive & NMR-STAR v3.2); FIPS 180-4 (`SHA-256` digest verification).
 - **User/CLI/GUI Contract**: `nmrassign fetch-bmrb --id <bmrb_id> --dest data/private/bmrb/<id>/ [--all-archives]` querying live `entry_directories/bmr<id>/` (`<= 1 req/s`, `User-Agent: nmrassign-fetch`), rejecting path traversal/symlinks across `.tar`/`.tar.gz`/`.tgz`/`.zip`, writing `PROVENANCE.md` with source URLs, CC0 notice, UTC timestamp, sizes, and SHA-256 digests; plus frozen `data/benchmark/real_manifest.tsv` (`5 dev` + `9 heldout`, 100% disjoint from `manifest.tsv` and prior training entries).
 - **Quantitative Done Gate**: Unit tests pass on NIST SHA-256 vectors, traversal/symlink tar/zip rejection, multi-archive isolation (`53371`/`51351`), and manifest schema/disjointness checks.
 
 ### T08.7 — CLI Raw-FID Integration, `real-benchmark` Runner & Single-Shot Cold `heldout` Evaluation
-- **Task ID**: `T08.7` (Status: `[ ]` open)
+- **Task ID**: `T08.7` (Status: `[x]` `dev` split verified; single-shot cold `heldout` run recorded at merge)
 - **Owned Files/Modules**: `crates/nmr-cli/src/main.rs`, `crates/nmr-cli/src/real_benchmark.rs`
 - **Clean-Room Literature Citations**: Wishart et al. (*J. Biomol. NMR* 1995); `docs/specs/11-fid-processing.md` (§3, §5).
 - **User/CLI/GUI Contract**: Wires `nmrassign process` (with `ProcessingRecipe` JSON, `--no-crop`, `--lp`, `--auto-phase`), `--fid` / `--fid-hsqc` / `--fid-triple` on `pick` and `pipeline` (including `StripBank3D` Pass-2 hook), and `nmrassign real-benchmark --manifest data/benchmark/real_manifest.tsv --split dev|heldout [--solver standard|evo-graph] [--seeds 5] [--json-out <path>]` using strictly unlabelled global offset fitting (`fit_unlabelled_global_offsets`) and skipping missing `data/private/` directories cleanly with exit code `0`.

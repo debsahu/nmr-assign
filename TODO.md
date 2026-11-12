@@ -27,7 +27,7 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 - [x] (A) Factor-graph belief propagation + evolutionary solver (`--solver evo-graph`, `nmr-core::evo_graph`, `specs/10`) with Pass-2 belief-damped fragment confidence calibration
 - [x] (A) Automatic unlabelled global chemical-shift reference-offset estimation (`nmr-core::priors`, WebGPU `U`-matrix parity, permutation-invariant `nmrassign score`)
 - [x] (A) Realistic Bruker 5-seed physics simulator CI gate (`--realistic --seeds 5`) and development real-spectrum benchmarks (Ubiquitin `pdata`/`.ucsf` and `BMRB 51439` `CISD3`)
-- [ ] (A) Deterministic covalent `(seq[k-1], seq[k], seq[k+1])` primary-sequence shift corrections (pre-Proline `CA`/`C'`/`CB` and `i-1` neighbor `15N`, Wishart 1995 / Schwarzinger 2001) (`specs/03`)
+- [x] (A) Deterministic covalent `(seq[k-1], seq[k], seq[k+1])` primary-sequence shift corrections (pre-Proline `CA`/`C'`/`CB` and `i-1` neighbor `15N`, Wishart 1995 / Schwarzinger 2001) (`specs/03`)
 - [ ] (A) Solver curation follow-ups (`T09.7`): weak-peak intensity penalty for minor conformers (`Gln2` 9% minor second-form peak), sparse-data `standard` vs `evo-graph` diagnosis when `HNCACB` is absent, and out-of-sample confidence calibration verification
 
 ## Phase 2: Rust + WebGPU performance & interactive GUI (`specs/06`)
@@ -45,7 +45,7 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 - [x] (A) Synthetic 2D/3D spectrum renderer in simulator (`render_hsqc_2d`, `render_triple_3d`)
 - [x] (A) Neural picker (2D & 3D separable residual CNN in `nmr-core::neural_picker` + WebGPU WGSL compute `nmr-gpu::neural_gpu`) trained on synthetic Voigt/ridge/baseline spectra (`nmrassign pick --method neural --engine gpu`)
 - [x] (A) End-to-end benchmark on volumetric spectra: `spectra -> peaks -> assignment` (`nmrassign e2e-benchmark`)
-- [x] (A) Two-pass experiment-guided corroborated weak-peak rescue in raw 3D strips (`T08.5`, `nmr-core::picker::StripBank3D` / `corroborated_re_pick_3d`, `specs/02`; verified on `swarm-repick-3d`, pending final merge)
+- [x] (A) Two-pass experiment-guided corroborated weak-peak rescue in raw 3D strips (`T08.5`, `nmr-core::picker::StripBank3D` / `corroborated_re_pick_3d`, `specs/02`)
 
 ## Phase 4: Sidechain assignment (`specs/07`)
 - [x] (A) Residue topology tables for all 20 standard amino acids from IUPAC / PDB CCD (`nmr-core::topology`) + empirical BMRB sidechain shift priors
@@ -74,12 +74,12 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 
 ## Phase 8: Raw time-domain (FID) processing, NUS, DSP operators & frozen real-data benchmark (`specs/11`)
 - [x] (A) `T08.1` — Clean-room raw FID, hypercomplex IST/FISTA NUS, and real-data benchmark specification (`docs/specs/11-fid-processing.md`)
-- [x] (A) `T08.2` — Raw FID & NUS readers (`nmr-core::fid`): Bruker `fid`/`ser` (`acqus`/`acqu2s`/`acqu3s`, `GRPDLY`/`DSPFVS`/`DECIM`, 256-word block padding, Linux case-insensitive lookup) and Varian/Agilent `fid` + `procpar` (`f1coef`/`f2coef`), explicit quadrature (`States`, `States-TPPI`, `Echo-Antiecho`, `QF`), and NUS (`FnTYPE=2`/`NusTD`/`nuslist`, `sampling.sch`) auto-detection (verified on `swarm-spec-fid`, pending final merge)
-- [x] (A) `T08.3` — Deterministic processing, 1D/2D hypercomplex IST/FISTA NUS reconstruction & Part 3 TopSpin + `CISD3` 3D NUS validation (`nmr-core::process`, 3D writers in `nmr-core::spectrum`, `ProcessingRecipe` JSON; Ubiquitin raw `ser` `+1.42` pts acc / `+0.00` pts rec vs `pdata/1` with zero picker/solver tuning; `CISD3` 3D NUS `62.5%` acc / `100.0%` HC prec; verified on `swarm-proc-engine`, pending final merge)
-- [ ] (A) `T08.4` — Composable multidimensional DSP vector-stream operators & blind 1D/2D/3D autophasing (`nmr-core::ops`: `LorentzToGauss`, `Trapezoid`, `JModulation`, `HilbertTransform`, `Forward`/`Backward`/`MirrorImage` LP, `MedianBaseline`, `.ft1`/`test%03d.ft3` I/O, biphasic indirect autophase)
-- [x] (A) `T08.5` — Two-pass experiment-guided corroborated weak-peak rescue in raw 3D strips (`nmr-core::picker::StripBank3D` / `corroborated_re_pick_3d`, `specs/02`; verified on `swarm-repick-3d`, pending final merge)
-- [ ] (A) `T08.6` — Public archive fetcher (`nmrassign fetch-bmrb` with `<= 1 req/s`, `User-Agent: nmrassign-fetch`, `PROVENANCE.md` SHA-256 digests) and frozen 14-entry (`5 dev` / `9 heldout`) manifest (`data/benchmark/real_manifest.tsv`)
-- [ ] (A) `T08.7` — CLI raw-FID integration (`nmrassign process`, `--fid` on `pick`/`pipeline`, `nmrassign real-benchmark`) and single-shot cold `heldout` evaluation
+- [x] (A) `T08.2` — Raw FID & NUS readers (`nmr-core::fid`): Bruker `fid`/`ser` (`acqus`/`acqu2s`/`acqu3s`, `GRPDLY`/`DSPFVS`/`DECIM`, 256-word block padding, Linux case-insensitive lookup) and Varian/Agilent `fid` + `procpar` (`f1coef`/`f2coef`), explicit quadrature (`States`, `States-TPPI`, `Echo-Antiecho`, `QF`), and NUS (`FnTYPE=2`/`NusTD`/`nuslist`, `sampling.sch`) auto-detection
+- [x] (A) `T08.3` — Deterministic processing, 1D/2D hypercomplex IST/FISTA NUS reconstruction & Part 3 TopSpin + `CISD3` 3D NUS validation (`nmr-core::process`, 3D writers in `nmr-core::spectrum`, `ProcessingRecipe` JSON; Ubiquitin raw `ser` `+1.42` pts acc / `+0.00` pts rec vs `pdata/1` with zero picker/solver tuning; `CISD3` 3D NUS `62.5%` acc / `100.0%` HC prec)
+- [x] (A) `T08.4` — Composable multidimensional DSP vector-stream operators & blind 1D/2D/3D autophasing (`nmr-core::ops`: `LorentzToGauss`, `Trapezoid`, `JModulation`, `HilbertTransform`, `Forward`/`Backward`/`MirrorImage` LP, `MedianBaseline`, `.ft1`/`test%03d.ft3` I/O, biphasic indirect autophase)
+- [x] (A) `T08.5` — Two-pass experiment-guided corroborated weak-peak rescue in raw 3D strips (`nmr-core::picker::StripBank3D` / `corroborated_re_pick_3d`, `specs/02`)
+- [x] (A) `T08.6` — Public archive fetcher (`nmrassign fetch-bmrb` with `<= 1 req/s`, `User-Agent: nmrassign-fetch`, `PROVENANCE.md` SHA-256 digests) and frozen 14-entry (`5 dev` / `9 heldout`) manifest (`data/benchmark/real_manifest.tsv`)
+- [x] (A) `T08.7` — CLI raw-FID integration (`nmrassign process`, `--fid` on `pick`/`pipeline`, `nmrassign real-benchmark`; `dev` split verified, single-shot cold `heldout` run recorded at merge)
 
 ## Phase 9: Zero-friction spectrometer ingest, interactive NMR workbench UX & solver curation (`specs/06`, `specs/12`)
 - [ ] (A) `T09.1` — Spectrometer folder & archive auto-classifier (`nmr-core::classify`: Bruker `PULPROG`/`vdlist`/`fqlist`/`nuslist` & Varian `seqfil`/`pslabel` -> experiment & problem-regime detection)
