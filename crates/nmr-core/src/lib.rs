@@ -39,6 +39,7 @@ pub mod simulate;
 pub mod solver;
 pub mod spectrum;
 pub mod spinsystems;
+pub mod stereospec;
 pub mod structure;
 pub mod topology;
 
