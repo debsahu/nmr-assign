@@ -7,12 +7,16 @@
 //! - Biological Magnetic Resonance Data Bank (BMRB) public archive and REST API v2 layout:
 //!   Hoch, J. C. et al., *Nucleic Acids Res.* **2023**, 51, D368–D376;
 //!   Ulrich, E. L. et al., *Nucleic Acids Res.* **2008**, 36, D402–D408.
-//! - POSIX.1-1988 `ustar` / Info-ZIP archive member path validation (rejecting leading `/`, `\`,
-//!   drive prefixes, NUL bytes, `..` traversal components, and escaping symbolic/hard links prior to extraction).
+//! - POSIX.1-1988 (`IEEE Std 1003.1-1988`) `ustar` 512-byte header block octal checksum
+//!   verification (comparing the parsed octal digest in `header[148..156]` against both unsigned
+//!   and historic signed byte sums over `header[0..512]` with `header[148..156]` filled with `0x20`
+//!   ASCII spaces, plus block-aligned member header walking) and Info-ZIP / `tar` archive member
+//!   path validation (rejecting leading `/`, `\`, drive prefixes, NUL bytes, `..` traversal
+//!   components, and escaping symbolic/hard links prior to extraction).
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -293,6 +297,48 @@ impl RateLimitedCurl {
         }
         let headers = String::from_utf8_lossy(&out.stdout);
         Ok(parse_last_content_length(&headers))
+    }
+
+    /// Fetch up to the first `max_bytes` of `url` (`curl -fsSL -A nmrassign-fetch -r 0-<end>`)
+    /// to inspect POSIX `ustar` 512-byte header blocks prior to downloading multi-hundred-MiB `.tar` files.
+    pub fn get_prefix_bytes(&mut self, url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let cap = max_bytes.max(512);
+        if let Some(local_path) = url.strip_prefix("file://") {
+            let mut f = File::open(Path::new(local_path))
+                .map_err(|e| format!("failed opening local file {url}: {e}"))?;
+            let mut buf = vec![0u8; cap];
+            let mut total = 0usize;
+            while total < cap {
+                let n = f
+                    .read(&mut buf[total..])
+                    .map_err(|e| format!("failed reading prefix of {url}: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            buf.truncate(total);
+            return Ok(buf);
+        }
+        self.throttle();
+        let range_spec = format!("0-{}", cap - 1);
+        let out = Command::new("curl")
+            .args(["-fsSL", "-A", BMRB_USER_AGENT, "-r", &range_spec, url])
+            .output()
+            .map_err(|e| format!("failed to spawn curl range GET for {url}: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!(
+                "curl range GET failed for {url} (status {}): {}",
+                out.status,
+                stderr.trim()
+            ));
+        }
+        let mut bytes = out.stdout;
+        if bytes.len() > cap {
+            bytes.truncate(cap);
+        }
+        Ok(bytes)
     }
 
     /// Stream `url` directly to `dest_file` via `curl -fsSL -A nmrassign-fetch --max-filesize <limit> -o <dest>`.
@@ -764,6 +810,246 @@ pub fn validate_archive_link_target(link_path: &str, target: &str) -> Result<(),
     Ok(())
 }
 
+const TAR_BLOCK_BYTES: usize = 512;
+const TAR_PROBE_WINDOW_BYTES: usize = 65_536;
+
+/// Parse an ASCII octal integer field from a 512-byte POSIX/V7 `tar` header (e.g. `header[148..156]`
+/// checksum or `header[124..136]` member byte size), rejecting embedded non-octal or shifted bytes.
+pub fn parse_tar_octal_u64(field: &[u8]) -> Result<u64, String> {
+    let mut i = 0usize;
+    while i < field.len() && field[i] == b' ' {
+        i += 1;
+    }
+    let start = i;
+    let mut val = 0u64;
+    while i < field.len() && matches!(field[i], b'0'..=b'7') {
+        val = val
+            .checked_mul(8)
+            .and_then(|v| v.checked_add((field[i] - b'0') as u64))
+            .ok_or_else(|| "tar octal field overflowed u64".to_string())?;
+        i += 1;
+    }
+    if i == start {
+        return Err("tar header octal field contains no octal digits".to_string());
+    }
+    for &rem in &field[i..] {
+        if rem != 0 && rem != b' ' {
+            return Err(format!(
+                "tar header octal field contains invalid trailing byte 0x{rem:02x}"
+            ));
+        }
+    }
+    Ok(val)
+}
+
+fn parse_tar_size_field(field: &[u8]) -> Result<u64, String> {
+    // Support GNU/STAR base-256 binary size extension (`field[0] & 0x80 != 0`, positive `(field[0] & 0x40) == 0`).
+    if let Some(&first) = field.first() {
+        if (first & 0x80) != 0 {
+            if (first & 0x40) != 0 {
+                return Err("negative base-256 tar member size rejected".to_string());
+            }
+            let mut acc = (first & 0x3f) as u64;
+            for &b in &field[1..] {
+                acc = acc
+                    .checked_shl(8)
+                    .map(|v| v | (b as u64))
+                    .ok_or_else(|| "base-256 tar member size overflowed u64".to_string())?;
+            }
+            return Ok(acc);
+        }
+    }
+    parse_tar_octal_u64(field)
+}
+
+#[inline]
+fn tar_typeflag_has_payload(typeflag: u8) -> bool {
+    !matches!(typeflag, b'1' | b'2' | b'3' | b'4' | b'5' | b'6')
+}
+
+/// Validate a single 512-byte POSIX `ustar` / V7 `tar` header block:
+/// - Rejects all-zero blocks or empty member names (`header[0] == 0 && header[345] == 0`),
+/// - Parses the stored octal checksum in `header[148..156]`,
+/// - Computes both unsigned (`u8 -> u64`) and historic signed (`i8 -> i64`) byte sums across all
+///   512 bytes with `header[148..156]` filled with `b' '` (`0x20`),
+/// - Verifies that the stored checksum matches either the unsigned or signed sum,
+/// - Returns the number of payload bytes following this header block.
+pub fn validate_tar_header_block(header: &[u8; TAR_BLOCK_BYTES]) -> Result<u64, String> {
+    if header.iter().all(|&b| b == 0) {
+        return Err("tar header block is all zeros".to_string());
+    }
+    if header[0] == 0 && header[345] == 0 {
+        return Err("tar header block has empty filename".to_string());
+    }
+    let stored_chksum = parse_tar_octal_u64(&header[148..156])
+        .map_err(|e| format!("invalid tar header checksum field: {e}"))?;
+
+    let mut unsigned_sum = 0u64;
+    let mut signed_sum = 0i64;
+    for (idx, &b) in header.iter().enumerate() {
+        let eff = if (148..156).contains(&idx) { b' ' } else { b };
+        unsigned_sum += eff as u64;
+        signed_sum += (eff as i8) as i64;
+    }
+
+    let matches_unsigned = stored_chksum == unsigned_sum;
+    let matches_signed = signed_sum >= 0 && stored_chksum == (signed_sum as u64);
+    if !matches_unsigned && !matches_signed {
+        return Err(format!(
+            "tar header checksum mismatch (stored=0o{stored_chksum:06o} [{stored_chksum}], unsigned={unsigned_sum}, signed={signed_sum})"
+        ));
+    }
+
+    let raw_size = parse_tar_size_field(&header[124..136])
+        .map_err(|e| format!("invalid tar member size field: {e}"))?;
+    Ok(if tar_typeflag_has_payload(header[156]) {
+        raw_size
+    } else {
+        0
+    })
+}
+
+/// Validate the initial prefix window of a `.tar` stream (plus optional `Content-Length` hint),
+/// checking the first 512-byte header block and walking any subsequent member headers reachable
+/// within `prefix`.
+pub fn validate_tar_prefix_bytes(
+    prefix: &[u8],
+    total_len_hint: Option<u64>,
+) -> Result<usize, String> {
+    if let Some(total) = total_len_hint {
+        if total < TAR_BLOCK_BYTES as u64 || !total.is_multiple_of(TAR_BLOCK_BYTES as u64) {
+            return Err(format!(
+                "tar total length {total} is not a positive 512-byte multiple"
+            ));
+        }
+    }
+    if prefix.len() < TAR_BLOCK_BYTES {
+        return Err(format!(
+            "tar prefix too short ({} bytes < 512 bytes)",
+            prefix.len()
+        ));
+    }
+    if total_len_hint.is_none() && !prefix.len().is_multiple_of(TAR_BLOCK_BYTES) {
+        return Err(format!(
+            "tar prefix length {} is not a 512-byte multiple",
+            prefix.len()
+        ));
+    }
+
+    let mut offset = 0usize;
+    let mut validated = 0usize;
+    while offset + TAR_BLOCK_BYTES <= prefix.len() {
+        let hdr: &[u8; TAR_BLOCK_BYTES] =
+            prefix[offset..offset + TAR_BLOCK_BYTES].try_into().unwrap();
+        if hdr.iter().all(|&b| b == 0) {
+            if validated == 0 {
+                return Err("tar archive starts with an all-zero EOA block".to_string());
+            }
+            return Ok(validated);
+        }
+        let payload_sz = validate_tar_header_block(hdr)
+            .map_err(|e| format!("header #{validated} at offset {offset}: {e}"))?;
+        validated += 1;
+
+        let padded_payload = payload_sz
+            .checked_add((TAR_BLOCK_BYTES as u64) - 1)
+            .map(|x| x & !((TAR_BLOCK_BYTES as u64) - 1))
+            .ok_or_else(|| "tar member padded size overflowed u64".to_string())?;
+        let next_off_u64 = (offset as u64)
+            .checked_add(TAR_BLOCK_BYTES as u64)
+            .and_then(|x| x.checked_add(padded_payload))
+            .ok_or_else(|| "tar stream offset overflowed u64".to_string())?;
+
+        if let Some(total) = total_len_hint {
+            if next_off_u64 > total {
+                return Err(format!(
+                    "header #{validated} payload ({payload_sz} bytes) extends past archive end ({total} bytes)"
+                ));
+            }
+        }
+        if next_off_u64 > (prefix.len() as u64) {
+            break;
+        }
+        offset = next_off_u64 as usize;
+    }
+
+    if validated == 0 {
+        return Err("no valid tar headers found in prefix".to_string());
+    }
+    Ok(validated)
+}
+
+/// Walk and validate every 512-byte member header checksum across an entire `.tar` file on disk
+/// via `Seek`, catching both block-0 corruption and mid-archive `\r\n -> \n` byte-shift corruption
+/// even when the overall file size happens to be an exact multiple of 512 bytes.
+pub fn validate_tar_file_headers(tar_path: &Path) -> Result<usize, String> {
+    let mut f = File::open(tar_path)
+        .map_err(|e| format!("failed opening tar {}: {e}", tar_path.display()))?;
+    let file_len = f
+        .metadata()
+        .map_err(|e| format!("failed reading metadata of {}: {e}", tar_path.display()))?
+        .len();
+    if file_len < TAR_BLOCK_BYTES as u64 || !file_len.is_multiple_of(TAR_BLOCK_BYTES as u64) {
+        return Err(format!(
+            "tar file {} length ({file_len} bytes) is not a positive 512-byte multiple",
+            tar_path.display()
+        ));
+    }
+
+    let mut offset = 0u64;
+    let mut validated = 0usize;
+    let mut hdr = [0u8; TAR_BLOCK_BYTES];
+    while offset < file_len {
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("failed seeking {} to {offset}: {e}", tar_path.display()))?;
+        f.read_exact(&mut hdr).map_err(|e| {
+            format!(
+                "failed reading tar header at {offset} in {}: {e}",
+                tar_path.display()
+            )
+        })?;
+        if hdr.iter().all(|&b| b == 0) {
+            if validated == 0 {
+                return Err(format!(
+                    "tar file {} starts with an all-zero EOA block",
+                    tar_path.display()
+                ));
+            }
+            return Ok(validated);
+        }
+        let payload_sz = validate_tar_header_block(&hdr).map_err(|e| {
+            format!(
+                "tar {} header #{validated} at offset {offset}: {e}",
+                tar_path.display()
+            )
+        })?;
+        validated += 1;
+
+        let padded_payload = payload_sz
+            .checked_add((TAR_BLOCK_BYTES as u64) - 1)
+            .map(|x| x & !((TAR_BLOCK_BYTES as u64) - 1))
+            .ok_or_else(|| "tar member padded size overflowed u64".to_string())?;
+        offset = offset
+            .checked_add(TAR_BLOCK_BYTES as u64)
+            .and_then(|x| x.checked_add(padded_payload))
+            .ok_or_else(|| "tar file offset overflowed u64".to_string())?;
+        if offset > file_len {
+            return Err(format!(
+                "tar {} member #{validated} ({payload_sz} bytes) extends past EOF ({file_len} bytes)",
+                tar_path.display()
+            ));
+        }
+    }
+
+    if validated == 0 {
+        return Err(format!(
+            "tar file {} contains zero validated member headers",
+            tar_path.display()
+        ));
+    }
+    Ok(validated)
+}
+
 /// Inspect all entries of a `.tar*` or `.zip` archive on disk and reject any unsafe path or link
 /// BEFORE extracting a single byte.
 pub fn inspect_and_validate_archive(archive_path: &Path) -> Result<usize, String> {
@@ -797,6 +1083,11 @@ pub fn inspect_and_validate_archive(archive_path: &Path) -> Result<usize, String
             count += 1;
         }
         return Ok(count);
+    }
+
+    // 0. For uncompressed `.tar` files, validate all 512-byte POSIX USTAR header checksums first.
+    if fname.ends_with(".tar") {
+        validate_tar_file_headers(archive_path)?;
     }
 
     // 1. Plain member path check via `tar -tf`
@@ -1164,13 +1455,69 @@ fn collect_unpacked_timedomain_dir(
     Ok(())
 }
 
+fn crawl_top_subdirs_into_items(
+    client: &mut RateLimitedCurl,
+    top_subdirs: &[(String, String)],
+    include_all_archives: bool,
+    dry_run: bool,
+    items: &mut Vec<RemoteTimeDomainItem>,
+) -> Result<(), String> {
+    let mut sub_archives = Vec::new();
+    for (sub_name, sub_url) in top_subdirs {
+        if is_auxiliary_unpacked_subdir(sub_name) {
+            continue;
+        }
+        if !include_all_archives && is_non_backbone_archive_filename(sub_name) {
+            continue;
+        }
+        validate_archive_member_path(sub_name)?;
+        collect_unpacked_timedomain_dir(
+            client,
+            sub_url,
+            sub_name,
+            1,
+            2,
+            include_all_archives,
+            dry_run,
+            &mut sub_archives,
+            items,
+        )?;
+    }
+    sub_archives.sort();
+    sub_archives.dedup();
+    for aurl in sub_archives {
+        let fname = aurl
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&aurl)
+            .rsplit('/')
+            .next()
+            .unwrap_or("archive.tar")
+            .to_string();
+        validate_archive_member_path(&fname)?;
+        let cl = client.head_content_length(&aurl).ok().flatten();
+        items.push(RemoteTimeDomainItem::Archive {
+            url: aurl,
+            filename: fname,
+            content_length: cl,
+        });
+    }
+    Ok(())
+}
+
+struct ResolvedTimeDomainPlan {
+    chosen_dir_url: String,
+    items: Vec<RemoteTimeDomainItem>,
+    top_subdirs: Vec<(String, String)>,
+}
+
 fn resolve_timedomain_items(
     client: &mut RateLimitedCurl,
     id: &str,
     ftp_base: &str,
     include_all_archives: bool,
     dry_run: bool,
-) -> Result<(String, Vec<RemoteTimeDomainItem>), String> {
+) -> Result<ResolvedTimeDomainPlan, String> {
     let dir_candidates = candidate_timedomain_dir_urls(id, ftp_base);
     let mut listing_html = None;
     let mut chosen_dir_url = String::new();
@@ -1262,18 +1609,34 @@ fn resolve_timedomain_items(
             .to_string();
         validate_archive_member_path(&fname)?;
         let cl = client.head_content_length(&aurl).ok().flatten();
-        // Every valid uncompressed POSIX/GNU `.tar` file has a byte length that is an exact
-        // multiple of 512 bytes. Several legacy BMRB `.tar` files (`15386`, `15476`, `16385`,
-        // `17030`, `18145`, `18465`) suffered `\r\n -> \n` ASCII-mode corruption on the FTP mirror
-        // (`Content-Length % 512 != 0`) while clean unpacked experiment subdirectories sit right
-        // alongside them in `timedomain_data/`. Detect and fall back automatically.
+        // Validate uncompressed `.tar` archives using actual 512-byte POSIX `ustar` header octal
+        // checksums (unsigned & historic signed byte sums with `header[148..156]` set to `0x20`),
+        // catching both non-512-byte lengths and corrupted 512-byte-multiple `.tar` files while
+        // falling back to unpacked experiment subdirectories when present.
         let is_plain_tar = fname.to_ascii_lowercase().ends_with(".tar");
-        if is_plain_tar && !top_subdirs.is_empty() && cl.is_some_and(|sz| sz % 512 != 0) {
-            println!(
-                "  Skipping server-corrupted plain .tar archive {} (Content-Length {:?} is not a 512-byte multiple); falling back to unpacked subdirectories.",
-                fname, cl
-            );
-            continue;
+        if is_plain_tar {
+            let tar_probe_res = match cl {
+                Some(sz) if sz < TAR_BLOCK_BYTES as u64 || sz % (TAR_BLOCK_BYTES as u64) != 0 => {
+                    Err(format!(
+                        "Content-Length {sz} is not a positive 512-byte multiple"
+                    ))
+                }
+                _ => client
+                    .get_prefix_bytes(&aurl, TAR_PROBE_WINDOW_BYTES)
+                    .and_then(|prefix| validate_tar_prefix_bytes(&prefix, cl).map(|_| ())),
+            };
+            if let Err(reason) = tar_probe_res {
+                if !top_subdirs.is_empty() {
+                    println!(
+                        "  Skipping corrupted plain .tar archive {fname} ({reason}); falling back to unpacked subdirectories."
+                    );
+                    continue;
+                } else {
+                    return Err(format!(
+                        "plain .tar archive {fname} failed POSIX USTAR header validation ({reason}) and no unpacked subdirectories exist at {chosen_dir_url}"
+                    ));
+                }
+            }
         }
         items.push(RemoteTimeDomainItem::Archive {
             url: aurl,
@@ -1283,46 +1646,13 @@ fn resolve_timedomain_items(
     }
 
     if items.is_empty() && !top_subdirs.is_empty() {
-        let mut sub_archives = Vec::new();
-        for (sub_name, sub_url) in &top_subdirs {
-            if is_auxiliary_unpacked_subdir(sub_name) {
-                continue;
-            }
-            if !include_all_archives && is_non_backbone_archive_filename(sub_name) {
-                continue;
-            }
-            validate_archive_member_path(sub_name)?;
-            collect_unpacked_timedomain_dir(
-                client,
-                sub_url,
-                sub_name,
-                1,
-                2,
-                include_all_archives,
-                dry_run,
-                &mut sub_archives,
-                &mut items,
-            )?;
-        }
-        sub_archives.sort();
-        sub_archives.dedup();
-        for aurl in sub_archives {
-            let fname = aurl
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(&aurl)
-                .rsplit('/')
-                .next()
-                .unwrap_or("archive.tar")
-                .to_string();
-            validate_archive_member_path(&fname)?;
-            let cl = client.head_content_length(&aurl).ok().flatten();
-            items.push(RemoteTimeDomainItem::Archive {
-                url: aurl,
-                filename: fname,
-                content_length: cl,
-            });
-        }
+        crawl_top_subdirs_into_items(
+            client,
+            &top_subdirs,
+            include_all_archives,
+            dry_run,
+            &mut items,
+        )?;
     }
 
     if items.is_empty() {
@@ -1331,7 +1661,11 @@ fn resolve_timedomain_items(
         ));
     }
 
-    Ok((chosen_dir_url, items))
+    Ok(ResolvedTimeDomainPlan {
+        chosen_dir_url,
+        items,
+        top_subdirs,
+    })
 }
 
 pub fn render_provenance_markdown(
@@ -1372,7 +1706,11 @@ pub fn execute_fetch_bmrb(cfg: &FetchBmrbConfig) -> Result<Vec<DownloadedArtifac
 
     let (star_url, star_len_opt) =
         resolve_star_url_and_size(&mut client, &id, &cfg.ftp_base_url, &cfg.api_base_url)?;
-    let (td_dir_url, td_items) = resolve_timedomain_items(
+    let ResolvedTimeDomainPlan {
+        chosen_dir_url: td_dir_url,
+        items: td_items,
+        top_subdirs,
+    } = resolve_timedomain_items(
         &mut client,
         &id,
         &cfg.ftp_base_url,
@@ -1456,80 +1794,111 @@ pub fn execute_fetch_bmrb(cfg: &FetchBmrbConfig) -> Result<Vec<DownloadedArtifac
     });
 
     // 2. Download & safely extract time-domain archives (or direct unpacked files)
-    let n_archives = td_items
-        .iter()
-        .filter(|it| matches!(it, RemoteTimeDomainItem::Archive { .. }))
-        .count();
-    for item in &td_items {
-        let rem = cfg.max_bytes.checked_sub(cumulative_bytes).ok_or_else(|| {
-            format!(
-                "cumulative download ({cumulative_bytes} bytes) reached --max-bytes ({})",
-                cfg.max_bytes
-            )
-        })?;
-        match item {
-            RemoteTimeDomainItem::Archive { url, filename, .. } => {
-                validate_archive_member_path(filename)?;
-                let archive_dest = cfg.dest_dir.join(filename);
-                client.download_to_file(url, &archive_dest, Some(rem))?;
-                let (sha, sz) = sha256_file_and_size(&archive_dest)?;
-                cumulative_bytes = cumulative_bytes.saturating_add(sz);
-                if cumulative_bytes > cfg.max_bytes {
-                    let _ = fs::remove_file(&archive_dest);
-                    return Err(format!(
-                        "cumulative download ({cumulative_bytes} bytes) exceeded --max-bytes ({})",
-                        cfg.max_bytes
-                    ));
-                }
-                // Isolate each archive under `<dest>/<stem>/` when multiple per-experiment archives
-                // exist (e.g. `53371` multi-`.zip` or `51351` multi-`.tgz`) so root-level `1/acqus`
-                // or `acqus`+`ser` files across archives can never overwrite one another.
-                let extract_root = if n_archives > 1 {
-                    let (stem, _) = archive_stem_key(filename);
-                    let clean_stem = if stem.is_empty() {
-                        "archive"
+    let mut pending_items = td_items;
+    let mut used_unpacked_fallback = false;
+    while !pending_items.is_empty() {
+        let current_batch = std::mem::take(&mut pending_items);
+        let n_archives = current_batch
+            .iter()
+            .filter(|it| matches!(it, RemoteTimeDomainItem::Archive { .. }))
+            .count();
+        for item in &current_batch {
+            let rem = cfg.max_bytes.checked_sub(cumulative_bytes).ok_or_else(|| {
+                format!(
+                    "cumulative download ({cumulative_bytes} bytes) reached --max-bytes ({})",
+                    cfg.max_bytes
+                )
+            })?;
+            match item {
+                RemoteTimeDomainItem::Archive { url, filename, .. } => {
+                    validate_archive_member_path(filename)?;
+                    let archive_dest = cfg.dest_dir.join(filename);
+                    client.download_to_file(url, &archive_dest, Some(rem))?;
+                    let (sha, sz) = sha256_file_and_size(&archive_dest)?;
+                    if cumulative_bytes.saturating_add(sz) > cfg.max_bytes {
+                        let _ = fs::remove_file(&archive_dest);
+                        return Err(format!(
+                            "cumulative download ({} bytes) exceeded --max-bytes ({})",
+                            cumulative_bytes.saturating_add(sz),
+                            cfg.max_bytes
+                        ));
+                    }
+                    // Isolate each archive under `<dest>/<stem>/` when multiple per-experiment archives
+                    // exist (e.g. `53371` multi-`.zip` or `51351` multi-`.tgz`) so root-level `1/acqus`
+                    // or `acqus`+`ser` files across archives can never overwrite one another.
+                    let extract_root = if n_archives > 1 {
+                        let (stem, _) = archive_stem_key(filename);
+                        let clean_stem = if stem.is_empty() {
+                            "archive"
+                        } else {
+                            stem.as_str()
+                        };
+                        validate_archive_member_path(clean_stem)?;
+                        cfg.dest_dir.join(clean_stem)
                     } else {
-                        stem.as_str()
+                        cfg.dest_dir.clone()
                     };
-                    validate_archive_member_path(clean_stem)?;
-                    cfg.dest_dir.join(clean_stem)
-                } else {
-                    cfg.dest_dir.clone()
-                };
-                let n_members = extract_validated_archive(&archive_dest, &extract_root)?;
-                println!(
-                    "  Extracted {} ({} bytes, {} validated entries, sha256={})",
-                    item.display_name(),
-                    sz,
-                    n_members,
-                    &sha[..16]
-                );
-                downloaded.push(DownloadedArtifact {
-                    relative_path: filename.clone(),
-                    source_url: url.clone(),
-                    size_bytes: sz,
-                    sha256_hex: sha,
-                });
-            }
-            RemoteTimeDomainItem::DirectFile { url, rel_path, .. } => {
-                validate_archive_member_path(rel_path)?;
-                let fdest = cfg.dest_dir.join(rel_path);
-                client.download_to_file(url, &fdest, Some(rem))?;
-                let (sha, sz) = sha256_file_and_size(&fdest)?;
-                cumulative_bytes = cumulative_bytes.saturating_add(sz);
-                if cumulative_bytes > cfg.max_bytes {
-                    let _ = fs::remove_file(&fdest);
-                    return Err(format!(
-                        "cumulative download ({cumulative_bytes} bytes) exceeded --max-bytes ({})",
-                        cfg.max_bytes
-                    ));
+                    match extract_validated_archive(&archive_dest, &extract_root) {
+                        Ok(n_members) => {
+                            cumulative_bytes = cumulative_bytes.saturating_add(sz);
+                            println!(
+                                "  Extracted {} ({} bytes, {} validated entries, sha256={})",
+                                item.display_name(),
+                                sz,
+                                n_members,
+                                &sha[..16]
+                            );
+                            downloaded.push(DownloadedArtifact {
+                                relative_path: filename.clone(),
+                                source_url: url.clone(),
+                                size_bytes: sz,
+                                sha256_hex: sha,
+                            });
+                        }
+                        Err(err)
+                            if filename.to_ascii_lowercase().ends_with(".tar")
+                                && !top_subdirs.is_empty()
+                                && !used_unpacked_fallback =>
+                        {
+                            let _ = fs::remove_file(&archive_dest);
+                            used_unpacked_fallback = true;
+                            println!(
+                                "  Plain .tar archive {filename} failed full block-header validation ({err}); falling back to unpacked subdirectories."
+                            );
+                            crawl_top_subdirs_into_items(
+                                &mut client,
+                                &top_subdirs,
+                                cfg.include_all_archives,
+                                false,
+                                &mut pending_items,
+                            )?;
+                        }
+                        Err(err) => {
+                            let _ = fs::remove_file(&archive_dest);
+                            return Err(err);
+                        }
+                    }
                 }
-                downloaded.push(DownloadedArtifact {
-                    relative_path: rel_path.clone(),
-                    source_url: url.clone(),
-                    size_bytes: sz,
-                    sha256_hex: sha,
-                });
+                RemoteTimeDomainItem::DirectFile { url, rel_path, .. } => {
+                    validate_archive_member_path(rel_path)?;
+                    let fdest = cfg.dest_dir.join(rel_path);
+                    client.download_to_file(url, &fdest, Some(rem))?;
+                    let (sha, sz) = sha256_file_and_size(&fdest)?;
+                    cumulative_bytes = cumulative_bytes.saturating_add(sz);
+                    if cumulative_bytes > cfg.max_bytes {
+                        let _ = fs::remove_file(&fdest);
+                        return Err(format!(
+                            "cumulative download ({cumulative_bytes} bytes) exceeded --max-bytes ({})",
+                            cfg.max_bytes
+                        ));
+                    }
+                    downloaded.push(DownloadedArtifact {
+                        relative_path: rel_path.clone(),
+                        source_url: url.clone(),
+                        size_bytes: sz,
+                        sha256_hex: sha,
+                    });
+                }
             }
         }
     }
@@ -2023,6 +2392,149 @@ mod tests {
         assert!(!dest18465.join("v6/NHSQC/o157_nhsqcv6.ucsf").exists());
         assert!(!dest18465.join("v6/NHSQC_T1_short").exists());
         assert!(!dest18465.join("bmrb18465td.tar").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_ustar_header_checksum_validation_and_512_multiple_corrupted_tar_fallback() {
+        let root = env::temp_dir().join(format!("nmr_fetch_ustar_csum_{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // 1. Valid multi-entry POSIX USTAR `.tar` passes header, prefix, and full-file checks
+        let valid_tar_bytes = build_ustar_archive(&[
+            ("b8/hsqc/acqus", b'0', "", b"##$PULPROG= <hsqcetfpf3gpsi>\n"),
+            ("b8/hsqc/ser", b'0', "", &[0x0d, 0x0a, 0x11, 0x22, 0x33]),
+        ]);
+        assert_eq!(valid_tar_bytes.len() % 512, 0);
+        let first_hdr: &[u8; 512] = valid_tar_bytes[..512].try_into().unwrap();
+        assert_eq!(validate_tar_header_block(first_hdr).unwrap(), 29);
+        assert_eq!(
+            validate_tar_prefix_bytes(&valid_tar_bytes, Some(valid_tar_bytes.len() as u64))
+                .unwrap(),
+            2
+        );
+        let valid_tar_path = root.join("valid.tar");
+        fs::write(&valid_tar_path, &valid_tar_bytes).unwrap();
+        assert_eq!(validate_tar_file_headers(&valid_tar_path).unwrap(), 2);
+
+        // 2. Historic signed-byte checksum (`header` containing >=0x80 byte summed as `i8`) also validates
+        let mut signed_hdr = *first_hdr;
+        signed_hdr[90] = 0xc3; // negative as `i8` (-61), positive as `u8` (195)
+        signed_hdr[148..156].fill(b' ');
+        let signed_sum: i64 = signed_hdr.iter().map(|&b| (b as i8) as i64).sum();
+        assert!(signed_sum > 0);
+        let signed_oct = format!("{:06o}\0 ", signed_sum);
+        signed_hdr[148..156].copy_from_slice(signed_oct.as_bytes());
+        assert_eq!(validate_tar_header_block(&signed_hdr).unwrap(), 29);
+
+        // 3. Corrupted `.tar` whose byte length IS an exact multiple of 512 (`2048` bytes)
+        //    (e.g. flipped byte / ASCII newline shift in block 0): old `len % 512 != 0` heuristic
+        //    would have passed it, whereas `validate_tar_header_block` / `execute_fetch_bmrb`
+        //    rejects it and falls back cleanly to unpacked raw FID subdirectories!
+        let mut bad_512_tar = valid_tar_bytes.clone();
+        assert_eq!(bad_512_tar.len() % 512, 0);
+        bad_512_tar[12] ^= 0x01; // single-bit corruption in block-0 header while preserving 512-byte multiple
+        let bad_first_hdr: &[u8; 512] = bad_512_tar[..512].try_into().unwrap();
+        assert!(validate_tar_header_block(bad_first_hdr).is_err());
+        let bad_tar_path = root.join("bad_512_multiple.tar");
+        fs::write(&bad_tar_path, &bad_512_tar).unwrap();
+        assert!(validate_tar_file_headers(&bad_tar_path).is_err());
+
+        let e_blk0 = root.join("ftp/entry_directories/bmr70001");
+        let td_blk0 = e_blk0.join("timedomain_data");
+        fs::create_dir_all(td_blk0.join("b8/NHSQC")).unwrap();
+        fs::write(e_blk0.join("bmr70001_3.str"), b"data_70001\n").unwrap();
+        fs::write(td_blk0.join("70001.tar"), &bad_512_tar).unwrap();
+        fs::write(
+            td_blk0.join("b8/NHSQC/acqus"),
+            b"##$PULPROG= <hsqcetfpf3gpsi>\n",
+        )
+        .unwrap();
+        fs::write(td_blk0.join("b8/NHSQC/ser"), b"CLEAN_UNPACKED_SER").unwrap();
+
+        let dest_blk0 = root.join("out_70001");
+        let arts_blk0 = execute_fetch_bmrb(&FetchBmrbConfig {
+            bmrb_id: "70001".to_string(),
+            dest_dir: dest_blk0.clone(),
+            dry_run: false,
+            include_all_archives: false,
+            max_bytes: 10_000_000,
+            ftp_base_url: format!("file://{}", root.join("ftp").display()),
+            api_base_url: String::new(),
+            min_interval: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(arts_blk0.len(), 3); // STAR + unpacked acqus + unpacked ser
+        assert!(dest_blk0.join("b8/NHSQC/ser").is_file());
+        assert!(!dest_blk0.join("70001.tar").exists());
+
+        // 4. Mid-archive 512-byte-multiple corruption beyond the 64 KiB prefix window:
+        //    Member #0 has a valid header and 70 KiB payload, followed by corrupted Header #1
+        //    while total file size remains an exact 512-byte multiple -> caught by post-download
+        //    `validate_tar_file_headers` walk and falls back to unpacked raw FID subdirectories!
+        let big_payload = vec![0x55u8; 70 * 1024];
+        let mut mid_corrupt_tar = build_ustar_archive(&[
+            ("b8/first/ser", b'0', "", &big_payload),
+            ("b8/second/acqus", b'0', "", b"##$TD= 1024\n"),
+        ]);
+        assert_eq!(mid_corrupt_tar.len() % 512, 0);
+        let second_hdr_off = 512 + big_payload.len();
+        mid_corrupt_tar[second_hdr_off + 4] ^= 0x7f; // corrupt Header #1 checksum beyond 64 KiB
+
+        let e_mid = root.join("ftp/entry_directories/bmr70002");
+        let td_mid = e_mid.join("timedomain_data");
+        fs::create_dir_all(td_mid.join("b8/NHSQC")).unwrap();
+        fs::write(e_mid.join("bmr70002_3.str"), b"data_70002\n").unwrap();
+        fs::write(td_mid.join("70002.tar"), &mid_corrupt_tar).unwrap();
+        fs::write(
+            td_mid.join("b8/NHSQC/acqus"),
+            b"##$PULPROG= <hsqcetfpf3gpsi>\n",
+        )
+        .unwrap();
+        fs::write(td_mid.join("b8/NHSQC/ser"), b"CLEAN_MID_FALLBACK_SER").unwrap();
+
+        let dest_mid = root.join("out_70002");
+        let arts_mid = execute_fetch_bmrb(&FetchBmrbConfig {
+            bmrb_id: "70002".to_string(),
+            dest_dir: dest_mid.clone(),
+            dry_run: false,
+            include_all_archives: false,
+            max_bytes: 10_000_000,
+            ftp_base_url: format!("file://{}", root.join("ftp").display()),
+            api_base_url: String::new(),
+            min_interval: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(arts_mid.len(), 3);
+        assert_eq!(
+            fs::read(dest_mid.join("b8/NHSQC/ser")).unwrap(),
+            b"CLEAN_MID_FALLBACK_SER"
+        );
+        assert!(!dest_mid.join("70002.tar").exists());
+
+        // 5. Valid `.tar` alongside sibling `analysis/` directory extracts the valid `.tar` directly
+        let e_valid = root.join("ftp/entry_directories/bmr70003");
+        let td_valid = e_valid.join("timedomain_data");
+        fs::create_dir_all(td_valid.join("analysis")).unwrap();
+        fs::write(e_valid.join("bmr70003_3.str"), b"data_70003\n").unwrap();
+        fs::write(td_valid.join("70003.tar"), &valid_tar_bytes).unwrap();
+        let dest_valid = root.join("out_70003");
+        let arts_valid = execute_fetch_bmrb(&FetchBmrbConfig {
+            bmrb_id: "70003".to_string(),
+            dest_dir: dest_valid.clone(),
+            dry_run: false,
+            include_all_archives: false,
+            max_bytes: 10_000_000,
+            ftp_base_url: format!("file://{}", root.join("ftp").display()),
+            api_base_url: String::new(),
+            min_interval: Duration::from_millis(1),
+        })
+        .unwrap();
+        assert_eq!(arts_valid.len(), 2); // STAR + valid 70003.tar
+        assert!(dest_valid.join("b8/hsqc/acqus").is_file());
+        assert!(dest_valid.join("b8/hsqc/ser").is_file());
 
         let _ = fs::remove_dir_all(&root);
     }

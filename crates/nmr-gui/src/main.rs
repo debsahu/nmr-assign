@@ -17,6 +17,7 @@ use std::time::Instant;
 use contour_painter::{ContourCallback, ContourPipelineResource, ContourUniforms};
 use eframe::{egui, egui_wgpu};
 use nmr_core::evaluate::{score, to_reference, Metrics};
+use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::nef::read_nef_str;
 use nmr_core::neural_picker::{pick_hsqc_2d_neural, NeuralPickerConfig};
 #[cfg(not(target_arch = "wasm32"))]
@@ -206,6 +207,22 @@ fn format_star_in_memory(
 enum WorkspaceMode {
     ProteinNmr,
     OctetChem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GuiSolverKind {
+    #[default]
+    EvoGraph,
+    Standard,
+}
+
+impl GuiSolverKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::EvoGraph => "Evo-Graph",
+            Self::Standard => "Standard",
+        }
+    }
 }
 
 struct CoreOctetBackendAdapter;
@@ -705,6 +722,7 @@ struct NmrWorkbenchApp {
     #[cfg(not(target_arch = "wasm32"))]
     gpu_engine: Option<GpuEngine>,
     adapter_label: Option<String>,
+    solver_kind: GuiSolverKind,
     #[cfg(not(target_arch = "wasm32"))]
     use_gpu: bool,
     use_neural_picker: bool,
@@ -813,6 +831,7 @@ impl NmrWorkbenchApp {
         let mut app = Self {
             workspace_mode: WorkspaceMode::ProteinNmr,
             octet_app,
+            solver_kind: GuiSolverKind::default(),
             #[cfg(not(target_arch = "wasm32"))]
             use_gpu: gpu_engine.is_some(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -970,51 +989,116 @@ impl NmrWorkbenchApp {
     }
 
     fn run_assignment(&mut self) {
-        if self.systems.is_empty() || self.sequence.is_empty() {
-            self.status_msg = "Need spin systems and sequence to run assignment".to_string();
+        if self.sequence.is_empty()
+            || (self.solver_kind == GuiSolverKind::EvoGraph && self.peaks.is_empty())
+            || (self.solver_kind == GuiSolverKind::Standard && self.systems.is_empty())
+        {
+            self.status_msg = "Need peaks/spin systems and sequence to run assignment".to_string();
             return;
         }
         let scfg = ScoreConfig {
             assign_cost: self.assign_cost,
             ..ScoreConfig::default()
         };
-        let acfg = AnnealConfig {
-            runs: self.replicas,
-            steps_per_system: self.steps_per_sys,
-            seed: self.sim_seed,
-            ..AnnealConfig::default()
-        };
 
         let timer = PerfTimer::start();
-        #[allow(unused_mut)]
-        let mut res_opt: Option<(AssignResult, &'static str)> = None;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.use_gpu {
-            if let Some(gpu) = &self.gpu_engine {
-                match gpu.assign_gpu(&self.systems, &self.sequence, &self.priors, &scfg, &acfg) {
-                    Ok(r) => res_opt = Some((r, "WebGPU")),
-                    Err(e) => {
-                        self.status_msg = format!("GPU solver error ({e}), falling back to CPU");
+        let (res, engine_tag, eff_priors, kept_hsqc_opt) = match self.solver_kind {
+            GuiSolverKind::EvoGraph => {
+                let mut evo_cfg = EvoGraphConfig {
+                    score_cfg: scfg.clone(),
+                    auto_reference: scfg.auto_reference,
+                    structure_torsions: None,
+                    seed: self.sim_seed,
+                    ..EvoGraphConfig::default()
+                };
+                evo_cfg.population_size = self.replicas.max(4);
+                evo_cfg.num_islands = evo_cfg.num_islands.min(evo_cfg.population_size).max(1);
+                evo_cfg.steps_per_system_per_gen = (self.steps_per_sys * 3 / 10).max(100);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    evo_cfg.generations = 4;
+                    evo_cfg.steps_per_system_per_gen = evo_cfg.steps_per_system_per_gen.min(250);
+                }
+                let (evo_systems, r, rep) = assign_evo_graph_from_peaks(
+                    &self.peaks,
+                    &self.sequence,
+                    &self.priors,
+                    &evo_cfg,
+                );
+                let shifted_pri = rep.shifted_priors(&self.priors);
+                self.u_mat = Some(unary_matrix(
+                    &evo_systems,
+                    &self.sequence,
+                    &shifted_pri,
+                    &scfg,
+                ));
+                self.p_mat = Some(pair_matrix(&evo_systems, &scfg));
+                self.systems = evo_systems;
+                self.selected_ss = match self.selected_ss {
+                    Some(s) if s < self.systems.len() => Some(s),
+                    _ => (!self.systems.is_empty()).then_some(0),
+                };
+                let tag = if cfg!(target_arch = "wasm32") {
+                    "WASM Evo-Graph"
+                } else {
+                    "CPU Evo-Graph"
+                };
+                (r, tag, shifted_pri, Some(rep.kept_hsqc_indices))
+            }
+            GuiSolverKind::Standard => {
+                // Rebuild unfiltered spin systems when switching back from Evo-Graph filtered systems
+                if let Ok(sys) = build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
+                    if sys.len() != self.systems.len() {
+                        self.systems = sys;
+                        self.p_mat = Some(pair_matrix(&self.systems, &scfg));
+                        self.selected_ss = (!self.systems.is_empty()).then_some(0);
                     }
                 }
-            }
-        }
+                let acfg = AnnealConfig {
+                    runs: self.replicas,
+                    steps_per_system: self.steps_per_sys,
+                    seed: self.sim_seed,
+                    ..AnnealConfig::default()
+                };
+                #[allow(unused_mut)]
+                let mut res_opt: Option<(AssignResult, &'static str)> = None;
 
-        let default_tag = if cfg!(target_arch = "wasm32") {
-            "WASM"
-        } else {
-            "CPU-MT"
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.use_gpu {
+                    if let Some(gpu) = &self.gpu_engine {
+                        match gpu.assign_gpu(
+                            &self.systems,
+                            &self.sequence,
+                            &self.priors,
+                            &scfg,
+                            &acfg,
+                        ) {
+                            Ok(r) => res_opt = Some((r, "WebGPU")),
+                            Err(e) => {
+                                self.status_msg =
+                                    format!("GPU solver error ({e}), falling back to CPU");
+                            }
+                        }
+                    }
+                }
+
+                let default_tag = if cfg!(target_arch = "wasm32") {
+                    "WASM"
+                } else {
+                    "CPU-MT"
+                };
+                let (r, tag) = res_opt.unwrap_or_else(|| {
+                    let u = unary_matrix(&self.systems, &self.sequence, &self.priors, &scfg);
+                    let p = self
+                        .p_mat
+                        .clone()
+                        .unwrap_or_else(|| pair_matrix(&self.systems, &scfg));
+                    self.u_mat = Some(u.clone());
+                    (assign_from_matrices(&u, &p, &acfg), default_tag)
+                });
+                (r, tag, self.priors.clone(), None)
+            }
         };
-        let (res, engine_tag) = res_opt.unwrap_or_else(|| {
-            let u = unary_matrix(&self.systems, &self.sequence, &self.priors, &scfg);
-            let p = self
-                .p_mat
-                .clone()
-                .unwrap_or_else(|| pair_matrix(&self.systems, &scfg));
-            self.u_mat = Some(u.clone());
-            (assign_from_matrices(&u, &p, &acfg), default_tag)
-        });
 
         let dt_ms = timer.elapsed_ms();
         self.last_solve_ms = Some(dt_ms);
@@ -1025,10 +1109,23 @@ impl NmrWorkbenchApp {
             &self.sequence,
             &self.seq_ids,
             0.0,
-            Some(&self.priors),
+            Some(&eff_priors),
         );
         if let Some(truth) = &self.truth {
-            if truth.len() == res.position.len() {
+            if let Some(kept) = &kept_hsqc_opt {
+                let eval_truth: Vec<i32> = kept
+                    .iter()
+                    .map(|&idx| truth.get(idx).copied().unwrap_or(-1))
+                    .collect();
+                if eval_truth.len() == res.position.len() {
+                    self.metrics = Some(Metrics {
+                        assignable: truth.iter().filter(|&&t| t >= 0).count(),
+                        ..score(&res, &eval_truth, 0.8)
+                    });
+                } else {
+                    self.metrics = None;
+                }
+            } else if truth.len() == res.position.len() {
                 self.metrics = Some(score(&res, truth, 0.8));
             } else {
                 self.metrics = None;
@@ -1560,8 +1657,28 @@ impl NmrWorkbenchApp {
             }
 
             ui.separator();
+            egui::ComboBox::from_id_salt("gui_solver_kind")
+                .selected_text(format!("Solver: {}", self.solver_kind.label()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.solver_kind,
+                        GuiSolverKind::EvoGraph,
+                        "Evo-Graph (CPU f64, default)",
+                    );
+                    ui.selectable_value(
+                        &mut self.solver_kind,
+                        GuiSolverKind::Standard,
+                        "Standard SA (GPU / CPU)",
+                    );
+                });
             #[cfg(not(target_arch = "wasm32"))]
-            ui.checkbox(&mut self.use_gpu, "WebGPU Compute");
+            ui.add_enabled(
+                self.solver_kind == GuiSolverKind::Standard,
+                egui::Checkbox::new(&mut self.use_gpu, "WebGPU Compute"),
+            )
+            .on_disabled_hover_text(
+                "Evo-Graph runs in f64 on CPU; switch Solver to Standard SA to use WebGPU Compute",
+            );
             ui.add(egui::Slider::new(&mut self.replicas, 8..=256).text("Replicas"));
             ui.add(egui::Slider::new(&mut self.steps_per_sys, 400..=4000).text("Steps/SS"));
             if ui
@@ -2497,4 +2614,15 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuiSolverKind;
+
+    #[test]
+    fn test_gui_default_solver_is_evo_graph() {
+        assert_eq!(GuiSolverKind::default(), GuiSolverKind::EvoGraph);
+        assert_eq!(GuiSolverKind::default().label(), "Evo-Graph");
+    }
 }

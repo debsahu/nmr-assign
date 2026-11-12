@@ -2323,7 +2323,7 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
 pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig, String> {
     let mut manifest_path = PathBuf::from("data/benchmark/real_manifest.tsv");
     let mut split_opt: Option<BenchmarkSplitFilter> = None;
-    let mut solver = SolverKind::Standard;
+    let mut solver = SolverKind::EvoGraph;
     let mut engine_opt: Option<EngineKind> = None;
     let mut seeds = 5usize;
     let mut base_seed = 0u64;
@@ -2753,11 +2753,27 @@ mod tests {
             .join("../../data/benchmark/real_manifest.tsv");
         let raw = fs::read_to_string(&manifest_path).unwrap();
         let entries = parse_real_manifest_str(&raw).unwrap();
-        assert_eq!(entries.len(), 14);
+        assert_eq!(entries.len(), 16);
         let n_dev = entries.iter().filter(|e| e.split == "dev").count();
         let n_held = entries.iter().filter(|e| e.split == "heldout").count();
-        assert_eq!(n_dev, 5);
+        assert_eq!(n_dev, 7);
         assert_eq!(n_held, 9);
+
+        // Verify Q4 governance transitions: 5329 and 6318 promoted to dev; 16099 and 18489 added to heldout.
+        for promoted_id in ["5329", "6318"] {
+            let e = entries
+                .iter()
+                .find(|e| e.bmrb_id == promoted_id)
+                .unwrap_or_else(|| panic!("missing promoted entry {promoted_id}"));
+            assert_eq!(e.split, "dev", "expected {promoted_id} in dev split");
+        }
+        for fresh_id in ["16099", "18489"] {
+            let e = entries
+                .iter()
+                .find(|e| e.bmrb_id == fresh_id)
+                .unwrap_or_else(|| panic!("missing fresh heldout entry {fresh_id}"));
+            assert_eq!(e.split, "heldout", "expected {fresh_id} in heldout split");
+        }
 
         // Verify zero overlap with Phase-1 `data/benchmark/manifest.tsv`
         let p1_raw = fs::read_to_string(
@@ -2773,5 +2789,36 @@ mod tests {
                 );
             }
         }
+
+        // Verify zero overlap with empirical prior training set in `data/priors/PROVENANCE.md`
+        let prov_raw = fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/priors/PROVENANCE.md"),
+        )
+        .unwrap();
+        for tok in prov_raw
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| t.starts_with("bmr") && t.len() > 3)
+        {
+            let id_num = tok.trim_start_matches("bmr");
+            if id_num.chars().all(|c| c.is_ascii_digit()) {
+                assert!(
+                    !entries.iter().any(|e| e.bmrb_id == id_num),
+                    "real_manifest entry {id_num} overlaps empirical prior training set in data/priors/PROVENANCE.md"
+                );
+            }
+        }
+
+        // Verify P1-6 default solver is `evo-graph` while `--solver standard` remains selectable
+        let cfg_default =
+            parse_real_benchmark_args(&["--split".to_string(), "dev".to_string()]).unwrap();
+        assert_eq!(cfg_default.solver, SolverKind::EvoGraph);
+        let cfg_std = parse_real_benchmark_args(&[
+            "--split".to_string(),
+            "dev".to_string(),
+            "--solver".to_string(),
+            "standard".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(cfg_std.solver, SolverKind::Standard);
     }
 }

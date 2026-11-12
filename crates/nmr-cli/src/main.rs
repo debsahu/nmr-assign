@@ -104,11 +104,11 @@ fn usage() -> String {
        nmrassign --version | -V | version\n\
        nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
        nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
-       nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--solver standard|evo-graph] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
+       nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--solver evo-graph|standard] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
        nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
+       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver evo-graph|standard] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
@@ -118,7 +118,7 @@ fn usage() -> String {
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
@@ -705,7 +705,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut out_arg: Option<String> = None;
     let mut priors_path: Option<String> = None;
     let mut first_seq_id = 1i32;
-    let mut solver = SolverKind::Standard;
+    let mut solver = SolverKind::EvoGraph;
     let mut engine_opt: Option<EngineKind> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
@@ -2514,7 +2514,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut snr = 5.0f32;
     let mut prob = 0.45f32;
     let mut priors_path: Option<String> = None;
-    let mut solver = SolverKind::Standard;
+    let mut solver = SolverKind::EvoGraph;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
@@ -4497,8 +4497,29 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             "expected unknown solver rejection for tripeptide, got: {tri_err}"
         );
 
-        // 3. Default engine omission works cleanly for standard (GPU) and evo-graph (CPU),
-        //    and emits '#' offset header while preserving experimental TMS ppm shifts.
+        // 3. Omitting `--solver` defaults to `evo-graph` (`P1-6`), while explicit `--solver standard`
+        //    and `--solver evo-graph` both work cleanly and preserve experimental TMS ppm shifts.
+        let out_default = dir.join("out_default_solver.str");
+        cmd_assign(&[
+            "--peaks".into(),
+            peaks_path.to_string_lossy().into_owned(),
+            "--seq".into(),
+            fasta_path.to_string_lossy().into_owned(),
+            "--out".into(),
+            out_default.to_string_lossy().into_owned(),
+            "--runs".into(),
+            "4".into(),
+            "--steps".into(),
+            "200".into(),
+        ])
+        .unwrap();
+        let default_content = fs::read_to_string(&out_default).unwrap();
+        assert!(
+            default_content.contains("solver=CPU (f64, evo-graph)"),
+            "expected default `nmrassign assign` solver to be `evo-graph`, got header:\n{}",
+            default_content.lines().next().unwrap_or("")
+        );
+
         for (tag, solver_name) in [("standard", "standard"), ("evo_graph", "evo-graph")] {
             let out_str = dir.join(format!("out_{tag}.str"));
             let args: Vec<String> = vec![
