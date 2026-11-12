@@ -34,7 +34,12 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fid::{
-    read_fid_2d, read_fid_3d, Complex64, Fid1D, Fid2D, Fid3D, FidAxisMeta, StoredWindowHint,
+    read_fid_2d, read_fid_3d, Complex64, Fid1D, Fid2D, Fid3D, FidAxisMeta, FidVendor,
+    StoredWindowHint,
+};
+use crate::ops::{
+    auto_phase_1d, auto_phase_direct_nd, auto_phase_indirect_nd, hilbert_transform_in_place,
+    lock_biphasic_ca_polarity_3d, AutoPhaseConfig, PolarityMode,
 };
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
@@ -110,6 +115,9 @@ pub enum PhaseSource {
     Explicit,
     /// Adopted from stored spectrometer processing metadata (`procs` / `procpar`).
     Stored,
+    /// Multidimensional blind automatic phase correction via `ops.rs` (`auto_phase_1d`,
+    /// `auto_phase_direct_nd`, `auto_phase_indirect_nd`, with `PolarityMode::Biphasic` on `HNCACB`).
+    Auto,
     /// Solved automatically via Chen et al. (2002) entropy minimization when no phases were stored.
     AutoChen2002,
     /// Default `(0.0, 0.0)` on indirect axes when no phases were stored.
@@ -144,9 +152,12 @@ pub struct DimRecipe {
     pub conjugate_for_fft: bool,
     /// Step 5b: Reverse frequency axis after FFT (`##$REVERSE= yes` in Bruker `procs`).
     pub reverse: bool,
-    /// Step 6: Zero-order phase in degrees (`None` when `phase_source == AutoChen2002`).
+    /// Optional causal Hilbert imaginary-channel reconstruction prior to phase rotation (`--hilbert`).
+    #[serde(default)]
+    pub hilbert: bool,
+    /// Step 6: Zero-order phase in degrees (`None` when `phase_source` is `Auto` / `AutoChen2002`).
     pub p0_deg: Option<f64>,
-    /// Step 6: First-order phase in degrees across `[0, N_fft)` (`None` when `phase_source == AutoChen2002`).
+    /// Step 6: First-order phase in degrees across `[0, N_fft)` (`None` when `phase_source` is `Auto` / `AutoChen2002`).
     pub p1_deg: Option<f64>,
     pub phase_source: PhaseSource,
     /// Step 8: Optional polynomial baseline correction after imaginary discard.
@@ -330,6 +341,7 @@ impl DimRecipe {
             si,
             conjugate_for_fft,
             reverse: sp.reverse,
+            hilbert: false,
             p0_deg,
             p1_deg,
             phase_source,
@@ -338,11 +350,20 @@ impl DimRecipe {
         }
     }
 
-    /// Explicitly override `(p0_deg, p1_deg)` on this dimension.
+    /// Explicitly override `(p0_deg, p1_deg)` on this dimension (adjusting `fcor` per Otting et al. 1986).
     pub fn set_explicit_phase(&mut self, p0_deg: f64, p1_deg: f64) {
         self.p0_deg = Some(p0_deg);
         self.p1_deg = Some(p1_deg);
         self.phase_source = PhaseSource::Explicit;
+        self.fcor = if p1_deg.abs() < 1.0 { 0.5 } else { 1.0 };
+    }
+
+    /// Switch this dimension to blind multidimensional automatic phase correction (`PhaseSource::Auto`).
+    pub fn set_auto_phase(&mut self) {
+        self.p0_deg = None;
+        self.p1_deg = None;
+        self.phase_source = PhaseSource::Auto;
+        self.fcor = 0.5;
     }
 }
 
@@ -355,24 +376,79 @@ impl ProcessingRecipe {
     }
 
     pub fn from_fid_2d(fid: &Fid2D) -> Self {
-        Self {
+        let mut rec = Self {
             dims: vec![
                 DimRecipe::from_axis_meta(&fid.axis_x, 0),
                 DimRecipe::from_axis_meta(&fid.axis_y, 1),
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+        };
+        if fid.vendor == FidVendor::Varian {
+            // Varian `.fid/procpar` stores VnmrJ 1D interactive scout cursor `rp*`/`lp*` rather
+            // than calibrated 2D spectral phases; solve both dimensions via blind autophasing.
+            rec.set_auto_phase();
+        } else {
+            for d in &mut rec.dims {
+                if matches!(
+                    d.phase_source,
+                    PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
+                ) {
+                    d.set_auto_phase();
+                }
+            }
         }
+        rec
     }
 
     pub fn from_fid_3d(fid: &Fid3D) -> Self {
-        Self {
+        let mut rec = Self {
             dims: vec![
                 DimRecipe::from_axis_meta(&fid.axis_x, 0),
                 DimRecipe::from_axis_meta(&fid.axis_y, 1),
                 DimRecipe::from_axis_meta(&fid.axis_z, 2),
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+        };
+        if fid.vendor == FidVendor::Varian {
+            rec.set_auto_phase();
+        } else {
+            for d in &mut rec.dims {
+                if matches!(
+                    d.phase_source,
+                    PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
+                ) {
+                    d.set_auto_phase();
+                }
+            }
         }
+        rec
+    }
+
+    /// Force blind multidimensional automatic phase correction across all dimensions (`--auto-phase`).
+    pub fn set_auto_phase(&mut self) {
+        for d in &mut self.dims {
+            d.set_auto_phase();
+        }
+    }
+
+    /// Builder helper to force blind multidimensional automatic phase correction (`--auto-phase`).
+    pub fn with_auto_phase(mut self) -> Self {
+        self.set_auto_phase();
+        self
+    }
+
+    /// Enable or disable causal Hilbert imaginary-channel reconstruction (`--hilbert`) across dimensions.
+    pub fn set_hilbert(&mut self, enabled: bool) {
+        for d in &mut self.dims {
+            d.hilbert = enabled;
+        }
+    }
+
+    /// Configure NUS reconstruction method (`fista_momentum = true` for `FISTA`, `false` for `IST`).
+    pub fn set_nus_method_fista(&mut self, fista_momentum: bool) {
+        self.nus
+            .get_or_insert_with(NusIstConfig::default)
+            .fista_momentum = fista_momentum;
     }
 
     /// Disable ROI cropping across all dimensions (`--no-crop`).
@@ -1199,6 +1275,83 @@ fn compute_axis_roi(
 // Single-Trace & Batch 1D Processing Engine
 // ============================================================================
 
+/// Optional causal Hilbert imaginary-channel reconstruction converted to `process.rs`'s
+/// `Re(S * exp(-i phi)) = re * cos(phi) + im * sin(phi)` sign convention.
+#[inline]
+fn apply_optional_hilbert_proc_sign(sc: &mut [Complex64], hilbert: bool) {
+    if hilbert && sc.len() > 1 {
+        for c in sc.iter_mut() {
+            c[1] = 0.0;
+        }
+        hilbert_transform_in_place(sc);
+        for c in sc.iter_mut() {
+            c[1] = -c[1];
+        }
+    }
+}
+
+/// Conjugate a `process.rs` frequency trace (`re * cos + im * sin`) into `ops.rs`'s
+/// `re * cos - im * sin` phase convention so `PhaseSolution` `(p0_deg, p1_deg)` matches verbatim.
+#[inline]
+fn conj_trace_for_ops(sc: &[Complex64]) -> Vec<Complex64> {
+    sc.iter().map(|&c| [c[0], -c[1]]).collect()
+}
+
+fn auto_phase_cfg_for_exp(exp: &str) -> AutoPhaseConfig {
+    let norm = exp.trim().replace(['(', ')'], "");
+    if norm.eq_ignore_ascii_case("HNCACB") {
+        AutoPhaseConfig::biphasic()
+    } else {
+        AutoPhaseConfig::default()
+    }
+}
+
+/// Select up to `max_cols` distinct local-maximum peak-apex indices separated by `>= min_sep` bins.
+fn select_apex_indices(energies: &[f64], min_sep: usize, max_cols: usize) -> Vec<usize> {
+    let n = energies.len();
+    let mut apices: Vec<(f64, usize)> = (0..n)
+        .filter(|&i| {
+            let e0 = energies[i];
+            let el = if i > 0 { energies[i - 1] } else { 0.0 };
+            let er = if i + 1 < n { energies[i + 1] } else { 0.0 };
+            e0 > 0.0 && e0 >= el && e0 >= er
+        })
+        .map(|i| (energies[i], i))
+        .collect();
+    apices.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut chosen = Vec::new();
+    for &(_, idx) in &apices {
+        if chosen.iter().all(|&q: &usize| q.abs_diff(idx) >= min_sep) {
+            chosen.push(idx);
+            if chosen.len() >= max_cols {
+                break;
+            }
+        }
+    }
+    if chosen.len() < 4 && n > 0 {
+        let mut all: Vec<(f64, usize)> = energies
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, e)| e > 0.0)
+            .map(|(i, e)| (e, i))
+            .collect();
+        all.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, idx) in all {
+            if !chosen.contains(&idx) {
+                chosen.push(idx);
+                if chosen.len() >= max_cols.min(16) {
+                    break;
+                }
+            }
+        }
+        if chosen.is_empty() {
+            chosen.push(0);
+        }
+    }
+    chosen
+}
+
 /// Resolve `(p0_deg, p1_deg)` for a dimension given a representative unphased spectrum `rep_spec`
 /// and full `AxisPpm`.
 fn resolve_dim_phase(dim: &DimRecipe, full_axis: &AxisPpm, rep_spec: &[Complex64]) -> (f64, f64) {
@@ -1207,6 +1360,15 @@ fn resolve_dim_phase(dim: &DimRecipe, full_axis: &AxisPpm, rep_spec: &[Complex64
         (Some(p0), None, _) => (p0, 0.0),
         (None, Some(p1), _) => (0.0, p1),
         (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::Auto) => {
+            let ops_tr = conj_trace_for_ops(rep_spec);
+            let mut cfg = AutoPhaseConfig::default();
+            if dim.remove_digital_filter && dim.group_delay > 0.0 {
+                cfg.max_abs_p1_deg = cfg.max_abs_p1_deg.min(18.0);
+            }
+            let sol = auto_phase_1d(&ops_tr, full_axis, &cfg);
+            (sol.p0_deg, sol.p1_deg)
+        }
         (None, None, _) => {
             // Evaluate Chen et al. (2002) on the amide sub-window (6.0..=10.5 ppm) when 1H spans it,
             // avoiding any residual water peak near 4.7 ppm; otherwise evaluate across [10%..90%].
@@ -1862,6 +2024,7 @@ pub fn process_fid_1d_mut(
         &mut work_fft,
         &mut spec_c,
     );
+    apply_optional_hilbert_proc_sign(&mut spec_c, dim0.hilbert);
 
     let full_ax = build_full_axis_ppm(&fid.axis_x, spec_c.len());
     let (p0, p1) = resolve_dim_phase(dim0, &full_ax, &spec_c);
@@ -1925,28 +2088,72 @@ pub fn process_fid_2d_mut(
     let (x0, x1, axis_x_out) = compute_axis_roi(&full_axis_x, dim_x.roi_ppm)?;
     let nx_out = axis_x_out.size;
 
-    // Resolve direct phase once (from stored/explicit or Chen 2002 on first sampled cosine trace)
-    let (p0_x, p1_x) = if let (Some(p0), Some(p1)) = (dim_x.p0_deg, dim_x.p1_deg) {
-        (p0, p1)
-    } else {
-        let first_k1 = fid
-            .nus_mask
-            .as_ref()
-            .and_then(|m| m.iter().position(|&b| b))
-            .unwrap_or(0);
-        let mut wt = Vec::new();
-        let mut wf = Vec::new();
-        let mut rep_spec = Vec::new();
-        transform_trace_steps_1_to_5(
-            fid.trace(first_k1, 0),
-            &fid.axis_x,
-            &dim_x,
-            &mut wt,
-            &mut wf,
-            &mut rep_spec,
-        );
-        let ax_rep = build_full_axis_ppm(&fid.axis_x, rep_spec.len());
-        resolve_dim_phase(&dim_x, &ax_rep, &rep_spec)
+    let (p0_x, p1_x) = match (dim_x.p0_deg, dim_x.p1_deg, dim_x.phase_source) {
+        (Some(p0), Some(p1), _) => (p0, p1),
+        (Some(p0), None, _) => (p0, 0.0),
+        (None, Some(p1), _) => (0.0, p1),
+        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::Auto) => {
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut sc = Vec::new();
+            let mut sample_x = Vec::new();
+            let mut ax_rep: Option<AxisPpm> = None;
+            for k1 in 0..n1 {
+                if let Some(ref mask) = fid.nus_mask {
+                    if !mask[k1] {
+                        continue;
+                    }
+                }
+                transform_trace_steps_1_to_5(
+                    fid.trace(k1, 0),
+                    &fid.axis_x,
+                    &dim_x,
+                    &mut wt,
+                    &mut wf,
+                    &mut sc,
+                );
+                apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
+                if ax_rep.is_none() {
+                    ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
+                }
+                sample_x.push(conj_trace_for_ops(&sc));
+                if sample_x.len() >= 64 {
+                    break;
+                }
+            }
+            if let Some(ax_x_full) = ax_rep {
+                let mut cfg_direct = AutoPhaseConfig::default();
+                if dim_x.remove_digital_filter && dim_x.group_delay > 0.0 {
+                    cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(18.0);
+                }
+                let sol = auto_phase_direct_nd(&sample_x, &ax_x_full, &cfg_direct);
+                (sol.p0_deg, sol.p1_deg)
+            } else {
+                (0.0, 0.0)
+            }
+        }
+        (None, None, _) => {
+            let first_k1 = fid
+                .nus_mask
+                .as_ref()
+                .and_then(|m| m.iter().position(|&b| b))
+                .unwrap_or(0);
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut rep_spec = Vec::new();
+            transform_trace_steps_1_to_5(
+                fid.trace(first_k1, 0),
+                &fid.axis_x,
+                &dim_x,
+                &mut wt,
+                &mut wf,
+                &mut rep_spec,
+            );
+            apply_optional_hilbert_proc_sign(&mut rep_spec, dim_x.hilbert);
+            let ax_rep = build_full_axis_ppm(&fid.axis_x, rep_spec.len());
+            resolve_dim_phase(&dim_x, &ax_rep, &rep_spec)
+        }
     };
     recipe.dims[0].p0_deg = Some(p0_x);
     recipe.dims[0].p1_deg = Some(p1_x);
@@ -1987,6 +2194,7 @@ pub fn process_fid_2d_mut(
                     &mut wf,
                     &mut sc,
                 );
+                apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
                 real_full.resize(sc.len(), 0.0);
                 apply_phase_and_discard_imag(&sc, p0_x, p1_x, &mut real_full);
                 dst.copy_from_slice(&real_full[x0..=x1]);
@@ -2002,12 +2210,68 @@ pub fn process_fid_2d_mut(
     let full_axis_y = build_full_axis_ppm(&fid.axis_y, si_y);
     let (y0, y1, axis_y_out) = compute_axis_roi(&full_axis_y, dim_y.roi_ppm)?;
     let ny_out = axis_y_out.size;
+    let nus_cfg = recipe.nus.clone().unwrap_or_default();
 
-    let (p0_y, p1_y) = (dim_y.p0_deg.unwrap_or(0.0), dim_y.p1_deg.unwrap_or(0.0));
+    let (p0_y, p1_y) = match (dim_y.p0_deg, dim_y.p1_deg, dim_y.phase_source) {
+        (Some(p0), Some(p1), _) => (p0, p1),
+        (Some(p0), None, _) => (p0, 0.0),
+        (None, Some(p1), _) => (0.0, p1),
+        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, _) => {
+            // Select up to 48 distinct `1H` local-maximum apex columns for blind indirect autophasing
+            let mut col_energy = vec![0.0_f64; nx_out];
+            for ix in 0..nx_out {
+                let mut e = 0.0;
+                for k1 in 0..n1 {
+                    let re = direct_cropped[(k1 * 2) * nx_out + ix];
+                    let im = direct_cropped[(k1 * 2 + 1) * nx_out + ix];
+                    e += re * re + im * im;
+                }
+                col_energy[ix] = e;
+            }
+            let chosen_ix = select_apex_indices(&col_energy, 3, 48);
+            let mut cand_cols = Vec::with_capacity(chosen_ix.len());
+            let mut col_td = vec![[0.0, 0.0]; n1];
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut sc = Vec::new();
+            let mut ax_y_rep: Option<AxisPpm> = None;
+            for &ix in &chosen_ix {
+                for k1 in 0..n1 {
+                    col_td[k1] = [
+                        direct_cropped[(k1 * 2) * nx_out + ix],
+                        direct_cropped[(k1 * 2 + 1) * nx_out + ix],
+                    ];
+                }
+                if let Some(mask) = nus_mask_ref {
+                    let rec = reconstruct_nus_1d_ist(&col_td, mask, &nus_cfg);
+                    col_td.copy_from_slice(&rec);
+                }
+                transform_trace_steps_1_to_5(
+                    &col_td,
+                    &fid.axis_y,
+                    &dim_y,
+                    &mut wt,
+                    &mut wf,
+                    &mut sc,
+                );
+                apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
+                if ax_y_rep.is_none() {
+                    ax_y_rep = Some(build_full_axis_ppm(&fid.axis_y, sc.len()));
+                }
+                cand_cols.push(conj_trace_for_ops(&sc));
+            }
+            if let Some(ax_y_full) = ax_y_rep {
+                let sol =
+                    auto_phase_indirect_nd(&cand_cols, &ax_y_full, &AutoPhaseConfig::default());
+                (sol.p0_deg, sol.p1_deg)
+            } else {
+                (0.0, 0.0)
+            }
+        }
+    };
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
-
-    let nus_cfg = recipe.nus.clone().unwrap_or_default();
 
     // Process each `ix in 0..nx_out` column independently in parallel, storing transposed `[nx_out * ny_out]`
     // then scattering to row-major `[ny_out * nx_out]`.
@@ -2047,6 +2311,7 @@ pub fn process_fid_2d_mut(
                     &mut wf,
                     &mut sc,
                 );
+                apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
                 real_full.resize(sc.len(), 0.0);
                 apply_phase_and_discard_imag(&sc, p0_y, p1_y, &mut real_full);
                 if let Some(ref bc) = dim_y.baseline {
@@ -2140,6 +2405,16 @@ pub fn process_fid_3d_mut(
         }
     }
 
+    let ap_cfg = auto_phase_cfg_for_exp(exp);
+    let any_dim_auto = recipe.dims[..3].iter().any(|d| {
+        d.p0_deg.is_none()
+            && d.p1_deg.is_none()
+            && matches!(
+                d.phase_source,
+                PhaseSource::Auto | PhaseSource::AutoChen2002
+            )
+    });
+
     // ------------------------------------------------------------------------
     // Step A: Direct 1H (Dim 0) processing + imaginary discard + 1H ROI crop
     // ------------------------------------------------------------------------
@@ -2149,29 +2424,92 @@ pub fn process_fid_3d_mut(
     let (x0, x1, axis_x_out) = compute_axis_roi(&full_axis_x, dim_x.roi_ppm)?;
     let nx_out = axis_x_out.size;
 
-    let (p0_x, p1_x) = if let (Some(p0), Some(p1)) = (dim_x.p0_deg, dim_x.p1_deg) {
-        (p0, p1)
-    } else {
-        let first_idx = fid
-            .nus_mask
-            .as_ref()
-            .and_then(|m| m.iter().position(|&b| b))
-            .unwrap_or(0);
-        let fk2 = first_idx / n1;
-        let fk1 = first_idx % n1;
-        let mut wt = Vec::new();
-        let mut wf = Vec::new();
-        let mut rep_spec = Vec::new();
-        transform_trace_steps_1_to_5(
-            fid.trace(fk2, 0, fk1, 0),
-            &fid.axis_x,
-            &dim_x,
-            &mut wt,
-            &mut wf,
-            &mut rep_spec,
-        );
-        let ax_rep = build_full_axis_ppm(&fid.axis_x, rep_spec.len());
-        resolve_dim_phase(&dim_x, &ax_rep, &rep_spec)
+    let (p0_x, p1_x) = match (dim_x.p0_deg, dim_x.p1_deg, dim_x.phase_source) {
+        (Some(p0), Some(p1), _) => (p0, p1),
+        (Some(p0), None, _) => (p0, 0.0),
+        (None, Some(p1), _) => (0.0, p1),
+        (None, None, PhaseSource::DefaultZero) => (0.0, 0.0),
+        (None, None, PhaseSource::Auto) => {
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut sc = Vec::new();
+            let mut sample_x = Vec::new();
+            let mut ax_rep: Option<AxisPpm> = None;
+            for k2 in 0..n2.min(8) {
+                for k1 in 0..n1.min(8) {
+                    if let Some(ref mask) = fid.nus_mask {
+                        if !mask[k2 * n1 + k1] {
+                            continue;
+                        }
+                    }
+                    transform_trace_steps_1_to_5(
+                        fid.trace(k2, 0, k1, 0),
+                        &fid.axis_x,
+                        &dim_x,
+                        &mut wt,
+                        &mut wf,
+                        &mut sc,
+                    );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
+                    if ax_rep.is_none() {
+                        ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
+                    }
+                    sample_x.push(conj_trace_for_ops(&sc));
+                }
+            }
+            if sample_x.is_empty() {
+                if let Some(first_idx) = fid
+                    .nus_mask
+                    .as_ref()
+                    .and_then(|m| m.iter().position(|&b| b))
+                {
+                    transform_trace_steps_1_to_5(
+                        fid.trace(first_idx / n1, 0, first_idx % n1, 0),
+                        &fid.axis_x,
+                        &dim_x,
+                        &mut wt,
+                        &mut wf,
+                        &mut sc,
+                    );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
+                    ax_rep = Some(build_full_axis_ppm(&fid.axis_x, sc.len()));
+                    sample_x.push(conj_trace_for_ops(&sc));
+                }
+            }
+            if let Some(ax_x_full) = ax_rep {
+                let mut cfg_direct = ap_cfg.clone();
+                if dim_x.remove_digital_filter && dim_x.group_delay > 0.0 {
+                    cfg_direct.max_abs_p1_deg = cfg_direct.max_abs_p1_deg.min(18.0);
+                }
+                let sol = auto_phase_direct_nd(&sample_x, &ax_x_full, &cfg_direct);
+                (sol.p0_deg, sol.p1_deg)
+            } else {
+                (0.0, 0.0)
+            }
+        }
+        (None, None, _) => {
+            let first_idx = fid
+                .nus_mask
+                .as_ref()
+                .and_then(|m| m.iter().position(|&b| b))
+                .unwrap_or(0);
+            let fk2 = first_idx / n1;
+            let fk1 = first_idx % n1;
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut rep_spec = Vec::new();
+            transform_trace_steps_1_to_5(
+                fid.trace(fk2, 0, fk1, 0),
+                &fid.axis_x,
+                &dim_x,
+                &mut wt,
+                &mut wf,
+                &mut rep_spec,
+            );
+            apply_optional_hilbert_proc_sign(&mut rep_spec, dim_x.hilbert);
+            let ax_rep = build_full_axis_ppm(&fid.axis_x, rep_spec.len());
+            resolve_dim_phase(&dim_x, &ax_rep, &rep_spec)
+        }
     };
     recipe.dims[0].p0_deg = Some(p0_x);
     recipe.dims[0].p1_deg = Some(p1_x);
@@ -2217,6 +2555,7 @@ pub fn process_fid_3d_mut(
                     &mut wf,
                     &mut sc,
                 );
+                apply_optional_hilbert_proc_sign(&mut sc, dim_x.hilbert);
                 real_full.resize(sc.len(), 0.0);
                 apply_phase_and_discard_imag(&sc, p0_x, p1_x, &mut real_full);
                 dst.copy_from_slice(&real_full[x0..=x1]);
@@ -2238,15 +2577,247 @@ pub fn process_fid_3d_mut(
     let (z0, z1, axis_z_out) = compute_axis_roi(&full_axis_z, dim_z.roi_ppm)?;
     let ny_out = axis_y_out.size;
     let nz_out = axis_z_out.size;
+    let nus_cfg = recipe.nus.clone().unwrap_or_default();
 
-    let (p0_y, p1_y) = (dim_y.p0_deg.unwrap_or(0.0), dim_y.p1_deg.unwrap_or(0.0));
-    let (p0_z, p1_z) = (dim_z.p0_deg.unwrap_or(0.0), dim_z.p1_deg.unwrap_or(0.0));
+    let need_auto_y = dim_y.p0_deg.is_none()
+        && dim_y.p1_deg.is_none()
+        && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
+    let need_auto_z = dim_z.p0_deg.is_none()
+        && dim_z.p1_deg.is_none()
+        && !matches!(dim_z.phase_source, PhaseSource::DefaultZero);
+
+    let (mut p0_y, p1_y) = (dim_y.p0_deg.unwrap_or(0.0), dim_y.p1_deg.unwrap_or(0.0));
+    let (mut p0_z, p1_z) = (dim_z.p0_deg.unwrap_or(0.0), dim_z.p1_deg.unwrap_or(0.0));
+
+    let (p0_y_solved, p1_y_solved, p0_z_solved, p1_z_solved) = if need_auto_y || need_auto_z {
+        // Select up to 24 distinct `1H` peak-apex planes `ix` to solve indirect phases `(dim_y, dim_z)`
+        let mut ix_energy = vec![0.0_f64; nx_out];
+        for k2 in 0..n2 {
+            for k1 in 0..n1 {
+                let b00 = (((k2 * 2) * n1 + k1) * 2) * nx_out;
+                let b01 = b00 + nx_out;
+                let b10 = (((k2 * 2 + 1) * n1 + k1) * 2) * nx_out;
+                let b11 = b10 + nx_out;
+                for ix in 0..nx_out {
+                    let q0 = direct_cropped[b00 + ix];
+                    let q1 = direct_cropped[b01 + ix];
+                    let q2 = direct_cropped[b10 + ix];
+                    let q3 = direct_cropped[b11 + ix];
+                    ix_energy[ix] += q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3;
+                }
+            }
+        }
+        let sel_ix = select_apex_indices(&ix_energy, 3, 24);
+        let n_sel = sel_ix.len();
+        let mut sel_quads = vec![vec![[0.0_f64; 4]; n2 * n1]; n_sel];
+        parallel_chunks_mut(
+            &mut sel_quads,
+            default_chunk_size(n_sel),
+            |base_p, chunk| {
+                for (local, qp) in chunk.iter_mut().enumerate() {
+                    let ix = sel_ix[base_p + local];
+                    for k2 in 0..n2 {
+                        for k1 in 0..n1 {
+                            let b00 = (((k2 * 2) * n1 + k1) * 2) * nx_out + ix;
+                            qp[k2 * n1 + k1] = [
+                                direct_cropped[b00],
+                                direct_cropped[b00 + nx_out],
+                                direct_cropped[((k2 * 2 + 1) * n1 + k1) * 2 * nx_out + ix],
+                                direct_cropped[(((k2 * 2 + 1) * n1 + k1) * 2 + 1) * nx_out + ix],
+                            ];
+                        }
+                    }
+                    if let Some(mask) = nus_mask_ref {
+                        *qp = reconstruct_nus_2d_hypercomplex_ist(qp, n2, n1, mask, &nus_cfg);
+                    }
+                }
+            },
+        );
+
+        let (sy0, sy1) = if need_auto_y {
+            let mut cand_y_cols = Vec::new();
+            let mut td_y = vec![[0.0, 0.0]; n1];
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut sc = Vec::new();
+            let mut ax_y_rep: Option<AxisPpm> = None;
+            for k2 in 0..n2.min(4) {
+                for qp in &sel_quads {
+                    for k1 in 0..n1 {
+                        let q = qp[k2 * n1 + k1];
+                        td_y[k1] = [q[0], q[1]];
+                    }
+                    transform_trace_steps_1_to_5(
+                        &td_y,
+                        &fid.axis_y,
+                        &dim_y,
+                        &mut wt,
+                        &mut wf,
+                        &mut sc,
+                    );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
+                    if ax_y_rep.is_none() {
+                        ax_y_rep = Some(build_full_axis_ppm(&fid.axis_y, sc.len()));
+                    }
+                    cand_y_cols.push(conj_trace_for_ops(&sc));
+                }
+            }
+            if let Some(ax_y_full) = ax_y_rep {
+                let sol = auto_phase_indirect_nd(&cand_y_cols, &ax_y_full, &ap_cfg);
+                (sol.p0_deg, sol.p1_deg)
+            } else {
+                (0.0, 0.0)
+            }
+        } else {
+            (p0_y, p1_y)
+        };
+
+        let (sz0, sz1) = if need_auto_z {
+            // Transform `dim_y` across the `n_sel` apex planes using `(sy0, sy1)` and select top `(plane, iy)` ridges
+            let mut sel_after_y = vec![vec![0.0_f64; n2 * 2 * ny_out]; n_sel];
+            let mut td_y = vec![[0.0, 0.0]; n1];
+            let mut wt = Vec::new();
+            let mut wf = Vec::new();
+            let mut sc = Vec::new();
+            let mut real_full = Vec::new();
+            for (pi, qp) in sel_quads.iter().enumerate() {
+                let ay = &mut sel_after_y[pi];
+                for k2 in 0..n2 {
+                    for k1 in 0..n1 {
+                        let q = qp[k2 * n1 + k1];
+                        td_y[k1] = [q[0], q[1]];
+                    }
+                    transform_trace_steps_1_to_5(
+                        &td_y,
+                        &fid.axis_y,
+                        &dim_y,
+                        &mut wt,
+                        &mut wf,
+                        &mut sc,
+                    );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
+                    real_full.resize(sc.len(), 0.0);
+                    apply_phase_and_discard_imag(&sc, sy0, sy1, &mut real_full);
+                    if let Some(ref bc) = dim_y.baseline {
+                        subtract_polynomial_baseline(&mut real_full, bc);
+                    }
+                    ay[(k2 * 2) * ny_out..(k2 * 2 + 1) * ny_out]
+                        .copy_from_slice(&real_full[y0..=y1]);
+
+                    for k1 in 0..n1 {
+                        let q = qp[k2 * n1 + k1];
+                        td_y[k1] = [q[2], q[3]];
+                    }
+                    transform_trace_steps_1_to_5(
+                        &td_y,
+                        &fid.axis_y,
+                        &dim_y,
+                        &mut wt,
+                        &mut wf,
+                        &mut sc,
+                    );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
+                    real_full.resize(sc.len(), 0.0);
+                    apply_phase_and_discard_imag(&sc, sy0, sy1, &mut real_full);
+                    if let Some(ref bc) = dim_y.baseline {
+                        subtract_polynomial_baseline(&mut real_full, bc);
+                    }
+                    ay[(k2 * 2 + 1) * ny_out..(k2 * 2 + 2) * ny_out]
+                        .copy_from_slice(&real_full[y0..=y1]);
+                }
+            }
+
+            let mut ridges: Vec<(f64, usize, usize)> = Vec::new();
+            let mut y_col_e = vec![0.0_f64; ny_out];
+            for (pi, ay) in sel_after_y.iter().enumerate() {
+                for iy in 0..ny_out {
+                    let mut e = 0.0;
+                    for k2 in 0..n2 {
+                        let re = ay[(k2 * 2) * ny_out + iy];
+                        let im = ay[(k2 * 2 + 1) * ny_out + iy];
+                        e += re * re + im * im;
+                    }
+                    y_col_e[iy] = e;
+                }
+                for iy in 1..ny_out.saturating_sub(1) {
+                    let e0 = y_col_e[iy];
+                    if e0 > 0.0 && e0 >= y_col_e[iy - 1] && e0 >= y_col_e[iy + 1] {
+                        ridges.push((e0, pi, iy));
+                    }
+                }
+            }
+            ridges.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let mut chosen_ridges: Vec<(usize, usize)> = Vec::new();
+            for &(_, pi, iy) in &ridges {
+                if chosen_ridges
+                    .iter()
+                    .all(|&(qp, qy)| qp != pi || iy.abs_diff(qy) >= 2)
+                {
+                    chosen_ridges.push((pi, iy));
+                    if chosen_ridges.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+            if chosen_ridges.len() < 4 {
+                for (pi, ay) in sel_after_y.iter().enumerate() {
+                    for iy in 0..ny_out {
+                        let mut e = 0.0;
+                        for k2 in 0..n2 {
+                            let re = ay[(k2 * 2) * ny_out + iy];
+                            let im = ay[(k2 * 2 + 1) * ny_out + iy];
+                            e += re * re + im * im;
+                        }
+                        ridges.push((e, pi, iy));
+                    }
+                }
+                ridges.sort_by(|a, b| b.0.total_cmp(&a.0));
+                chosen_ridges = ridges
+                    .into_iter()
+                    .take(64)
+                    .map(|(_, p, y)| (p, y))
+                    .collect();
+            }
+
+            let mut cand_z_cols = Vec::with_capacity(chosen_ridges.len());
+            let mut td_z = vec![[0.0, 0.0]; n2];
+            let mut ax_z_rep: Option<AxisPpm> = None;
+            for (pi, iy) in chosen_ridges {
+                let ay = &sel_after_y[pi];
+                for k2 in 0..n2 {
+                    td_z[k2] = [ay[(k2 * 2) * ny_out + iy], ay[(k2 * 2 + 1) * ny_out + iy]];
+                }
+                transform_trace_steps_1_to_5(&td_z, &fid.axis_z, &dim_z, &mut wt, &mut wf, &mut sc);
+                apply_optional_hilbert_proc_sign(&mut sc, dim_z.hilbert);
+                if ax_z_rep.is_none() {
+                    ax_z_rep = Some(build_full_axis_ppm(&fid.axis_z, sc.len()));
+                }
+                cand_z_cols.push(conj_trace_for_ops(&sc));
+            }
+            if let Some(ax_z_full) = ax_z_rep {
+                let sol = auto_phase_indirect_nd(&cand_z_cols, &ax_z_full, &ap_cfg);
+                (sol.p0_deg, sol.p1_deg)
+            } else {
+                (0.0, 0.0)
+            }
+        } else {
+            (p0_z, p1_z)
+        };
+
+        (sy0, sy1, sz0, sz1)
+    } else {
+        (p0_y, p1_y, p0_z, p1_z)
+    };
+
+    p0_y = p0_y_solved;
+    p0_z = p0_z_solved;
+    let p1_y = p1_y_solved;
+    let p1_z = p1_z_solved;
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
     recipe.dims[2].p0_deg = Some(p0_z);
     recipe.dims[2].p1_deg = Some(p1_z);
 
-    let nus_cfg = recipe.nus.clone().unwrap_or_default();
     let plane_out_elems = nz_out * ny_out;
     let mut planes_by_x = vec![0.0_f32; nx_out * plane_out_elems];
 
@@ -2307,6 +2878,7 @@ pub fn process_fid_3d_mut(
                         &mut wf,
                         &mut sc,
                     );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
                     real_full.resize(sc.len(), 0.0);
                     apply_phase_and_discard_imag(&sc, p0_y, p1_y, &mut real_full);
                     if let Some(ref bc) = dim_y.baseline {
@@ -2328,6 +2900,7 @@ pub fn process_fid_3d_mut(
                         &mut wf,
                         &mut sc,
                     );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_y.hilbert);
                     real_full.resize(sc.len(), 0.0);
                     apply_phase_and_discard_imag(&sc, p0_y, p1_y, &mut real_full);
                     if let Some(ref bc) = dim_y.baseline {
@@ -2353,6 +2926,7 @@ pub fn process_fid_3d_mut(
                         &mut wf,
                         &mut sc,
                     );
+                    apply_optional_hilbert_proc_sign(&mut sc, dim_z.hilbert);
                     real_full.resize(sc.len(), 0.0);
                     apply_phase_and_discard_imag(&sc, p0_z, p1_z, &mut real_full);
                     if let Some(ref bc) = dim_z.baseline {
@@ -2373,7 +2947,7 @@ pub fn process_fid_3d_mut(
     let swap_yz = axis_y_out.label.contains('C') && axis_z_out.label.contains('N');
     let run_x_baseline = !(dim_x.roi_ppm.is_none() && dim_x.remove_digital_filter);
 
-    if !swap_yz {
+    let mut out_spec = if !swap_yz {
         let mut data = vec![0.0_f32; nz_out * ny_out * nx_out];
         for ix in 0..nx_out {
             let src = &planes_by_x[ix * plane_out_elems..(ix + 1) * plane_out_elems];
@@ -2406,14 +2980,14 @@ pub fn process_fid_3d_mut(
                 );
             }
         }
-        Ok(Spectrum3D {
+        Spectrum3D {
             name: fid.name.clone(),
             exp: exp.to_string(),
             axis_x: axis_x_out,
             axis_y: axis_y_out,
             axis_z: axis_z_out,
             data,
-        })
+        }
     } else {
         // Transpose `(iz_n, iy_c)` -> `(iz_new = iy_c, iy_new = iz_n)`
         let new_ny = nz_out;
@@ -2449,15 +3023,26 @@ pub fn process_fid_3d_mut(
                 );
             }
         }
-        Ok(Spectrum3D {
+        Spectrum3D {
             name: fid.name.clone(),
             exp: exp.to_string(),
             axis_x: axis_x_out,
             axis_y: axis_z_out,
             axis_z: axis_y_out,
             data,
-        })
+        }
+    };
+
+    if ap_cfg.polarity == PolarityMode::Biphasic
+        && (any_dim_auto || need_auto_y || need_auto_z)
+        && lock_biphasic_ca_polarity_3d(&mut out_spec, ap_cfg.biphasic_pos_band_ppm)
+    {
+        let flip_dim = if swap_yz { 1 } else { 2 };
+        let cur = recipe.dims[flip_dim].p0_deg.unwrap_or(0.0);
+        recipe.dims[flip_dim].p0_deg = Some(wrap_deg_180(cur + 180.0));
     }
+
+    Ok(out_spec)
 }
 
 /// Convenience helper: read and process a 2D FID directory, returning `(Spectrum2D, resolved ProcessingRecipe)`.

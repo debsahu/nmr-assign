@@ -20,7 +20,9 @@ use std::time::Instant;
 
 use nmr_core::evaluate::to_reference;
 use nmr_core::peaks::Peak;
-use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
+use nmr_core::picker::{
+    corroborated_re_pick_3d, pick_hsqc_2d, CorroboratedRepickConfig, PickerConfig, StripBank3D,
+};
 use nmr_core::priors::ShiftOffsets;
 use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
 use nmr_core::solver::ScoreConfig;
@@ -1127,12 +1129,13 @@ fn inspect_varian_dir(dir: &Path, rel_path: &str) -> Option<CandidateFidInspecti
         let reffrq = pp.first_f64(reffrq_key).unwrap_or(0.0);
         let axis_ch = axis_chars.get(slot).copied();
 
-        // Determine channel (`d` -> dn/dfrq, `2` -> dn2/dfrq2, `3` -> dn3/dfrq3)
+        // Determine channel (`d` -> dn/dfrq, `2` -> dn2/dfrq2, `3` -> dn3/dfrq3).
+        // Prefer hardware synthesizer frequency `chan_frq` (`dfrq`/`dfrq2`) over `reffrq*`,
+        // which in legacy VnmrJ `procpar` files is occasionally left at the 1H frequency.
         let (chan_nuc_raw, chan_frq) = match axis_ch {
             Some('d') | Some('1') => (dn, dfrq),
             Some('2') => (dn2, dfrq2),
             Some('3') => (dn3, dfrq3),
-            _ if reffrq > 1.0 => ("", reffrq),
             _ => {
                 // BioPack standard: in 2D `gNhsqc`, `ni` (`sw1 ~ 1200..3500 Hz`) is `N15` (`dn2`) when `dn=C13`,
                 // whereas in 3D (`ghncacb`, `ghnco`), `ni` (`sw1`) is `C13` (`dn`) and `ni2` (`sw2`) is `N15` (`dn2`).
@@ -1156,13 +1159,13 @@ fn inspect_varian_dir(dir: &Path, rel_path: &str) -> Option<CandidateFidInspecti
 
         let nuc = normalize_nucleus_code(
             chan_nuc_raw,
-            if reffrq > 1.0 { reffrq } else { chan_frq },
+            if chan_frq > 1.0 { chan_frq } else { reffrq },
             h_mhz,
         );
-        let obs = if reffrq > 1.0 {
-            reffrq
-        } else if chan_frq > 1.0 {
+        let obs = if chan_frq > 1.0 {
             chan_frq
+        } else if reffrq > 1.0 {
+            reffrq
         } else if nuc == "13C" {
             h_mhz * 0.25144953
         } else if nuc == "15N" {
@@ -1757,12 +1760,13 @@ pub fn run_real_benchmark_with_loaders(
         let mut entry_failed_diag: Option<EntryFailureDiagnostic> = None;
 
         // 4. Process each 3D triple-resonance raw FID one cube at a time & pick strips
+        let mut strip_bank = StripBank3D::new();
         for texp in &triple_exps {
             let is_required =
                 required_set.is_empty() || required_set.contains(texp.exp_type.as_str());
             match load_fid_3d(&texp.dir, &texp.exp_type) {
                 Ok(spec3d) => {
-                    let pks = pick_triple_3d(&spec3d, &roots, &picker_cfg);
+                    let pks = strip_bank.pick_and_record_3d(&spec3d, &roots, &picker_cfg);
                     all_peaks.extend(pks);
                     used_exps.push((texp.exp_type.clone(), texp.rel_path.clone()));
                 }
@@ -1793,6 +1797,16 @@ pub fn run_real_benchmark_with_loaders(
                 outcome: EntryBenchmarkOutcome::Failed(diag),
             });
             continue;
+        }
+
+        if used_exps.len() >= 3 && !roots.is_empty() {
+            all_peaks.extend(corroborated_re_pick_3d(
+                &strip_bank,
+                &roots,
+                &all_peaks,
+                &picker_cfg,
+                &CorroboratedRepickConfig::default(),
+            ));
         }
 
         let all_systems_for_eval =

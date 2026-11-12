@@ -45,7 +45,10 @@ use nmr_core::octet_render::{
     render_scene_pdf, render_scene_png, render_scene_svg, DocumentStyle, JournalStyle, RenderScene,
 };
 use nmr_core::peaks::{read_peaks, write_peaks, Peak, EXPERIMENT_NAMES};
-use nmr_core::picker::{pick_c13_hsqc_2d, pick_hsqc_2d, pick_triple_3d, PickerConfig};
+use nmr_core::picker::{
+    corroborated_re_pick_3d, pick_c13_hsqc_2d, pick_hsqc_2d, CorroboratedRepickConfig,
+    PickerConfig, StripBank3D,
+};
 use nmr_core::priors::{compute_priors, one_to_three, Priors, ShiftOffsets};
 use nmr_core::process::{process_fid_2d_mut, process_fid_3d_mut, ProcessingRecipe};
 use nmr_core::report::{
@@ -103,19 +106,19 @@ fn usage() -> String {
        nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--solver standard|evo-graph] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
        nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
-       nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp]\n\
+       nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
        nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
-       nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
+       nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
        nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--recipe <json>] [--no-crop] [--lp] [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver standard|evo-graph] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
@@ -906,6 +909,12 @@ struct FidCliOpts {
     crop_h: Option<[f64; 2]>,
     no_crop: bool,
     lp: bool,
+    auto_phase: bool,
+    phase_x: Option<(f64, f64)>,
+    phase_y: Option<(f64, f64)>,
+    phase_z: Option<(f64, f64)>,
+    hilbert: bool,
+    nus_fista: Option<bool>,
 }
 
 fn parse_crop_h_arg(raw: &str) -> Result<[f64; 2], String> {
@@ -923,7 +932,38 @@ fn parse_crop_h_arg(raw: &str) -> Result<[f64; 2], String> {
     Ok([v0.min(v1), v0.max(v1)])
 }
 
+fn parse_phase_pair_arg(raw: &str, flag: &str) -> Result<(f64, f64), String> {
+    let (a, b) = raw.split_once([':', ',']).ok_or_else(|| {
+        format!("expected P0:P1 degrees for {flag} (e.g. -45.0:180.0), got {raw:?}")
+    })?;
+    let p0: f64 = a
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid {flag} zero-order phase {a:?}: {e}"))?;
+    let p1: f64 = b
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid {flag} first-order phase {b:?}: {e}"))?;
+    if !p0.is_finite() || !p1.is_finite() {
+        return Err(format!("non-finite phase value in {flag}={raw:?}"));
+    }
+    Ok((p0, p1))
+}
+
+fn parse_nus_method_arg(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fista" => Ok(true),
+        "ist" => Ok(false),
+        other => Err(format!(
+            "unknown --nus-method {other:?}; expected fista or ist"
+        )),
+    }
+}
+
 fn build_recipe_for_fid_2d(fid: &Fid2D, opts: &FidCliOpts) -> Result<ProcessingRecipe, String> {
+    if opts.phase_z.is_some() {
+        return Err("--phase-z cannot be applied to a 2D FID".to_string());
+    }
     let mut recipe = match &opts.recipe_path {
         Some(rp) => ProcessingRecipe::read_json(rp)?,
         None => ProcessingRecipe::from_fid_2d(fid),
@@ -936,6 +976,25 @@ fn build_recipe_for_fid_2d(fid: &Fid2D, opts: &FidCliOpts) -> Result<ProcessingR
     }
     if opts.lp {
         recipe.set_linear_prediction(true);
+    }
+    if opts.auto_phase {
+        recipe.set_auto_phase();
+    }
+    if let Some((p0, p1)) = opts.phase_x {
+        if let Some(dim_x) = recipe.dims.get_mut(0) {
+            dim_x.set_explicit_phase(p0, p1);
+        }
+    }
+    if let Some((p0, p1)) = opts.phase_y {
+        if let Some(dim_y) = recipe.dims.get_mut(1) {
+            dim_y.set_explicit_phase(p0, p1);
+        }
+    }
+    if opts.hilbert {
+        recipe.set_hilbert(true);
+    }
+    if let Some(fista) = opts.nus_fista {
+        recipe.set_nus_method_fista(fista);
     }
     Ok(recipe)
 }
@@ -953,6 +1012,30 @@ fn build_recipe_for_fid_3d(fid: &Fid3D, opts: &FidCliOpts) -> Result<ProcessingR
     }
     if opts.lp {
         recipe.set_linear_prediction(true);
+    }
+    if opts.auto_phase {
+        recipe.set_auto_phase();
+    }
+    if let Some((p0, p1)) = opts.phase_x {
+        if let Some(dim_x) = recipe.dims.get_mut(0) {
+            dim_x.set_explicit_phase(p0, p1);
+        }
+    }
+    if let Some((p0, p1)) = opts.phase_y {
+        if let Some(dim_y) = recipe.dims.get_mut(1) {
+            dim_y.set_explicit_phase(p0, p1);
+        }
+    }
+    if let Some((p0, p1)) = opts.phase_z {
+        if let Some(dim_z) = recipe.dims.get_mut(2) {
+            dim_z.set_explicit_phase(p0, p1);
+        }
+    }
+    if opts.hilbert {
+        recipe.set_hilbert(true);
+    }
+    if let Some(fista) = opts.nus_fista {
+        recipe.set_nus_method_fista(fista);
     }
     Ok(recipe)
 }
@@ -1026,6 +1109,35 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
             }
             "--no-crop" => opts.no_crop = true,
             "--lp" => opts.lp = true,
+            "--auto-phase" => opts.auto_phase = true,
+            "--phase-x" => {
+                i += 1;
+                opts.phase_x = Some(parse_phase_pair_arg(
+                    args.get(i).ok_or("missing value for --phase-x")?,
+                    "--phase-x",
+                )?);
+            }
+            "--phase-y" => {
+                i += 1;
+                opts.phase_y = Some(parse_phase_pair_arg(
+                    args.get(i).ok_or("missing value for --phase-y")?,
+                    "--phase-y",
+                )?);
+            }
+            "--phase-z" => {
+                i += 1;
+                opts.phase_z = Some(parse_phase_pair_arg(
+                    args.get(i).ok_or("missing value for --phase-z")?,
+                    "--phase-z",
+                )?);
+            }
+            "--hilbert" => opts.hilbert = true,
+            "--nus-method" => {
+                i += 1;
+                opts.nus_fista = Some(parse_nus_method_arg(
+                    args.get(i).ok_or("missing value for --nus-method")?,
+                )?);
+            }
             other => return Err(format!("unknown process flag {other:?}")),
         }
         i += 1;
@@ -1168,8 +1280,18 @@ fn pick_in_memory_spectra(
                 None => Vec::new(),
             };
             let mut all = r.clone();
+            let mut strip_bank = StripBank3D::new();
             for (_exp, s3) in triples {
-                all.extend(pick_triple_3d(s3, &r, &cfg));
+                all.extend(strip_bank.pick_and_record_3d(s3, &r, &cfg));
+            }
+            if triples.len() >= 2 && !r.is_empty() {
+                all.extend(corroborated_re_pick_3d(
+                    &strip_bank,
+                    &r,
+                    &all,
+                    &cfg,
+                    &CorroboratedRepickConfig::default(),
+                ));
             }
             Ok((r, all, "classical".to_string()))
         }
@@ -1394,6 +1516,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
             }
             "--no-crop" => fid_opts.no_crop = true,
             "--lp" => fid_opts.lp = true,
+            "--auto-phase" => fid_opts.auto_phase = true,
             "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
@@ -2478,6 +2601,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
             "--no-crop" => fid_opts.no_crop = true,
             "--lp" => fid_opts.lp = true,
+            "--auto-phase" => fid_opts.auto_phase = true,
             "--peaks" => {
                 i += 1;
                 peaks_path = args.get(i).map(PathBuf::from);
@@ -4835,6 +4959,326 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         .unwrap();
         assert!(out_pipe_bundle.join("processing_recipe.json").exists());
         assert!(out_pipe_bundle.join("shifts.str").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn write_synthetic_unphased_bruker_hsqc_2d(
+        dir: &Path,
+        peaks_hn: &[(f64, f64)],
+        phi0_x_deg: f64,
+        phi0_y_deg: f64,
+    ) {
+        fs::create_dir_all(dir).unwrap();
+        let td_x = 512usize;
+        let n_x = td_x / 2;
+        let n_y = 64usize;
+        let td_y = n_y * 2;
+
+        let bf1_h = 600.0f64;
+        let carrier_h = 4.7f64;
+        let sw_h_ppm = 12.0f64;
+        let sw_h_hz = sw_h_ppm * bf1_h;
+        let sfo1_h = bf1_h * (1.0 + carrier_h * 1e-6);
+
+        let bf1_n = 60.0f64;
+        let carrier_n = 118.0f64;
+        let sw_n_ppm = 30.0f64;
+        let sfo1_n = bf1_n * (1.0 + carrier_n * 1e-6);
+
+        // Deliberately omit `pdata/1/procs` and `pdata/1/proc2s` to mimic raw BMRB archives.
+        fs::write(dir.join("pulseprogram"), "; synthetic hsqcetfpf3gpsi\n").unwrap();
+        fs::write(
+            dir.join("acqus"),
+            format!(
+                "##TITLE= unphased HSQC\n##$TD= {td_x}\n##$BYTORDA= 0\n##$DTYPA= 0\n##$AQ_mod= 3\n##$SFO1= {sfo1_h:.8}\n##$BF1= {bf1_h:.8}\n##$SW_h= {sw_h_hz:.4}\n##$NUC1= <1H>\n##$GRPDLY= 0.0\n##END=\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("acqu2s"),
+            format!(
+                "##TITLE= unphased F1\n##$TD= {td_y}\n##$FnMODE= 4\n##$SFO1= {sfo1_n:.8}\n##$BF1= {bf1_n:.8}\n##$SW= {sw_n_ppm:.4}\n##$NUC1= <15N>\n##END=\n"
+            ),
+        )
+        .unwrap();
+
+        let mut ser = Vec::with_capacity(td_y * td_x * 4);
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let phi_x = phi0_x_deg.to_radians();
+        let phi_y = phi0_y_deg.to_radians();
+        for ty in 0..td_y {
+            let ky = (ty / 2) as f64;
+            let is_sin_y = (ty % 2) == 1;
+            let dec_y = (-ky / 24.0).exp();
+            for kx in 0..n_x {
+                let kx_f = kx as f64;
+                let dec_x = (-kx_f / 64.0).exp();
+                let mut re = 0.0f64;
+                let mut im = 0.0f64;
+                for &(h_ppm, n_ppm) in peaks_hn {
+                    let fx = (carrier_h - h_ppm) / sw_h_ppm;
+                    let fy = (carrier_n - n_ppm) / sw_n_ppm;
+                    let mod_y = if is_sin_y {
+                        -(two_pi * fy * ky + phi_y).sin()
+                    } else {
+                        (two_pi * fy * ky + phi_y).cos()
+                    };
+                    let amp = 50_000.0 * dec_x * dec_y * mod_y;
+                    re += amp * (two_pi * fx * kx_f + phi_x).cos();
+                    im += -amp * (two_pi * fx * kx_f + phi_x).sin();
+                }
+                ser.extend_from_slice(&(re.round() as i32).to_le_bytes());
+                ser.extend_from_slice(&(im.round() as i32).to_le_bytes());
+            }
+        }
+        fs::write(dir.join("ser"), &ser).unwrap();
+    }
+
+    fn make_cli_test_cube_3d(
+        exp: &str,
+        c_hi: f64,
+        c_lo: f64,
+        gaussians_sigma: &[(f64, f64, f64, f32)],
+    ) -> Spectrum3D {
+        use nmr_core::picker::estimate_noise_mad;
+        use nmr_core::spectrum::AxisPpm;
+
+        let (nx, ny, nz) = (160usize, 64usize, 384usize);
+        let axis_x = AxisPpm::from_bounds("1H", nx, 10.2, 5.8, 600.0);
+        let axis_y = AxisPpm::from_bounds("15N", ny, 130.0, 106.0, 60.0);
+        let axis_z = AxisPpm::from_bounds("13C", nz, c_hi, c_lo, 150.0);
+        let mut data = vec![0.0f32; nx * ny * nz];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (exp.len() as u64 * 0x517C_C1B7_2722_0A95);
+        for v in &mut data {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u1 = (((state >> 40) & 0xFFFF) as f32) / 65536.0 - 0.5;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u2 = (((state >> 40) & 0xFFFF) as f32) / 65536.0 - 0.5;
+            *v = u1 + u2;
+        }
+        let sigma = estimate_noise_mad(&data);
+        for &(h0, n0, c0, snr_mult) in gaussians_sigma {
+            let amp = snr_mult * sigma;
+            let cx = axis_x.ppm_to_index(h0);
+            let cy = axis_y.ppm_to_index(n0);
+            let cz = axis_z.ppm_to_index(c0);
+            for iz in (cz.floor() as isize - 4).max(0) as usize
+                ..=(cz.ceil() as isize + 4).min(nz as isize - 1) as usize
+            {
+                for iy in (cy.floor() as isize - 3).max(0) as usize
+                    ..=(cy.ceil() as isize + 3).min(ny as isize - 1) as usize
+                {
+                    for ix in (cx.floor() as isize - 3).max(0) as usize
+                        ..=(cx.ceil() as isize + 3).min(nx as isize - 1) as usize
+                    {
+                        if (ix as f64 - cx).abs() <= 1.3
+                            && (iy as f64 - cy).abs() <= 1.3
+                            && (iz as f64 - cz).abs() <= 1.3
+                        {
+                            data[(iz * ny + iy) * nx + ix] = 0.0;
+                        }
+                        let dx = (ix as f64 - cx) / 1.45;
+                        let dy = (iy as f64 - cy) / 1.45;
+                        let dz = (iz as f64 - cz) / 1.55;
+                        let g = (-0.5 * (dx * dx + dy * dy + dz * dz)) as f32;
+                        data[(iz * ny + iy) * nx + ix] += amp * g.exp();
+                    }
+                }
+            }
+        }
+        Spectrum3D {
+            name: exp.to_string(),
+            exp: exp.to_string(),
+            axis_x,
+            axis_y,
+            axis_z,
+            data,
+        }
+    }
+
+    #[test]
+    fn test_process_auto_phase_dsp_flags_and_two_pass_corroborated_3d_cli() {
+        let dir = env::temp_dir().join(format!("nmr_cli_phase8_int_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let peaks_hn = [(8.42, 120.5), (7.91, 115.2), (8.76, 124.8), (7.58, 111.4)];
+        let unphased_hsqc = dir.join("unphased_hsqc");
+        write_synthetic_unphased_bruker_hsqc_2d(&unphased_hsqc, &peaks_hn, 68.0, -34.0);
+
+        // 1. `nmrassign process --auto-phase --hilbert --nus-method fista`
+        let auto_dir = dir.join("proc_auto");
+        fs::create_dir_all(&auto_dir).unwrap();
+        let auto_ft2 = auto_dir.join("hsqc_auto.ft2");
+        cmd_process(&[
+            "--in".into(),
+            unphased_hsqc.to_string_lossy().into_owned(),
+            "--out".into(),
+            auto_ft2.to_string_lossy().into_owned(),
+            "--auto-phase".into(),
+            "--hilbert".into(),
+            "--nus-method".into(),
+            "fista".into(),
+        ])
+        .unwrap();
+        let auto_recipe =
+            ProcessingRecipe::read_json(auto_dir.join("processing_recipe.json")).unwrap();
+        assert_eq!(
+            auto_recipe.dims[0].phase_source,
+            nmr_core::process::PhaseSource::Auto
+        );
+        assert!(auto_recipe.dims[0].hilbert);
+        assert_eq!(
+            auto_recipe.nus.as_ref().map(|n| n.fista_momentum),
+            Some(true)
+        );
+        let auto_spec = read_nmrpipe_2d(&auto_ft2).unwrap();
+        let auto_pks = pick_hsqc_2d(&auto_spec, &PickerConfig::default());
+        for &(h0, n0) in &peaks_hn {
+            assert!(
+                auto_pks
+                    .iter()
+                    .any(|p| (p.h - h0).abs() < 0.12 && (p.n - n0).abs() < 0.75),
+                "blind 2D auto-phased HSQC missed ({h0}, {n0}); picked={auto_pks:?}"
+            );
+        }
+
+        // 2. Explicit `--phase-x`, `--phase-y`, `--nus-method ist`, and 2D `--phase-z` rejection
+        let exp_dir = dir.join("proc_explicit");
+        fs::create_dir_all(&exp_dir).unwrap();
+        let exp_ft2 = exp_dir.join("hsqc_exp.ft2");
+        cmd_process(&[
+            "--in".into(),
+            unphased_hsqc.to_string_lossy().into_owned(),
+            "--out".into(),
+            exp_ft2.to_string_lossy().into_owned(),
+            "--phase-x".into(),
+            "-68.0:0.0".into(),
+            "--phase-y".into(),
+            "34.0:0.0".into(),
+            "--nus-method".into(),
+            "ist".into(),
+        ])
+        .unwrap();
+        let exp_recipe =
+            ProcessingRecipe::read_json(exp_dir.join("processing_recipe.json")).unwrap();
+        assert_eq!(
+            exp_recipe.dims[0].phase_source,
+            nmr_core::process::PhaseSource::Explicit
+        );
+        assert_eq!(
+            exp_recipe.nus.as_ref().map(|n| n.fista_momentum),
+            Some(false)
+        );
+        assert!(
+            cmd_process(&[
+                "--in".into(),
+                unphased_hsqc.to_string_lossy().into_owned(),
+                "--out".into(),
+                exp_ft2.to_string_lossy().into_owned(),
+                "--phase-z".into(),
+                "0.0:0.0".into(),
+            ])
+            .is_err(),
+            "expected --phase-z on a 2D FID to return an error"
+        );
+
+        // 3. End-to-end two-pass corroborated 3D re-picking via `nmrassign pick --auto-phase`:
+        //    First pick 2D roots via `cmd_pick --fid <unphased_hsqc> --auto-phase` so the 3D cubes
+        //    share the exact root coordinates produced by `cmd_pick --auto-phase`.
+        let roots_tsv = dir.join("roots_2d.tsv");
+        cmd_pick(&[
+            "--fid".into(),
+            unphased_hsqc.to_string_lossy().into_owned(),
+            "--auto-phase".into(),
+            "--method".into(),
+            "classical".into(),
+            "--snr".into(),
+            "5.0".into(),
+            "-o".into(),
+            roots_tsv.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let roots_2d = read_peaks(&roots_tsv).unwrap();
+        let r0 = roots_2d
+            .iter()
+            .find(|p| (p.h - 8.42).abs() < 0.12 && (p.n - 120.5).abs() < 0.75)
+            .unwrap();
+        let hnca_ft3 = dir.join("hnca.ft3");
+        let cbcaconh_ft3 = dir.join("cbcaconh.ft3");
+        let hnca_cube = make_cli_test_cube_3d(
+            "HNCA",
+            68.0,
+            44.0,
+            &[(r0.h, r0.n, 56.2, 4.8), (r0.h, r0.n, 63.8, 4.9)],
+        );
+        let cbcaconh_cube = make_cli_test_cube_3d(
+            "CBCACONH",
+            72.0,
+            16.0,
+            &[(r0.h, r0.n, 56.2, 16.0), (r0.h, r0.n, 31.4, 15.0)],
+        );
+        write_nmrpipe_3d(&hnca_ft3, &hnca_cube).unwrap();
+        write_nmrpipe_3d(&cbcaconh_ft3, &cbcaconh_cube).unwrap();
+
+        let single_tsv = dir.join("single_3d.tsv");
+        cmd_pick(&[
+            "--fid-hsqc".into(),
+            unphased_hsqc.to_string_lossy().into_owned(),
+            "--triple".into(),
+            format!("HNCA={}", hnca_ft3.display()),
+            "--auto-phase".into(),
+            "--method".into(),
+            "classical".into(),
+            "--snr".into(),
+            "5.5".into(),
+            "-o".into(),
+            single_tsv.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let single_pks = read_peaks(&single_tsv).unwrap();
+        assert_eq!(
+            single_pks.iter().filter(|p| p.exp == "HNCA").count(),
+            0,
+            "single-experiment pick at --snr 5.5 must not pick 4.8-sigma peaks without corroboration"
+        );
+
+        let bundle_tsv = dir.join("corroborated_bundle.tsv");
+        cmd_pick(&[
+            "--fid-hsqc".into(),
+            unphased_hsqc.to_string_lossy().into_owned(),
+            "--triple".into(),
+            format!("HNCA={}", hnca_ft3.display()),
+            "--triple".into(),
+            format!("CBCACONH={}", cbcaconh_ft3.display()),
+            "--auto-phase".into(),
+            "--method".into(),
+            "classical".into(),
+            "--snr".into(),
+            "5.5".into(),
+            "-o".into(),
+            bundle_tsv.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let bundle_pks = read_peaks(&bundle_tsv).unwrap();
+        let hnca_pks: Vec<&Peak> = bundle_pks.iter().filter(|p| p.exp == "HNCA").collect();
+        assert!(
+            hnca_pks
+                .iter()
+                .any(|p| p.c.is_some_and(|c| (c - 56.2).abs() < 0.6)),
+            "two-pass corroborated 3D picker failed to rescue 4.1-sigma HNCA CA peak at 56.2 ppm; got {hnca_pks:?}"
+        );
+        assert!(
+            !hnca_pks
+                .iter()
+                .any(|p| p.c.is_some_and(|c| (c - 63.8).abs() < 0.8)),
+            "two-pass corroborated 3D picker falsely rescued uncorroborated 63.8 ppm decoy: {hnca_pks:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

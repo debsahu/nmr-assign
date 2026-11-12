@@ -1240,6 +1240,216 @@ pub fn read_bruker_fid_1d(dir: impl AsRef<Path>) -> Result<Fid1D, String> {
     })
 }
 
+fn read_optional_bruker_pulseprogram(dir: &Path) -> Option<String> {
+    find_file_ci(dir, "pulseprogram")
+        .or_else(|| find_file_ci(dir, "pulseprogram.precomp"))
+        .and_then(|p| fs::read_to_string(p).ok())
+}
+
+fn contains_word_token(line: &str, word: &str) -> bool {
+    let bytes = line.as_bytes();
+    let wb = word.as_bytes();
+    if wb.is_empty() || bytes.len() < wb.len() {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut pos = 0usize;
+    while pos + wb.len() <= bytes.len() {
+        if let Some(rel) = line[pos..].find(word) {
+            let start = pos + rel;
+            let end = start + wb.len();
+            let left_ok = start == 0 || !is_ident(bytes[start - 1]);
+            let right_ok = end == bytes.len() || !is_ident(bytes[end]);
+            if left_ok && right_ok {
+                return true;
+            }
+            pos = start + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Extract `(reg_num, step_sign)` from `ip<k>` (`+1`) or `dp<k>` (`-1`) tokens WITHOUT `*`
+/// (`ip<m>*2` / `dp<m>*2` are `180 deg` axial-peak toggles rather than `90 deg` States quadrature).
+fn extract_90deg_ip_dp_token(line: &str) -> Option<(usize, i32)> {
+    for raw_tok in line.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';' | ':' | '+' | '-' | '=')
+    }) {
+        if raw_tok.contains('*') {
+            continue;
+        }
+        if let Some(num_str) = raw_tok.strip_prefix("ip") {
+            if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(reg) = num_str.parse::<usize>() {
+                    return Some((reg, 1));
+                }
+            }
+        } else if let Some(num_str) = raw_tok.strip_prefix("dp") {
+            if !num_str.is_empty() && num_str.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(reg) = num_str.parse::<usize>() {
+                    return Some((reg, -1));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract `(reg_num, step_sign)` from TopSpin `F1PH(calph(ph<k>, +90), ...)` or `F2PH(...)`.
+fn extract_calph_90deg_macro(text: &str, macro_prefix: &str) -> Option<(usize, i32)> {
+    let idx = text.find(macro_prefix)?;
+    let tail = &text[idx + macro_prefix.len()..];
+    let cidx = tail.find("calph(")?;
+    let inner = &tail[cidx + "calph(".len()..];
+    let end = inner.find(')')?;
+    let args = &inner[..end];
+    let (ph_part, deg_part) = args.split_once(',')?;
+    let reg = ph_part
+        .trim()
+        .strip_prefix("ph")?
+        .trim()
+        .parse::<usize>()
+        .ok()?;
+    let deg: i32 = deg_part.trim().trim_start_matches('+').parse().ok()?;
+    match deg.rem_euclid(360) {
+        90 => Some((reg, 1)),
+        270 => Some((reg, -1)),
+        _ => None,
+    }
+}
+
+/// Infer Bruker indirect `##$REVERSE` from spin-physics phase incrementation in `pulseprogram`
+/// when `pdata/1/proc2s` or `proc3s` is absent (States, Haberkorn & Ruben *J. Magn. Reson.* **1982**,
+/// 48, 286–292; Marion et al. *J. Magn. Reson.* **1989**, 85, 393–399):
+/// - `f_dim == 1`: Bruker `F1` (`acqu2s` in 2D, `acqu3s` in 3D; evolution delay `d0`).
+/// - `f_dim == 2`: Bruker `F2` (`acqu2s` in 3D; evolution delay `d10`).
+pub fn infer_bruker_raw_indirect_reverse(
+    pp_text: Option<&str>,
+    pulprog: &str,
+    f_dim: usize,
+    quad_mode: QuadMode,
+) -> bool {
+    let rev_tag = if f_dim == 1 {
+        "f1 reverse:"
+    } else {
+        "f2 reverse:"
+    };
+    if let Some(txt) = pp_text {
+        for raw_line in txt.lines() {
+            if let Some((_, cmt)) = raw_line.split_once(';') {
+                let low = cmt.trim().to_ascii_lowercase();
+                if let Some(rest) = low.strip_prefix(rev_tag) {
+                    let val = rest.trim();
+                    if val.starts_with("true") || val.starts_with("yes") {
+                        return true;
+                    }
+                    if val.starts_with("false") || val.starts_with("no") {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    if !matches!(quad_mode, QuadMode::States | QuadMode::StatesTppi) {
+        return false;
+    }
+
+    if let Some(txt) = pp_text {
+        let mut rf_lines: Vec<&str> = Vec::new();
+        for raw_line in txt.lines() {
+            let code = raw_line.split(';').next().unwrap_or("").trim();
+            if code.is_empty() || code.starts_with('#') || code.starts_with('"') {
+                continue;
+            }
+            if let Some(rest) = code.strip_prefix("ph") {
+                let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+                if digits_len > 0 && rest[digits_len..].trim_start().starts_with('=') {
+                    break;
+                }
+            }
+            rf_lines.push(code);
+        }
+
+        let macro_name = if f_dim == 1 { "F1PH" } else { "F2PH" };
+        let inc_tok = if f_dim == 1 { "id0" } else { "id10" };
+        let precomp_loop = if f_dim == 1 { "t1loop" } else { "t2loop" };
+
+        let quad_reg_sign = extract_calph_90deg_macro(txt, macro_name)
+            .or_else(|| {
+                // Precompiled TopSpin `d0 = d0orig + t1loop * in0` followed by `MCWRK ip<k> + phval<k>`
+                let lines: Vec<&str> = txt.lines().collect();
+                for (idx, line) in lines.iter().enumerate() {
+                    if line.contains(precomp_loop) {
+                        for follow in lines.iter().skip(idx + 1).take(6) {
+                            let code = follow.split(';').next().unwrap_or("");
+                            if let Some(found) = extract_90deg_ip_dp_token(code) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .or_else(|| {
+                // Classic Avance loop: 2-step quadrature `ip<k>` / `dp<k>` appears immediately before `id0` / `id10`
+                for (idx, line) in rf_lines.iter().enumerate() {
+                    if contains_word_token(line, inc_tok) {
+                        for prev in (0..idx).rev().take(4) {
+                            if contains_word_token(
+                                rf_lines[prev],
+                                if f_dim == 1 { "id10" } else { "id0" },
+                            ) {
+                                break;
+                            }
+                            if let Some(found) = extract_90deg_ip_dp_token(rf_lines[prev]) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+        if let Some((reg, step_sign)) = quad_reg_sign {
+            let ph_tok = format!("ph{reg}");
+            let evo_tok = if f_dim == 1 { "d0" } else { "d10" };
+            let dec_tok = if f_dim == 1 { "d20" } else { "d30" };
+
+            let ph_line = rf_lines
+                .iter()
+                .position(|l| !l.contains("calph") && contains_word_token(l, &ph_tok));
+            let evo_line = rf_lines.iter().position(|l| {
+                !l.starts_with("define ")
+                    && !l.contains("caldel")
+                    && contains_word_token(l, evo_tok)
+            });
+
+            if let (Some(p_idx), Some(e_idx)) = (ph_line, evo_line) {
+                let mut net_sign = step_sign;
+                if p_idx > e_idx {
+                    // Quadrature readout pulse occurs AFTER evolution `t_1`/`t_2`: `cos(omega t + phi)`
+                    net_sign = -net_sign;
+                } else {
+                    // Quadrature excitation pulse occurs BEFORE evolution: check whether a decremented
+                    // semi-constant-time delay (`d30` / `d20`) and `180 deg` refocusing pulse precede `d10`/`d0`
+                    let has_dec_before_evo = rf_lines[p_idx + 1..e_idx]
+                        .iter()
+                        .any(|l| contains_word_token(l, dec_tok));
+                    if has_dec_before_evo {
+                        net_sign = -net_sign;
+                    }
+                }
+                return net_sign < 0;
+            }
+        }
+    }
+
+    f_dim == 2 && pulprog.to_ascii_lowercase().contains("gpwg3d")
+}
+
 /// Read a Bruker 2D `ser` directory (`acqus`, `acqu2s`, and `ser`), automatically detecting uniform vs NUS.
 pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
     let dir = resolve_fid_dir(dir.as_ref())?;
@@ -1286,7 +1496,13 @@ pub fn read_bruker_fid_2d(dir: impl AsRef<Path>) -> Result<Fid2D, String> {
         td_acq_y
     };
 
-    let axis_y = parse_bruker_indirect_axis(&acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
+    let mut axis_y = parse_bruker_indirect_axis(&acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
+    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+        let pp_txt = read_optional_bruker_pulseprogram(&dir);
+        let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+        axis_y.stored_proc.reverse =
+            infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_y.quad_mode);
+    }
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
     } else {
@@ -1583,8 +1799,22 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
         (td_acq_y, td_acq_z)
     };
 
-    let axis_y = parse_bruker_indirect_axis(&acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
-    let axis_z = parse_bruker_indirect_axis(&acqu3s, proc3s.as_ref(), "13C", Some(td_full_z))?;
+    let mut axis_y = parse_bruker_indirect_axis(&acqu2s, proc2s.as_ref(), "15N", Some(td_full_y))?;
+    let mut axis_z = parse_bruker_indirect_axis(&acqu3s, proc3s.as_ref(), "13C", Some(td_full_z))?;
+    if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
+        || proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none()
+    {
+        let pp_txt = read_optional_bruker_pulseprogram(&dir);
+        let pulprog = acqus.get("PULPROG").map(String::as_str).unwrap_or("");
+        if proc2s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+            axis_y.stored_proc.reverse =
+                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 2, axis_y.quad_mode);
+        }
+        if proc3s.as_ref().and_then(|p| p.get("REVERSE")).is_none() {
+            axis_z.stored_proc.reverse =
+                infer_bruker_raw_indirect_reverse(pp_txt.as_deref(), pulprog, 1, axis_z.quad_mode);
+        }
+    }
 
     let q1_mult = if axis_y.quad_mode == QuadMode::Qf {
         1
@@ -2002,50 +2232,31 @@ fn iupac_xi_ratio(nuc_label: &str) -> f64 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Compute Varian/Agilent chemical-shift axis `(obs_mhz, first_ppm)` directly from hardware
+/// spectrometer frequencies (`sfrq`, `dfrq`, `dfrq2`), sample temperature (`temp` in C, default 25 C),
+/// and IUPAC indirect $\Xi$ ratios anchored to ${}^{1}\text{H}$ DSS (Wishart et al., *J. Biomol. NMR* 1995),
+/// ignoring VnmrJ interactive display cursor offsets (`rfl*`, `rfp*`, `reffrq*`) stored in `procpar`.
 fn varian_axis_ppm(
     pp: &HashMap<String, ProcparVal>,
     nuc_label: &str,
     sw_hz: f64,
     carrier_mhz: f64,
     sfrq_1h: f64,
-    rfl_key: &str,
-    rfp_key: &str,
-    reffrq_key: &str,
 ) -> (f64, f64) {
-    let rfl = pp
-        .get(rfl_key)
-        .and_then(ProcparVal::first_f64)
-        .unwrap_or(0.0);
-    let rfp = pp
-        .get(rfp_key)
-        .and_then(ProcparVal::first_f64)
-        .unwrap_or(0.0);
-    let reffrq = pp
-        .get(reffrq_key)
-        .and_then(ProcparVal::first_f64)
-        .filter(|&v| v > 0.0);
-
-    if let Some(rf) = reffrq {
-        if rfl.abs() > 1e-6 || rfp.abs() > 1e-6 {
-            let first_ppm = (sw_hz - rfl + rfp) / rf;
-            return (rf, first_ppm);
-        }
-    }
-
-    // Fallback to IUPAC indirect Xi referencing anchored to 1H water carrier (`temp` in C, default 25 C)
     let temp_c = pp
         .get("temp")
         .and_then(ProcparVal::first_f64)
         .filter(|&t| (-20.0..=100.0).contains(&t))
         .unwrap_or(25.0);
     let h2o_ppm = 4.766 - 0.0119 * (temp_c - 25.0);
+    let bf_1h_hw = sfrq_1h / (1.0 + h2o_ppm * 1.0e-6);
+    // Accept calibrated `H1reffrq` only if consistent within 2.5 ppm of hardware `sfrq_1h`
     let bf_1h = pp
         .get("H1reffrq")
         .and_then(ProcparVal::first_f64)
-        .filter(|&v| v > 0.0)
-        .unwrap_or_else(|| sfrq_1h / (1.0 + h2o_ppm * 1.0e-6));
-    let obs_mhz = reffrq.unwrap_or_else(|| bf_1h * iupac_xi_ratio(nuc_label));
+        .filter(|&v| v > 0.0 && ((v - bf_1h_hw) / bf_1h_hw.max(1.0)).abs() <= 2.5e-6)
+        .unwrap_or(bf_1h_hw);
+    let obs_mhz = bf_1h * iupac_xi_ratio(nuc_label);
     let first_ppm = ((carrier_mhz - obs_mhz) * 1.0e6 + 0.5 * sw_hz) / obs_mhz;
     (obs_mhz, first_ppm)
 }
@@ -2263,7 +2474,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         pp.get("tn").and_then(ProcparVal::first_str).unwrap_or("1H"),
         "1H",
     );
-    let (obs_x, first_ppm_x) = varian_axis_ppm(&pp, &tn, sw, sfrq, sfrq, "rfl", "rfp", "reffrq");
+    let (obs_x, first_ppm_x) = varian_axis_ppm(&pp, &tn, sw, sfrq, sfrq);
 
     let rp = pp.get("rp").and_then(ProcparVal::first_f64);
     let lp = pp.get("lp").and_then(ProcparVal::first_f64);
@@ -2402,9 +2613,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
     let fcoef_1 = parse_varian_fcoef(raw_fcoef_1)?;
     let (qm1, coef1) = parse_varian_phase_array(&pp, "phase", fcoef_1)?;
     let (label_1, carrier_1) = infer_varian_indirect_channel(&pp, 1, sw1);
-    let (obs_1, first_ppm_1) = varian_axis_ppm(
-        &pp, &label_1, sw1, carrier_1, sfrq, "rfl1", "rfp1", "reffrq1",
-    );
+    let (obs_1, first_ppm_1) = varian_axis_ppm(&pp, &label_1, sw1, carrier_1, sfrq);
     let fn1 = pp
         .get("fn1")
         .and_then(ProcparVal::first_f64)
@@ -2422,7 +2631,9 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         first_ppm: first_ppm_1,
         quad_mode: qm1,
         group_delay: 0.0,
-        conjugate_for_fft: false,
+        // VnmrJ `wft2da`/`ft3d` transforms explicit `fcoef` coefficients with `+i` indirect FT,
+        // whereas default States without `fcoef` folds imaginary negation into `[1,0,0,0,0,0,+1,0]`.
+        conjugate_for_fft: fcoef_1.is_some(),
         stored_proc: StoredDimProc {
             p0_deg: pp.get("rp1").and_then(ProcparVal::first_f64),
             p1_deg: pp.get("lp1").and_then(ProcparVal::first_f64),
@@ -2554,9 +2765,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
     let fcoef_2 = parse_varian_fcoef(non_empty_procpar_str(&pp, "f2coef"))?;
     let (qm2, coef2) = parse_varian_phase_array(&pp, "phase2", fcoef_2)?;
     let (label_2, carrier_2) = infer_varian_indirect_channel(&pp, 2, sw2);
-    let (obs_2, first_ppm_2) = varian_axis_ppm(
-        &pp, &label_2, sw2, carrier_2, sfrq, "rfl2", "rfp2", "reffrq2",
-    );
+    let (obs_2, first_ppm_2) = varian_axis_ppm(&pp, &label_2, sw2, carrier_2, sfrq);
     let fn2 = pp
         .get("fn2")
         .and_then(ProcparVal::first_f64)
@@ -2574,7 +2783,7 @@ fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
         first_ppm: first_ppm_2,
         quad_mode: qm2,
         group_delay: 0.0,
-        conjugate_for_fft: false,
+        conjugate_for_fft: fcoef_2.is_some(),
         stored_proc: StoredDimProc {
             p0_deg: pp.get("rp2").and_then(ProcparVal::first_f64),
             p1_deg: pp.get("lp2").and_then(ProcparVal::first_f64),

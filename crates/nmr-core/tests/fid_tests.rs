@@ -1265,6 +1265,167 @@ array 2 2 32 0 0 2 1 1 1 19
     fs::write(dir.join("procpar"), &procpar_2d_empty_fcoef).unwrap();
     let v2_fb = read_fid_2d(&dir).expect("read Varian 2D with empty fcoef + non-empty f1coef");
     assert_eq!(v2_fb.axis_y.quad_mode, QuadMode::EchoAntiecho);
+    assert!(v2_fb.axis_y.conjugate_for_fft);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn varian_hardware_xi_referencing_and_bruker_raw_pulseprogram_reverse_inference() {
+    use nmr_core::fid::infer_bruker_raw_indirect_reverse;
+
+    // 1. Varian hardware Xi referencing ignores stale VnmrJ interactive `rfl*`/`rfp*`/`reffrq*` cursor offsets
+    let dir = temp_test_dir("varian_xi_hw");
+    let procpar_stale_cursors = "\
+sfrq 1 1 1000 0 0 2 1 1 1 1
+1 599.7429
+0
+dfrq2 1 1 1000 0 0 2 1 1 1 2
+1 60.7782
+0
+temp 1 1 200 -100 0 2 1 1 1 3
+1 25.0
+0
+sw 1 1 100000 0 0 2 1 1 1 4
+1 8000.0
+0
+sw1 1 1 100000 0 0 2 1 1 1 5
+1 2000.0
+0
+np 1 1 65536 2 2 2 1 1 1 6
+1 8
+0
+ni 1 1 4096 0 1 2 1 1 1 7
+1 4
+0
+tn 2 2 8 0 0 2 1 1 1 8
+1 \"H1\"
+0
+dn2 2 2 8 0 0 2 1 1 1 9
+1 \"N15\"
+0
+axis 2 2 8 0 0 2 1 1 1 10
+1 \"p2\"
+0
+phase 1 1 4 1 1 2 1 1 1 11
+2 1 2
+0
+rfl 1 1 100000 -100000 0 2 1 1 1 12
+1 9999.0
+0
+rfp 1 1 100000 -100000 0 2 1 1 1 13
+1 -1234.0
+0
+reffrq 1 1 1000 0 0 2 1 1 1 14
+1 599.880
+0
+rfl1 1 1 100000 -100000 0 2 1 1 1 15
+1 8888.0
+0
+rfp1 1 1 100000 -100000 0 2 1 1 1 16
+1 1234.0
+0
+reffrq1 1 1 1000 0 0 2 1 1 1 17
+1 599.880
+0
+";
+    fs::write(dir.join("procpar"), procpar_stale_cursors).unwrap();
+    let traces: Vec<Vec<[f32; 2]>> = (0..8).map(|_| vec![[1.0, 0.0]; 4]).collect();
+    fs::write(dir.join("fid"), build_varian_f32_fid(&traces)).unwrap();
+
+    let v_no_fcoef = read_fid_2d(&dir).expect("read Varian 2D without fcoef");
+    assert!(
+        !v_no_fcoef.axis_y.conjugate_for_fft,
+        "Default Varian States without fcoef uses [1,0,0,0,0,0,+1,0] (conjugate_for_fft = false)"
+    );
+    let bf_1h = 599.7429 / (1.0 + 4.766e-6);
+    let expected_first_h = ((599.7429 - bf_1h) * 1.0e6 + 4000.0) / bf_1h;
+    let obs_15n = bf_1h * 0.101_329_118;
+    let expected_first_n = ((60.7782 - obs_15n) * 1.0e6 + 1000.0) / obs_15n;
+    assert!((v_no_fcoef.axis_x.first_ppm - expected_first_h).abs() < 1e-6);
+    assert!((v_no_fcoef.axis_y.first_ppm - expected_first_n).abs() < 1e-6);
+
+    let procpar_with_fcoef = format!(
+        "{procpar_stale_cursors}\nfcoef 2 2 32 0 0 2 1 1 1 18\n1 \"1 0 -1 0 0 -1 0 -1\"\n0\n"
+    );
+    fs::write(dir.join("procpar"), procpar_with_fcoef).unwrap();
+    let v_with_fcoef = read_fid_2d(&dir).expect("read Varian 2D with explicit fcoef");
+    assert!(
+        v_with_fcoef.axis_y.conjugate_for_fft,
+        "Explicit Varian fcoef requires +i indirect FT (conjugate_for_fft = true)"
+    );
+    let _ = fs::remove_dir_all(&dir);
+
+    // 2. Bruker raw `ser` indirect `REVERSE` spin-physics inference
+    let pp_post_ip9 = "\
+  d0
+  (p13:sp2 ph9):f2
+  d10
+  go=2 ph31
+  MCWRK id10
+  MCWRK rd10 MCWRK ip9 MCWRK ip10
+  MCWRK id0 MCWRK dp9*2
+ph9=3 1
+";
+    assert!(infer_bruker_raw_indirect_reverse(
+        Some(pp_post_ip9),
+        "hncacbgp3d",
+        1,
+        QuadMode::StatesTppi
+    ));
+
+    let pp_post_dp9 = pp_post_ip9.replace("ip9", "dp9");
+    assert!(!infer_bruker_raw_indirect_reverse(
+        Some(&pp_post_dp9),
+        "hncacbgp3d",
+        1,
+        QuadMode::StatesTppi
+    ));
+
+    let pp_pre_ip4 = "\
+  (p13:sp2 ph4):f2
+  d0
+  d10
+  go=2 ph31
+  MCWRK id10
+  MCWRK rd10 MCWRK ip4
+  MCWRK id0
+ph4=0
+";
+    assert!(!infer_bruker_raw_indirect_reverse(
+        Some(pp_pre_ip4),
+        "hncogp3d",
+        1,
+        QuadMode::StatesTppi
+    ));
+    assert!(!infer_bruker_raw_indirect_reverse(
+        Some(pp_post_ip9),
+        "hncacbgp3d",
+        2,
+        QuadMode::EchoAntiecho
+    ));
+
+    let pp_sct_f2 = "\
+  (p13:sp2 ph3):f2
+  d0
+  (p21 ph5):f3
+  d30
+  (p22 ph8):f3
+  d10
+  F1PH(calph(ph3, +90), caldel(d0, +in0))
+  F2PH(calph(ph5, +90), caldel(d10, +in10) & caldel(d30, -in30))
+ph3=0
+";
+    assert!(!infer_bruker_raw_indirect_reverse(
+        Some(pp_sct_f2),
+        "cbcacgp3d",
+        1,
+        QuadMode::StatesTppi
+    ));
+    assert!(infer_bruker_raw_indirect_reverse(
+        Some(pp_sct_f2),
+        "cbcacgp3d",
+        2,
+        QuadMode::StatesTppi
+    ));
 }

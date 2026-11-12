@@ -1405,3 +1405,102 @@ fn real_cisd3_fid_and_nus_vs_topspin_gate() {
         "CISD3 Raw FID + 3D NUS evo-graph 5-seed HC precision {evo_fid_hcp:.2}% < 90.0%"
     );
 }
+
+#[test]
+fn blind_3d_hncacb_autophasing_locks_ca_positive_and_cb_negative() {
+    let nx = 128usize;
+    let ny = 24usize;
+    let nz = 32usize;
+    // Unphased axes (no stored procs phases -> `PhaseSource::Auto`)
+    let ax_x = make_axis_meta("1H", nx, 9600.0, 800.0, 4.70, true, 0.0);
+    let ax_y = make_axis_meta("15N", ny, 2400.0, 81.0, 118.0, true, 0.0);
+    let ax_z = make_axis_meta("13C", nz, 12_800.0, 201.0, 44.0, true, 0.0);
+
+    // Inject two HNCACB spin systems with CA > 0 and CB < 0, rotated by a blind 145 deg
+    // direct-dimension phase (which would invert CA < 0 and CB > 0 without biphasic lock!).
+    let peaks = [
+        (8.25, 119.5, 57.5, 1.25),
+        (8.25, 119.5, 30.5, -0.95),
+        (7.72, 114.8, 54.0, 1.15),
+        (7.72, 114.8, 39.2, -0.85),
+    ];
+    let phi_x = 145.0_f64.to_radians();
+    let phi_y = (-28.0_f64).to_radians();
+    let mut data = vec![[0.0, 0.0]; nz * 2 * ny * 2 * nx];
+    for &(ph, pn, pc, amp) in &peaks {
+        let fx = (ph - 4.70) * 800.0 / 9600.0;
+        let fy = (pn - 118.0) * 81.0 / 2400.0;
+        let fz = (pc - 44.0) * 201.0 / 12_800.0;
+        for k2 in 0..nz {
+            let ez = (-(k2 as f64) / 22.0).exp();
+            let pz = 2.0 * PI * fz * (k2 as f64);
+            let (sz, cz) = (ez * pz.sin(), ez * pz.cos());
+            for k1 in 0..ny {
+                let ey = (-(k1 as f64) / 18.0).exp();
+                let py = 2.0 * PI * fy * (k1 as f64) + phi_y;
+                let (sy, cy) = (ey * py.sin(), ey * py.cos());
+                let q = [cz * cy, cz * sy, sz * cy, sz * sy];
+                for c2 in 0..2 {
+                    for c1 in 0..2 {
+                        let w = q[c2 * 2 + c1];
+                        let base = (((k2 * 2 + c2) * ny + k1) * 2 + c1) * nx;
+                        for k0 in 0..nx {
+                            let ex = amp * (-(k0 as f64) / 72.0).exp();
+                            let px = 2.0 * PI * fx * (k0 as f64) + phi_x;
+                            data[base + k0][0] += w * ex * px.cos();
+                            data[base + k0][1] += w * ex * px.sin();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let fid3 = Fid3D {
+        name: "blind_hncacb".to_string(),
+        vendor: FidVendor::Varian,
+        pulse_program: "ghncacb".to_string(),
+        axis_x: ax_x,
+        axis_y: ax_y,
+        axis_z: ax_z,
+        nus_mask: None,
+        data,
+    };
+    let recipe = ProcessingRecipe::from_fid_3d(&fid3);
+    assert_eq!(recipe.dims[0].phase_source, PhaseSource::Auto);
+    let spec3 = process_fid_3d(&fid3, "HNCACB", &recipe).expect("blind 3D HNCACB process");
+
+    let sample_at = |h: f64, n: f64, c: f64| -> f32 {
+        let ix = spec3.axis_x.ppm_to_index(h).round() as usize;
+        let iy = spec3.axis_y.ppm_to_index(n).round() as usize;
+        let iz = spec3.axis_z.ppm_to_index(c).round() as usize;
+        let mut best: f32 = 0.0;
+        for dz in -1isize..=1 {
+            for dy in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let x = (ix as isize + dx).clamp(0, spec3.axis_x.size as isize - 1) as usize;
+                    let y = (iy as isize + dy).clamp(0, spec3.axis_y.size as isize - 1) as usize;
+                    let z = (iz as isize + dz).clamp(0, spec3.axis_z.size as isize - 1) as usize;
+                    let v = spec3.data[(z * spec3.axis_y.size + y) * spec3.axis_x.size + x];
+                    if v.abs() > best.abs() {
+                        best = v;
+                    }
+                }
+            }
+        }
+        best
+    };
+
+    let ca1 = sample_at(8.25, 119.5, 57.5);
+    let cb1 = sample_at(8.25, 119.5, 30.5);
+    let ca2 = sample_at(7.72, 114.8, 54.0);
+    let cb2 = sample_at(7.72, 114.8, 39.2);
+    assert!(
+        ca1 > 0.0 && ca2 > 0.0,
+        "expected positive CA peaks after blind HNCACB autophase, got ca1={ca1}, ca2={ca2}"
+    );
+    assert!(
+        cb1 < 0.0 && cb2 < 0.0,
+        "expected negative CB peaks after blind HNCACB autophase, got cb1={cb1}, cb2={cb2}"
+    );
+}
