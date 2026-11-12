@@ -225,8 +225,28 @@ pub fn resolve_local_entry_paths(
     allow_repo_fallbacks: bool,
 ) -> Result<ResolvedEntryLocations, String> {
     let id_trim = bmrb_id.trim();
-    let mut base_roots: Vec<PathBuf> = vec![PathBuf::from("data")];
+    let mut base_roots: Vec<PathBuf> = Vec::new();
+    // When `--data-root` has shape `<repo>/data/private/bmrb`, include `<repo>/data` so sibling
+    // `<repo>/data/ubiquitin` and `<repo>/data/private/bmrb51439_cisd3` resolve cleanly too.
+    if data_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("bmrb"))
+    {
+        if let Some(priv_parent) = data_root.parent() {
+            if priv_parent
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("private"))
+            {
+                if let Some(data_anc) = priv_parent.parent() {
+                    base_roots.push(data_anc.to_path_buf());
+                }
+            }
+        }
+    }
     if allow_repo_fallbacks {
+        base_roots.push(PathBuf::from("data"));
         if let Some(env_data) = env::var_os("NMR_REAL_DATA_DIR") {
             base_roots.push(PathBuf::from(env_data));
         }
@@ -246,20 +266,15 @@ pub fn resolve_local_entry_paths(
                 });
             }
         }
-        if allow_repo_fallbacks {
-            for droot in &base_roots {
-                if let Some(ubq_dir) = find_child_ci(droot, "ubiquitin") {
-                    if ubq_dir.is_dir() {
-                        let truth =
-                            find_child_ci(droot, "ubiquitin_backbone_assignment_191104.txt")
-                                .or_else(|| {
-                                    find_truth_file_in_or_near(&ubq_dir, "ubiquitin_local")
-                                });
-                        return Ok(ResolvedEntryLocations {
-                            entry_dir: ubq_dir,
-                            truth_path: truth,
-                        });
-                    }
+        for droot in &base_roots {
+            if let Some(ubq_dir) = find_child_ci(droot, "ubiquitin") {
+                if ubq_dir.is_dir() {
+                    let truth = find_child_ci(droot, "ubiquitin_backbone_assignment_191104.txt")
+                        .or_else(|| find_truth_file_in_or_near(&ubq_dir, "ubiquitin_local"));
+                    return Ok(ResolvedEntryLocations {
+                        entry_dir: ubq_dir,
+                        truth_path: truth,
+                    });
                 }
             }
         }
@@ -280,7 +295,7 @@ pub fn resolve_local_entry_paths(
         dir_candidates.push(c2);
     }
 
-    if allow_repo_fallbacks {
+    if !base_roots.is_empty() {
         if id_digits == "51439" {
             for droot in &base_roots {
                 if let Some(priv_dir) = find_child_ci(droot, "private") {
@@ -2481,6 +2496,30 @@ mod tests {
         assert!(json_txt.contains("\"skipped_missing_local_data\": 2"));
         assert!(json_txt.contains("\"failed\": 0"));
         assert!(json_txt.contains("SKIPPED (missing local data)"));
+
+        // Verify sibling `<repo>/data/ubiquitin` & `<repo>/data/private/bmrb51439_cisd3`
+        // resolve when `--data-root` has shape `<repo>/data/private/bmrb`
+        let fake_repo_data = dir.join("fake_repo/data");
+        let fake_bmrb_root = fake_repo_data.join("private/bmrb");
+        fs::create_dir_all(fake_repo_data.join("ubiquitin")).unwrap();
+        fs::write(
+            fake_repo_data.join("ubiquitin_backbone_assignment_191104.txt"),
+            "truth",
+        )
+        .unwrap();
+        fs::create_dir_all(fake_repo_data.join("private/bmrb51439_cisd3")).unwrap();
+        fs::create_dir_all(&fake_bmrb_root).unwrap();
+        let ubq_sib = resolve_local_entry_paths("ubiquitin_local", &fake_bmrb_root, false).unwrap();
+        assert_eq!(ubq_sib.entry_dir, fake_repo_data.join("ubiquitin"));
+        assert_eq!(
+            ubq_sib.truth_path,
+            Some(fake_repo_data.join("ubiquitin_backbone_assignment_191104.txt"))
+        );
+        let cisd_sib = resolve_local_entry_paths("51439", &fake_bmrb_root, false).unwrap();
+        assert_eq!(
+            cisd_sib.entry_dir,
+            fake_repo_data.join("private/bmrb51439_cisd3")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

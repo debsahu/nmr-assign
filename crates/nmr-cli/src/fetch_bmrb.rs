@@ -381,8 +381,8 @@ pub fn is_non_backbone_archive_filename(name: &str) -> bool {
     const NON_BACKBONE_TOKENS: &[&str] = &[
         "noesy", "roesy", "tocsy", "dipsi", "hcch", "cchtoc", "cosy", "hbha", "hccconh", "ccconh",
         "hmqc", "hmbc", "chsqc", "alichsqc", "arohsqc", "13chsqc", "c13hsqc", "hsqcctet",
-        "hsqcnoe", "hetnoe", "hsqct1", "hsqct2", "nhsqct1", "nhsqct2", "nhsqcnh2", "t1rho", "cpmg",
-        "cest", "hnha", "1dpresat", "zgpr",
+        "hsqcnoe", "hetnoe", "hnnoe", "hsqct1", "hsqct2", "nhsqct1", "nhsqct2", "nhsqcnh2",
+        "t1rho", "cpmg", "cest", "hnha", "1dpresat", "zgpr",
     ];
     if NON_BACKBONE_TOKENS.iter().any(|tok| alnum.contains(tok)) {
         return true;
