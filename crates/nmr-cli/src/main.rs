@@ -84,6 +84,7 @@ use nmr_gpu::neural_gpu::{GpuNeuralPicker, GpuNeuralPickerConfig, PRETRAINED_WEI
 use nmr_gpu::GpuEngine;
 
 pub mod fetch_bmrb;
+pub mod inspect_cmd;
 pub mod real_benchmark;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +112,7 @@ fn usage() -> String {
         "{} — Rust + WebGPU\n\
      Usage:\n\
        nmrassign --version | -V | version\n\
+       nmrassign inspect         <path> [--json]\n\
        nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
        nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--solver evo-graph|standard] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
@@ -4174,6 +4176,7 @@ fn main() {
         return;
     }
     let res = match args[0].as_str() {
+        "inspect" => inspect_cmd::cmd_inspect(&args[1..]),
         "benchmark" => cmd_benchmark(&args[1..]),
         "benchmark-suite" => cmd_benchmark_suite(&args[1..]),
         "real-benchmark" => real_benchmark::cmd_real_benchmark(&args[1..]),

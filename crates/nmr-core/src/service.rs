@@ -16,6 +16,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify::{
+    classify_nmr_entries, classify_nmr_workspace, extract_archive_virtual_entries, VirtualEntry,
+    WorkspaceInventory,
+};
 use crate::evaluate::to_reference;
 use crate::nef::{
     read_nef_str, write_nef_file, NefDihedralRestraint, NefDihedralRestraintList, NefDocument,
@@ -64,6 +68,20 @@ pub struct JobSubmitRequest {
     /// Starting `Seq_ID` when `sequence` is provided as raw/FASTA text (defaults to 1).
     #[serde(default)]
     pub first_seq_id: Option<i32>,
+}
+
+/// Payload accepted by `POST /api/v1/inspect`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct InspectRequest {
+    /// Local directory, spectrum, or `.tar` / `.tar.gz` / `.tgz` archive path on the server host.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional workspace label when supplying in-memory `entries`.
+    #[serde(default)]
+    pub root_name: Option<String>,
+    /// In-memory `VirtualEntry` headers (`wasm32` / browser drag-and-drop compatible).
+    #[serde(default)]
+    pub entries: Option<Vec<VirtualEntry>>,
 }
 
 /// Summary metrics computed for a completed assignment job.
@@ -302,6 +320,7 @@ fn accept_loop(listener: TcpListener, state: Arc<SharedState>) {
 struct HttpRequest {
     method: String,
     path: String,
+    content_type: String,
     body: Vec<u8>,
 }
 
@@ -324,6 +343,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
     let path = raw_target.split('?').next().unwrap_or("/").to_string();
 
     let mut content_length = 0usize;
+    let mut content_type = String::new();
     loop {
         let mut line = String::new();
         let bytes = reader
@@ -341,6 +361,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
                 if content_length > MAX_HTTP_BODY_BYTES {
                     return Err("payload exceeds maximum size limit (64 MiB)".to_string());
                 }
+            } else if k.trim().eq_ignore_ascii_case("content-type") {
+                content_type = v.trim().to_ascii_lowercase();
             }
         }
     }
@@ -352,7 +374,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
             .map_err(|e| format!("incomplete request body: {e}"))?;
     }
 
-    Ok(Some(HttpRequest { method, path, body }))
+    Ok(Some(HttpRequest {
+        method,
+        path,
+        content_type,
+        body,
+    }))
 }
 
 fn write_http_response(
@@ -465,6 +492,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
             )
         }
         ("GET", "/api/v1/demo/ubiquitin") => handle_demo_ubiquitin(&mut stream),
+        ("POST", "/api/v1/inspect") => handle_inspect(&mut stream, &req.content_type, &req.body),
         ("POST", "/api/v1/jobs") => handle_submit_job(&mut stream, &req.body, state),
         ("GET", "/api/v1/jobs") => handle_list_jobs(&mut stream, state),
         ("GET", path) if path.starts_with("/api/v1/jobs/") => {
@@ -503,6 +531,78 @@ fn handle_demo_ubiquitin(stream: &mut TcpStream) -> Result<(), String> {
         peaks_tsv,
     };
     write_json(stream, 200, "OK", &payload)
+}
+
+fn handle_inspect(stream: &mut TcpStream, content_type: &str, body: &[u8]) -> Result<(), String> {
+    if body.is_empty() {
+        return write_json_error(
+            stream,
+            400,
+            "Bad Request",
+            "POST /api/v1/inspect requires a JSON InspectRequest or tar/tar.gz archive body",
+        );
+    }
+
+    let is_binary_archive = content_type.contains("gzip")
+        || content_type.contains("x-tar")
+        || content_type.contains("octet-stream")
+        || (body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b)
+        || (body.len() >= 262 && &body[257..262] == b"ustar");
+
+    if is_binary_archive {
+        match extract_archive_virtual_entries("archive_upload", body) {
+            Ok(entries) => {
+                let mut inv: WorkspaceInventory = classify_nmr_entries(&entries);
+                inv.root_name = "archive_upload".to_string();
+                return write_json(stream, 200, "OK", &inv);
+            }
+            Err(e) => {
+                return write_json_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    &format!("invalid archive payload: {e}"),
+                );
+            }
+        }
+    }
+
+    let inspect_req: InspectRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_json_error(
+                stream,
+                400,
+                "Bad Request",
+                &format!("invalid JSON inspect request: {e}"),
+            );
+        }
+    };
+
+    if let Some(raw_path) = inspect_req
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match classify_nmr_workspace(Path::new(raw_path)) {
+            Ok(inv) => write_json(stream, 200, "OK", &inv),
+            Err(e) => write_json_error(stream, 400, "Bad Request", &e),
+        }
+    } else if let Some(entries) = inspect_req.entries {
+        let mut inv = classify_nmr_entries(&entries);
+        if let Some(name) = inspect_req.root_name.filter(|s| !s.trim().is_empty()) {
+            inv.root_name = name;
+        }
+        write_json(stream, 200, "OK", &inv)
+    } else {
+        write_json_error(
+            stream,
+            400,
+            "Bad Request",
+            "InspectRequest must specify either 'path' or 'entries'",
+        )
+    }
 }
 
 fn handle_submit_job(
