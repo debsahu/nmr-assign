@@ -1,20 +1,29 @@
-//! Standard 20-amino-acid IUPAC covalent spin-system topologies and BMRB sidechain priors.
+//! Standard 20-amino-acid IUPAC covalent spin-system topologies, planar 2D covalent layouts,
+//! chemical-state variants, and empirical BMRB sidechain priors.
 //!
 //! Provenance: Clean-room original implementation derived strictly from:
-//! - IUPAC-IUBMB 1998 NMR atom nomenclature recommendations: Markley et al.,
-//!   *J. Biomol. NMR* 12, 1-23 (1998).
-//! - RCSB PDB Chemical Component Dictionary (CCD) standard L-peptide monomer covalent
-//!   bond graphs: Westbrook et al., *Bioinformatics* 31, 1274-1278 (2015) (CC0 1.0).
-//! - Public Biological Magnetic Resonance Data Bank (BMRB) chemical shift statistics:
-//!   Ulrich et al., *Nucleic Acids Res.* 36, D402-D408 (2008), computed with a robust
-//!   3.5-MAD outlier trim across 30 public BMRB NMR-STAR entries strictly disjoint from
-//!   the benchmark suite (`bmr4022`, `bmr4098`, `bmr4106`, `bmr4144`, `bmr4267`, `bmr4302`,
-//!   `bmr4391`, `bmr4472`, `bmr4562`, `bmr4670`, `bmr4752`, `bmr4807`, `bmr5010`, `bmr5106`,
-//!   `bmr5211`, `bmr5505`, `bmr5694`, `bmr5757`, `bmr6032`, `bmr6240`, `bmr6338`, `bmr6622`,
-//!   `bmr6801`, `bmr7021`, `bmr7280`, `bmr15250`, `bmr15380`, `bmr16042`, `bmr16310`, `bmr18025`).
+//! - IUPAC-IUBMB-IUPAB biochemical NMR atom nomenclature recommendations: Markley et al.,
+//!   *J. Mol. Biol.* 1998, 280, 933–952 (and *J. Biomol. NMR* 1998, 12, 1–23).
+//! - wwPDB Chemical Component Dictionary (`CCD`, public domain / CC0 1.0) standard L-peptide
+//!   monomer covalent bond graphs: Westbrook et al., *Bioinformatics* 2015, 31, 1274–1278.
+//! - Public Biological Magnetic Resonance Data Bank (BMRB) empirical chemical shift statistics:
+//!   Ulrich et al., *Nucleic Acids Res.* 2008, 36, D402–D408, computed with a robust 3.5-MAD
+//!   outlier trim across 30 public BMRB NMR-STAR entries strictly disjoint from the benchmark
+//!   suite (`bmr4022`, `bmr4098`, `bmr4106`, `bmr4144`, `bmr4267`, `bmr4302`, `bmr4391`,
+//!   `bmr4472`, `bmr4562`, `bmr4670`, `bmr4752`, `bmr4807`, `bmr5010`, `bmr5106`, `bmr5211`,
+//!   `bmr5505`, `bmr5694`, `bmr5757`, `bmr6032`, `bmr6240`, `bmr6338`, `bmr6622`, `bmr6801`,
+//!   `bmr7021`, `bmr7280`, `bmr15250`, `bmr15380`, `bmr16042`, `bmr16310`, `bmr18025`).
+//! - Cysteine reduced thiol vs oxidized disulfide `13CA`/`13CB` chemical shift statistics:
+//!   Sharma & Rajarathnam, *J. Biomol. NMR* 2000, 18, 165–171.
+//! - Histidine `Nδ1-H`, `Nε2-H`, and doubly protonated imidazolium `15N`/`13C` tautomeric
+//!   shifts: Pelton, Torchia, Meadow & Roseman, *Protein Sci.* 1993, 2, 543–558.
 
 use std::collections::BTreeMap;
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
+
+use serde::{Deserialize, Serialize};
+
+use crate::priors::{aa_all_atom_prior, Priors};
 
 /// Chemical element in a standard protein residue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2439,4 +2448,884 @@ impl SidechainPriors {
         };
         (lp - self.background_h1(region, v)).max(-10.0)
     }
+}
+
+// ============================================================================
+// 2D IUPAC Covalent Amino-Acid Layouts, Chemical State Variants & BMRB Z-Scores
+// ============================================================================
+
+/// Covalent bond order in a 2D amino-acid topological diagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CovalentBondOrder {
+    /// Localized single covalent sigma bond (`C-C`, `C-N`, `C-O`, `C-S`, `X-H`).
+    Single,
+    /// Localized double bond (`C=O` peptide/amide carbonyl).
+    Double,
+    /// Hückel aromatic ring bond (`Phe`, `Tyr`, `His` imidazole, `Trp` indole).
+    Aromatic,
+    /// Delocalized resonance bond (`Asp`/`Glu` carboxylate, `Arg` guanidinium).
+    Resonance,
+}
+
+/// Chemical / protonation / redox state variant of an amino-acid residue.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum ResidueVariant {
+    /// Default canonical IUPAC / BMRB pooled monomer state.
+    #[default]
+    Canonical,
+    /// Reduced cysteine thiol (`-SH`, `HG` present, `CB ~ 28 ppm`).
+    CysReduced,
+    /// Oxidized cystine disulfide (`-S-S-`, `HG` absent, `CB ~ 41 ppm`).
+    CysOxidized,
+    /// Neutral histidine $\pi$-tautomer (`Nδ1-H`, `HD1` on `ND1`, `HE2` absent).
+    HisNd1H,
+    /// Neutral histidine $\tau$-tautomer (`Nε2-H`, `HE2` on `NE2`, `HD1` absent).
+    HisNe2H,
+    /// Cationic doubly protonated histidine imidazolium (`HD1` on `ND1` + `HE2` on `NE2`).
+    HisDoublyProtonated,
+}
+
+impl ResidueVariant {
+    /// Human-readable label for UI buttons and tooltips.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "Canonical",
+            Self::CysReduced => "Cys Reduced (-SH, CB ~28 ppm)",
+            Self::CysOxidized => "Cys Oxidized (S-S, CB ~41 ppm)",
+            Self::HisNd1H => "His Nδ1-H (HD1)",
+            Self::HisNe2H => "His Nε2-H (HE2)",
+            Self::HisDoublyProtonated => "His Doubly Protonated (HisH+)",
+        }
+    }
+
+    /// Compact pill badge for headers and ribbon indicators.
+    pub const fn short_badge(self) -> &'static str {
+        match self {
+            Self::Canonical => "Canonical",
+            Self::CysReduced => "Red (-SH)",
+            Self::CysOxidized => "Ox (S-S)",
+            Self::HisNd1H => "Nδ1-H",
+            Self::HisNe2H => "Nε2-H",
+            Self::HisDoublyProtonated => "HisH+",
+        }
+    }
+
+    /// Return the list of selectable chemical state variants applicable to `res_name`.
+    pub fn applicable_for_residue(res_name: &str) -> &'static [Self] {
+        let Some(topo) = residue_topology(res_name) else {
+            return &[Self::Canonical];
+        };
+        match topo.three_letter {
+            "CYS" => &[Self::Canonical, Self::CysReduced, Self::CysOxidized],
+            "HIS" => &[
+                Self::Canonical,
+                Self::HisNd1H,
+                Self::HisNe2H,
+                Self::HisDoublyProtonated,
+            ],
+            _ => &[Self::Canonical],
+        }
+    }
+
+    /// True if `self` is an applicable state variant for `res_name`.
+    pub fn is_valid_for_residue(self, res_name: &str) -> bool {
+        Self::applicable_for_residue(res_name).contains(&self)
+    }
+}
+
+/// Planar 2D atom node in normalized covalent bond coordinates (`+x` right, `+y` up).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtomNode2D {
+    pub name: &'static str,
+    pub element: Element,
+    pub x: f64,
+    pub y: f64,
+    pub attached_heavy: Option<&'static str>,
+    pub is_backbone: bool,
+    /// True for NMR-active `1H`, `15N`, backbone `13C`, and protonated sidechain `13C` spins;
+    /// false for `O`/`S` heteroatoms and unprotonated sidechain carbonyl/quaternary carbons
+    /// (`O`, `CG` on `Phe`/`Tyr`/`Trp`/`His`/`Asp`/`Asn`, `CD` on `Glu`/`Gln`, `CZ` on `Arg`/`Tyr`,
+    /// `CD2`/`CE2` on `Trp`).
+    pub is_nmr_observable: bool,
+}
+
+/// Directed-agnostic 2D covalent bond edge with explicit bond order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CovalentBond2D {
+    pub atom_a: &'static str,
+    pub atom_b: &'static str,
+    pub order: CovalentBondOrder,
+}
+
+/// Regular 5- or 6-membered ring metadata for aromatic/alicyclic rendering.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RingPolygon2D {
+    pub atoms: &'static [&'static str],
+    pub center_x: f64,
+    pub center_y: f64,
+    pub is_aromatic: bool,
+}
+
+/// Complete planar, non-overlapping 2D covalent layout for an amino acid and state variant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidueLayout2D {
+    pub three_letter: &'static str,
+    pub one_letter: char,
+    pub variant: ResidueVariant,
+    pub atoms: Vec<AtomNode2D>,
+    pub bonds: Vec<CovalentBond2D>,
+    pub rings: Vec<RingPolygon2D>,
+}
+
+impl ResidueLayout2D {
+    /// Look up a 2D atom node by IUPAC name.
+    pub fn atom(&self, name: &str) -> Option<&AtomNode2D> {
+        self.atoms.iter().find(|a| a.name == name)
+    }
+
+    /// True if `atom_a` and `atom_b` share a covalent bond in this layout.
+    pub fn are_bonded(&self, atom_a: &str, atom_b: &str) -> bool {
+        self.bond_order(atom_a, atom_b).is_some()
+    }
+
+    /// Look up the [`CovalentBondOrder`] between `atom_a` and `atom_b`, if bonded.
+    pub fn bond_order(&self, atom_a: &str, atom_b: &str) -> Option<CovalentBondOrder> {
+        self.bonds.iter().find_map(|b| {
+            if (b.atom_a == atom_a && b.atom_b == atom_b)
+                || (b.atom_a == atom_b && b.atom_b == atom_a)
+            {
+                Some(b.order)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Axis-aligned bounding box `(min_x, max_x, min_y, max_y)` in normalized bond units.
+    pub fn bounding_box(&self) -> (f64, f64, f64, f64) {
+        if self.atoms.is_empty() {
+            return (-1.0, 1.0, -1.0, 1.0);
+        }
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for a in &self.atoms {
+            min_x = min_x.min(a.x);
+            max_x = max_x.max(a.x);
+            min_y = min_y.min(a.y);
+            max_y = max_y.max(a.y);
+        }
+        (min_x, max_x, min_y, max_y)
+    }
+}
+
+#[inline]
+fn polar_xy(cx: f64, cy: f64, radius: f64, deg: f64) -> (f64, f64) {
+    let rad = deg * (PI / 180.0);
+    (cx + radius * rad.cos(), cy + radius * rad.sin())
+}
+
+#[inline]
+fn rotate_xy(x: f64, y: f64, ox: f64, oy: f64, deg: f64) -> (f64, f64) {
+    let rad = deg * (PI / 180.0);
+    let (s, c) = rad.sin_cos();
+    let dx = x - ox;
+    let dy = y - oy;
+    (ox + dx * c - dy * s, oy + dx * s + dy * c)
+}
+
+fn is_atom_nmr_observable(topo: &ResidueTopology, spec: &AtomSpec) -> bool {
+    match spec.element {
+        Element::O | Element::S => false,
+        Element::H | Element::N => true,
+        Element::C => {
+            if spec.name == "CA" || spec.name == "C" {
+                true
+            } else {
+                topo.ch_group(spec.name).is_some()
+            }
+        }
+    }
+}
+
+fn atom_included_in_variant(three_letter: &str, variant: ResidueVariant, atom_name: &str) -> bool {
+    match (three_letter, variant) {
+        ("CYS", ResidueVariant::CysOxidized) => atom_name != "HG",
+        ("HIS", ResidueVariant::HisNd1H) => atom_name != "HE2",
+        ("HIS", ResidueVariant::HisNe2H) => atom_name != "HD1",
+        _ => true,
+    }
+}
+
+fn classify_bond_order(
+    three_letter: &str,
+    atom_a: &'static str,
+    atom_b: &'static str,
+) -> CovalentBondOrder {
+    let pair = |x: &str, y: &str| (atom_a == x && atom_b == y) || (atom_a == y && atom_b == x);
+
+    if pair("C", "O") {
+        return CovalentBondOrder::Double;
+    }
+
+    match three_letter {
+        "ASN" if pair("CG", "OD1") => CovalentBondOrder::Double,
+        "GLN" if pair("CD", "OE1") => CovalentBondOrder::Double,
+        "ASP" if pair("CG", "OD1") || pair("CG", "OD2") => CovalentBondOrder::Resonance,
+        "GLU" if pair("CD", "OE1") || pair("CD", "OE2") => CovalentBondOrder::Resonance,
+        "ARG" if pair("NE", "CZ") || pair("CZ", "NH1") || pair("CZ", "NH2") => {
+            CovalentBondOrder::Resonance
+        }
+        "HIS"
+            if pair("CG", "ND1")
+                || pair("ND1", "CE1")
+                || pair("CE1", "NE2")
+                || pair("CD2", "NE2")
+                || pair("CG", "CD2") =>
+        {
+            CovalentBondOrder::Aromatic
+        }
+        "PHE" | "TYR"
+            if pair("CG", "CD1")
+                || pair("CD1", "CE1")
+                || pair("CE1", "CZ")
+                || pair("CE2", "CZ")
+                || pair("CD2", "CE2")
+                || pair("CG", "CD2") =>
+        {
+            CovalentBondOrder::Aromatic
+        }
+        "TRP"
+            if pair("CG", "CD1")
+                || pair("CD1", "NE1")
+                || pair("NE1", "CE2")
+                || pair("CG", "CD2")
+                || pair("CD2", "CE2")
+                || pair("CD2", "CE3")
+                || pair("CE3", "CZ3")
+                || pair("CZ3", "CH2")
+                || pair("CZ2", "CH2")
+                || pair("CE2", "CZ2") =>
+        {
+            CovalentBondOrder::Aromatic
+        }
+        _ => CovalentBondOrder::Single,
+    }
+}
+
+fn insert_standard_backbone_coords(coords: &mut BTreeMap<&'static str, (f64, f64)>, is_gly: bool) {
+    let n = (-1.15, 0.00);
+    let ca = (0.00, 0.00);
+    let c = (1.15, 0.00);
+    coords.insert("N", n);
+    coords.insert("H", polar_xy(n.0, n.1, 0.72, 135.0));
+    coords.insert("CA", ca);
+    if is_gly {
+        coords.insert("HA2", (-0.48, -0.68));
+        coords.insert("HA3", (0.48, -0.68));
+    } else {
+        coords.insert("HA", (0.00, 0.76));
+    }
+    coords.insert("C", c);
+    coords.insert("O", polar_xy(c.0, c.1, 0.78, 45.0));
+}
+
+fn insert_methyl_fan(
+    coords: &mut BTreeMap<&'static str, (f64, f64)>,
+    parent: (f64, f64),
+    out_deg: f64,
+    protons: [&'static str; 3],
+) {
+    let h_len = 0.72;
+    let spread = 58.0;
+    coords.insert(
+        protons[0],
+        polar_xy(parent.0, parent.1, h_len, out_deg - spread),
+    );
+    coords.insert(protons[1], polar_xy(parent.0, parent.1, h_len, out_deg));
+    coords.insert(
+        protons[2],
+        polar_xy(parent.0, parent.1, h_len, out_deg + spread),
+    );
+}
+
+fn insert_methylene_pair(
+    coords: &mut BTreeMap<&'static str, (f64, f64)>,
+    parent: (f64, f64),
+    bisector_deg: f64,
+    protons: [&'static str; 2],
+) {
+    let h_len = 0.72;
+    let half = 28.0;
+    coords.insert(
+        protons[0],
+        polar_xy(parent.0, parent.1, h_len, bisector_deg - half),
+    );
+    coords.insert(
+        protons[1],
+        polar_xy(parent.0, parent.1, h_len, bisector_deg + half),
+    );
+}
+
+fn build_residue_coords_and_rings(
+    three_letter: &str,
+) -> (BTreeMap<&'static str, (f64, f64)>, Vec<RingPolygon2D>) {
+    let mut coords: BTreeMap<&'static str, (f64, f64)> = BTreeMap::new();
+    let mut rings: Vec<RingPolygon2D> = Vec::new();
+    let h_len = 0.72;
+
+    if three_letter == "PRO" {
+        // Regular 5-membered pyrrolidine pentagon of exact side 1.00 sharing top horizontal N-CA edge
+        let r5 = 0.5 / (36.0_f64.to_radians()).sin();
+        let cx = -0.50;
+        let cy = -0.5 / (36.0_f64.to_radians()).tan();
+        let ca = polar_xy(cx, cy, r5, 54.0); // (0.00, 0.00)
+        let n = polar_xy(cx, cy, r5, 126.0); // (-1.00, 0.00)
+        let cd = polar_xy(cx, cy, r5, 198.0);
+        let cg = polar_xy(cx, cy, r5, 270.0);
+        let cb = polar_xy(cx, cy, r5, 342.0);
+        let c = (1.15, 0.15);
+
+        coords.insert("N", n);
+        coords.insert("CA", ca);
+        coords.insert("HA", (0.00, 0.76));
+        coords.insert("C", c);
+        coords.insert("O", polar_xy(c.0, c.1, 0.78, 45.0));
+        coords.insert("CB", cb);
+        insert_methylene_pair(&mut coords, cb, -18.0, ["HB2", "HB3"]);
+        coords.insert("CG", cg);
+        insert_methylene_pair(&mut coords, cg, -90.0, ["HG2", "HG3"]);
+        coords.insert("CD", cd);
+        insert_methylene_pair(&mut coords, cd, 198.0, ["HD2", "HD3"]);
+
+        rings.push(RingPolygon2D {
+            atoms: &["N", "CA", "CB", "CG", "CD"],
+            center_x: cx,
+            center_y: cy,
+            is_aromatic: false,
+        });
+        return (coords, rings);
+    }
+
+    insert_standard_backbone_coords(&mut coords, three_letter == "GLY");
+    if three_letter == "GLY" {
+        return (coords, rings);
+    }
+
+    let cb = (0.00, -1.05);
+    coords.insert("CB", cb);
+
+    match three_letter {
+        "ALA" => {
+            insert_methyl_fan(&mut coords, cb, -90.0, ["HB1", "HB2", "HB3"]);
+        }
+        "SER" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let og = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            coords.insert("OG", og);
+            coords.insert("HG", polar_xy(og.0, og.1, h_len, -120.0));
+        }
+        "CYS" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let sg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            coords.insert("SG", sg);
+            coords.insert("HG", polar_xy(sg.0, sg.1, h_len, -120.0));
+        }
+        "ASN" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            let od1 = polar_xy(cg.0, cg.1, 1.00, 0.0);
+            let nd2 = polar_xy(cg.0, cg.1, 1.00, -120.0);
+            coords.insert("CG", cg);
+            coords.insert("OD1", od1);
+            coords.insert("ND2", nd2);
+            coords.insert("HD21", polar_xy(nd2.0, nd2.1, h_len, -175.0));
+            coords.insert("HD22", polar_xy(nd2.0, nd2.1, h_len, -65.0));
+        }
+        "ASP" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            coords.insert("CG", cg);
+            coords.insert("OD1", polar_xy(cg.0, cg.1, 1.00, 0.0));
+            coords.insert("OD2", polar_xy(cg.0, cg.1, 1.00, -120.0));
+        }
+        "GLN" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            insert_methylene_pair(&mut coords, cg, 0.0, ["HG2", "HG3"]);
+            let cd = polar_xy(cg.0, cg.1, 1.05, -120.0);
+            let oe1 = polar_xy(cd.0, cd.1, 1.00, 180.0);
+            let ne2 = polar_xy(cd.0, cd.1, 1.00, -60.0);
+            coords.insert("CG", cg);
+            coords.insert("CD", cd);
+            coords.insert("OE1", oe1);
+            coords.insert("NE2", ne2);
+            coords.insert("HE21", polar_xy(ne2.0, ne2.1, h_len, -115.0));
+            coords.insert("HE22", polar_xy(ne2.0, ne2.1, h_len, -5.0));
+        }
+        "GLU" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            insert_methylene_pair(&mut coords, cg, 0.0, ["HG2", "HG3"]);
+            let cd = polar_xy(cg.0, cg.1, 1.05, -120.0);
+            coords.insert("CG", cg);
+            coords.insert("CD", cd);
+            coords.insert("OE1", polar_xy(cd.0, cd.1, 1.00, 180.0));
+            coords.insert("OE2", polar_xy(cd.0, cd.1, 1.00, -60.0));
+        }
+        "MET" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            insert_methylene_pair(&mut coords, cg, 0.0, ["HG2", "HG3"]);
+            let sd = polar_xy(cg.0, cg.1, 1.05, -120.0);
+            let ce = polar_xy(sd.0, sd.1, 1.05, -60.0);
+            coords.insert("CG", cg);
+            coords.insert("SD", sd);
+            coords.insert("CE", ce);
+            insert_methyl_fan(&mut coords, ce, -60.0, ["HE1", "HE2", "HE3"]);
+        }
+        "LYS" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            insert_methylene_pair(&mut coords, cg, 0.0, ["HG2", "HG3"]);
+            let cd = polar_xy(cg.0, cg.1, 1.05, -120.0);
+            insert_methylene_pair(&mut coords, cd, 180.0, ["HD2", "HD3"]);
+            let ce = polar_xy(cd.0, cd.1, 1.05, -60.0);
+            insert_methylene_pair(&mut coords, ce, 0.0, ["HE2", "HE3"]);
+            let nz = polar_xy(ce.0, ce.1, 1.05, -120.0);
+            coords.insert("CG", cg);
+            coords.insert("CD", cd);
+            coords.insert("CE", ce);
+            coords.insert("NZ", nz);
+            insert_methyl_fan(&mut coords, nz, -120.0, ["HZ1", "HZ2", "HZ3"]);
+        }
+        "ARG" => {
+            insert_methylene_pair(&mut coords, cb, 195.0, ["HB2", "HB3"]);
+            let cg = polar_xy(cb.0, cb.1, 1.05, -60.0);
+            insert_methylene_pair(&mut coords, cg, 0.0, ["HG2", "HG3"]);
+            let cd = polar_xy(cg.0, cg.1, 1.05, -120.0);
+            insert_methylene_pair(&mut coords, cd, 180.0, ["HD2", "HD3"]);
+            let ne = polar_xy(cd.0, cd.1, 1.05, -60.0);
+            let cz = polar_xy(ne.0, ne.1, 1.05, -120.0);
+            let nh1 = polar_xy(cz.0, cz.1, 1.05, 180.0);
+            let nh2 = polar_xy(cz.0, cz.1, 1.05, -60.0);
+            coords.insert("CG", cg);
+            coords.insert("CD", cd);
+            coords.insert("NE", ne);
+            coords.insert("HE", polar_xy(ne.0, ne.1, h_len, 0.0));
+            coords.insert("CZ", cz);
+            coords.insert("NH1", nh1);
+            coords.insert("HH11", polar_xy(nh1.0, nh1.1, h_len, 130.0));
+            coords.insert("HH12", polar_xy(nh1.0, nh1.1, h_len, 230.0));
+            coords.insert("NH2", nh2);
+            coords.insert("HH21", polar_xy(nh2.0, nh2.1, h_len, -110.0));
+            coords.insert("HH22", polar_xy(nh2.0, nh2.1, h_len, -10.0));
+        }
+        "VAL" => {
+            coords.insert("HB", (0.75, -0.80));
+            let cg1 = polar_xy(cb.0, cb.1, 1.15, -135.0);
+            let cg2 = polar_xy(cb.0, cb.1, 1.15, -45.0);
+            coords.insert("CG1", cg1);
+            insert_methyl_fan(&mut coords, cg1, -135.0, ["HG11", "HG12", "HG13"]);
+            coords.insert("CG2", cg2);
+            insert_methyl_fan(&mut coords, cg2, -45.0, ["HG21", "HG22", "HG23"]);
+        }
+        "THR" => {
+            coords.insert("HB", (0.75, -0.80));
+            let og1 = polar_xy(cb.0, cb.1, 1.10, -135.0);
+            let cg2 = polar_xy(cb.0, cb.1, 1.15, -45.0);
+            coords.insert("OG1", og1);
+            coords.insert("HG1", polar_xy(og1.0, og1.1, h_len, -135.0));
+            coords.insert("CG2", cg2);
+            insert_methyl_fan(&mut coords, cg2, -45.0, ["HG21", "HG22", "HG23"]);
+        }
+        "LEU" => {
+            coords.insert("HB2", (-0.72, -0.95));
+            coords.insert("HB3", (0.72, -0.95));
+            let cg = (0.00, -2.15);
+            let cd1 = polar_xy(cg.0, cg.1, 1.15, -135.0);
+            let cd2 = polar_xy(cg.0, cg.1, 1.15, -45.0);
+            coords.insert("CG", cg);
+            coords.insert("HG", (0.75, -1.95));
+            coords.insert("CD1", cd1);
+            insert_methyl_fan(&mut coords, cd1, -135.0, ["HD11", "HD12", "HD13"]);
+            coords.insert("CD2", cd2);
+            insert_methyl_fan(&mut coords, cd2, -45.0, ["HD21", "HD22", "HD23"]);
+        }
+        "ILE" => {
+            coords.insert("HB", (0.75, -0.80));
+            let cg1 = polar_xy(cb.0, cb.1, 1.15, -135.0);
+            let cg2 = polar_xy(cb.0, cb.1, 1.15, -45.0);
+            let cd1 = (cg1.0, cg1.1 - 1.10);
+            coords.insert("CG1", cg1);
+            insert_methylene_pair(&mut coords, cg1, 157.5, ["HG12", "HG13"]);
+            coords.insert("CG2", cg2);
+            insert_methyl_fan(&mut coords, cg2, -45.0, ["HG21", "HG22", "HG23"]);
+            coords.insert("CD1", cd1);
+            insert_methyl_fan(&mut coords, cd1, -90.0, ["HD11", "HD12", "HD13"]);
+        }
+        "PHE" | "TYR" => {
+            coords.insert("HB2", (-0.72, -0.95));
+            coords.insert("HB3", (0.72, -0.95));
+            // Regular 6-membered benzene ring of exact side 1.00
+            let r_cx = 0.00;
+            let r_cy = -3.10;
+            let cg = polar_xy(r_cx, r_cy, 1.00, 90.0);
+            let cd1 = polar_xy(r_cx, r_cy, 1.00, 150.0);
+            let ce1 = polar_xy(r_cx, r_cy, 1.00, 210.0);
+            let cz = polar_xy(r_cx, r_cy, 1.00, 270.0);
+            let ce2 = polar_xy(r_cx, r_cy, 1.00, 330.0);
+            let cd2 = polar_xy(r_cx, r_cy, 1.00, 30.0);
+
+            coords.insert("CG", cg);
+            coords.insert("CD1", cd1);
+            coords.insert("HD1", polar_xy(cd1.0, cd1.1, h_len, 150.0));
+            coords.insert("CE1", ce1);
+            coords.insert("HE1", polar_xy(ce1.0, ce1.1, h_len, 210.0));
+            coords.insert("CZ", cz);
+            coords.insert("CE2", ce2);
+            coords.insert("HE2", polar_xy(ce2.0, ce2.1, h_len, 330.0));
+            coords.insert("CD2", cd2);
+            coords.insert("HD2", polar_xy(cd2.0, cd2.1, h_len, 30.0));
+
+            if three_letter == "PHE" {
+                coords.insert("HZ", polar_xy(cz.0, cz.1, h_len, 270.0));
+            } else {
+                let oh = polar_xy(cz.0, cz.1, 1.00, 270.0);
+                coords.insert("OH", oh);
+                coords.insert("HH", polar_xy(oh.0, oh.1, h_len, -30.0));
+            }
+
+            rings.push(RingPolygon2D {
+                atoms: &["CG", "CD1", "CE1", "CZ", "CE2", "CD2"],
+                center_x: r_cx,
+                center_y: r_cy,
+                is_aromatic: true,
+            });
+        }
+        "HIS" => {
+            coords.insert("HB2", (-0.72, -0.95));
+            coords.insert("HB3", (0.72, -0.95));
+            // Regular 5-membered imidazole pentagon of exact side 1.00
+            let r5 = 0.5 / (36.0_f64.to_radians()).sin();
+            let r_cx = 0.00;
+            let r_cy = -2.10 - r5;
+            let cg = polar_xy(r_cx, r_cy, r5, 90.0);
+            let nd1 = polar_xy(r_cx, r_cy, r5, 162.0);
+            let ce1 = polar_xy(r_cx, r_cy, r5, 234.0);
+            let ne2 = polar_xy(r_cx, r_cy, r5, 306.0);
+            let cd2 = polar_xy(r_cx, r_cy, r5, 18.0);
+
+            coords.insert("CG", cg);
+            coords.insert("ND1", nd1);
+            coords.insert("HD1", polar_xy(nd1.0, nd1.1, h_len, 162.0));
+            coords.insert("CE1", ce1);
+            coords.insert("HE1", polar_xy(ce1.0, ce1.1, h_len, 234.0));
+            coords.insert("NE2", ne2);
+            coords.insert("HE2", polar_xy(ne2.0, ne2.1, h_len, 306.0));
+            coords.insert("CD2", cd2);
+            coords.insert("HD2", polar_xy(cd2.0, cd2.1, h_len, 18.0));
+
+            rings.push(RingPolygon2D {
+                atoms: &["CG", "ND1", "CE1", "NE2", "CD2"],
+                center_x: r_cx,
+                center_y: r_cy,
+                is_aromatic: true,
+            });
+        }
+        "TRP" => {
+            coords.insert("HB2", (-0.72, -0.95));
+            coords.insert("HB3", (0.72, -0.95));
+            // Fused regular 5-membered pyrrole + regular 6-membered benzene indole bicycle
+            // sharing bond CD2-CE2 of exact unit length 1.00, rotated -18 deg so CG's bisector
+            // aligns vertically under CB = (0.00, -1.05).
+            let r5 = 0.5 / (36.0_f64.to_radians()).sin();
+            let c5_0 = (-0.5 / (36.0_f64.to_radians()).tan(), 0.0);
+            let c6_0 = (3.0_f64.sqrt() * 0.5, 0.0);
+
+            let cg_0 = polar_xy(c5_0.0, c5_0.1, r5, 108.0);
+            let cd1_0 = polar_xy(c5_0.0, c5_0.1, r5, 180.0);
+            let ne1_0 = polar_xy(c5_0.0, c5_0.1, r5, 252.0);
+            let ce2_0 = polar_xy(c5_0.0, c5_0.1, r5, 324.0);
+            let cd2_0 = polar_xy(c5_0.0, c5_0.1, r5, 36.0);
+
+            let ce3_0 = polar_xy(c6_0.0, c6_0.1, 1.00, 90.0);
+            let cz3_0 = polar_xy(c6_0.0, c6_0.1, 1.00, 30.0);
+            let ch2_0 = polar_xy(c6_0.0, c6_0.1, 1.00, -30.0);
+            let cz2_0 = polar_xy(c6_0.0, c6_0.1, 1.00, -90.0);
+
+            let xform = |p: (f64, f64)| -> (f64, f64) {
+                let r = rotate_xy(p.0, p.1, cg_0.0, cg_0.1, -18.0);
+                (r.0 - cg_0.0, r.1 - cg_0.1 - 2.10)
+            };
+
+            let cg = xform(cg_0);
+            let cd1 = xform(cd1_0);
+            let ne1 = xform(ne1_0);
+            let ce2 = xform(ce2_0);
+            let cd2 = xform(cd2_0);
+            let ce3 = xform(ce3_0);
+            let cz3 = xform(cz3_0);
+            let ch2 = xform(ch2_0);
+            let cz2 = xform(cz2_0);
+            let c5 = xform(c5_0);
+            let c6 = xform(c6_0);
+
+            coords.insert("CG", cg);
+            coords.insert("CD1", cd1);
+            coords.insert("HD1", polar_xy(cd1.0, cd1.1, h_len, 162.0));
+            coords.insert("NE1", ne1);
+            coords.insert("HE1", polar_xy(ne1.0, ne1.1, h_len, 234.0));
+            coords.insert("CE2", ce2);
+            coords.insert("CD2", cd2);
+            coords.insert("CE3", ce3);
+            coords.insert("HE3", polar_xy(ce3.0, ce3.1, h_len, 72.0));
+            coords.insert("CZ3", cz3);
+            coords.insert("HZ3", polar_xy(cz3.0, cz3.1, h_len, 12.0));
+            coords.insert("CH2", ch2);
+            coords.insert("HH2", polar_xy(ch2.0, ch2.1, h_len, -48.0));
+            coords.insert("CZ2", cz2);
+            coords.insert("HZ2", polar_xy(cz2.0, cz2.1, h_len, -108.0));
+
+            rings.push(RingPolygon2D {
+                atoms: &["CG", "CD1", "NE1", "CE2", "CD2"],
+                center_x: c5.0,
+                center_y: c5.1,
+                is_aromatic: true,
+            });
+            rings.push(RingPolygon2D {
+                atoms: &["CD2", "CE2", "CZ2", "CH2", "CZ3", "CE3"],
+                center_x: c6.0,
+                center_y: c6.1,
+                is_aromatic: true,
+            });
+        }
+        _ => {}
+    }
+
+    (coords, rings)
+}
+
+impl ResidueTopology {
+    /// Construct the deterministic, planar, non-overlapping 2D covalent layout for this residue
+    /// and chemical state variant.
+    pub fn layout_2d(&self, variant: ResidueVariant) -> ResidueLayout2D {
+        let effective_variant = if variant.is_valid_for_residue(self.three_letter) {
+            variant
+        } else {
+            ResidueVariant::Canonical
+        };
+
+        let (coords, rings) = build_residue_coords_and_rings(self.three_letter);
+
+        let mut atoms = Vec::with_capacity(self.atoms.len());
+        for spec in self.atoms {
+            if !atom_included_in_variant(self.three_letter, effective_variant, spec.name) {
+                continue;
+            }
+            let &(x, y) = coords.get(spec.name).unwrap_or_else(|| {
+                panic!(
+                    "missing 2D layout coordinate for {} {}",
+                    self.three_letter, spec.name
+                )
+            });
+            atoms.push(AtomNode2D {
+                name: spec.name,
+                element: spec.element,
+                x,
+                y,
+                attached_heavy: spec.attached_heavy,
+                is_backbone: spec.is_backbone,
+                is_nmr_observable: is_atom_nmr_observable(self, spec),
+            });
+        }
+
+        let mut bonds = Vec::with_capacity(self.bonds.len());
+        for &(a, b) in self.bonds {
+            if !atom_included_in_variant(self.three_letter, effective_variant, a)
+                || !atom_included_in_variant(self.three_letter, effective_variant, b)
+            {
+                continue;
+            }
+            bonds.push(CovalentBond2D {
+                atom_a: a,
+                atom_b: b,
+                order: classify_bond_order(self.three_letter, a, b),
+            });
+        }
+
+        ResidueLayout2D {
+            three_letter: self.three_letter,
+            one_letter: self.one_letter,
+            variant: effective_variant,
+            atoms,
+            bonds,
+            rings,
+        }
+    }
+}
+
+/// Look up the planar 2D covalent amino-acid layout for `res_name` (`3`- or `1`-letter code)
+/// and chemical state `variant`.
+pub fn residue_layout_2d(res_name: &str, variant: ResidueVariant) -> Option<ResidueLayout2D> {
+    let topo = residue_topology(res_name)?;
+    Some(topo.layout_2d(variant))
+}
+
+fn canonical_atom_alias(atom: &str) -> &str {
+    match atom {
+        "HN" => "H",
+        "CO" => "C",
+        other => other,
+    }
+}
+
+fn exchangeable_proton_fallback_prior(three_letter: &str, atom: &str) -> Option<(f64, f64)> {
+    match (three_letter, atom) {
+        ("ARG", "HH11" | "HH12" | "HH21" | "HH22") => Some((6.80, 0.45)),
+        ("LYS", "HZ1" | "HZ2" | "HZ3") => Some((7.52, 0.45)),
+        ("SER", "HG") => Some((5.33, 0.85)),
+        ("THR", "HG1") => Some((5.12, 0.85)),
+        ("TYR", "HH") => Some((9.28, 0.95)),
+        ("CYS", "HG") => Some((2.05, 0.65)),
+        ("HIS", "HD1") => Some((12.30, 1.20)),
+        ("HIS", "HE2") => Some((12.10, 1.20)),
+        _ => None,
+    }
+}
+
+fn variant_specific_prior_override(
+    three_letter: &str,
+    variant: ResidueVariant,
+    atom: &str,
+    priors: &Priors,
+) -> Option<(f64, f64)> {
+    match (three_letter, variant) {
+        // Sharma & Rajarathnam (J. Biomol. NMR 2000, 18, 165-171) + BMRB redox-separated priors
+        ("CYS", ResidueVariant::CysReduced) => match atom {
+            "CB" => Some((28.05, 2.20)),
+            "CA" => priors
+                .table
+                .get("CYS_REDUCED")
+                .and_then(|m| m.get("CA"))
+                .copied()
+                .or(Some((58.30, 3.10))),
+            "HG" => Some((2.05, 0.65)),
+            _ => priors
+                .table
+                .get("CYS_REDUCED")
+                .and_then(|m| m.get(atom))
+                .copied(),
+        },
+        ("CYS", ResidueVariant::CysOxidized) => match atom {
+            "CB" => Some((41.10, 3.20)),
+            "CA" => priors
+                .table
+                .get("CYS_OXIDIZED")
+                .and_then(|m| m.get("CA"))
+                .copied()
+                .or(Some((55.60, 3.10))),
+            _ => priors
+                .table
+                .get("CYS_OXIDIZED")
+                .and_then(|m| m.get(atom))
+                .copied(),
+        },
+        // Pelton et al. (Protein Sci. 1993, 2, 543-558) imidazole 15N/13C tautomeric distributions
+        ("HIS", ResidueVariant::HisNd1H) => match atom {
+            "ND1" => Some((167.5, 5.0)),
+            "NE2" => Some((249.5, 6.0)),
+            "HD1" => Some((12.30, 1.20)),
+            "CG" => Some((129.0, 2.2)),
+            "CD2" => Some((125.5, 2.2)),
+            "CE1" => Some((138.0, 1.8)),
+            _ => None,
+        },
+        ("HIS", ResidueVariant::HisNe2H) => match atom {
+            "ND1" => Some((249.5, 6.0)),
+            "NE2" => Some((167.5, 5.0)),
+            "HE2" => Some((12.10, 1.20)),
+            "CG" => Some((135.5, 2.2)),
+            "CD2" => Some((118.2, 2.0)),
+            "CE1" => Some((138.0, 1.8)),
+            _ => None,
+        },
+        ("HIS", ResidueVariant::HisDoublyProtonated) => match atom {
+            "ND1" => Some((176.0, 4.5)),
+            "NE2" => Some((173.5, 4.5)),
+            "HD1" => Some((13.20, 1.30)),
+            "HE2" => Some((13.00, 1.30)),
+            "CG" => Some((130.5, 2.2)),
+            "CD2" => Some((119.5, 2.0)),
+            "CE1" => Some((135.8, 1.8)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Compute empirical BMRB `(mu, sd, z_score)` for an assigned chemical shift `ppm` on
+/// `(res_name, variant, atom)`.
+///
+/// Returns `None` for unknown residues/atoms, atoms absent in the specified `ResidueVariant`
+/// (such as `HG` in `CysOxidized` or `HD1` in `HisNe2H`), and non-spin-1/2 heteroatoms (`O`, `S`).
+pub fn compute_atom_bmrb_zscore(
+    res_name: &str,
+    variant: ResidueVariant,
+    atom: &str,
+    ppm: f64,
+    priors: &Priors,
+    sc_priors: &SidechainPriors,
+) -> Option<(f64, f64, f64)> {
+    if !ppm.is_finite() {
+        return None;
+    }
+    let topo = residue_topology(res_name)?;
+    let three = topo.three_letter;
+    let effective_variant = if variant.is_valid_for_residue(three) {
+        variant
+    } else {
+        ResidueVariant::Canonical
+    };
+
+    let up_atom = atom.trim().to_ascii_uppercase();
+    let norm_atom = canonical_atom_alias(&up_atom);
+    let spec = topo.atom(norm_atom)?;
+
+    if matches!(spec.element, Element::O | Element::S) {
+        return None;
+    }
+    if !atom_included_in_variant(three, effective_variant, spec.name) {
+        return None;
+    }
+
+    let is_backbone_five = matches!(norm_atom, "H" | "N" | "CA" | "CB" | "C");
+    let (mu, sd) = variant_specific_prior_override(three, effective_variant, norm_atom, priors)
+        .or_else(|| {
+            if is_backbone_five {
+                priors
+                    .table
+                    .get(three)
+                    .and_then(|m| m.get(norm_atom))
+                    .copied()
+                    .or_else(|| sc_priors.prior(three, norm_atom))
+            } else {
+                sc_priors.prior(three, norm_atom).or_else(|| {
+                    priors
+                        .table
+                        .get(three)
+                        .and_then(|m| m.get(norm_atom))
+                        .copied()
+                })
+            }
+        })
+        .or_else(|| aa_all_atom_prior(three, norm_atom))
+        .or_else(|| exchangeable_proton_fallback_prior(three, norm_atom))?;
+
+    let safe_sd = sd.max(1e-6);
+    let z_score = (ppm - mu) / safe_sd;
+    Some((mu, safe_sd, z_score))
 }
