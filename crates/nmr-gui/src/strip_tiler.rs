@@ -20,7 +20,6 @@ use nmr_core::spinsystems::SpinSystem;
 use crate::contour_painter::SyncCrosshair;
 
 /// Direction of a candidate sequential strip relative to the active query root `i`.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripMatchDirection {
     /// Predecessor `p` at `i - 1`, ranked by `P(p, i)`.
@@ -30,7 +29,6 @@ pub enum StripMatchDirection {
 }
 
 /// Configuration for [`CandidateMatchFinder`].
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct MatchFinderConfig {
     /// Maximum number of ranked predecessor (`i - 1`) and successor (`i + 1`) strips to return.
@@ -53,7 +51,6 @@ impl Default for MatchFinderConfig {
 }
 
 /// Ranked predecessor (`i - 1`) or successor (`i + 1`) candidate spin system around an active root.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct StripMatchCandidate {
     pub spin_system_idx: usize,
@@ -87,7 +84,6 @@ pub struct StripMatchCandidate {
     pub confirmed_link: bool,
 }
 
-#[allow(dead_code)]
 impl StripMatchCandidate {
     /// Root-mean-square chemical-shift residual (ppm) across all compared nuclei.
     pub fn rms_residual_ppm(&self) -> f64 {
@@ -109,7 +105,6 @@ impl StripMatchCandidate {
 }
 
 /// Top-$K$ predecessor (`i - 1`) and successor (`i + 1`) candidate sets for an active spin system.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct StripMatchResult {
     pub root_idx: usize,
@@ -119,10 +114,8 @@ pub struct StripMatchResult {
 
 /// Stateless ranking engine computing ranked `i - 1` and `i + 1` candidate strips from `SpinSystem`
 /// carbon hypotheses and `nmr_core::solver::pair_matrix`.
-#[allow(dead_code)]
 pub struct CandidateMatchFinder;
 
-#[allow(dead_code)]
 impl CandidateMatchFinder {
     /// Convenience entry point ranking top-$K$ predecessors and successors with default settings.
     pub fn rank_top_k(
@@ -393,7 +386,6 @@ impl CandidateMatchFinder {
 ///
 /// Positive lobes represent `CA` and `C'` peaks; `CB(i)` emits a negative lobe (matching standard
 /// `HNCACB` sign convention) while `CB(i - 1)` emits a positive lobe (`CBCA(CO)NH` convention).
-#[allow(dead_code)]
 pub fn synthetic_strip_intensity_at_ppm(ss: &SpinSystem, c_ppm: f64) -> f32 {
     let mut acc = 0.0f64;
     for ((atom, off), cands) in &ss.cands {
@@ -422,7 +414,6 @@ pub fn synthetic_strip_intensity_at_ppm(ss: &SpinSystem, c_ppm: f64) -> f32 {
 }
 
 /// Optional volumetric 3D cubes used by [`StripTilerPanel`] when experimental 3D data are loaded.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Default)]
 pub struct StripSpectra3D<'a> {
     /// Aliphatic `13C` 3D cube (`HNCACB`, `CBCA(CO)NH`, `HNCA`, `HN(CO)CA`).
@@ -432,7 +423,6 @@ pub struct StripSpectra3D<'a> {
 }
 
 /// Read-only data context passed to [`StripTilerPanel::show`].
-#[allow(dead_code)]
 pub struct StripTilerContext<'a> {
     pub systems: &'a [SpinSystem],
     pub pair_mat: &'a Matrix2D,
@@ -447,7 +437,6 @@ pub struct StripTilerContext<'a> {
 }
 
 /// User actions emitted by 1-click controls inside [`StripTilerPanel`].
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StripTilerAction {
     /// Make `spin_system_idx` the active query strip `i` (`1`-click sequential strip walk).
@@ -462,7 +451,6 @@ pub enum StripTilerAction {
 }
 
 /// Interactive `egui` `Predecessors (i - 1) | Active Root (i) | Successors (i + 1)` strip tiler.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct StripTilerPanel {
     pub cfg: MatchFinderConfig,
@@ -512,7 +500,6 @@ impl ColumnRole {
     }
 }
 
-#[allow(dead_code)]
 impl StripTilerPanel {
     pub fn new() -> Self {
         Self::default()

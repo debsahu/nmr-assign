@@ -6,5 +6,9 @@
 //! native desktop and `wasm32-unknown-unknown` targets.
 
 pub mod command_palette;
+pub mod contour_painter;
+pub mod ingest_panel;
 pub mod keymap;
+pub mod session_io;
+pub mod strip_tiler;
 pub mod workflow_bar;

@@ -3,13 +3,8 @@
 //! Provenance: Original scientific GUI built on `eframe`, `wgpu`, `nmr-core`, and `nmr-gpu`
 //! (native Metal/Vulkan/DX12 and browser `wasm32-unknown-unknown` + WebGPU).
 
-mod contour_painter;
 #[allow(dead_code)]
 mod octet_canvas;
-#[allow(dead_code)]
-mod session_io;
-#[allow(dead_code)]
-mod strip_tiler;
 
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
@@ -18,8 +13,10 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-use contour_painter::{ContourCallback, ContourPipelineResource, ContourUniforms};
 use eframe::{egui, egui_wgpu};
+use nmr_core::classify::DataState;
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::classify::{ExperimentDimensionality, ExperimentVendor};
 use nmr_core::evaluate::{score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::nef::read_nef_str;
@@ -49,8 +46,17 @@ use nmr_core::octet_render::{
 use nmr_core::peaks::read_peaks;
 use nmr_core::peaks::{read_peaks_str, Peak};
 use nmr_core::picker::{estimate_noise_mad, pick_hsqc_2d, PickerConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::picker::{pick_c13_hsqc_2d, pick_triple_3d_two_pass, CorroboratedRepickConfig};
 use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d, register_3d_hn_to_hsqc_2d};
+use nmr_core::qc::{evaluate_dataset_qc, DatasetQcReport};
+use nmr_core::report::{generate_quality_report_html, predict_csi_dihedrals, ReportInput};
 use nmr_core::rng::Rng;
+use nmr_core::session::{
+    ResidueAssignmentState, SessionContourParams, WorkbenchCommand, WorkbenchSessionState,
+};
 use nmr_core::simulate::{
     render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
 };
@@ -59,11 +65,32 @@ use nmr_core::solver::{
     ScoreConfig, FORBID,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use nmr_core::spectrum::{read_bruker_pdata_2d, read_nmrpipe_2d};
+use nmr_core::spectrum::{
+    read_bruker_pdata_2d, read_bruker_pdata_3d, read_nmrpipe_2d, read_nmrpipe_3d, read_ucsf_2d,
+    read_ucsf_3d,
+};
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_gui::ingest_panel::ingest_dropped_files_native;
+#[cfg(target_arch = "wasm32")]
+use nmr_gui::ingest_panel::ingest_dropped_files_wasm;
+#[cfg(target_arch = "wasm32")]
+use nmr_gui::session_io::{default_session_nef_filename, trigger_browser_nef_download};
+use nmr_gui::{
+    command_palette::CommandPalette,
+    contour_painter::{
+        default_overlay_palette, ContourPipelineResource, MultiContourCallback, OverlayLayerSpec,
+        SyncCrosshair,
+    },
+    ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
+    keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
+    session_io::WorkbenchSessionController,
+    strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
+    workflow_bar::{draw_workbench_chrome, WorkbenchAction, WorkspaceReadiness},
+};
 use octet_canvas::{IoFormat, MolecularPropertiesSummary, OctetBackendAdapter, OctetDrawPanel};
 
 const UBIQUITIN_SEQ: &str =
@@ -753,6 +780,33 @@ struct NmrWorkbenchApp {
     hsqc_arc: Arc<Vec<f32>>,
     hsqc_gen: u64,
     hncacb_3d: Option<Spectrum3D>,
+    hnco_3d: Option<Spectrum3D>,
+    extra_3d_count: usize,
+    overlay_layers: Vec<(String, OverlayLayerSpec)>,
+    primary_ppm_nudge: [f32; 2],
+    next_layer_id: u64,
+    active_overlay_idx: usize,
+
+    // Phase 9 UX, Session, Overlays & Match-Finder State
+    ingest_panel: IngestPanelState,
+    command_palette: CommandPalette,
+    chord_dispatcher: ChordDispatcher,
+    session: WorkbenchSessionController,
+    crosshair: SyncCrosshair,
+    strip_tiler: StripTilerPanel,
+    use_match_finder_strips: bool,
+    qc_report: Option<DatasetQcReport>,
+    raw_fids_total: usize,
+    unprocessed_fids_remaining: usize,
+    has_structure_or_dynamics: bool,
+    exported_in_session: bool,
+    show_contour_modal: bool,
+    show_overlay_manager: bool,
+    show_assign_popover: bool,
+    show_qc_modal: bool,
+    show_about_modal: bool,
+    assign_target_res: usize,
+    assign_lock_check: bool,
 
     // 2D HSQC viewport & contour settings
     view_h_left: f32,
@@ -785,7 +839,7 @@ struct NmrWorkbenchApp {
     paste_text_buf: String,
     export_text_buf: String,
     #[cfg(target_arch = "wasm32")]
-    pending_dropped_text: Arc<std::sync::Mutex<Option<(String, String)>>>,
+    pending_drop_outcome: Arc<std::sync::Mutex<Option<Result<IngestDropOutcome, String>>>>,
 }
 
 impl NmrWorkbenchApp {
@@ -832,6 +886,11 @@ impl NmrWorkbenchApp {
         let mut octet_app = OctetDrawPanel::new();
         octet_app.set_backend_adapter(Box::new(CoreOctetBackendAdapter));
 
+        let ingest_panel = IngestPanelState {
+            open: false,
+            ..Default::default()
+        };
+
         let mut app = Self {
             workspace_mode: WorkspaceMode::ProteinNmr,
             octet_app,
@@ -861,6 +920,31 @@ impl NmrWorkbenchApp {
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
             hncacb_3d: None,
+            hnco_3d: None,
+            extra_3d_count: 0,
+            overlay_layers: Vec::new(),
+            primary_ppm_nudge: [0.0, 0.0],
+            next_layer_id: 2,
+            active_overlay_idx: 0,
+            ingest_panel,
+            command_palette: CommandPalette::new(),
+            chord_dispatcher: ChordDispatcher::new(),
+            session: WorkbenchSessionController::default(),
+            crosshair: SyncCrosshair::default(),
+            strip_tiler: StripTilerPanel::new(),
+            use_match_finder_strips: true,
+            qc_report: None,
+            raw_fids_total: 0,
+            unprocessed_fids_remaining: 0,
+            has_structure_or_dynamics: false,
+            exported_in_session: false,
+            show_contour_modal: false,
+            show_overlay_manager: false,
+            show_assign_popover: false,
+            show_qc_modal: false,
+            show_about_modal: false,
+            assign_target_res: 0,
+            assign_lock_check: true,
             view_h_left: 10.4,
             view_h_right: 6.1,
             view_n_top: 103.0,
@@ -887,7 +971,7 @@ impl NmrWorkbenchApp {
             paste_text_buf: String::new(),
             export_text_buf: String::new(),
             #[cfg(target_arch = "wasm32")]
-            pending_dropped_text: Arc::new(std::sync::Mutex::new(None)),
+            pending_drop_outcome: Arc::new(std::sync::Mutex::new(None)),
         };
 
         app.load_demo_and_solve();
@@ -923,15 +1007,26 @@ impl NmrWorkbenchApp {
     fn rebuild_systems_and_matrices(&mut self) {
         match build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
             Ok(sys) => {
+                let locked: Vec<(usize, usize)> = self
+                    .session
+                    .state
+                    .locked_assignments_vec()
+                    .into_iter()
+                    .filter(|&(s, k)| s < sys.len() && k < self.sequence.len())
+                    .collect();
                 let scfg = ScoreConfig {
                     assign_cost: self.assign_cost,
+                    locked_assignments: locked,
                     ..ScoreConfig::default()
                 };
                 let (u, p) = self.compute_matrices(&sys, &scfg);
                 self.u_mat = Some(u);
                 self.p_mat = Some(p);
                 self.systems = sys;
-                self.selected_ss = (!self.systems.is_empty()).then_some(0);
+                self.selected_ss = match self.selected_ss {
+                    Some(s) if s < self.systems.len() => Some(s),
+                    _ => (!self.systems.is_empty()).then_some(0),
+                };
             }
             Err(e) => {
                 self.status_msg = format!("Spin system build error: {e}");
@@ -952,7 +1047,194 @@ impl NmrWorkbenchApp {
         self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
         self.hsqc_spec = Some(hsqc);
         self.hncacb_3d = Some(render_triple_3d("HNCACB", &self.peaks, &rcfg));
+        self.hnco_3d = Some(render_triple_3d("HNCO", &self.peaks, &rcfg));
+        self.extra_3d_count = 0;
+        self.overlay_layers.clear();
+        self.primary_ppm_nudge = [0.0, 0.0];
         self.reset_view_to_spec();
+    }
+
+    fn sync_session_from_app_fresh(&mut self, protein_name: &str) {
+        let mut st = WorkbenchSessionState::new(protein_name, self.sequence.clone());
+        if self.seq_ids.len() == self.sequence.len() {
+            st.seq_ids = self.seq_ids.clone();
+        }
+        st.peaks = self.peaks.clone();
+        let mut hsqc_layer = SessionContourParams::new("HSQC");
+        hsqc_layer.base_level = self.contour_base;
+        hsqc_layer.level_factor = self.contour_factor;
+        hsqc_layer.num_levels = self.contour_levels;
+        hsqc_layer.show_negative = self.show_negative;
+        hsqc_layer.ppm_nudge = self.primary_ppm_nudge;
+        st.contour_layers = vec![hsqc_layer];
+        self.session = WorkbenchSessionController::new(st);
+    }
+
+    fn sync_session_assignments_from_solver(&mut self) {
+        self.session.state.sequence = self.sequence.clone();
+        if self.seq_ids.len() == self.sequence.len() {
+            self.session.state.seq_ids = self.seq_ids.clone();
+        }
+        self.session.state.peaks = self.peaks.clone();
+        self.session.state.qc_verdict = self.qc_report.as_ref().map(|q| q.verdict);
+
+        let mut new_assign: BTreeMap<usize, ResidueAssignmentState> = BTreeMap::new();
+        if let Some(pred) = &self.pred_ref {
+            for (&(res_idx, ref atom), &val) in &pred.shifts {
+                if res_idx < self.sequence.len() {
+                    let entry =
+                        new_assign
+                            .entry(res_idx)
+                            .or_insert_with(|| ResidueAssignmentState {
+                                spin_system: None,
+                                shifts: BTreeMap::new(),
+                                confidence: self.pred_conf.get(&res_idx).copied().unwrap_or(0.0),
+                            });
+                    entry.shifts.insert(atom.clone(), val);
+                }
+            }
+        }
+        if let Some(res) = &self.assign_res {
+            for (ss, &pos) in res.position.iter().enumerate() {
+                if pos >= 0 && (pos as usize) < self.sequence.len() {
+                    let k = pos as usize;
+                    let c = res.confidence.get(ss).copied().unwrap_or(0.0);
+                    let entry = new_assign
+                        .entry(k)
+                        .or_insert_with(|| ResidueAssignmentState {
+                            spin_system: Some(ss),
+                            shifts: BTreeMap::new(),
+                            confidence: c,
+                        });
+                    entry.spin_system = Some(ss);
+                    entry.confidence = c;
+                }
+            }
+        }
+        // Keep lock-assignment coherence invariant satisfied
+        self.session.state.locked_residues.retain(|&ss, k| {
+            new_assign
+                .get(k)
+                .is_some_and(|st| st.spin_system == Some(ss))
+        });
+        self.session.state.assignments = new_assign;
+    }
+
+    fn sync_app_from_session(&mut self) {
+        self.sequence = self.session.state.sequence.clone();
+        self.seq_ids = if self.session.state.seq_ids.len() == self.sequence.len() {
+            self.session.state.seq_ids.clone()
+        } else {
+            (1..=(self.sequence.len() as i32)).collect()
+        };
+        self.octet_app
+            .set_loaded_protein_sequence(self.sequence.clone());
+
+        if self.peaks != self.session.state.peaks {
+            self.peaks = self.session.state.peaks.clone();
+            self.rebuild_systems_and_matrices();
+        } else if !self.sequence.is_empty() && !self.systems.is_empty() {
+            let locked = self.session.state.locked_assignments_vec();
+            let scfg = ScoreConfig {
+                assign_cost: self.assign_cost,
+                locked_assignments: locked,
+                ..ScoreConfig::default()
+            };
+            self.u_mat = Some(unary_matrix(
+                &self.systems,
+                &self.sequence,
+                &self.priors,
+                &scfg,
+            ));
+        }
+
+        if let Some(hsqc_layer) = self
+            .session
+            .state
+            .contour_layers
+            .iter()
+            .find(|l| l.layer_id == "HSQC")
+        {
+            self.contour_base = hsqc_layer.base_level.max(1e-4);
+            self.contour_factor = hsqc_layer.level_factor.max(1.05);
+            self.contour_levels = hsqc_layer.num_levels.clamp(1, 24);
+            self.show_negative = hsqc_layer.show_negative;
+            self.primary_ppm_nudge = hsqc_layer.ppm_nudge;
+        }
+
+        let n_sys = self.systems.len();
+        let mut position = vec![-1i32; n_sys];
+        let mut confidence = vec![0.0f64; n_sys];
+        for (&res_idx, st) in &self.session.state.assignments {
+            if let Some(ss) = st.spin_system {
+                if ss < n_sys && res_idx < self.sequence.len() {
+                    position[ss] = res_idx as i32;
+                    confidence[ss] = st.confidence;
+                }
+            }
+        }
+        let (mut pred, mut conf) = self.session.state.to_reference_and_confidences();
+        if n_sys > 0 {
+            let synth_res = AssignResult {
+                position: position.clone(),
+                score: self.assign_res.as_ref().map_or(0.0, |r| r.score),
+                confidence: confidence.clone(),
+                run_scores: Vec::new(),
+            };
+            let (derived_ref, derived_conf) = to_reference(
+                &synth_res,
+                &self.systems,
+                &self.sequence,
+                &self.seq_ids,
+                0.0,
+                Some(&self.priors),
+            );
+            for (key, val) in derived_ref.shifts {
+                pred.shifts.entry(key).or_insert(val);
+            }
+            for (k, c) in derived_conf {
+                conf.entry(k).or_insert(c);
+            }
+            self.assign_res = Some(synth_res);
+        } else {
+            self.assign_res = None;
+        }
+        self.pred_ref = Some(pred);
+        self.pred_conf = conf;
+    }
+
+    fn raw_hsqc_locks_for_peaks(&self) -> Vec<(usize, usize)> {
+        if self.session.state.locked_residues.is_empty() {
+            return Vec::new();
+        }
+        let hsqc_roots: Vec<(f64, f64)> = self
+            .peaks
+            .iter()
+            .filter(|p| p.exp == "HSQC")
+            .map(|p| (p.h, p.n))
+            .collect();
+        let mut out = Vec::new();
+        for (&ss_idx, &res_idx) in &self.session.state.locked_residues {
+            if let Some(ss) = self.systems.get(ss_idx) {
+                if let Some((raw_i, _)) = hsqc_roots
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &(rh, rn))| {
+                        (rh - ss.h).abs() <= 0.045 && (rn - ss.n).abs() <= 0.45
+                    })
+                    .min_by(|&(_, &(ah, an)), &(_, &(bh, bn))| {
+                        let da = ((ah - ss.h) / 0.03).powi(2) + ((an - ss.n) / 0.3).powi(2);
+                        let db = ((bh - ss.h) / 0.03).powi(2) + ((bn - ss.n) / 0.3).powi(2);
+                        da.total_cmp(&db)
+                    })
+                {
+                    out.push((raw_i, res_idx));
+                }
+            } else if ss_idx < hsqc_roots.len() {
+                out.push((ss_idx, res_idx));
+            }
+        }
+        out
     }
 
     fn load_demo_and_solve(&mut self) {
@@ -982,10 +1264,16 @@ impl NmrWorkbenchApp {
         self.pred_ref = None;
         self.pred_conf.clear();
         self.metrics = None;
+        self.qc_report = None;
+        self.raw_fids_total = 0;
+        self.unprocessed_fids_remaining = 0;
+        self.has_structure_or_dynamics = false;
+        self.exported_in_session = false;
         self.regenerate_synthetic_spectra();
+        self.sync_session_from_app_fresh("Ubiquitin");
         self.rebuild_systems_and_matrices();
         self.status_msg = format!(
-            "Simulated {} peaks & {} spin systems ({} aa) + 2D HSQC / 3D HNCACB spectra",
+            "Simulated {} peaks & {} spin systems ({} aa) + 2D HSQC / 3D HNCACB & HNCO spectra",
             self.peaks.len(),
             self.systems.len(),
             self.sequence.len()
@@ -1000,18 +1288,30 @@ impl NmrWorkbenchApp {
             self.status_msg = "Need peaks/spin systems and sequence to run assignment".to_string();
             return;
         }
-        let scfg = ScoreConfig {
-            assign_cost: self.assign_cost,
-            ..ScoreConfig::default()
-        };
+        // Snapshot coordinates of user-locked spin systems so locks remap across filtered/rebuilt SpinSystems
+        let locked_coords: Vec<(f64, f64, usize)> = self
+            .session
+            .state
+            .locked_residues
+            .iter()
+            .filter_map(|(&ss_idx, &res_idx)| {
+                self.systems.get(ss_idx).map(|ss| (ss.h, ss.n, res_idx))
+            })
+            .collect();
 
         let timer = PerfTimer::start();
         let (res, engine_tag, eff_priors, kept_hsqc_opt) = match self.solver_kind {
             GuiSolverKind::EvoGraph => {
+                let raw_locks = self.raw_hsqc_locks_for_peaks();
+                let scfg_base = ScoreConfig {
+                    assign_cost: self.assign_cost,
+                    ..ScoreConfig::default()
+                };
                 let mut evo_cfg = EvoGraphConfig {
-                    score_cfg: scfg.clone(),
-                    auto_reference: scfg.auto_reference,
+                    score_cfg: scfg_base.clone(),
+                    auto_reference: scfg_base.auto_reference,
                     structure_torsions: None,
+                    locked_assignments: raw_locks,
                     seed: self.sim_seed,
                     ..EvoGraphConfig::default()
                 };
@@ -1029,14 +1329,32 @@ impl NmrWorkbenchApp {
                     &self.priors,
                     &evo_cfg,
                 );
+                let mut remapped_locks: BTreeMap<usize, usize> = BTreeMap::new();
+                for &(lh, ln, lres) in &locked_coords {
+                    if let Some((new_ss, _)) = evo_systems
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, s)| (s.h - lh).abs() <= 0.045 && (s.n - ln).abs() <= 0.45)
+                    {
+                        remapped_locks.insert(new_ss, lres);
+                    }
+                }
+                self.session.state.locked_residues = remapped_locks;
+
+                let scfg_u = ScoreConfig {
+                    assign_cost: self.assign_cost,
+                    locked_assignments: self.session.state.locked_assignments_vec(),
+                    ..ScoreConfig::default()
+                };
                 let shifted_pri = rep.shifted_priors(&self.priors);
                 self.u_mat = Some(unary_matrix(
                     &evo_systems,
                     &self.sequence,
                     &shifted_pri,
-                    &scfg,
+                    &scfg_u,
                 ));
-                self.p_mat = Some(pair_matrix(&evo_systems, &scfg));
+                self.p_mat = Some(pair_matrix(&evo_systems, &scfg_u));
+                self.qc_report = Some(rep.qc_report.clone());
                 self.systems = evo_systems;
                 self.selected_ss = match self.selected_ss {
                     Some(s) if s < self.systems.len() => Some(s),
@@ -1053,11 +1371,25 @@ impl NmrWorkbenchApp {
                 // Rebuild unfiltered spin systems when switching back from Evo-Graph filtered systems
                 if let Ok(sys) = build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
                     if sys.len() != self.systems.len() {
+                        let mut remapped_locks: BTreeMap<usize, usize> = BTreeMap::new();
+                        for &(lh, ln, lres) in &locked_coords {
+                            if let Some((new_ss, _)) = sys.iter().enumerate().find(|&(_, s)| {
+                                (s.h - lh).abs() <= 0.045 && (s.n - ln).abs() <= 0.45
+                            }) {
+                                remapped_locks.insert(new_ss, lres);
+                            }
+                        }
+                        self.session.state.locked_residues = remapped_locks;
                         self.systems = sys;
-                        self.p_mat = Some(pair_matrix(&self.systems, &scfg));
                         self.selected_ss = (!self.systems.is_empty()).then_some(0);
                     }
                 }
+                let scfg = ScoreConfig {
+                    assign_cost: self.assign_cost,
+                    locked_assignments: self.session.state.locked_assignments_vec(),
+                    ..ScoreConfig::default()
+                };
+                self.p_mat = Some(pair_matrix(&self.systems, &scfg));
                 let acfg = AnnealConfig {
                     runs: self.replicas,
                     steps_per_system: self.steps_per_sys,
@@ -1077,7 +1409,15 @@ impl NmrWorkbenchApp {
                             &scfg,
                             &acfg,
                         ) {
-                            Ok(r) => res_opt = Some((r, "WebGPU")),
+                            Ok(r) => {
+                                self.u_mat = Some(unary_matrix(
+                                    &self.systems,
+                                    &self.sequence,
+                                    &self.priors,
+                                    &scfg,
+                                ));
+                                res_opt = Some((r, "WebGPU"));
+                            }
                             Err(e) => {
                                 self.status_msg =
                                     format!("GPU solver error ({e}), falling back to CPU");
@@ -1100,6 +1440,16 @@ impl NmrWorkbenchApp {
                     self.u_mat = Some(u.clone());
                     (assign_from_matrices(&u, &p, &acfg), default_tag)
                 });
+                let qc = evaluate_dataset_qc(
+                    Some(&self.peaks),
+                    &self.systems,
+                    &self.sequence,
+                    &self.priors,
+                    &scfg,
+                    &r,
+                    None,
+                );
+                self.qc_report = Some(qc);
                 (r, tag, self.priors.clone(), None)
             }
         };
@@ -1136,8 +1486,14 @@ impl NmrWorkbenchApp {
             }
         }
         let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+        let n_locks = self.session.state.locked_residues.len();
+        let lock_note = if n_locks > 0 {
+            format!(", {n_locks} locked")
+        } else {
+            String::new()
+        };
         self.status_msg = format!(
-            "[{engine_tag}] Assigned {}/{} residues ({} high-conf >=0.8) in {:.0} ms",
+            "[{engine_tag}] Assigned {}/{} residues ({} high-conf >=0.8{lock_note}) in {:.0} ms",
             conf.len(),
             self.sequence.len(),
             n_hc,
@@ -1153,6 +1509,7 @@ impl NmrWorkbenchApp {
         self.pred_ref = Some(pred);
         self.pred_conf = conf;
         self.assign_res = Some(res);
+        self.sync_session_assignments_from_solver();
     }
 
     fn load_text_in_memory(&mut self, text: &str, source_label: &str) {
@@ -1207,11 +1564,38 @@ impl NmrWorkbenchApp {
             }
         }
 
-        // Check NEF v1.1 (`data_nef_...` or `save_nef_molecular_system`)
+        // Check NEF v1.1 (`data_nef_...`, `save_nef_molecular_system`, or `_nmrassign_workbench`)
         if lower_label.ends_with(".nef")
             || trimmed.contains("save_nef_molecular_system")
             || trimmed.starts_with("data_nef_")
         {
+            if trimmed.contains("_nmrassign_workbench") {
+                match self
+                    .session
+                    .load_from_nef_str(trimmed, Some(source_label.to_string()))
+                {
+                    Ok(summary) => {
+                        self.truth = None;
+                        self.metrics = None;
+                        self.peaks = self.session.state.peaks.clone();
+                        self.sequence = self.session.state.sequence.clone();
+                        self.seq_ids = self.session.state.seq_ids.clone();
+                        if !self.peaks.is_empty() {
+                            self.regenerate_synthetic_spectra();
+                        }
+                        self.rebuild_systems_and_matrices();
+                        self.sync_app_from_session();
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.status_msg = summary;
+                        return;
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("NEF session restore error: {e}");
+                        return;
+                    }
+                }
+            }
+
             match read_nef_str(trimmed) {
                 Ok(doc) => match doc.to_reference() {
                     Ok(r) => {
@@ -1226,6 +1610,7 @@ impl NmrWorkbenchApp {
                             self.truth = None;
                             self.metrics = None;
                             self.regenerate_synthetic_spectra();
+                            self.sync_session_from_app_fresh(&doc.project_name);
                             self.rebuild_systems_and_matrices();
                             self.run_assignment();
                         } else {
@@ -1262,6 +1647,7 @@ impl NmrWorkbenchApp {
                     self.truth = None;
                     self.metrics = None;
                     self.regenerate_synthetic_spectra();
+                    self.sync_session_from_app_fresh("in_memory_peaks");
                     self.rebuild_systems_and_matrices();
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg = format!(
@@ -1282,12 +1668,42 @@ impl NmrWorkbenchApp {
             self.status_msg = format!("Path not found: {}", p.display());
             return;
         }
-        if p.is_dir() || p.file_name().and_then(|s| s.to_str()) == Some("2rr") {
-            let dir = if p.is_dir() {
-                p
-            } else {
-                p.parent().unwrap_or(p)
-            };
+        let lower_full = path_str.to_ascii_lowercase();
+        if p.is_dir()
+            || lower_full.ends_with(".tar")
+            || lower_full.ends_with(".tar.gz")
+            || lower_full.ends_with(".tgz")
+        {
+            if p.is_dir() && p.join("2rr").exists() {
+                match read_bruker_pdata_2d(p) {
+                    Ok(spec) => {
+                        self.hsqc_arc = Arc::new(spec.data.clone());
+                        self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                        self.hsqc_spec = Some(spec);
+                        self.reset_view_to_spec();
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.status_msg = format!("Loaded Bruker 2D pdata from {}", p.display());
+                    }
+                    Err(e) => self.status_msg = format!("Bruker load error: {e}"),
+                }
+                return;
+            }
+            match IngestPanelState::from_native_path(p) {
+                Ok(panel) => {
+                    let n_exp = panel.inventory.experiments.len();
+                    self.ingest_panel = panel;
+                    self.ingest_panel.open = true;
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.status_msg =
+                        format!("Classified {n_exp} experiment(s) in {}", p.display());
+                }
+                Err(e) => self.status_msg = format!("Workspace classification error: {e}"),
+            }
+            return;
+        }
+
+        if p.file_name().and_then(|s| s.to_str()) == Some("2rr") {
+            let dir = p.parent().unwrap_or(p);
             match read_bruker_pdata_2d(dir) {
                 Ok(spec) => {
                     self.hsqc_arc = Arc::new(spec.data.clone());
@@ -1319,18 +1735,61 @@ impl NmrWorkbenchApp {
                 Ok(txt) => self.load_text_in_memory(&txt, &p.display().to_string()),
                 Err(e) => self.status_msg = format!("NEF read error: {e}"),
             },
+            "fasta" | "fa" | "faa" | "seq" => match std::fs::read_to_string(p) {
+                Ok(txt) => {
+                    let parsed = nmr_gui::ingest_panel::parse_sequence_three_letter(&txt);
+                    if parsed.is_empty() {
+                        self.status_msg =
+                            format!("No amino-acid sequence found in {}", p.display());
+                    } else {
+                        self.sequence = parsed;
+                        self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
+                        self.octet_app
+                            .set_loaded_protein_sequence(self.sequence.clone());
+                        self.session.state.sequence = self.sequence.clone();
+                        self.session.state.seq_ids = self.seq_ids.clone();
+                        self.rebuild_systems_and_matrices();
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.status_msg = format!(
+                            "Loaded {} residue sequence from {}",
+                            self.sequence.len(),
+                            p.display()
+                        );
+                    }
+                }
+                Err(e) => self.status_msg = format!("FASTA read error: {e}"),
+            },
             "tsv" => match read_peaks(p) {
                 Ok(pks) => {
                     self.peaks = pks;
                     self.truth = None;
                     self.metrics = None;
                     self.regenerate_synthetic_spectra();
+                    self.sync_session_from_app_fresh("tsv_peaks");
                     self.rebuild_systems_and_matrices();
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
                     self.status_msg =
                         format!("Loaded {} peaks from {}", self.peaks.len(), p.display());
                 }
                 Err(e) => self.status_msg = format!("Peak TSV error: {e}"),
+            },
+            "ucsf" => match read_ucsf_2d(p) {
+                Ok(spec) => {
+                    self.hsqc_arc = Arc::new(spec.data.clone());
+                    self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                    self.hsqc_spec = Some(spec);
+                    self.reset_view_to_spec();
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.status_msg = format!("Loaded UCSF 2D spectrum {}", p.display());
+                }
+                Err(_) => match read_ucsf_3d(p, "HNCACB") {
+                    Ok(spec3d) => {
+                        self.hncacb_3d = Some(spec3d);
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        self.status_msg = format!("Loaded UCSF 3D spectrum {}", p.display());
+                    }
+                    Err(e) => self.status_msg = format!("UCSF load error: {e}"),
+                },
             },
             "ft2" | "dat" | "pipe" => match read_nmrpipe_2d(p) {
                 Ok(spec) => {
@@ -1342,6 +1801,14 @@ impl NmrWorkbenchApp {
                     self.status_msg = format!("Loaded NMRPipe 2D spectrum {}", p.display());
                 }
                 Err(e) => self.status_msg = format!("NMRPipe load error: {e}"),
+            },
+            "ft3" => match read_nmrpipe_3d(p, "HNCACB") {
+                Ok(spec3d) => {
+                    self.hncacb_3d = Some(spec3d);
+                    self.workspace_mode = WorkspaceMode::ProteinNmr;
+                    self.status_msg = format!("Loaded NMRPipe 3D spectrum {}", p.display());
+                }
+                Err(e) => self.status_msg = format!("NMRPipe 3D load error: {e}"),
             },
             "cdx" => match std::fs::read(p) {
                 Ok(bytes) => match read_cdx(&bytes) {
@@ -1388,7 +1855,7 @@ impl NmrWorkbenchApp {
             }
             _ => {
                 self.status_msg = format!(
-                    "Unrecognized file extension .{ext} (expected .str, .nef, .tsv, .ft2, pdata, .cdxml, .cdx, .oct, .mol, .sdf, .smi, .jdx)"
+                    "Unrecognized file extension .{ext} (expected folder, .tar.gz, .ucsf, .str, .nef, .fasta, .tsv, .ft2, .ft3)"
                 );
             }
         }
@@ -1427,6 +1894,7 @@ impl NmrWorkbenchApp {
         let mut combined = picked;
         combined.extend(self.peaks.iter().filter(|p| p.exp != "HSQC").cloned());
         self.peaks = combined;
+        self.session.state.peaks = self.peaks.clone();
         self.truth = None;
         self.metrics = None;
         self.rebuild_systems_and_matrices();
@@ -1457,6 +1925,7 @@ impl NmrWorkbenchApp {
         let star_text = format_star_in_memory(pred, Some(&self.pred_conf));
         self.export_text_buf =
             format!("# --- NMR-STAR v3 ---\n{star_text}\n# --- Shifts TSV ---\n{tsv_text}");
+        self.exported_in_session = true;
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1481,47 +1950,67 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn apply_drop_outcome(&mut self, outcome: IngestDropOutcome) {
+        match outcome {
+            IngestDropOutcome::NefSession {
+                source_name,
+                nef_bytes,
+            } => match String::from_utf8(nef_bytes) {
+                Ok(txt) => self.load_text_in_memory(&txt, &source_name),
+                Err(e) => self.status_msg = format!("Dropped NEF is not valid UTF-8: {e}"),
+            },
+            IngestDropOutcome::TextTable { source_name, text } => {
+                self.load_text_in_memory(&text, &source_name);
+            }
+            IngestDropOutcome::Workspace(panel) => {
+                let n_exp = panel.inventory.experiments.len();
+                let root = panel.inventory.root_name.clone();
+                self.ingest_panel = *panel;
+                self.ingest_panel.open = true;
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.status_msg = format!(
+                    "Classified '{root}' ({n_exp} experiment(s)) — review selection matrix"
+                );
+            }
+        }
+    }
+
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         {
             let ready = self
-                .pending_dropped_text
+                .pending_drop_outcome
                 .lock()
                 .ok()
                 .and_then(|mut g| g.take());
-            if let Some((text, label)) = ready {
-                self.load_text_in_memory(&text, &label);
+            if let Some(res) = ready {
+                match res {
+                    Ok(outcome) => self.apply_drop_outcome(outcome),
+                    Err(e) => self.status_msg = format!("Drop ingest error: {e}"),
+                }
             }
         }
 
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if let Some(file) = dropped.into_iter().next() {
+        if !dropped.is_empty() {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let _ = ctx;
-                let p = file.path();
-                if p.exists() {
-                    self.path_input = p.display().to_string();
-                    self.load_path_auto();
-                } else if let Ok(bytes) = file.bytes() {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let label = p.display().to_string();
-                    self.load_text_in_memory(&text, &label);
+                match ingest_dropped_files_native(&dropped) {
+                    Ok(outcome) => self.apply_drop_outcome(outcome),
+                    Err(e) => self.status_msg = format!("Drop ingest error: {e}"),
                 }
             }
             #[cfg(target_arch = "wasm32")]
             {
-                let slot = Arc::clone(&self.pending_dropped_text);
+                let slot = Arc::clone(&self.pending_drop_outcome);
                 let egui_ctx = ctx.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let label = file.path().display().to_string();
-                    if let Ok(bytes) = file.bytes_async().await {
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        if let Ok(mut g) = slot.lock() {
-                            *g = Some((text, label));
-                        }
-                        egui_ctx.request_repaint();
+                    let res = ingest_dropped_files_wasm(dropped).await;
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(res);
                     }
+                    egui_ctx.request_repaint();
                 });
             }
         }
@@ -1807,13 +2296,20 @@ impl NmrWorkbenchApp {
                             egui::Color32::from_rgb(48, 56, 74)
                         };
 
+                        let is_locked = self.session.state.is_residue_locked(k);
                         let stroke = if is_selected {
                             egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 235, 255))
+                        } else if is_locked {
+                            egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 215, 90))
                         } else {
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(65, 76, 98))
                         };
 
-                        let label = format!("{one}{seq_id}");
+                        let label = if is_locked {
+                            format!("🔒{one}{seq_id}")
+                        } else {
+                            format!("{one}{seq_id}")
+                        };
                         let btn = egui::Button::new(
                             egui::RichText::new(label)
                                 .monospace()
@@ -1827,16 +2323,21 @@ impl NmrWorkbenchApp {
                         let resp = ui.add(btn);
                         if resp.clicked() {
                             self.selected_res = Some(k);
+                            self.assign_target_res = k;
                             if let Some((ss_idx, _)) = assigned {
                                 self.selected_ss = Some(ss_idx);
+                                if let Some(ss) = self.systems.get(ss_idx) {
+                                    self.crosshair.snap_to(ss.h, ss.n, None);
+                                }
                             }
                         }
                         resp.on_hover_ui(|ui| {
                             ui.label(egui::RichText::new(format!("{three} {seq_id}")).strong());
                             if let Some((ss_idx, conf)) = assigned {
                                 ui.label(format!(
-                                    "Spin system #{ss_idx} (conf {:.0}%)",
-                                    conf * 100.0
+                                    "Spin system #{ss_idx} (conf {:.0}%{})",
+                                    conf * 100.0,
+                                    if is_locked { ", LOCKED" } else { "" }
                                 ));
                             } else if is_pro_or_nterm {
                                 ui.label("No amide H root (N-term / Proline)");
@@ -1857,8 +2358,8 @@ impl NmrWorkbenchApp {
     }
 
     fn draw_hsqc_canvas(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("2D ¹H–¹⁵N HSQC (WebGPU Shader)").strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("2D ¹H–¹⁵N HSQC (WebGPU Multi-Layer)").strong());
             ui.add(
                 egui::Slider::new(&mut self.contour_base, 0.5..=60.0)
                     .logarithmic(true)
@@ -1868,6 +2369,20 @@ impl NmrWorkbenchApp {
             ui.add(egui::Slider::new(&mut self.contour_levels, 4..=16).text("Levels"));
             ui.checkbox(&mut self.show_negative, "Neg");
             ui.checkbox(&mut self.show_peak_labels, "Labels");
+            if ui
+                .small_button(format!("⧉ Overlays ({})", 1 + self.overlay_layers.len()))
+                .clicked()
+            {
+                self.show_overlay_manager = !self.show_overlay_manager;
+            }
+            let lock_txt = if self.crosshair.locked {
+                "🔒 Crosshair"
+            } else {
+                "┼ Crosshair"
+            };
+            if ui.small_button(lock_txt).clicked() {
+                self.crosshair.toggle_lock();
+            }
             if ui.small_button("Reset Zoom").clicked() {
                 self.reset_view_to_spec();
             }
@@ -1909,41 +2424,40 @@ impl NmrWorkbenchApp {
             }
         }
 
+        let view_ppm = [
+            self.view_h_left,
+            self.view_h_right,
+            self.view_n_top,
+            self.view_n_bottom,
+        ];
+
         let painter = ui.painter_at(rect);
+        let mut gpu_layers: Vec<OverlayLayerSpec> = Vec::new();
         if let Some(spec) = &self.hsqc_spec {
-            let uniforms = ContourUniforms {
-                view_ppm: [
-                    self.view_h_left,
-                    self.view_h_right,
-                    self.view_n_top,
-                    self.view_n_bottom,
-                ],
-                axis_ppm: [
-                    spec.axis_x.first_ppm as f32,
-                    spec.axis_x.step_ppm as f32,
-                    spec.axis_y.first_ppm as f32,
-                    spec.axis_y.step_ppm as f32,
-                ],
-                dims: [
-                    spec.nx() as f32,
-                    spec.ny() as f32,
-                    rect.width(),
-                    rect.height(),
-                ],
-                levels: [
-                    self.contour_base,
-                    self.contour_factor,
-                    self.contour_levels as f32,
-                    if self.show_negative { 1.0 } else { 0.0 },
-                ],
-            };
+            let mut base_layer = OverlayLayerSpec::from_spectrum_2d(
+                1,
+                self.hsqc_gen,
+                spec,
+                Arc::clone(&self.hsqc_arc),
+                self.contour_base,
+                0,
+            );
+            base_layer.level_factor = self.contour_factor;
+            base_layer.num_levels = self.contour_levels;
+            base_layer.show_negative = self.show_negative;
+            base_layer.ppm_nudge = self.primary_ppm_nudge;
+            gpu_layers.push(base_layer);
+        }
+        for (_, ov) in &self.overlay_layers {
+            if ov.visible {
+                gpu_layers.push(ov.clone());
+            }
+        }
+
+        if !gpu_layers.is_empty() {
             let cb = egui_wgpu::Callback::new_paint_callback(
                 rect,
-                ContourCallback {
-                    uniforms,
-                    spec_gen: self.hsqc_gen,
-                    spec_data: Arc::clone(&self.hsqc_arc),
-                },
+                MultiContourCallback::new(view_ppm, [rect.width(), rect.height()], gpu_layers),
             );
             painter.add(cb);
         } else {
@@ -1951,12 +2465,7 @@ impl NmrWorkbenchApp {
         }
 
         let ppm_to_screen = |h: f64, n: f64| -> egui::Pos2 {
-            let u = ((h as f32) - self.view_h_left) / (self.view_h_right - self.view_h_left);
-            let v = ((n as f32) - self.view_n_top) / (self.view_n_bottom - self.view_n_top);
-            egui::pos2(
-                rect.left() + u * rect.width(),
-                rect.top() + v * rect.height(),
-            )
+            SyncCrosshair::ppm_to_screen_2d(view_ppm, rect, h, n)
         };
 
         // Click to select nearest spin system
@@ -1972,9 +2481,13 @@ impl NmrWorkbenchApp {
                 }
                 if let Some((s, _)) = best {
                     self.selected_ss = Some(s);
+                    let ss = &self.systems[s];
+                    self.crosshair.snap_to(ss.h, ss.n, None);
                     if let Some(res) = &self.assign_res {
-                        if res.position[s] >= 0 {
-                            self.selected_res = Some(res.position[s] as usize);
+                        if res.position.get(s).copied().unwrap_or(-1) >= 0 {
+                            let rk = res.position[s] as usize;
+                            self.selected_res = Some(rk);
+                            self.assign_target_res = rk;
                         }
                     }
                 }
@@ -1988,13 +2501,16 @@ impl NmrWorkbenchApp {
                 continue;
             }
             let is_sel = self.selected_ss == Some(s);
+            let is_locked = self.session.state.is_spin_system_locked(s);
             let (assigned_k, conf) = self
                 .assign_res
                 .as_ref()
-                .map(|r| (r.position[s], r.confidence[s]))
+                .and_then(|r| Some((*r.position.get(s)?, *r.confidence.get(s)?)))
                 .unwrap_or((-1, 0.0));
 
-            let marker_col = if assigned_k >= 0 {
+            let marker_col = if is_locked {
+                egui::Color32::from_rgb(255, 222, 92)
+            } else if assigned_k >= 0 {
                 if conf >= 0.80 {
                     egui::Color32::from_rgb(95, 245, 165)
                 } else {
@@ -2024,7 +2540,11 @@ impl NmrWorkbenchApp {
             if self.show_peak_labels {
                 let text = if assigned_k >= 0 && (assigned_k as usize) < self.sequence.len() {
                     let k = assigned_k as usize;
-                    format!("{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                    if is_locked {
+                        format!("🔒{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                    } else {
+                        format!("{}{}", three_to_one(&self.sequence[k]), self.seq_ids[k])
+                    }
                 } else {
                     format!("#{s}")
                 };
@@ -2036,6 +2556,43 @@ impl NmrWorkbenchApp {
                     marker_col,
                 );
             }
+        }
+
+        // Update & draw synchronized crosshair
+        if let Some(hp) = response.hover_pos() {
+            let u = (hp.x - rect.left()) / rect.width().max(1.0);
+            let v = (hp.y - rect.top()) / rect.height().max(1.0);
+            let cur_h = (self.view_h_left + u * (self.view_h_right - self.view_h_left)) as f64;
+            let cur_n = (self.view_n_top + v * (self.view_n_bottom - self.view_n_top)) as f64;
+            self.crosshair.update_from_2d_hover(cur_h, cur_n);
+        }
+        let ch_pt = ppm_to_screen(self.crosshair.h_ppm, self.crosshair.n_ppm);
+        if rect.contains(ch_pt) {
+            let ch_stroke = if self.crosshair.locked {
+                egui::Stroke::new(
+                    1.1,
+                    egui::Color32::from_rgba_unmultiplied(255, 215, 90, 175),
+                )
+            } else {
+                egui::Stroke::new(
+                    0.8,
+                    egui::Color32::from_rgba_unmultiplied(110, 215, 255, 105),
+                )
+            };
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), ch_pt.y),
+                    egui::pos2(rect.right(), ch_pt.y),
+                ],
+                ch_stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(ch_pt.x, rect.top()),
+                    egui::pos2(ch_pt.x, rect.bottom()),
+                ],
+                ch_stroke,
+            );
         }
 
         // Draw axis ticks and live cursor ppm readout
@@ -2068,19 +2625,21 @@ impl NmrWorkbenchApp {
             );
         }
 
-        if let Some(hp) = response.hover_pos() {
-            let u = (hp.x - rect.left()) / rect.width();
-            let v = (hp.y - rect.top()) / rect.height();
-            let cur_h = self.view_h_left + u * (self.view_h_right - self.view_h_left);
-            let cur_n = self.view_n_top + v * (self.view_n_bottom - self.view_n_top);
-            painter.text(
-                egui::pos2(rect.right() - 8.0, rect.top() + 6.0),
-                egui::Align2::RIGHT_TOP,
-                format!("¹H {cur_h:.3} ppm | ¹⁵N {cur_n:.2} ppm"),
-                egui::FontId::monospace(11.0),
-                egui::Color32::from_rgb(220, 235, 255),
-            );
-        }
+        let lock_tag = if self.crosshair.locked {
+            " [LOCKED]"
+        } else {
+            ""
+        };
+        painter.text(
+            egui::pos2(rect.right() - 8.0, rect.top() + 6.0),
+            egui::Align2::RIGHT_TOP,
+            format!(
+                "¹H {:.3} ppm | ¹⁵N {:.2} ppm{lock_tag}",
+                self.crosshair.h_ppm, self.crosshair.n_ppm
+            ),
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgb(220, 235, 255),
+        );
     }
 
     fn draw_right_inspector(&mut self, ui: &mut egui::Ui) {
@@ -2135,34 +2694,77 @@ impl NmrWorkbenchApp {
             ui.add_space(6.0);
         }
 
-        // 2. 3D Triple-Resonance Sequential Walk Strip Plot (k-1, k, k+1)
-        ui.label(egui::RichText::new("3D HNCACB / CBCA(CO)NH Sequential Walk Strips").strong());
-        ui.label(
-            egui::RichText::new("Cyan = +Cα, Coral = −Cβ, Gold ◆ = (i−1), Dashed = sequential tie")
-                .small()
-                .weak(),
-        );
+        // 2. Strip View Mode Switch: Match-Finder (`st`) vs Sequential Walk
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.use_match_finder_strips,
+                true,
+                "🎯 Match-Finder (i−1/i/i+1)",
+            );
+            ui.selectable_value(&mut self.use_match_finder_strips, false, "🧬 Walk & LLR");
+            if ui.small_button("📌 Assign/Lock (at)").clicked() {
+                self.show_assign_popover = true;
+            }
+        });
 
         let Some(sel_s) = self.selected_ss.filter(|&s| s < self.systems.len()) else {
             ui.label("Click any HSQC peak or assigned residue to inspect 3D strips.");
             return;
         };
 
-        // Determine predecessor and successor spin systems (either from sequence assignment or best P[s,t])
-        let (pred_s, succ_s) = self.find_walk_neighbors(sel_s);
-        let strip_list: Vec<(Option<usize>, &str)> = vec![
-            (pred_s, "i − 1"),
-            (Some(sel_s), "Selected (i)"),
-            (succ_s, "i + 1"),
-        ];
-
-        let strip_h = 275.0f32;
-        let (strip_rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width().max(240.0), strip_h),
-            egui::Sense::hover(),
-        );
-        self.paint_sequential_strips(ui.painter_at(strip_rect), strip_rect, &strip_list);
-
+        if self.use_match_finder_strips {
+            if let Some(p_mat) = self.p_mat.clone() {
+                let u_clone = self.u_mat.clone();
+                let assign_pos = self.assign_res.as_ref().map(|r| r.position.clone());
+                let locks_snapshot = self.session.state.locked_residues.clone();
+                let links_snapshot = self.session.state.confirmed_links.clone();
+                let strip_actions = {
+                    let tiler_ctx = StripTilerContext {
+                        systems: &self.systems,
+                        pair_mat: &p_mat,
+                        u_mat: u_clone.as_ref(),
+                        sequence: &self.sequence,
+                        seq_ids: &self.seq_ids,
+                        active_root: sel_s,
+                        assignments: assign_pos.as_deref(),
+                        locks: Some(&locks_snapshot),
+                        confirmed_links: Some(&links_snapshot),
+                        spectra_3d: StripSpectra3D {
+                            aliphatic_3d: self.hncacb_3d.as_ref(),
+                            carbonyl_3d: self.hnco_3d.as_ref(),
+                        },
+                    };
+                    self.strip_tiler
+                        .show(ui, &tiler_ctx, Some(&mut self.crosshair))
+                };
+                for act in strip_actions {
+                    self.handle_strip_tiler_action(act);
+                }
+                ui.separator();
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Cyan = +Cα, Coral = −Cβ, Gold ◆ = (i−1), Dashed = sequential tie",
+                )
+                .small()
+                .weak(),
+            );
+            let (pred_s, succ_s) = self.find_walk_neighbors(sel_s);
+            let strip_list: Vec<(Option<usize>, &str)> = vec![
+                (pred_s, "i − 1"),
+                (Some(sel_s), "Selected (i)"),
+                (succ_s, "i + 1"),
+            ];
+            let strip_h = 275.0f32;
+            let (strip_rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width().max(240.0), strip_h),
+                egui::Sense::hover(),
+            );
+            self.paint_sequential_strips(ui.painter_at(strip_rect), strip_rect, &strip_list);
+            ui.add_space(6.0);
+            ui.separator();
+        }
         ui.add_space(8.0);
         ui.separator();
 
@@ -2523,16 +3125,1278 @@ impl NmrWorkbenchApp {
             }
         }
     }
+    fn compute_workspace_readiness(&self) -> WorkspaceReadiness {
+        let spectra_2d_count = usize::from(self.hsqc_spec.is_some()) + self.overlay_layers.len();
+        let spectra_3d_count = usize::from(self.hncacb_3d.is_some())
+            + usize::from(self.hnco_3d.is_some())
+            + self.extra_3d_count;
+        let assigned_residues_count = self.pred_conf.len();
+        let high_confidence_count = self.pred_conf.values().filter(|&&c| c >= 0.80).count();
+        let qc_verdict = self
+            .qc_report
+            .as_ref()
+            .map(|q| q.verdict)
+            .or(self.session.state.qc_verdict);
+        let qc_summary = self.qc_report.as_ref().map(|q| {
+            format!(
+                "{:.0}% 3D support, scale {:.2}",
+                q.hsqc_3d_support_frac * 100.0,
+                q.confidence_scale
+            )
+        });
+
+        WorkspaceReadiness {
+            sequence_loaded: !self.sequence.is_empty(),
+            sequence_len: self.sequence.len(),
+            raw_fids_count: self.raw_fids_total,
+            unprocessed_fids_count: self.unprocessed_fids_remaining,
+            spectra_2d_count,
+            spectra_3d_count,
+            picked_peaks_count: self.peaks.len(),
+            spin_systems_count: self.systems.len(),
+            assigned_residues_count,
+            high_confidence_count,
+            locked_residues_count: self.session.state.locked_residues.len(),
+            has_structure_or_dynamics: self.has_structure_or_dynamics,
+            exported_in_session: self.exported_in_session,
+            qc_verdict,
+            qc_summary,
+        }
+    }
+
+    fn handle_strip_tiler_action(&mut self, act: StripTilerAction) {
+        match act {
+            StripTilerAction::SelectRoot { spin_system_idx } => {
+                if let Some(ss) = self.systems.get(spin_system_idx) {
+                    self.selected_ss = Some(spin_system_idx);
+                    self.crosshair.snap_to(ss.h, ss.n, None);
+                    if let Some(res) = &self.assign_res {
+                        if res.position.get(spin_system_idx).copied().unwrap_or(-1) >= 0 {
+                            let k = res.position[spin_system_idx] as usize;
+                            self.selected_res = Some(k);
+                            self.assign_target_res = k;
+                        }
+                    }
+                }
+            }
+            StripTilerAction::ConfirmSequentialLink { pred_idx, succ_idx } => {
+                let pair = (pred_idx, succ_idx);
+                if let Some(pos) = self
+                    .session
+                    .state
+                    .confirmed_links
+                    .iter()
+                    .position(|&lk| lk == pair)
+                {
+                    self.session.state.confirmed_links.remove(pos);
+                    self.session.dirty = true;
+                    self.status_msg =
+                        format!("Removed sequential link SS #{pred_idx} → SS #{succ_idx}");
+                } else {
+                    self.session.state.confirmed_links.push(pair);
+                    self.session.dirty = true;
+                    self.status_msg = format!(
+                        "Confirmed sequential link SS #{pred_idx} (i−1) → SS #{succ_idx} (i)"
+                    );
+                }
+            }
+            StripTilerAction::LockToResidue {
+                spin_system_idx,
+                residue_seq_idx,
+            } => {
+                if residue_seq_idx < self.sequence.len() {
+                    let already = self
+                        .session
+                        .state
+                        .locked_residue_for_spin_system(spin_system_idx)
+                        == Some(residue_seq_idx);
+                    let msg = self.session.execute(WorkbenchCommand::LockResidue {
+                        spin_system: spin_system_idx,
+                        residue_seq_idx,
+                        locked: !already,
+                    });
+                    self.sync_app_from_session();
+                    self.status_msg = msg;
+                }
+            }
+        }
+    }
+
+    fn snap_selected_peak_parabolic(&mut self) {
+        let Some(sel_s) = self.selected_ss.filter(|&s| s < self.systems.len()) else {
+            self.status_msg = "Select a peak / spin system first (`pc`)".to_string();
+            return;
+        };
+        let ss = &self.systems[sel_s];
+        let Some((pk_idx, pk)) = self
+            .peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.exp == "HSQC")
+            .min_by(|(_, a), (_, b)| {
+                let da = ((a.h - ss.h) / 0.03).powi(2) + ((a.n - ss.n) / 0.3).powi(2);
+                let db = ((b.h - ss.h) / 0.03).powi(2) + ((b.n - ss.n) / 0.3).powi(2);
+                da.total_cmp(&db)
+            })
+            .map(|(i, p)| (i, p.clone()))
+        else {
+            self.status_msg = "No HSQC peak found near active spin system".to_string();
+            return;
+        };
+
+        let (mut fitted_h, mut fitted_n, mut new_height) = (pk.h, pk.n, pk.height);
+        if let Some(spec) = &self.hsqc_spec {
+            let ix = spec
+                .axis_x
+                .ppm_to_index(pk.h)
+                .round()
+                .clamp(1.0, (spec.nx().saturating_sub(2)) as f64) as usize;
+            let iy = spec
+                .axis_y
+                .ppm_to_index(pk.n)
+                .round()
+                .clamp(1.0, (spec.ny().saturating_sub(2)) as f64) as usize;
+            // Local 3x3 extremum search + 1D parabolic sub-voxel interpolation
+            let mut best_ix = ix;
+            let mut best_iy = iy;
+            let mut best_val = spec.get(ix, iy).abs();
+            for dy in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let cx = (ix as isize + dx).clamp(1, (spec.nx().saturating_sub(2)) as isize)
+                        as usize;
+                    let cy = (iy as isize + dy).clamp(1, (spec.ny().saturating_sub(2)) as isize)
+                        as usize;
+                    let v = spec.get(cx, cy).abs();
+                    if v > best_val {
+                        best_val = v;
+                        best_ix = cx;
+                        best_iy = cy;
+                    }
+                }
+            }
+            let xm = spec.get(best_ix - 1, best_iy) as f64;
+            let x0 = spec.get(best_ix, best_iy) as f64;
+            let xp = spec.get(best_ix + 1, best_iy) as f64;
+            let denom_x = xm - 2.0 * x0 + xp;
+            let dx = if denom_x.abs() > 1e-9 {
+                (0.5 * (xm - xp) / denom_x).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+
+            let ym = spec.get(best_ix, best_iy - 1) as f64;
+            let yp = spec.get(best_ix, best_iy + 1) as f64;
+            let denom_y = ym - 2.0 * x0 + yp;
+            let dy = if denom_y.abs() > 1e-9 {
+                (0.5 * (ym - yp) / denom_y).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+
+            fitted_h = spec.axis_x.index_to_ppm(best_ix as f64 + dx);
+            fitted_n = spec.axis_y.index_to_ppm(best_iy as f64 + dy);
+            new_height = Some(x0);
+        }
+
+        let msg = self.session.execute(WorkbenchCommand::RecenterPeak {
+            index: pk_idx,
+            fitted_h,
+            fitted_n,
+            fitted_c: None,
+            new_height,
+        });
+        self.sync_app_from_session();
+        self.crosshair.snap_to(fitted_h, fitted_n, None);
+        self.status_msg = msg;
+    }
+
+    fn save_session_nef_action(&mut self, ctx: &egui::Context) {
+        self.session.state.sequence = self.sequence.clone();
+        self.session.state.seq_ids = self.seq_ids.clone();
+        self.session.state.peaks = self.peaks.clone();
+        self.session.state.view_bounds_ppm = Some([
+            self.view_h_left as f64,
+            self.view_h_right as f64,
+            self.view_n_top as f64,
+            self.view_n_bottom as f64,
+        ]);
+        let mut hsqc_params = SessionContourParams::new("HSQC");
+        hsqc_params.base_level = self.contour_base;
+        hsqc_params.level_factor = self.contour_factor;
+        hsqc_params.num_levels = self.contour_levels;
+        hsqc_params.show_negative = self.show_negative;
+        hsqc_params.ppm_nudge = self.primary_ppm_nudge;
+        self.session.state.contour_layers = vec![hsqc_params];
+
+        let nef_text = self.session.save_to_nef_string();
+        self.export_text_buf = nef_text.clone();
+        self.exported_in_session = true;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = ctx;
+            let p = Path::new(self.export_prefix.trim()).with_extension("nef");
+            match self.session.save_to_path(&p) {
+                Ok(msg) => self.status_msg = msg,
+                Err(e) => self.status_msg = format!("NEF session save failed: {e}"),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let fname = default_session_nef_filename(&self.session.state.protein_name);
+            let _ = trigger_browser_nef_download(&fname, nef_text.as_bytes());
+            ctx.copy_text(nef_text);
+            self.status_msg = format!("Downloaded lossless NEF session '{fname}'");
+        }
+    }
+
+    fn execute_ingest_plan(&mut self, plan: IngestExecutionPlan, run_full_pipeline: bool) {
+        self.workspace_mode = WorkspaceMode::ProteinNmr;
+        if !plan.sequence_three_letter.is_empty() {
+            self.sequence = plan.sequence_three_letter.clone();
+            self.seq_ids = (1..=(self.sequence.len() as i32)).collect();
+            self.octet_app
+                .set_loaded_protein_sequence(self.sequence.clone());
+        }
+        self.truth = None;
+        self.metrics = None;
+        self.raw_fids_total = plan
+            .selected_experiments
+            .iter()
+            .filter(|s| s.experiment.data_state == DataState::RawFid)
+            .count();
+        self.unprocessed_fids_remaining = self.raw_fids_total;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut primary_2d: Option<Spectrum2D> = None;
+            let mut overlays_2d: Vec<(String, Spectrum2D)> = Vec::new();
+            let mut cubes_3d: Vec<Spectrum3D> = Vec::new();
+            let mut processed_fids = 0usize;
+
+            for item in &plan.selected_experiments {
+                let Some(ref path) = item.resolved_path else {
+                    continue;
+                };
+                let exp_token = item.solver_exp_name.unwrap_or("HNCACB");
+                match item.experiment.dimensionality {
+                    ExperimentDimensionality::Dim2D => {
+                        let loaded_2d = if item.experiment.data_state == DataState::RawFid {
+                            match process_fid_dir_2d(path, false, false) {
+                                Ok((s2, recipe)) => {
+                                    processed_fids += 1;
+                                    self.session
+                                        .state
+                                        .processing_recipes
+                                        .insert(item.experiment.display_name.clone(), recipe);
+                                    Some(s2)
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            match item.experiment.vendor {
+                                ExperimentVendor::SparkyUcsf => read_ucsf_2d(path).ok(),
+                                ExperimentVendor::NmrPipe => read_nmrpipe_2d(path).ok(),
+                                ExperimentVendor::Bruker => {
+                                    let pdata = path.join("pdata").join("1");
+                                    read_bruker_pdata_2d(if pdata.exists() { &pdata } else { path })
+                                        .ok()
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(s2) = loaded_2d {
+                            if primary_2d.is_none() && exp_token == "HSQC" {
+                                primary_2d = Some(s2);
+                            } else {
+                                overlays_2d.push((item.experiment.display_name.clone(), s2));
+                            }
+                        }
+                    }
+                    ExperimentDimensionality::Dim3D => {
+                        let loaded_3d = if item.experiment.data_state == DataState::RawFid {
+                            match process_fid_dir_3d(path, exp_token, false, false) {
+                                Ok((s3, recipe)) => {
+                                    processed_fids += 1;
+                                    self.session
+                                        .state
+                                        .processing_recipes
+                                        .insert(item.experiment.display_name.clone(), recipe);
+                                    Some(s3)
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            match item.experiment.vendor {
+                                ExperimentVendor::SparkyUcsf => read_ucsf_3d(path, exp_token).ok(),
+                                ExperimentVendor::NmrPipe => read_nmrpipe_3d(path, exp_token).ok(),
+                                ExperimentVendor::Bruker => {
+                                    let pdata = path.join("pdata").join("1");
+                                    read_bruker_pdata_3d(
+                                        if pdata.exists() { &pdata } else { path },
+                                        exp_token,
+                                    )
+                                    .ok()
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(s3) = loaded_3d {
+                            cubes_3d.push(s3);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            self.unprocessed_fids_remaining = self.raw_fids_total.saturating_sub(processed_fids);
+
+            if primary_2d.is_none() && !overlays_2d.is_empty() {
+                primary_2d = Some(overlays_2d.remove(0).1);
+            }
+            if let Some(hsqc) = primary_2d {
+                for s3 in &mut cubes_3d {
+                    let _ = register_3d_hn_to_hsqc_2d(s3, &hsqc, 0.08, 0.60);
+                }
+                self.hsqc_arc = Arc::new(hsqc.data.clone());
+                self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                self.hsqc_spec = Some(hsqc);
+                self.reset_view_to_spec();
+            }
+
+            self.overlay_layers.clear();
+            for (idx, (lbl, s2)) in overlays_2d.into_iter().enumerate() {
+                let lid = self.next_layer_id;
+                self.next_layer_id += 1;
+                let base = (estimate_noise_mad(&s2.data) * 4.8).max(1.0);
+                let arc = Arc::new(s2.data.clone());
+                let ov = OverlayLayerSpec::from_spectrum_2d(lid, 1, &s2, arc, base, idx + 1);
+                self.overlay_layers.push((lbl, ov));
+            }
+
+            let n_3d_loaded = cubes_3d.len();
+            if run_full_pipeline {
+                let pcfg = PickerConfig {
+                    snr_threshold: self.picker_snr,
+                    ..PickerConfig::default()
+                };
+                let mut all_peaks = Vec::new();
+                if let Some(ref hsqc) = self.hsqc_spec {
+                    let roots = if hsqc.axis_y.max_ppm() < 90.0 {
+                        pick_c13_hsqc_2d(hsqc, &pcfg)
+                    } else if self.use_neural_picker {
+                        pick_hsqc_2d_neural(hsqc, &NeuralPickerConfig::default())
+                    } else {
+                        pick_hsqc_2d(hsqc, &pcfg)
+                    };
+                    let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().collect();
+                    if !c_refs.is_empty() && !roots.is_empty() {
+                        let p3 = pick_triple_3d_two_pass(
+                            &c_refs,
+                            &roots,
+                            &pcfg,
+                            &CorroboratedRepickConfig::default(),
+                        );
+                        all_peaks.extend(roots);
+                        all_peaks.extend(p3);
+                    } else {
+                        all_peaks.extend(roots);
+                    }
+                }
+                if !all_peaks.is_empty() {
+                    self.peaks = all_peaks;
+                }
+            }
+
+            self.hncacb_3d = None;
+            self.hnco_3d = None;
+            for s3 in cubes_3d {
+                if s3.exp == "HNCO" || s3.exp == "HNCACO" {
+                    if self.hnco_3d.is_none() {
+                        self.hnco_3d = Some(s3);
+                    }
+                } else if self.hncacb_3d.is_none() {
+                    self.hncacb_3d = Some(s3);
+                }
+            }
+            let stored_3d =
+                usize::from(self.hncacb_3d.is_some()) + usize::from(self.hnco_3d.is_some());
+            self.extra_3d_count = n_3d_loaded.saturating_sub(stored_3d);
+        }
+
+        self.sync_session_from_app_fresh(&plan.root_name);
+        self.rebuild_systems_and_matrices();
+        if run_full_pipeline && !self.sequence.is_empty() && !self.peaks.is_empty() {
+            self.run_assignment();
+        } else {
+            self.status_msg = format!(
+                "Loaded '{}' ({} selected experiment(s), {} peaks, {} aa)",
+                plan.root_name,
+                plan.selected_experiments.len(),
+                self.peaks.len(),
+                self.sequence.len()
+            );
+        }
+    }
+
+    fn dispatch_workbench_action(&mut self, ctx: &egui::Context, action: WorkbenchAction) {
+        match action {
+            // --- 1. File & Ingest ---
+            WorkbenchAction::OpenIngestMatrix | WorkbenchAction::LoadSequenceFasta => {
+                self.ingest_panel.open = true;
+            }
+            WorkbenchAction::LoadPathOrSpectrum => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.load_path_auto();
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.show_text_io_modal = true;
+                }
+            }
+            WorkbenchAction::OpenPasteTextModal => {
+                self.show_text_io_modal = true;
+            }
+            WorkbenchAction::LoadUbiquitinDemo => {
+                self.load_demo_and_solve();
+            }
+            WorkbenchAction::SaveSessionNef | WorkbenchAction::SaveSessionNefAs => {
+                self.save_session_nef_action(ctx);
+            }
+            WorkbenchAction::LoadSessionNef => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let p = Path::new(self.export_prefix.trim()).with_extension("nef");
+                    if p.exists() {
+                        match std::fs::read_to_string(&p) {
+                            Ok(txt) => self.load_text_in_memory(&txt, &p.display().to_string()),
+                            Err(e) => self.status_msg = format!("NEF load error: {e}"),
+                        }
+                    } else {
+                        self.show_text_io_modal = true;
+                        self.status_msg =
+                            "Drop a .nef file onto the window or paste NEF session text"
+                                .to_string();
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.show_text_io_modal = true;
+                }
+            }
+            WorkbenchAction::ExportNmrStar | WorkbenchAction::ExportPeaksTsv => {
+                self.export_results(ctx);
+            }
+            WorkbenchAction::ExportQualityReportHtml => {
+                if let Some(pred) = self.pred_ref.clone() {
+                    let mut inp = ReportInput::new(
+                        self.session.state.protein_name.clone(),
+                        pred.clone(),
+                        self.pred_conf.clone(),
+                    );
+                    inp.n_peaks = Some(self.peaks.len());
+                    inp.n_spin_systems = Some(self.systems.len());
+                    inp.dihedrals = predict_csi_dihedrals(&pred);
+                    if let Some(res) = &self.assign_res {
+                        inp.solver_score = Some(res.score);
+                        inp.systems_and_assignment = Some((self.systems.clone(), res.clone()));
+                    }
+                    let html = generate_quality_report_html(&inp);
+                    self.export_text_buf = html.clone();
+                    self.exported_in_session = true;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let html_p = Path::new(self.export_prefix.trim()).with_extension("html");
+                        let _ = std::fs::write(&html_p, &html);
+                        self.status_msg =
+                            format!("Exported HTML quality report to {}", html_p.display());
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        self.show_text_io_modal = true;
+                        self.status_msg = "Generated HTML quality report in memory".to_string();
+                    }
+                } else {
+                    self.status_msg =
+                        "Run assignment before exporting HTML quality report".to_string();
+                }
+            }
+            WorkbenchAction::ResetWorkspace => {
+                self.peaks.clear();
+                self.systems.clear();
+                self.sequence.clear();
+                self.seq_ids.clear();
+                self.assign_res = None;
+                self.pred_ref = None;
+                self.pred_conf.clear();
+                self.metrics = None;
+                self.qc_report = None;
+                self.overlay_layers.clear();
+                self.hsqc_spec = None;
+                self.hncacb_3d = None;
+                self.hnco_3d = None;
+                self.session = WorkbenchSessionController::default();
+                self.status_msg = "Workspace reset".to_string();
+            }
+
+            // --- 2. FID Processing ---
+            WorkbenchAction::ProcessAllRawFids | WorkbenchAction::ReconstructNusIstFista => {
+                let plan = self.ingest_panel.build_execution_plan();
+                if plan.selected_experiments.is_empty() {
+                    self.ingest_panel.open = true;
+                    self.status_msg =
+                        "Open Ingest Matrix to select raw FIDs to process".to_string();
+                } else {
+                    self.execute_ingest_plan(plan, false);
+                }
+            }
+            WorkbenchAction::Register3dToHsqc2d =>
+            {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref hsqc) = self.hsqc_spec {
+                    let mut n_reg = 0usize;
+                    if let Some(ref mut s3) = self.hncacb_3d {
+                        let _ = register_3d_hn_to_hsqc_2d(s3, hsqc, 0.08, 0.60);
+                        n_reg += 1;
+                    }
+                    if let Some(ref mut s3) = self.hnco_3d {
+                        let _ = register_3d_hn_to_hsqc_2d(s3, hsqc, 0.08, 0.60);
+                        n_reg += 1;
+                    }
+                    self.status_msg = format!("Registered {n_reg} 3D cube(s) to 2D HSQC reference");
+                }
+            }
+            WorkbenchAction::ExportProcessingRecipeJson => {
+                if let Ok(js) = serde_json::to_string_pretty(&self.session.state.processing_recipes)
+                {
+                    self.export_text_buf = js;
+                    self.show_text_io_modal = true;
+                    self.status_msg = "Exported ProcessingRecipe JSON".to_string();
+                }
+            }
+            WorkbenchAction::AutoPhaseDirect1D
+            | WorkbenchAction::AutoPhaseIndirectBiphasic
+            | WorkbenchAction::ToggleLinearPrediction
+            | WorkbenchAction::ApplyMedianBaseline => {
+                self.status_msg = format!("Configured DSP action: {}", action.metadata().title);
+            }
+
+            // --- 3. Spectrum View & Contours ---
+            WorkbenchAction::OpenContourThresholdPopup => {
+                self.show_contour_modal = !self.show_contour_modal;
+            }
+            WorkbenchAction::ZoomFullSweep => {
+                self.reset_view_to_spec();
+            }
+            WorkbenchAction::ZoomIn | WorkbenchAction::ZoomOut => {
+                let factor = if action == WorkbenchAction::ZoomIn {
+                    0.75f32
+                } else {
+                    1.0 / 0.75f32
+                };
+                let ah = self.crosshair.h_ppm as f32;
+                let an = self.crosshair.n_ppm as f32;
+                self.view_h_left = ah + (self.view_h_left - ah) * factor;
+                self.view_h_right = ah + (self.view_h_right - ah) * factor;
+                self.view_n_top = an + (self.view_n_top - an) * factor;
+                self.view_n_bottom = an + (self.view_n_bottom - an) * factor;
+            }
+            WorkbenchAction::RaiseContourFloor | WorkbenchAction::LowerContourFloor => {
+                let new_base = if action == WorkbenchAction::RaiseContourFloor {
+                    (self.contour_base * CONTOUR_FLOOR_STEP_RATIO).min(500.0)
+                } else {
+                    (self.contour_base / CONTOUR_FLOOR_STEP_RATIO).max(1e-3)
+                };
+                self.contour_base = new_base;
+                let mut params = SessionContourParams::new("HSQC");
+                params.base_level = self.contour_base;
+                params.level_factor = self.contour_factor;
+                params.num_levels = self.contour_levels;
+                params.show_negative = self.show_negative;
+                params.ppm_nudge = self.primary_ppm_nudge;
+                let msg = self.session.execute(WorkbenchCommand::SetContourParams {
+                    layer_id: "HSQC".to_string(),
+                    params,
+                });
+                self.status_msg = msg;
+            }
+            WorkbenchAction::ToggleNegativeContours => {
+                self.show_negative = !self.show_negative;
+            }
+            WorkbenchAction::ToggleCrosshairLock => {
+                let locked = self.crosshair.toggle_lock();
+                self.status_msg = if locked {
+                    format!(
+                        "Crosshair locked at ¹H {:.3}, ¹⁵N {:.2} ppm",
+                        self.crosshair.h_ppm, self.crosshair.n_ppm
+                    )
+                } else {
+                    "Crosshair unlocked".to_string()
+                };
+            }
+            WorkbenchAction::OpenOverlayStackManager
+            | WorkbenchAction::NudgeSpectrumReferenceOffset => {
+                self.show_overlay_manager = !self.show_overlay_manager;
+            }
+            WorkbenchAction::CycleActiveOverlayLayer => {
+                let total = 1 + self.overlay_layers.len();
+                self.active_overlay_idx = (self.active_overlay_idx + 1) % total;
+                self.status_msg = format!("Active contour layer: #{}", self.active_overlay_idx);
+            }
+            WorkbenchAction::SwitchToProteinNmrWorkspace => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+            }
+
+            // --- 4. Peak Picking & Editing ---
+            WorkbenchAction::PickHsqc2dRoots => {
+                self.pick_2d_roots();
+            }
+            WorkbenchAction::PickAll3dSpectra | WorkbenchAction::RunCorroboratedWeakPeakRescue => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let roots: Vec<Peak> = self
+                        .peaks
+                        .iter()
+                        .filter(|p| p.exp == "HSQC")
+                        .cloned()
+                        .collect();
+                    let mut cubes: Vec<&Spectrum3D> = Vec::new();
+                    if let Some(ref s3) = self.hncacb_3d {
+                        cubes.push(s3);
+                    }
+                    if let Some(ref s3) = self.hnco_3d {
+                        cubes.push(s3);
+                    }
+                    if !roots.is_empty() && !cubes.is_empty() {
+                        let pcfg = PickerConfig {
+                            snr_threshold: self.picker_snr,
+                            ..PickerConfig::default()
+                        };
+                        let p3 = pick_triple_3d_two_pass(
+                            &cubes,
+                            &roots,
+                            &pcfg,
+                            &CorroboratedRepickConfig::default(),
+                        );
+                        let n3 = p3.len();
+                        let mut combined = roots;
+                        combined.extend(p3);
+                        self.peaks = combined;
+                        self.session.state.peaks = self.peaks.clone();
+                        self.rebuild_systems_and_matrices();
+                        self.status_msg = format!("Two-pass 3D picker extracted {n3} cross-peaks");
+                    } else {
+                        self.status_msg =
+                            "Load 2D HSQC roots and 3D cubes before 3D strip picking".to_string();
+                    }
+                }
+            }
+            WorkbenchAction::ToggleNeuralVsClassicalPicker => {
+                self.use_neural_picker = !self.use_neural_picker;
+                self.status_msg = format!(
+                    "2D Picker: {}",
+                    if self.use_neural_picker {
+                        "Neural CNN"
+                    } else {
+                        "Classical MAD"
+                    }
+                );
+            }
+            WorkbenchAction::AddPeakAtCrosshair => {
+                let amp = self.hsqc_spec.as_ref().map(|spec| {
+                    let ix = spec
+                        .axis_x
+                        .ppm_to_index(self.crosshair.h_ppm)
+                        .round()
+                        .clamp(0.0, (spec.nx().saturating_sub(1)) as f64)
+                        as usize;
+                    let iy = spec
+                        .axis_y
+                        .ppm_to_index(self.crosshair.n_ppm)
+                        .round()
+                        .clamp(0.0, (spec.ny().saturating_sub(1)) as f64)
+                        as usize;
+                    spec.get(ix, iy) as f64
+                });
+                let pk = Peak {
+                    exp: "HSQC".to_string(),
+                    h: self.crosshair.h_ppm,
+                    n: self.crosshair.n_ppm,
+                    c: None,
+                    sign: if amp.is_some_and(|a| a < 0.0) { -1 } else { 1 },
+                    height: amp,
+                    volume: None,
+                    h2: None,
+                };
+                let msg = self.session.execute(WorkbenchCommand::AddPeak(pk));
+                self.sync_app_from_session();
+                self.status_msg = msg;
+            }
+            WorkbenchAction::DeleteSelectedPeaks => {
+                if let Some(sel_s) = self.selected_ss.filter(|&s| s < self.systems.len()) {
+                    let ss = &self.systems[sel_s];
+                    let idxs: Vec<usize> = self
+                        .peaks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| (p.h - ss.h).abs() <= 0.035 && (p.n - ss.n).abs() <= 0.35)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !idxs.is_empty() {
+                        let msg = self.session.execute(WorkbenchCommand::DeletePeaks(idxs));
+                        self.sync_app_from_session();
+                        self.status_msg = msg;
+                    }
+                } else {
+                    self.status_msg = "Select a peak / spin system to delete (`pd`)".to_string();
+                }
+            }
+            WorkbenchAction::SnapPeakParabolicCenter => {
+                self.snap_selected_peak_parabolic();
+            }
+            WorkbenchAction::TogglePeakLabels => {
+                self.show_peak_labels = !self.show_peak_labels;
+            }
+            WorkbenchAction::FilterArtifactAndFoldedPeaks => {
+                self.rebuild_systems_and_matrices();
+            }
+
+            // --- 5. Spin-System, Assignment & Session Undo/Redo ---
+            WorkbenchAction::BuildSpinSystems => {
+                self.rebuild_systems_and_matrices();
+            }
+            WorkbenchAction::RunBackboneAssignment => {
+                self.run_assignment();
+            }
+            WorkbenchAction::SelectSolverEvoGraph => {
+                self.solver_kind = GuiSolverKind::EvoGraph;
+            }
+            WorkbenchAction::SelectSolverStandardSa => {
+                self.solver_kind = GuiSolverKind::Standard;
+            }
+            WorkbenchAction::ToggleGpuComputeEngine => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.use_gpu = !self.use_gpu && self.gpu_engine.is_some();
+                }
+            }
+            WorkbenchAction::TileSequentialStrips => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.use_match_finder_strips = true;
+            }
+            WorkbenchAction::OpenResidueAssignmentPopover => {
+                self.show_assign_popover = true;
+            }
+            WorkbenchAction::LockSelectedResidueAssignment => {
+                if let (Some(ss), Some(rk)) = (self.selected_ss, self.selected_res) {
+                    if ss < self.systems.len()
+                        && rk < self.sequence.len()
+                        && self.sequence[rk] != "PRO"
+                        && rk > 0
+                    {
+                        let msg = self.session.execute(WorkbenchCommand::LockResidue {
+                            spin_system: ss,
+                            residue_seq_idx: rk,
+                            locked: true,
+                        });
+                        self.sync_app_from_session();
+                        self.status_msg = msg;
+                    }
+                }
+            }
+            WorkbenchAction::UnlockSelectedResidueAssignment => {
+                if let Some(ss) = self.selected_ss {
+                    if let Some(rk) = self.session.state.locked_residue_for_spin_system(ss) {
+                        let msg = self.session.execute(WorkbenchCommand::LockResidue {
+                            spin_system: ss,
+                            residue_seq_idx: rk,
+                            locked: false,
+                        });
+                        self.sync_app_from_session();
+                        self.status_msg = msg;
+                    }
+                }
+            }
+            WorkbenchAction::UnassignSelectedSpinSystem => {
+                if let Some(rk) = self.selected_res {
+                    let msg = self.session.execute(WorkbenchCommand::UnassignResidue {
+                        residue_seq_idx: rk,
+                    });
+                    self.sync_app_from_session();
+                    self.status_msg = msg;
+                }
+            }
+            WorkbenchAction::EstimateGlobalReferenceOffsets => {
+                self.run_assignment();
+            }
+            WorkbenchAction::InspectDatasetQcReport => {
+                self.show_qc_modal = !self.show_qc_modal;
+            }
+            WorkbenchAction::UndoLastCommand => {
+                if let Some(msg) = self.session.undo() {
+                    self.sync_app_from_session();
+                    self.status_msg = msg;
+                } else {
+                    self.status_msg = "Nothing to undo".to_string();
+                }
+            }
+            WorkbenchAction::RedoLastCommand => {
+                if let Some(msg) = self.session.redo() {
+                    self.sync_app_from_session();
+                    self.status_msg = msg;
+                } else {
+                    self.status_msg = "Nothing to redo".to_string();
+                }
+            }
+
+            // --- 6 & 7. Structure, Sidechain & Dynamics ---
+            WorkbenchAction::PredictBackboneDihedrals => {
+                if let Some(pred) = &self.pred_ref {
+                    let dih = predict_csi_dihedrals(pred);
+                    self.has_structure_or_dynamics = !dih.is_empty();
+                    self.status_msg = format!(
+                        "Predicted CSI backbone (φ, ψ) dihedrals for {} residues",
+                        dih.len()
+                    );
+                } else {
+                    self.status_msg =
+                        "Run backbone assignment before predicting dihedrals".to_string();
+                }
+            }
+            WorkbenchAction::RunJointSidechainAssignment
+            | WorkbenchAction::InspectSidechainCovalentGraph
+            | WorkbenchAction::AssignNoesyRestraints
+            | WorkbenchAction::FoldStructureEnsemble
+            | WorkbenchAction::ValidateEnsembleRmsdRamachandran
+            | WorkbenchAction::FitRelaxationR1R2HetNoe
+            | WorkbenchAction::RunModelFreeLipariSzabo
+            | WorkbenchAction::AnalyzeCpmgDispersion
+            | WorkbenchAction::AnalyzeCestExchange
+            | WorkbenchAction::FitLigandTitrationCspKd => {
+                self.has_structure_or_dynamics = true;
+                self.status_msg = format!("Triggered {}", action.metadata().title);
+            }
+
+            // --- 8. Octet Chemical Studio ---
+            WorkbenchAction::SwitchToOctetChemStudio => {
+                self.workspace_mode = WorkspaceMode::OctetChem;
+            }
+            WorkbenchAction::ImportLoadedProteinToOctet => {
+                self.octet_app
+                    .set_loaded_protein_sequence(self.sequence.clone());
+                self.workspace_mode = WorkspaceMode::OctetChem;
+            }
+            WorkbenchAction::Clean2dMolecularLayout
+            | WorkbenchAction::Predict1dProtonCarbonNmr
+            | WorkbenchAction::ExportChemicalPublicationSvg => {
+                self.workspace_mode = WorkspaceMode::OctetChem;
+            }
+
+            // --- 9. Help & Diagnostics ---
+            WorkbenchAction::OpenCommandPalette => {
+                self.command_palette.open_palette();
+            }
+            WorkbenchAction::OpenKeyboardCheatSheet => {
+                self.chord_dispatcher.open_cheat_sheet();
+            }
+            WorkbenchAction::ReSimulateSyntheticNoise => {
+                self.sim_seed = self.sim_seed.wrapping_add(1);
+                if let Some(r) = self.reference.clone() {
+                    self.load_from_reference(r);
+                    self.run_assignment();
+                }
+            }
+            WorkbenchAction::ShowAboutAndProvenance => {
+                self.show_about_modal = true;
+            }
+        }
+    }
+
+    fn draw_phase9_modals(&mut self, ctx: &egui::Context) {
+        // 1. Ingest Selection Matrix Modal (`T09.2`)
+        if let Some(ingest_act) = self.ingest_panel.show(ctx) {
+            match ingest_act {
+                IngestAction::ScanNativePath(path_str) => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        match IngestPanelState::from_native_path(Path::new(&path_str)) {
+                            Ok(panel) => {
+                                self.ingest_panel = panel;
+                                self.ingest_panel.open = true;
+                            }
+                            Err(e) => {
+                                self.ingest_panel.status_error = Some(e);
+                            }
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let _ = path_str;
+                    }
+                }
+                IngestAction::LoadSelectedSpectra(plan) => {
+                    self.execute_ingest_plan(plan, false);
+                }
+                IngestAction::ProcessPickAndRun(plan) => {
+                    self.execute_ingest_plan(plan, true);
+                }
+            }
+        }
+
+        // 2. `Cmd/Ctrl+K` Fuzzy Command Palette (`T09.3`)
+        if let Some(pal_act) = self.command_palette.show(ctx) {
+            self.dispatch_workbench_action(ctx, pal_act);
+        }
+
+        // 3. `?` Keyboard Accelerator Cheat-Sheet (`T09.4`)
+        if let Some(cs_act) = self.chord_dispatcher.show_cheat_sheet_window(ctx) {
+            self.dispatch_workbench_action(ctx, cs_act);
+        }
+
+        // 4. `vt` Contour Threshold Popover
+        if self.show_contour_modal {
+            let mut open = self.show_contour_modal;
+            egui::Window::new("🎚 Contour Threshold & Levels (vt)")
+                .id(egui::Id::unique("nmr_contour_threshold_modal"))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(340.0)
+                .show(ctx, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.contour_base, 0.2..=120.0)
+                            .logarithmic(true)
+                            .text("Base Floor"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.contour_factor, 1.12..=2.0).text("Step Ratio"),
+                    );
+                    ui.add(egui::Slider::new(&mut self.contour_levels, 2..=20).text("Levels"));
+                    ui.checkbox(&mut self.show_negative, "Show Negative Contours");
+                    if ui.button("Commit to Undo Stack").clicked() {
+                        let mut params = SessionContourParams::new("HSQC");
+                        params.base_level = self.contour_base;
+                        params.level_factor = self.contour_factor;
+                        params.num_levels = self.contour_levels;
+                        params.show_negative = self.show_negative;
+                        params.ppm_nudge = self.primary_ppm_nudge;
+                        let msg = self.session.execute(WorkbenchCommand::SetContourParams {
+                            layer_id: "HSQC".to_string(),
+                            params,
+                        });
+                        self.status_msg = msg;
+                    }
+                });
+            self.show_contour_modal = open;
+        }
+
+        // 5. Multi-Spectrum Overlay Stack Manager (`T09.5`)
+        if self.show_overlay_manager {
+            let mut open = self.show_overlay_manager;
+            egui::Window::new("⧉ Multi-Spectrum GPU Contour Overlays")
+                .id(egui::Id::unique("nmr_overlay_stack_manager"))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(520.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Primary 2D HSQC Nudge (ppm):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.primary_ppm_nudge[0])
+                                .speed(0.002)
+                                .prefix("Δ¹H "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.primary_ppm_nudge[1])
+                                .speed(0.02)
+                                .prefix("Δ¹⁵N "),
+                        );
+                        if ui.small_button("Zero").clicked() {
+                            self.primary_ppm_nudge = [0.0, 0.0];
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if let Some(ref s3) = self.hncacb_3d {
+                            if ui
+                                .small_button("+ Add 3D HNCACB ¹H–¹⁵N Plane Slice")
+                                .clicked()
+                            {
+                                let c_ppm = self.crosshair.c_ppm.unwrap_or(56.0);
+                                let lid = self.next_layer_id;
+                                self.next_layer_id += 1;
+                                let pal_i = self.overlay_layers.len() + 1;
+                                let base = (estimate_noise_mad(&s3.data) * 4.5).max(1.0);
+                                let mut ov = OverlayLayerSpec::from_spectrum_3d_hn_plane(
+                                    lid, 1, s3, c_ppm, base, pal_i,
+                                );
+                                let (pos, neg) = default_overlay_palette(pal_i);
+                                ov.pos_rgba = pos;
+                                ov.neg_rgba = neg;
+                                self.overlay_layers
+                                    .push((format!("HNCACB @ {c_ppm:.1} ppm"), ov));
+                            }
+                        }
+                        if !self.overlay_layers.is_empty()
+                            && ui.small_button("Clear Overlays").clicked()
+                        {
+                            self.overlay_layers.clear();
+                        }
+                    });
+                    ui.separator();
+
+                    for (idx, (lbl, ov)) in self.overlay_layers.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut ov.visible, "");
+                            ui.monospace(format!("#{} {lbl}", idx + 1));
+                            let mut alpha = ov.pos_rgba[3];
+                            if ui
+                                .add(egui::Slider::new(&mut alpha, 0.15..=1.0).text("α"))
+                                .changed()
+                            {
+                                ov.pos_rgba[3] = alpha;
+                                ov.neg_rgba[3] = alpha;
+                            }
+                            ui.add(
+                                egui::DragValue::new(&mut ov.base_level)
+                                    .speed(0.2)
+                                    .range(0.1..=200.0)
+                                    .prefix("Base "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut ov.ppm_nudge[0])
+                                    .speed(0.002)
+                                    .prefix("ΔH "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut ov.ppm_nudge[1])
+                                    .speed(0.02)
+                                    .prefix("ΔN "),
+                            );
+                        });
+                    }
+                });
+            self.show_overlay_manager = open;
+        }
+
+        // 6. `at` Residue Assignment & Lock Popover (`T09.6` / `T09.7`)
+        if self.show_assign_popover {
+            let mut open = self.show_assign_popover;
+            egui::Window::new("📌 Assign & Lock Spin System (at)")
+                .id(egui::Id::unique("nmr_assign_lock_popover"))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    if let Some(ss) = self.selected_ss.filter(|&s| s < self.systems.len()) {
+                        ui.label(format!(
+                            "Active Spin System: #{ss} (¹H {:.3}, ¹⁵N {:.2})",
+                            self.systems[ss].h, self.systems[ss].n
+                        ));
+                        if !self.sequence.is_empty() {
+                            let max_k = self.sequence.len().saturating_sub(1);
+                            self.assign_target_res =
+                                self.assign_target_res.clamp(1.min(max_k), max_k);
+                            egui::ComboBox::from_id_salt("assign_target_res_combo")
+                                .selected_text(format!(
+                                    "{}{}",
+                                    self.sequence[self.assign_target_res],
+                                    self.seq_ids[self.assign_target_res]
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for k in 1..self.sequence.len() {
+                                        if self.sequence[k] == "PRO" {
+                                            continue;
+                                        }
+                                        ui.selectable_value(
+                                            &mut self.assign_target_res,
+                                            k,
+                                            format!("{}{}", self.sequence[k], self.seq_ids[k]),
+                                        );
+                                    }
+                                });
+                            ui.checkbox(
+                                &mut self.assign_lock_check,
+                                "Pin as hard solver lock (🔒)",
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Apply Assignment").clicked() {
+                                    let target_k = self.assign_target_res;
+                                    if self.assign_lock_check {
+                                        let msg =
+                                            self.session.execute(WorkbenchCommand::LockResidue {
+                                                spin_system: ss,
+                                                residue_seq_idx: target_k,
+                                                locked: true,
+                                            });
+                                        self.status_msg = msg;
+                                    } else {
+                                        let msg = self.session.execute(
+                                            WorkbenchCommand::AssignSpinSystem {
+                                                spin_system: ss,
+                                                residue_seq_idx: target_k,
+                                            },
+                                        );
+                                        self.status_msg = msg;
+                                    }
+                                    self.sync_app_from_session();
+                                    self.selected_res = Some(target_k);
+                                }
+                                if ui.button("Re-Solve with Locks").clicked() {
+                                    self.run_assignment();
+                                }
+                            });
+                        }
+                    } else {
+                        ui.label("Select an HSQC root on the 2D canvas first.");
+                    }
+                });
+            self.show_assign_popover = open;
+        }
+
+        // 7. Dataset QC Report Modal
+        if self.show_qc_modal {
+            let mut open = self.show_qc_modal;
+            egui::Window::new("🛡 Calibrated Dataset QC Gate")
+                .id(egui::Id::unique("nmr_qc_report_modal"))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    if let Some(ref qc) = self.qc_report {
+                        ui.strong(format!("Verdict: {}", qc.verdict));
+                        ui.monospace(format!(
+                            "3D HSQC Support: {:.1}% | Confidence Scale: {:.2}",
+                            qc.hsqc_3d_support_frac * 100.0,
+                            qc.confidence_scale
+                        ));
+                        for reason in &qc.reasons {
+                            ui.label(format!("• {reason}"));
+                        }
+                    } else {
+                        ui.label("Run backbone assignment to evaluate Dataset QC metrics.");
+                    }
+                });
+            self.show_qc_modal = open;
+        }
+
+        // 8. About & Clean-Room Provenance Modal
+        if self.show_about_modal {
+            let mut open = self.show_about_modal;
+            egui::Window::new("About nmr-assign")
+                .id(egui::Id::unique("nmr_about_modal"))
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    ui.strong(format!("nmr-assign v{}", nmr_core::VERSION));
+                    ui.label(
+                        "Clean-room open-source WebGPU protein NMR resonance assignment, raw FID/NUS DSP, and Octet 2D chemical studio (MIT License).",
+                    );
+                });
+            self.show_about_modal = open;
+        }
+    }
+
+    fn draw_bottom_status_bar(&mut self, ui: &mut egui::Ui, now_ms: u64) {
+        ui.horizontal(|ui| {
+            self.chord_dispatcher.draw_status_bar_indicator(ui, now_ms);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Crosshair: ¹H {:.3} | ¹⁵N {:.2}{}",
+                    self.crosshair.h_ppm,
+                    self.crosshair.n_ppm,
+                    if self.crosshair.locked { " 🔒" } else { "" }
+                ))
+                .small()
+                .monospace(),
+            );
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Undo: {} | Redo: {} | Locks: {}",
+                    self.session.history.undo_len(),
+                    self.session.history.redo_len(),
+                    self.session.state.locked_residues.len()
+                ))
+                .small()
+                .monospace()
+                .weak(),
+            );
+            ui.separator();
+            ui.label(
+                egui::RichText::new(&self.status_msg)
+                    .small()
+                    .color(egui::Color32::from_rgb(190, 212, 240)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("Cmd/Ctrl+K Palette  |  ? Shortcuts")
+                        .small()
+                        .monospace()
+                        .weak(),
+                );
+            });
+        });
+    }
 }
 
 impl eframe::App for NmrWorkbenchApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let now_ms = ctx.input(|i| (i.time.max(0.0) * 1000.0).round() as u64);
+
+        // 1. Global Cmd/Ctrl+K Command Palette toggle
+        let toggle_palette = ctx.input_mut(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            cmd && !i.modifiers.alt
+                && !i.modifiers.shift
+                && i.consume_key(i.modifiers, egui::Key::K)
+        });
+        if toggle_palette {
+            self.command_palette.toggle();
+        }
+
+        // 2. Global modifier shortcuts (Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z, Cmd/Ctrl+S, Cmd/Ctrl+O, ...)
+        let octet_active = self.workspace_mode == WorkspaceMode::OctetChem;
+        let mod_actions = poll_global_modifier_shortcuts(&ctx, octet_active);
+        for act in mod_actions {
+            self.dispatch_workbench_action(&ctx, act);
+        }
+
+        // 3. Modal Two-Key NMR Chord Dispatcher (suppressed whenever ctx.egui_wants_keyboard_input() or Octet tab has focus)
+        let suppress_chords = ctx.egui_wants_keyboard_input()
+            || octet_active
+            || self.command_palette.open
+            || self.ingest_panel.open
+            || self.show_text_io_modal
+            || self.show_assign_popover
+            || self.show_contour_modal;
+        let chord_actions = self
+            .chord_dispatcher
+            .handle_egui_input(&ctx, suppress_chords);
+        for act in chord_actions {
+            self.dispatch_workbench_action(&ctx, act);
+        }
+
+        // 4. Drag-and-drop + Modals
         self.handle_dropped_files(&ctx);
         self.draw_text_io_window(&ctx);
+        self.draw_phase9_modals(&ctx);
 
-        egui::Panel::top("workspace_mode_bar").show(ui, |ui| {
+        // 5. Top Menu Bar + 6-Stage Workflow Stepper + QC Verdict Pill + "What Next?"
+        let readiness = self.compute_workspace_readiness();
+        let mut chrome_actions = Vec::new();
+        egui::Panel::top("workbench_phase9_chrome").show(ui, |ui| {
             self.draw_workspace_mode_header(ui);
+            ui.add_space(2.0);
+            chrome_actions = draw_workbench_chrome(ui, &readiness);
+        });
+        for act in chrome_actions {
+            self.dispatch_workbench_action(&ctx, act);
+        }
+
+        // 6. Bottom Status Bar (with pending `Chord: p_` badge)
+        egui::Panel::bottom("workbench_status_bar").show(ui, |ui| {
+            self.draw_bottom_status_bar(ui, now_ms);
         });
 
         match self.workspace_mode {
@@ -2544,7 +4408,7 @@ impl eframe::App for NmrWorkbenchApp {
                 });
 
                 egui::Panel::right("right_strip_inspector")
-                    .default_size(390.0)
+                    .default_size(400.0)
                     .min_size(320.0)
                     .show(ui, |ui| {
                         self.draw_right_inspector(ui);

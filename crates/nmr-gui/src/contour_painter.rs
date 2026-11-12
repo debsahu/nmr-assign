@@ -24,7 +24,6 @@ static NEXT_MULTI_CALLBACK_BATCH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Curated dark-theme `(positive_rgba, negative_rgba)` overlay color palettes so stacked
 /// `15N-HSQC`, `13C-HSQC`, titration points, and 3D orthogonal slices remain visually distinct.
-#[allow(dead_code)]
 pub const OVERLAY_PALETTES: [([f32; 4], [f32; 4]); 6] = [
     // 0: Sky-cyan (+) / Coral-rose (-) — primary reference spectrum
     ([0.12, 0.68, 0.96, 1.0], [0.95, 0.36, 0.42, 0.95]),
@@ -41,7 +40,6 @@ pub const OVERLAY_PALETTES: [([f32; 4], [f32; 4]); 6] = [
 ];
 
 /// Return `(pos_rgba, neg_rgba)` from [`OVERLAY_PALETTES`] cycling cleanly by `layer_idx`.
-#[allow(dead_code)]
 #[inline]
 pub fn default_overlay_palette(layer_idx: usize) -> ([f32; 4], [f32; 4]) {
     OVERLAY_PALETTES[layer_idx % OVERLAY_PALETTES.len()]
@@ -64,7 +62,6 @@ pub struct ContourUniforms {
 
 impl ContourUniforms {
     /// Construct single-spectrum uniforms from a [`Spectrum2D`] and viewport parameters.
-    #[allow(dead_code)]
     pub fn from_spectrum_2d(
         spec: &Spectrum2D,
         view_ppm: [f32; 4],
@@ -140,7 +137,6 @@ pub struct GpuContourLayerUniforms {
 }
 
 /// Per-layer specification for an ordered stack of overlaid 2D NMR spectra or 3D orthogonal slices.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct OverlayLayerSpec {
     pub layer_id: u64,
@@ -161,7 +157,6 @@ pub struct OverlayLayerSpec {
     pub visible: bool,
 }
 
-#[allow(dead_code)]
 impl OverlayLayerSpec {
     /// Build an overlay layer from a [`Spectrum2D`] using [`default_overlay_palette`].
     pub fn from_spectrum_2d(
@@ -365,7 +360,6 @@ impl OverlayLayerSpec {
 }
 
 /// Synchronized `(1H, 15N, 13C)` cursor crosshair shared across 2D contour viewports and 3D strips.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SyncCrosshair {
     pub h_ppm: f64,
@@ -385,7 +379,6 @@ impl Default for SyncCrosshair {
     }
 }
 
-#[allow(dead_code)]
 impl SyncCrosshair {
     pub fn new(h_ppm: f64, n_ppm: f64, c_ppm: Option<f64>) -> Self {
         Self {
@@ -975,7 +968,6 @@ impl ContourPipelineResource {
     }
 
     /// Number of cached GPU spectrum storage buffers currently resident in VRAM.
-    #[allow(dead_code)]
     pub fn cached_layer_count(&self) -> usize {
         self.spec_cache.len()
     }
@@ -1036,7 +1028,6 @@ impl egui_wgpu::CallbackTrait for ContourCallback {
 
 /// Ordered multi-spectrum 2D / 3D-slice GPU contour paint callback composited via hardware
 /// `BlendState::ALPHA_BLENDING`.
-#[allow(dead_code)]
 pub struct MultiContourCallback {
     batch_id: u64,
     pub view_ppm: [f32; 4],
@@ -1045,7 +1036,6 @@ pub struct MultiContourCallback {
     pub draw_opaque_bg: bool,
 }
 
-#[allow(dead_code)]
 impl MultiContourCallback {
     pub fn new(
         view_ppm: [f32; 4],

@@ -28,7 +28,7 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 - [x] (A) Automatic unlabelled global chemical-shift reference-offset estimation (`nmr-core::priors`, WebGPU `U`-matrix parity, permutation-invariant `nmrassign score`)
 - [x] (A) Realistic Bruker 5-seed physics simulator CI gate (`--realistic --seeds 5`) and development real-spectrum benchmarks (Ubiquitin `pdata`/`.ucsf` and `BMRB 51439` `CISD3`)
 - [x] (A) Deterministic covalent `(seq[k-1], seq[k], seq[k+1])` primary-sequence shift corrections (pre-Proline `CA`/`C'`/`CB` and `i-1` neighbor `15N`, Wishart 1995 / Schwarzinger 2001) (`specs/03`)
-- [ ] (A) Solver curation follow-ups (`T09.7`): weak-peak intensity penalty for minor conformers (`Gln2` 9% minor second-form peak), sparse-data `standard` vs `evo-graph` diagnosis when `HNCACB` is absent, and out-of-sample confidence calibration verification
+- [x] (A) Solver curation follow-ups (`T09.7`): weak-peak intensity penalty for minor conformers (`Gln2` 9% minor second-form peak), sparse-data `standard` vs `evo-graph` diagnosis when `HNCACB` is absent, and out-of-sample confidence calibration verification
 
 ## Phase 2: Rust + WebGPU performance & interactive GUI (`specs/06`)
 - [x] (A) Port full reference pipeline to pure Rust (`crates/nmr-core`) with `< 1e-13` `U`/`P` parity
@@ -82,13 +82,13 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 - [x] (A) `T08.7` — CLI raw-FID integration (`nmrassign process`, `--fid` on `pick`/`pipeline`, `nmrassign real-benchmark`; `dev` split verified, single-shot cold `heldout` run recorded at merge)
 
 ## Phase 9: Zero-friction spectrometer ingest, interactive NMR workbench UX & solver curation (`specs/06`, `specs/12`)
-- [ ] (A) `T09.1` — Spectrometer folder & archive auto-classifier (`nmr-core::classify`: Bruker `PULPROG`/`vdlist`/`fqlist`/`nuslist` & Varian `seqfil`/`pslabel` -> experiment & problem-regime detection)
-- [ ] (A) `T09.2` — Drag-and-drop folder/archive loader & editable Experiment Selection Matrix (`nmr-gui` desktop + `wasm32` WebGPU + `nmr-core::service`)
-- [ ] (A) `T09.3` — Guided *"What Next?"* workflow stepper, structured top menu bar, and fuzzy command palette (`Cmd/Ctrl+K`) in `nmr-gui`
-- [ ] (A) `T09.4` — Interactive two-key NMR spectrum keyboard accelerators (`vt`, `pa`, `pd`, `pc`, `oz`, `ct`, `st`, `at`, `Space`, `?` cheat-sheet) comparable to modern desktop assignment suites (`nmr-gui::keymap`)
-- [ ] (A) `T09.5` — Synchronized 2D/3D/4D multi-spectrum contour overlays and ranked `i-1 / i / i+1` candidate match-finding strips (`nmr-gui`)
-- [ ] (A) `T09.6` — Bounded undo/redo command stack (`Cmd/Ctrl+Z`) and lossless `.nef` + workspace session persistence (`nmr-core::session`, `nmr-gui`)
-- [ ] (A) `T09.7` — Backbone solver curation follow-ups: `Gln2` 9% minor-conformer weak-peak penalty, `HNCACB`-absent sparse-data convergence, locked residue constraints, and out-of-sample confidence calibration audit
+- [x] (A) `T09.1` — Spectrometer folder & archive auto-classifier (`nmr-core::classify`: Bruker `PULPROG`/`vdlist`/`fqlist`/`nuslist` & Varian `seqfil`/`pslabel` -> experiment & problem-regime detection)
+- [x] (A) `T09.2` — Drag-and-drop folder/archive loader & editable Experiment Selection Matrix (`nmr-gui` desktop + `wasm32` WebGPU + `nmr-core::service`)
+- [x] (A) `T09.3` — Guided *"What Next?"* workflow stepper, structured top menu bar, and fuzzy command palette (`Cmd/Ctrl+K`) in `nmr-gui`
+- [x] (A) `T09.4` — Interactive two-key NMR spectrum keyboard accelerators (`vt`, `pa`, `pd`, `pc`, `oz`, `ct`, `st`, `at`, `Space`, `?` cheat-sheet) comparable to modern desktop assignment suites (`nmr-gui::keymap`)
+- [x] (A) `T09.5` — Synchronized 2D/3D/4D multi-spectrum contour overlays and ranked `i-1 / i / i+1` candidate match-finding strips (`nmr-gui`)
+- [x] (A) `T09.6` — Bounded undo/redo command stack (`Cmd/Ctrl+Z`) and lossless `.nef` + workspace session persistence (`nmr-core::session`, `nmr-gui`)
+- [x] (A) `T09.7` — Backbone solver curation follow-ups: `Gln2` 9% minor-conformer weak-peak penalty, `HNCACB`-absent sparse-data convergence, locked residue constraints, and out-of-sample confidence calibration audit
 
 ## Phase 10: Interactive covalent sidechain graph, aromatics, stereospecificity & Methyl-TROSY (`specs/07`, `specs/13`)
 - [ ] (A) `T10.1` — Interactive sequence ribbon & live 2D covalent amino-acid sidechain graph with per-atom assigned `ppm`, BMRB Z-scores, and strip jump (`nmr-gui`)

@@ -53,7 +53,7 @@ From the ensemble of `ExperimentRecord` entries, `classify_nmr_entries` infers a
 | `Paramagnetic` | Explicit paramagnetic/oxidized+reduced pair/PCS/PRE metadata or ultra-wide `¹H` sweep (`> 28 ppm`) |
 | `Idp13cDetected` | Majority or primary backbone suite consists of `¹³C`-detected `Con2D` / `Caco2D` / `Canco3D` / `Cbcaco3D` without `¹H`-detected 3D triple-resonance |
 | `MethylTrosy` | `C13Hmqc` methyl-TROSY spectra dominate without `¹⁵N` amide triple-resonance |
-| `TitrationCsp` | `>= 4`同-nucleus 2D `HSQC`/`HMQC` series points with titration/concentration/ratio labels (or `TitrationSeries`) without 3D assignment suite |
+| `TitrationCsp` | `>= 4` same-nucleus 2D `HSQC`/`HMQC` series points with titration/concentration/ratio labels (or `TitrationSeries`) without 3D assignment suite |
 | `RelaxationDynamics` | Workspace contains `RelaxR1` / `RelaxR2` / `HetNoe` / `Cpmg` / `Cest` dynamics experiments as primary payload |
 | `SidechainNoesy` | Full backbone suite supplemented by aliphatic sidechain (`Ccconh`, `Hccconh`, `HcchTocsy`, `C13Hsqc`) and/or `N15Noesy` / `C13Noesy` |
 | `GlobularBackbone` | Standard `¹H, ¹⁵N, ¹³C` backbone assignment bundle (`N15Hsqc` + 3D triple-resonance) |
