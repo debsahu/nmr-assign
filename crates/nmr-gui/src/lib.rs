@@ -6,4 +6,5 @@
 //! native desktop and `wasm32-unknown-unknown` targets.
 
 pub mod command_palette;
+pub mod keymap;
 pub mod workflow_bar;
