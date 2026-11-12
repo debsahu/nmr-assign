@@ -376,19 +376,90 @@ pub fn is_non_backbone_archive_filename(name: &str) -> bool {
         .collect::<String>()
         .to_ascii_lowercase();
 
+    // Check explicit non-backbone / sidechain / NOESY / relaxation / 13C-HSQC / 1D presat tokens
+    // first so names like `NHSQC_T1_short`, `NHSQC_NH2`, or `hsqcctetgpsp` are filtered cleanly.
+    const NON_BACKBONE_TOKENS: &[&str] = &[
+        "noesy", "roesy", "tocsy", "dipsi", "hcch", "cchtoc", "cosy", "hbha", "hccconh", "ccconh",
+        "hmqc", "hmbc", "chsqc", "alichsqc", "arohsqc", "13chsqc", "c13hsqc", "hsqcctet",
+        "hsqcnoe", "hetnoe", "hsqct1", "hsqct2", "nhsqct1", "nhsqct2", "nhsqcnh2", "t1rho", "cpmg",
+        "cest", "hnha", "1dpresat", "zgpr",
+    ];
+    if NON_BACKBONE_TOKENS.iter().any(|tok| alnum.contains(tok)) {
+        return true;
+    }
+
     const BACKBONE_TOKENS: &[&str] = &[
-        "nhsqc", "fhsqc", "15nhsqc", "n15hsqc", "hnco", "hnca", "hncacb", "cbcanh", "cbcaconh",
-        "cbcacoca", "hncoca", "hncaco", "trosy",
+        "nhsqc", "fhsqc", "15nhsqc", "n15hsqc", "hsqcet", "hsqcgp", "hnco", "hnca", "hncacb",
+        "cbcanh", "cbcaconh", "cbcacoca", "hncoca", "hncaco", "hacaconh", "trosy",
     ];
     if BACKBONE_TOKENS.iter().any(|tok| alnum.contains(tok)) {
         return false;
     }
 
-    const NON_BACKBONE_TOKENS: &[&str] = &[
-        "noesy", "roesy", "tocsy", "dipsi", "hcch", "cosy", "hbha", "hccconh", "ccconh", "hmqcj",
-        "hmbc", "chsqc", "13chsqc", "c13hsqc", "arohsqc", "hetnoe", "t1rho", "cpmg", "cest",
-    ];
-    NON_BACKBONE_TOKENS.iter().any(|tok| alnum.contains(tok))
+    false
+}
+
+/// Returns `true` when a subdirectory name inside an unpacked BMRB `timedomain_data/` directory
+/// is an auxiliary/processed/script folder rather than a raw time-domain experiment directory.
+fn is_auxiliary_unpacked_subdir(dir_name: &str) -> bool {
+    let low = dir_name.trim().to_ascii_lowercase();
+    matches!(
+        low.as_str(),
+        "analysis"
+            | "processed"
+            | "processing"
+            | "processing_scripts"
+            | "pipe_conversion"
+            | "sparky"
+            | "ucsf"
+            | "peaks"
+            | "peaklists"
+            | "scripts"
+    )
+}
+
+/// Returns `true` when a filename inside an unpacked Bruker or Varian experiment directory is a
+/// raw FID or acquisition/processing metadata file required by `nmr_core::fid` / `real_benchmark`
+/// (skipping pre-processed `.ucsf`/`.ft2`/`.ft3` cubes, `.csh` scripts, and waveform tables).
+fn is_raw_fid_or_param_filename(fname: &str) -> bool {
+    let low = fname.trim().to_ascii_lowercase();
+    if matches!(
+        low.as_str(),
+        "fid"
+            | "ser"
+            | "procpar"
+            | "text"
+            | "log"
+            | "acqu"
+            | "acqus"
+            | "acqu2"
+            | "acqu2s"
+            | "acqu3"
+            | "acqu3s"
+            | "acqu4"
+            | "acqu4s"
+            | "proc"
+            | "procs"
+            | "proc2"
+            | "proc2s"
+            | "proc3"
+            | "proc3s"
+            | "title"
+            | "outd"
+            | "pulseprogram"
+            | "uxnmr.par"
+            | "audita.txt"
+            | "scon"
+            | "scon2"
+            | "fq1list"
+            | "vclist"
+            | "vdlist"
+            | "valist"
+            | "vp"
+    ) {
+        return true;
+    }
+    low.contains("nus") || low.contains("sched") || low.ends_with(".sch") || low.ends_with(".hdr")
 }
 
 fn archive_stem_key(url_or_name: &str) -> (String, usize) {
@@ -959,11 +1030,146 @@ fn resolve_star_url_and_size(
     ))
 }
 
+fn fetch_dir_listing_html(client: &mut RateLimitedCurl, dir_url: &str) -> Option<String> {
+    if let Some(local_sub) = dir_url.strip_prefix("file://") {
+        let p = Path::new(local_sub);
+        if !p.is_dir() {
+            return None;
+        }
+        let mut s = String::new();
+        if let Ok(rd) = fs::read_dir(p) {
+            let mut ents: Vec<_> = rd.filter_map(|r| r.ok()).collect();
+            ents.sort_by_key(|e| e.file_name());
+            for ent in ents {
+                let nm = ent.file_name().to_string_lossy().into_owned();
+                let suf = if ent.path().is_dir() { "/" } else { "" };
+                s.push_str(&format!("<a href=\"{nm}{suf}\">{nm}{suf}</a>\n"));
+            }
+        }
+        Some(s)
+    } else {
+        client
+            .get_bytes(dir_url)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_unpacked_timedomain_dir(
+    client: &mut RateLimitedCurl,
+    dir_url: &str,
+    rel_prefix: &str,
+    depth: usize,
+    max_depth: usize,
+    include_all_archives: bool,
+    dry_run: bool,
+    archive_urls: &mut Vec<String>,
+    items: &mut Vec<RemoteTimeDomainItem>,
+) -> Result<(), String> {
+    let Some(sub_html) = fetch_dir_listing_html(client, dir_url) else {
+        return Ok(());
+    };
+    let sub_archives = parse_archive_urls_from_listing(&sub_html, dir_url);
+    if !sub_archives.is_empty() && depth <= 1 {
+        archive_urls.extend(sub_archives);
+        return Ok(());
+    }
+
+    let direct_files = parse_direct_file_urls_from_listing(&sub_html, dir_url);
+    let has_fid_marker = direct_files.iter().any(|(fname, _)| {
+        matches!(
+            fname.to_ascii_lowercase().as_str(),
+            "acqus" | "acqu" | "procpar" | "ser" | "fid"
+        )
+    });
+
+    if has_fid_marker {
+        for (fname, furl) in &direct_files {
+            if !include_all_archives && !is_raw_fid_or_param_filename(fname) {
+                continue;
+            }
+            let rel = format!("{rel_prefix}/{fname}");
+            validate_archive_member_path(&rel)?;
+            let cl = if dry_run {
+                client.head_content_length(furl).ok().flatten()
+            } else {
+                None
+            };
+            items.push(RemoteTimeDomainItem::DirectFile {
+                url: furl.clone(),
+                rel_path: rel,
+                content_length: cl,
+            });
+        }
+        // Also fetch `pdata/1/{title,procs,proc2s,proc3s}` inside Bruker unpacked experiment dirs when present.
+        let child_dirs = parse_subdir_urls_from_listing(&sub_html, dir_url);
+        if let Some((_, pdata_url)) = child_dirs
+            .iter()
+            .find(|(nm, _)| nm.eq_ignore_ascii_case("pdata"))
+        {
+            let pdata1_url = format!("{}1/", pdata_url);
+            if let Some(p1_html) = fetch_dir_listing_html(client, &pdata1_url) {
+                for (fname, furl) in parse_direct_file_urls_from_listing(&p1_html, &pdata1_url) {
+                    if !include_all_archives && !is_raw_fid_or_param_filename(&fname) {
+                        continue;
+                    }
+                    let rel = format!("{rel_prefix}/pdata/1/{fname}");
+                    validate_archive_member_path(&rel)?;
+                    let cl = if dry_run {
+                        client.head_content_length(&furl).ok().flatten()
+                    } else {
+                        None
+                    };
+                    items.push(RemoteTimeDomainItem::DirectFile {
+                        url: furl,
+                        rel_path: rel,
+                        content_length: cl,
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if depth >= max_depth {
+        return Ok(());
+    }
+
+    for (child_name, child_url) in parse_subdir_urls_from_listing(&sub_html, dir_url) {
+        if is_auxiliary_unpacked_subdir(&child_name) {
+            continue;
+        }
+        if !include_all_archives && is_non_backbone_archive_filename(&child_name) {
+            continue;
+        }
+        let next_rel = if rel_prefix.is_empty() {
+            child_name
+        } else {
+            format!("{rel_prefix}/{child_name}")
+        };
+        validate_archive_member_path(&next_rel)?;
+        collect_unpacked_timedomain_dir(
+            client,
+            &child_url,
+            &next_rel,
+            depth + 1,
+            max_depth,
+            include_all_archives,
+            dry_run,
+            archive_urls,
+            items,
+        )?;
+    }
+    Ok(())
+}
+
 fn resolve_timedomain_items(
     client: &mut RateLimitedCurl,
     id: &str,
     ftp_base: &str,
     include_all_archives: bool,
+    dry_run: bool,
 ) -> Result<(String, Vec<RemoteTimeDomainItem>), String> {
     let dir_candidates = candidate_timedomain_dir_urls(id, ftp_base);
     let mut listing_html = None;
@@ -1010,56 +1216,9 @@ fn resolve_timedomain_items(
         )
     })?;
 
+    let top_subdirs = parse_subdir_urls_from_listing(&html, &chosen_dir_url);
     let mut archive_urls = parse_archive_urls_from_listing(&html, &chosen_dir_url);
     let mut items = Vec::new();
-
-    if archive_urls.is_empty() {
-        // Check 1-level subdirectories for archives or unpacked `.fid` / Bruker experiment files.
-        let subdirs = parse_subdir_urls_from_listing(&html, &chosen_dir_url);
-        for (sub_name, sub_url) in subdirs {
-            let sub_html_opt = if let Some(local_sub) = sub_url.strip_prefix("file://") {
-                let p = Path::new(local_sub);
-                if p.is_dir() {
-                    let mut s = String::new();
-                    if let Ok(rd) = fs::read_dir(p) {
-                        let mut ents: Vec<_> = rd.filter_map(|r| r.ok()).collect();
-                        ents.sort_by_key(|e| e.file_name());
-                        for ent in ents {
-                            let nm = ent.file_name().to_string_lossy().into_owned();
-                            let suf = if ent.path().is_dir() { "/" } else { "" };
-                            s.push_str(&format!("<a href=\"{nm}{suf}\">{nm}{suf}</a>\n"));
-                        }
-                    }
-                    Some(s)
-                } else {
-                    None
-                }
-            } else {
-                client
-                    .get_bytes(&sub_url)
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-            };
-
-            if let Some(sub_html) = sub_html_opt {
-                let sub_archives = parse_archive_urls_from_listing(&sub_html, &sub_url);
-                if !sub_archives.is_empty() {
-                    archive_urls.extend(sub_archives);
-                } else {
-                    for (fname, furl) in parse_direct_file_urls_from_listing(&sub_html, &sub_url) {
-                        let rel = format!("{sub_name}/{fname}");
-                        validate_archive_member_path(&rel)?;
-                        let cl = client.head_content_length(&furl).ok().flatten();
-                        items.push(RemoteTimeDomainItem::DirectFile {
-                            url: furl,
-                            rel_path: rel,
-                            content_length: cl,
-                        });
-                    }
-                }
-            }
-        }
-    }
 
     archive_urls.sort();
     archive_urls.dedup();
@@ -1091,6 +1250,7 @@ fn resolve_timedomain_items(
             archive_urls = kept;
         }
     }
+
     for aurl in archive_urls {
         let fname = aurl
             .split(['?', '#'])
@@ -1102,11 +1262,67 @@ fn resolve_timedomain_items(
             .to_string();
         validate_archive_member_path(&fname)?;
         let cl = client.head_content_length(&aurl).ok().flatten();
+        // Every valid uncompressed POSIX/GNU `.tar` file has a byte length that is an exact
+        // multiple of 512 bytes. Several legacy BMRB `.tar` files (`15386`, `15476`, `16385`,
+        // `17030`, `18145`, `18465`) suffered `\r\n -> \n` ASCII-mode corruption on the FTP mirror
+        // (`Content-Length % 512 != 0`) while clean unpacked experiment subdirectories sit right
+        // alongside them in `timedomain_data/`. Detect and fall back automatically.
+        let is_plain_tar = fname.to_ascii_lowercase().ends_with(".tar");
+        if is_plain_tar && !top_subdirs.is_empty() && cl.is_some_and(|sz| sz % 512 != 0) {
+            println!(
+                "  Skipping server-corrupted plain .tar archive {} (Content-Length {:?} is not a 512-byte multiple); falling back to unpacked subdirectories.",
+                fname, cl
+            );
+            continue;
+        }
         items.push(RemoteTimeDomainItem::Archive {
             url: aurl,
             filename: fname,
             content_length: cl,
         });
+    }
+
+    if items.is_empty() && !top_subdirs.is_empty() {
+        let mut sub_archives = Vec::new();
+        for (sub_name, sub_url) in &top_subdirs {
+            if is_auxiliary_unpacked_subdir(sub_name) {
+                continue;
+            }
+            if !include_all_archives && is_non_backbone_archive_filename(sub_name) {
+                continue;
+            }
+            validate_archive_member_path(sub_name)?;
+            collect_unpacked_timedomain_dir(
+                client,
+                sub_url,
+                sub_name,
+                1,
+                2,
+                include_all_archives,
+                dry_run,
+                &mut sub_archives,
+                &mut items,
+            )?;
+        }
+        sub_archives.sort();
+        sub_archives.dedup();
+        for aurl in sub_archives {
+            let fname = aurl
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(&aurl)
+                .rsplit('/')
+                .next()
+                .unwrap_or("archive.tar")
+                .to_string();
+            validate_archive_member_path(&fname)?;
+            let cl = client.head_content_length(&aurl).ok().flatten();
+            items.push(RemoteTimeDomainItem::Archive {
+                url: aurl,
+                filename: fname,
+                content_length: cl,
+            });
+        }
     }
 
     if items.is_empty() {
@@ -1161,6 +1377,7 @@ pub fn execute_fetch_bmrb(cfg: &FetchBmrbConfig) -> Result<Vec<DownloadedArtifac
         &id,
         &cfg.ftp_base_url,
         cfg.include_all_archives,
+        cfg.dry_run,
     )?;
 
     let mut known_total = star_len_opt.unwrap_or(0);
@@ -1765,6 +1982,47 @@ mod tests {
             "##$PULPROG= <hncogp3d>\n"
         );
         assert!(!dest53371.join("noesy_sidechain.tar").exists());
+
+        // 4. BMRB 18465 / 15386 FTP-ASCII-corrupted plain `.tar` (`size % 512 != 0`) fallback to
+        // nested 2-level unpacked raw FID directories (`v6/NHSQC/{fid,procpar}`), skipping
+        // `NHSQC_T1_short`, `CCcoNH_TOCSY`, and pre-processed `.ucsf` files!
+        let e18465 = root.join("ftp/entry_directories/bmr18465");
+        let td18465 = e18465.join("timedomain_data");
+        fs::create_dir_all(td18465.join("v6/NHSQC")).unwrap();
+        fs::create_dir_all(td18465.join("v6/NHSQC_T1_short")).unwrap();
+        fs::create_dir_all(td18465.join("v6/CCcoNH_TOCSY")).unwrap();
+        fs::write(e18465.join("bmr18465_3.str"), b"data_18465\n").unwrap();
+        // Corrupted plain `.tar` with size 515 (`515 % 512 == 3 != 0`)
+        fs::write(td18465.join("bmrb18465td.tar"), vec![b'X'; 515]).unwrap();
+        fs::write(td18465.join("v6/NHSQC/procpar"), b"pslabel gNhsqc\n").unwrap();
+        fs::write(td18465.join("v6/NHSQC/fid"), b"RAW_VARIAN_FID").unwrap();
+        fs::write(
+            td18465.join("v6/NHSQC/o157_nhsqcv6.ucsf"),
+            b"PREPROCESSED_CUBE",
+        )
+        .unwrap();
+        fs::write(td18465.join("v6/NHSQC_T1_short/fid"), b"RELAX_FID").unwrap();
+        fs::write(td18465.join("v6/CCcoNH_TOCSY/fid"), b"TOCSY_FID").unwrap();
+
+        let dest18465 = root.join("out_18465");
+        let arts18465 = execute_fetch_bmrb(&FetchBmrbConfig {
+            bmrb_id: "18465".to_string(),
+            dest_dir: dest18465.clone(),
+            dry_run: false,
+            include_all_archives: false,
+            max_bytes: 10_000_000,
+            ftp_base_url: format!("file://{}", root.join("ftp").display()),
+            api_base_url: String::new(),
+            min_interval: Duration::from_millis(1),
+        })
+        .unwrap();
+        // STAR + v6/NHSQC/fid + v6/NHSQC/procpar ONLY!
+        assert_eq!(arts18465.len(), 3);
+        assert!(dest18465.join("v6/NHSQC/fid").is_file());
+        assert!(dest18465.join("v6/NHSQC/procpar").is_file());
+        assert!(!dest18465.join("v6/NHSQC/o157_nhsqcv6.ucsf").exists());
+        assert!(!dest18465.join("v6/NHSQC_T1_short").exists());
+        assert!(!dest18465.join("bmrb18465td.tar").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
