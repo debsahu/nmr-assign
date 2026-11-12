@@ -6,6 +6,8 @@
 mod contour_painter;
 #[allow(dead_code)]
 mod octet_canvas;
+#[allow(dead_code)]
+mod strip_tiler;
 
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]

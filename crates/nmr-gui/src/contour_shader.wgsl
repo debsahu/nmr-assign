@@ -1,6 +1,7 @@
-// Clean-room WGSL 2D NMR contour renderer for eframe / egui_wgpu.
-// Provenance: Original GPU contour shader computing bilinear spectrum interpolation
-// and screen-space gradient anti-aliased positive/negative geometric contour lines.
+// Clean-room WGSL multi-spectrum 2D NMR contour & 3D slice overlay renderer for eframe / egui_wgpu.
+// Provenance: Original GPU contour shader computing per-layer chemical-shift nudged bilinear
+// spectrum interpolation and screen-space gradient anti-aliased positive/negative geometric
+// contour lines composited via hardware alpha blending (`BlendState::ALPHA_BLENDING`).
 
 struct ContourUniforms {
     // (h_left_ppm, h_right_ppm, n_top_ppm, n_bottom_ppm)
@@ -11,6 +12,12 @@ struct ContourUniforms {
     dims: vec4<f32>,
     // (base_level, level_factor, num_levels, show_negative)
     levels: vec4<f32>,
+    // Positive contour base color & layer opacity (r, g, b, a)
+    pos_rgba: vec4<f32>,
+    // Negative contour base color & layer opacity (r, g, b, a)
+    neg_rgba: vec4<f32>,
+    // (nudge_x_ppm, nudge_y_ppm, draw_background, apex_whiten)
+    layer_meta: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uni: ContourUniforms;
@@ -38,14 +45,18 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 }
 
 fn sample_bilinear(uv: vec2<f32>) -> f32 {
-    let h_ppm = mix(uni.view_ppm.x, uni.view_ppm.y, uv.x);
-    let n_ppm = mix(uni.view_ppm.z, uni.view_ppm.w, uv.y);
+    let nx = i32(uni.dims.x);
+    let ny = i32(uni.dims.y);
+    if (nx <= 1 || ny <= 1 || abs(uni.axis_ppm.y) < 1e-12 || abs(uni.axis_ppm.w) < 1e-12) {
+        return 0.0;
+    }
+
+    let h_ppm = mix(uni.view_ppm.x, uni.view_ppm.y, uv.x) - uni.layer_meta.x;
+    let n_ppm = mix(uni.view_ppm.z, uni.view_ppm.w, uv.y) - uni.layer_meta.y;
 
     let fx = (h_ppm - uni.axis_ppm.x) / uni.axis_ppm.y;
     let fy = (n_ppm - uni.axis_ppm.z) / uni.axis_ppm.w;
 
-    let nx = i32(uni.dims.x);
-    let ny = i32(uni.dims.y);
     if (fx < 0.0 || fy < 0.0 || fx > f32(nx - 1) || fy > f32(ny - 1)) {
         return 0.0;
     }
@@ -54,6 +65,11 @@ fn sample_bilinear(uv: vec2<f32>) -> f32 {
     let y0 = clamp(i32(floor(fy)), 0, ny - 1);
     let x1 = min(x0 + 1, nx - 1);
     let y1 = min(y0 + 1, ny - 1);
+    let max_idx = u32(y1 * nx + x1);
+    if (max_idx >= arrayLength(&spec_data)) {
+        return 0.0;
+    }
+
     let tx = fx - floor(fx);
     let ty = fy - floor(fy);
 
@@ -65,13 +81,10 @@ fn sample_bilinear(uv: vec2<f32>) -> f32 {
     return mix(mix(v00, v10, tx), mix(v01, v11, tx), ty);
 }
 
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Deep slate NMR canvas background with subtle grid
+fn compute_canvas_bg(uv: vec2<f32>) -> vec3<f32> {
     var bg = vec3<f32>(0.055, 0.070, 0.098);
-
-    let h_ppm = mix(uni.view_ppm.x, uni.view_ppm.y, in.uv.x);
-    let n_ppm = mix(uni.view_ppm.z, uni.view_ppm.w, in.uv.y);
+    let h_ppm = mix(uni.view_ppm.x, uni.view_ppm.y, uv.x);
+    let n_ppm = mix(uni.view_ppm.z, uni.view_ppm.w, uv.y);
 
     let dh_px = abs(uni.view_ppm.x - uni.view_ppm.y) / max(uni.dims.z, 1.0);
     let dn_px = abs(uni.view_ppm.z - uni.view_ppm.w) / max(uni.dims.w, 1.0);
@@ -80,23 +93,39 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (min(grid_h, grid_n) < 0.75) {
         bg = bg + vec3<f32>(0.025, 0.032, 0.045);
     }
+    return bg;
+}
 
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let draw_bg = uni.layer_meta.z > 0.5;
+    let n_levels = i32(uni.levels.z);
+    if (n_levels <= 0) {
+        if (draw_bg) {
+            return vec4<f32>(compute_canvas_bg(in.uv), 1.0);
+        }
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let base = max(uni.levels.x, 1e-4);
+    let show_neg = uni.levels.w > 0.5;
     let val = sample_bilinear(in.uv);
+    let abs_v = abs(val);
+
+    // Early out on baseline pixels before evaluating 4 neighbor gradient taps (~5x bandwidth win)
+    if (abs_v < base * 0.65 || (val < 0.0 && !show_neg)) {
+        if (draw_bg) {
+            return vec4<f32>(compute_canvas_bg(in.uv), 1.0);
+        }
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let factor = max(uni.levels.y, 1.05);
     let du = vec2<f32>(1.0 / max(uni.dims.z, 1.0), 0.0);
     let dv = vec2<f32>(0.0, 1.0 / max(uni.dims.w, 1.0));
     let gx = sample_bilinear(in.uv + du) - sample_bilinear(in.uv - du);
     let gy = sample_bilinear(in.uv + dv) - sample_bilinear(in.uv - dv);
     let grad = max(0.5 * length(vec2<f32>(gx, gy)), 1e-4);
-
-    let base = max(uni.levels.x, 1e-4);
-    let factor = max(uni.levels.y, 1.05);
-    let n_levels = i32(uni.levels.z);
-    let show_neg = uni.levels.w > 0.5;
-
-    let abs_v = abs(val);
-    if (abs_v < base * 0.65 || (val < 0.0 && !show_neg)) {
-        return vec4<f32>(bg, 1.0);
-    }
 
     var line_alpha: f32 = 0.0;
     var level_norm: f32 = 0.0;
@@ -112,18 +141,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // Subtle soft glow inside high contours so dense peaks remain readable when zoomed out
-    let fill_glow = clamp((log(max(abs_v / base, 1.0)) / log(pow(factor, f32(n_levels)))) * 0.22, 0.0, 0.25);
+    let denom = max(log(pow(factor, f32(n_levels))), 1e-4);
+    let fill_glow = clamp((log(max(abs_v / base, 1.0)) / denom) * 0.22, 0.0, 0.25);
 
-    var contour_col: vec3<f32>;
-    if (val >= 0.0) {
-        // Positive contours: deep sky cyan -> bright ice white-cyan at peak apex
-        contour_col = mix(vec3<f32>(0.12, 0.68, 0.96), vec3<f32>(0.68, 0.96, 1.0), level_norm);
-    } else {
-        // Negative contours: warm coral-rose -> bright amber-coral
-        contour_col = mix(vec3<f32>(0.95, 0.36, 0.42), vec3<f32>(1.0, 0.72, 0.52), level_norm);
+    let base_rgba = select(uni.neg_rgba, uni.pos_rgba, val >= 0.0);
+    let whiten = clamp(uni.layer_meta.w, 0.0, 1.0);
+    let apex_rgb = clamp(
+        mix(base_rgba.rgb, vec3<f32>(1.0, 1.0, 1.0), whiten),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    let contour_col = mix(base_rgba.rgb, apex_rgb, level_norm);
+    let alpha = clamp(max(line_alpha, fill_glow) * clamp(base_rgba.a, 0.0, 1.0), 0.0, 1.0);
+
+    if (draw_bg) {
+        let bg = compute_canvas_bg(in.uv);
+        return vec4<f32>(mix(bg, contour_col, alpha), 1.0);
     }
-
-    let alpha = clamp(max(line_alpha, fill_glow), 0.0, 1.0);
-    let final_rgb = mix(bg, contour_col, alpha);
-    return vec4<f32>(final_rgb, 1.0);
+    return vec4<f32>(contour_col, alpha);
 }
