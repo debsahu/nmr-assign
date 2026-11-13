@@ -393,11 +393,21 @@ fn test_cli_assign_regime_paramagnetic_metal_ligands_and_pcs_svd() {
 
     let mut pdb_with_metal = fs::read_to_string(&pdb_in).expect("read 1d3z.pdb text");
     if let Some(end_idx) = pdb_with_metal.find("ENDMDL") {
-        let het_line = format!(
-            "HETATM99999 DY    DY A 999    {:8.3}{:8.3}{:8.3}  1.00 10.00          DY\n",
+        // Prepend decoy HETATMs (selenomethionine CA with and without col 77-78 element, plus
+        // closed-shell diamagnetic CA/MG/ZN/LA/LU ions) BEFORE the true paramagnetic DY ion so any
+        // naive first-HETATM or atom_name=="CA" matcher would lock onto the wrong site!
+        let het_block = format!(
+            "HETATM99990  CA  MSE A 990     -25.000 -25.000 -25.000  1.00 10.00           C\n\
+             HETATM99991  CA  MSE A 991     -23.000 -25.000 -25.000  1.00 10.00\n\
+             HETATM99992 MG    MG A 992     -20.000  20.000 -20.000  1.00 10.00          MG\n\
+             HETATM99993 CA    CA A 993      20.000 -20.000 -20.000  1.00 10.00          CA\n\
+             HETATM99994 ZN    ZN A 994      20.000  20.000 -20.000  1.00 10.00          ZN\n\
+             HETATM99995 LA    LA A 995     -20.000 -20.000  20.000  1.00 10.00          LA\n\
+             HETATM99996 LU    LU A 996      20.000 -20.000  20.000  1.00 10.00          LU\n\
+             HETATM99999 DY    DY A 999    {:8.3}{:8.3}{:8.3}  1.00 10.00          DY\n",
             metal_pos[0], metal_pos[1], metal_pos[2]
         );
-        pdb_with_metal.insert_str(end_idx, &het_line);
+        pdb_with_metal.insert_str(end_idx, &het_block);
     }
     let para_pdb = dir.join("ubiquitin_dy_tag.pdb");
     fs::write(&para_pdb, &pdb_with_metal).expect("write tagged PDB");
@@ -508,6 +518,104 @@ fn test_cli_assign_regime_paramagnetic_metal_ligands_and_pcs_svd() {
             pred.shifts.len()
         );
     }
+
+    // Regression check (P1): tandem multi-cluster [2Fe-2S] FES cofactors (>15 Å apart) with FE1/FE2
+    // (~2.7 Å intra-cluster) + S1/S2 sulfurs + HETATM CA MSE decoy must preserve BOTH cluster sites
+    // (2 clusters) without truncating to 1 cluster or matching non-metal S/C atoms.
+    let glu24 = pdb_chain
+        .residues
+        .iter()
+        .find(|r| r.seq_id == 24)
+        .expect("Glu24 in 1d3z.pdb");
+    let c1 = [glu24.ca[0] - 4.0, glu24.ca[1] - 3.0, glu24.ca[2]];
+    let c2 = [his68.ca[0] + 5.5, his68.ca[1] + 4.5, his68.ca[2] + 3.0];
+    let inter_dist =
+        ((c1[0] - c2[0]).powi(2) + (c1[1] - c2[1]).powi(2) + (c1[2] - c2[2]).powi(2)).sqrt();
+    assert!(
+        inter_dist > 15.0,
+        "expected >15 Å separation between tandem FES sites, got {inter_dist:.2}"
+    );
+    let mut tandem_pdb_txt = fs::read_to_string(&pdb_in).expect("read 1d3z.pdb text");
+    if let Some(end_idx) = tandem_pdb_txt.find("ENDMDL") {
+        let tandem_het = format!(
+            "HETATM99800  CA  MSE A 980     -30.000 -30.000 -30.000  1.00 10.00           C\n\
+             HETATM99801 FE1  FES A 981    {:8.3}{:8.3}{:8.3}  1.00 10.00          FE\n\
+             HETATM99802 FE2  FES A 981    {:8.3}{:8.3}{:8.3}  1.00 10.00          FE\n\
+             HETATM99803  S1  FES A 981    {:8.3}{:8.3}{:8.3}  1.00 10.00           S\n\
+             HETATM99804  S2  FES A 981    {:8.3}{:8.3}{:8.3}  1.00 10.00           S\n\
+             HETATM99805 FE1  FES A 982    {:8.3}{:8.3}{:8.3}  1.00 10.00\n\
+             HETATM99806 FE2  FES A 982    {:8.3}{:8.3}{:8.3}  1.00 10.00\n\
+             HETATM99807  S1  FES A 982    {:8.3}{:8.3}{:8.3}  1.00 10.00\n\
+             HETATM99808  S2  FES A 982    {:8.3}{:8.3}{:8.3}  1.00 10.00\n",
+            c1[0] - 1.35,
+            c1[1],
+            c1[2],
+            c1[0] + 1.35,
+            c1[1],
+            c1[2],
+            c1[0],
+            c1[1] + 1.80,
+            c1[2],
+            c1[0],
+            c1[1] - 1.80,
+            c1[2],
+            c2[0] - 1.35,
+            c2[1],
+            c2[2],
+            c2[0] + 1.35,
+            c2[1],
+            c2[2],
+            c2[0],
+            c2[1] + 1.80,
+            c2[2],
+            c2[0],
+            c2[1] - 1.80,
+            c2[2],
+        );
+        tandem_pdb_txt.insert_str(end_idx, &tandem_het);
+    }
+    let tandem_pdb = dir.join("ubiquitin_tandem_fes.pdb");
+    fs::write(&tandem_pdb, &tandem_pdb_txt).expect("write tandem FES PDB");
+    let tandem_out_prefix = dir.join("para_tandem_out");
+    let tandem_run = Command::new(nmrassign_bin())
+        .args([
+            "assign",
+            "--regime",
+            "paramagnetic",
+            "--solver",
+            "standard",
+            "--seq",
+            &seq_str,
+            "--peaks",
+            peaks_tsv.to_str().unwrap(),
+            "--metal-ligands",
+            "GLU24,HIS68",
+            "--pdb",
+            tandem_pdb.to_str().unwrap(),
+            "--seed",
+            "11",
+            "--out",
+            tandem_out_prefix.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run assign --regime paramagnetic with tandem [2Fe-2S] PDB");
+    let tandem_stdout = String::from_utf8_lossy(&tandem_run.stdout);
+    let tandem_stderr = String::from_utf8_lossy(&tandem_run.stderr);
+    assert!(
+        tandem_run.status.success(),
+        "tandem [2Fe-2S] paramagnetic assign failed:\nstdout: {tandem_stdout}\nstderr: {tandem_stderr}"
+    );
+    assert!(
+        tandem_stdout.contains("regime=paramagnetic | 2 clusters,"),
+        "expected both tandem [2Fe-2S] clusters preserved (2 clusters), got:\n{tandem_stdout}"
+    );
+    let tandem_star_txt =
+        fs::read_to_string(tandem_out_prefix.with_extension("str")).expect("read tandem .str");
+    assert!(
+        tandem_star_txt.contains("clusters=2,"),
+        "expected clusters=2 in output NMR-STAR header, got:\n{}",
+        &tandem_star_txt[..tandem_star_txt.len().min(600)]
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -669,6 +777,36 @@ fn test_cli_propensity_tsv_json_and_report_idp_propensity() {
     assert!(pipe_dir.join("propensity.tsv").exists());
     let pipe_html = fs::read_to_string(pipe_dir.join("report.html")).unwrap();
     assert!(pipe_html.contains("section-idp-propensity"));
+
+    // 5. NEF input parity: nmrassign propensity --shifts <result.nef> --format tsv
+    let nef_path = pipe_dir.join("result.nef");
+    assert!(nef_path.exists(), "expected pipeline to emit result.nef");
+    let out_nef_prop = Command::new(nmrassign_bin())
+        .args([
+            "propensity",
+            "--shifts",
+            nef_path.to_str().unwrap(),
+            "--format",
+            "tsv",
+        ])
+        .output()
+        .expect("run nmrassign propensity --shifts result.nef");
+    assert!(
+        out_nef_prop.status.success(),
+        "propensity on .nef failed: {}",
+        String::from_utf8_lossy(&out_nef_prop.stderr)
+    );
+    let nef_tsv_rows = String::from_utf8_lossy(&out_nef_prop.stdout)
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#') && !t.starts_with("seq_id\t")
+        })
+        .count();
+    assert_eq!(
+        nef_tsv_rows, 18,
+        "expected 18 residue propensity rows from result.nef"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

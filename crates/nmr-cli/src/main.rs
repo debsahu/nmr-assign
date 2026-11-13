@@ -1438,17 +1438,75 @@ pub(crate) fn execute_idp_13c_workflow(
     })
 }
 
-type PdbAtomCoordsBundle = (BTreeMap<(i32, String), Vec3>, Option<Vec3>, Vec<Vec3>);
+type PdbAtomCoordsBundle = (BTreeMap<(i32, String), Vec3>, Vec<Vec3>, Vec<Vec3>);
+
+fn cluster_metal_atoms_single_linkage(atoms: &[Vec3], cutoff_angstrom: f64) -> Vec<Vec3> {
+    let mut unique: Vec<Vec3> = Vec::new();
+    for &c in atoms {
+        if !unique.iter().any(|&u| {
+            let dx = u[0] - c[0];
+            let dy = u[1] - c[1];
+            let dz = u[2] - c[2];
+            dx * dx + dy * dy + dz * dz < 1e-10
+        }) {
+            unique.push(c);
+        }
+    }
+    let m = unique.len();
+    if m == 0 {
+        return Vec::new();
+    }
+    let cut2 = cutoff_angstrom * cutoff_angstrom;
+    let mut visited = vec![false; m];
+    let mut centroids = Vec::new();
+    for start in 0..m {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut queue = vec![start];
+        let mut head = 0usize;
+        let mut sum = [0.0_f64; 3];
+        while head < queue.len() {
+            let cur = queue[head];
+            head += 1;
+            let cc = unique[cur];
+            sum[0] += cc[0];
+            sum[1] += cc[1];
+            sum[2] += cc[2];
+            for nxt in 0..m {
+                if !visited[nxt] {
+                    let nc = unique[nxt];
+                    let d2 =
+                        (cc[0] - nc[0]).powi(2) + (cc[1] - nc[1]).powi(2) + (cc[2] - nc[2]).powi(2);
+                    if d2 <= cut2 {
+                        visited[nxt] = true;
+                        queue.push(nxt);
+                    }
+                }
+            }
+        }
+        let inv = 1.0 / (queue.len() as f64);
+        centroids.push([sum[0] * inv, sum[1] * inv, sum[2] * inv]);
+    }
+    centroids
+}
 
 fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
     let mut atom_map: BTreeMap<(i32, String), Vec3> = BTreeMap::new();
-    let mut metal_coord: Option<Vec3> = None;
+    let mut raw_metal_atoms: Vec<Vec3> = Vec::new();
     let mut ca_coords: Vec<Vec3> = Vec::new();
     let mut active_chain: Option<char> = None;
 
-    const METAL_RES_OR_ELEMS: &[&str] = &[
-        "FE", "FE2", "FES", "SF4", "F3S", "HEM", "HEC", "ZN", "CO", "CU", "NI", "MN", "LA", "CE",
-        "PR", "ND", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB", "LU", "CA", "MG",
+    // Open-shell paramagnetic transition-metal and lanthanide elements only
+    // (excludes diamagnetic closed-shell CA, MG, ZN, LA, LU and non-metals S, C, N, O, SE).
+    const PARAMAGNETIC_METAL_ELEMENTS: &[&str] = &[
+        "FE", "CO", "CU", "NI", "MN", "CE", "PR", "ND", "SM", "EU", "GD", "TB", "DY", "HO", "ER",
+        "TM", "YB",
+    ];
+    const METAL_COFACTOR_RESIDUES: &[&str] = &[
+        "FE", "FE2", "FES", "SF4", "F3S", "HEM", "HEC", "CO", "CU", "NI", "MN", "CE", "PR", "ND",
+        "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB",
     ];
 
     for line in pdb_text.lines() {
@@ -1478,19 +1536,31 @@ fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
         if is_het {
             let res_name = line[17..20].trim().to_ascii_uppercase();
             let atom_name = line[12..16].trim().to_ascii_uppercase();
-            let elem = if line.len() >= 78 {
-                line[76..78].trim().to_ascii_uppercase()
+            let elem_col: String = if line.len() >= 78 {
+                line[76..78]
+                    .chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect()
             } else {
                 String::new()
             };
-            if metal_coord.is_none()
-                && (METAL_RES_OR_ELEMS.contains(&res_name.as_str())
-                    || METAL_RES_OR_ELEMS.contains(&elem.as_str())
-                    || (res_name != "HOH"
-                        && res_name != "WAT"
-                        && METAL_RES_OR_ELEMS.contains(&atom_name.as_str())))
+            let inferred_elem = if !elem_col.is_empty() {
+                Some(elem_col)
+            } else if METAL_COFACTOR_RESIDUES.contains(&res_name.as_str()) {
+                let lead: String = atom_name
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect();
+                (!lead.is_empty()).then_some(lead)
+            } else {
+                None
+            };
+            if inferred_elem
+                .as_deref()
+                .is_some_and(|el| PARAMAGNETIC_METAL_ELEMENTS.contains(&el))
             {
-                metal_coord = Some(pos);
+                raw_metal_atoms.push(pos);
             }
             continue;
         }
@@ -1534,7 +1604,11 @@ fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
         }
     }
 
-    (atom_map, metal_coord, ca_coords)
+    // Cluster multi-iron cofactors (e.g. FE1+FE2 of one [2Fe-2S] FES ~2.7 Å apart) into 1 centroid
+    // while keeping distinct clusters (e.g. tandem [2Fe-2S] sites ~16 Å apart) separate.
+    let metal_centroids = cluster_metal_atoms_single_linkage(&raw_metal_atoms, 4.5);
+
+    (atom_map, metal_centroids, ca_coords)
 }
 
 fn fit_and_report_pcs_tensor_cli(
@@ -1544,7 +1618,7 @@ fn fit_and_report_pcs_tensor_cli(
 ) -> Result<DeltaChiTensor, String> {
     let raw_pcs = fs::read_to_string(pcs_path)
         .map_err(|e| format!("failed to read PCS file {}: {e}", pcs_path.display()))?;
-    let (atom_map, pdb_metal, ca_coords) = parse_pdb_atom_coords_first_model(pdb_text);
+    let (atom_map, pdb_metals, ca_coords) = parse_pdb_atom_coords_first_model(pdb_text);
     if atom_map.is_empty() {
         return Err("no ATOM records parsed from --pdb for PCS tensor SVD fitting".to_string());
     }
@@ -1648,13 +1722,33 @@ fn fit_and_report_pcs_tensor_cli(
         ));
     }
 
-    let cluster_metal = para_report
-        .detected_clusters
-        .iter()
-        .find_map(|c| c.metal_coord);
+    let mut candidate_metals: Vec<Vec3> = pdb_metals;
+    if candidate_metals.is_empty() {
+        candidate_metals.extend(
+            para_report
+                .detected_clusters
+                .iter()
+                .filter_map(|c| c.metal_coord),
+        );
+    }
 
-    let tensor = if let Some(mpos) = pdb_metal.or(cluster_metal) {
-        fit_pcs_tensor_svd(&observations, mpos)?
+    let tensor = if !candidate_metals.is_empty() {
+        let mut best_tensor: Option<DeltaChiTensor> = None;
+        let mut last_err: Option<String> = None;
+        for mpos in candidate_metals {
+            match fit_pcs_tensor_svd(&observations, mpos) {
+                Ok(t) => {
+                    if best_tensor.as_ref().is_none_or(|b| t.q_factor < b.q_factor) {
+                        best_tensor = Some(t);
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match best_tensor {
+            Some(t) => t,
+            None => return Err(last_err.unwrap_or_else(|| "PCS SVD fit failed".to_string())),
+        }
     } else {
         let ca_centroid = if ca_coords.is_empty() {
             [0.0, 0.0, 0.0]
@@ -1745,8 +1839,7 @@ pub(crate) fn execute_paramagnetic_workflow(
     };
 
     let explicit_metal_coords = if let Some(ref txt) = pdb_coordinates {
-        let (_, m_opt, _) = parse_pdb_atom_coords_first_model(txt);
-        m_opt.into_iter().collect()
+        parse_pdb_atom_coords_first_model(txt).1
     } else {
         Vec::new()
     };
@@ -4324,7 +4417,7 @@ fn cmd_propensity(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign propensity --shifts <assigned.str> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]"
+                    "Usage: nmrassign propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]"
                 );
                 return Ok(());
             }
@@ -4366,9 +4459,17 @@ fn cmd_propensity(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let shifts_p = shifts_path.ok_or("propensity requires --shifts <assigned.str>")?;
+    let shifts_p = shifts_path.ok_or("propensity requires --shifts <shifts.str|shifts.nef>")?;
     let prop_cfg = build_propensity_config(temp_k, ph_opt)?;
-    let ref_data = read_star_all_atoms(&shifts_p, None)?;
+    let is_nef = shifts_p
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("nef"));
+    let ref_data = if is_nef {
+        read_nef_file(&shifts_p)?.to_reference()?
+    } else {
+        read_star_all_atoms(&shifts_p, None)?
+    };
     let report = compute_idp_propensity(&ref_data, &prop_cfg);
 
     let rendered = match format.as_str() {
