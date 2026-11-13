@@ -15,10 +15,22 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
+use nmr_core::c13_detected::{
+    pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
+    C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
+    IdpCubeSimConfig,
+};
 use nmr_core::dihedrals::{predict_dihedrals, validate_dihedrals_against_torsions};
 use nmr_core::evaluate::{compare_shifts, score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::fid::{read_fid_2d, read_fid_3d, read_fid_auto, Fid2D, Fid3D, RawFid};
+use nmr_core::idp_propensity::{
+    compute_idp_propensity, format_propensity_json, format_propensity_tsv, PropensityConfig,
+};
+use nmr_core::idp_solver::{
+    assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems,
+    ConDipeptideSystem, IdpAssignResult, IdpSolverConfig,
+};
 use nmr_core::nef::{read_nef_file, write_nef_file, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
@@ -27,8 +39,8 @@ use nmr_core::nmrstar::{
     read_star, read_star_all_atoms, read_star_str, write_star, write_star_with_header, Reference,
 };
 use nmr_core::noesy::{
-    compute_chain_torsions, parse_pdb_first_model, simulate_noesy_peaks, summarize_adrs,
-    NoesySimConfig,
+    compute_chain_torsions, parse_pdb_first_model, parse_pdb_str_first_model, simulate_noesy_peaks,
+    summarize_adrs, NoesySimConfig, Vec3,
 };
 use nmr_core::octet_analyt::iupac_naming::{iupac_name_to_mol, mol_to_iupac_name};
 use nmr_core::octet_analyt::jcamp_spec1d::{
@@ -45,6 +57,11 @@ use nmr_core::octet_mol::{
 };
 use nmr_core::octet_render::{
     render_scene_pdf, render_scene_png, render_scene_svg, DocumentStyle, JournalStyle, RenderScene,
+};
+use nmr_core::paramagnetic::{
+    assign_paramagnetic_backbone, assign_paramagnetic_from_peaks, fit_pcs_tensor_svd,
+    parse_metal_ligands, refine_metal_position_and_tensor, DeltaChiTensor,
+    ParamagneticAssignConfig, ParamagneticAssignReport, ParamagneticSolverMode, PcsObservation,
 };
 use nmr_core::peaks::{read_peaks, write_peaks, Peak, EXPERIMENT_NAMES};
 use nmr_core::picker::{
@@ -96,9 +113,41 @@ pub enum EngineKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineRequest {
+    Auto,
+    Gpu,
+    Cpu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolverKind {
     Standard,
     EvoGraph,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RegimeKind {
+    #[default]
+    Globular,
+    Idp13C,
+    Paramagnetic,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReportOptions {
+    pub include_idp_propensity_track: bool,
+    pub temp_k: f64,
+    pub ph: Option<f64>,
+}
+
+impl Default for ReportOptions {
+    fn default() -> Self {
+        Self {
+            include_idp_propensity_track: false,
+            temp_k: 298.15,
+            ph: None,
+        }
+    }
 }
 
 pub(crate) fn version_string() -> String {
@@ -121,7 +170,8 @@ fn usage() -> String {
        nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          --peaks <peaks.tsv> (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--solver evo-graph|standard] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
+       nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard] [--engine auto|gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
+       nmrassign propensity      --shifts <assigned.str> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
@@ -131,8 +181,8 @@ fn usage() -> String {
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
-       nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard] [--method classical|neural] [--engine gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
@@ -166,6 +216,28 @@ pub(crate) fn parse_engine(val: &str) -> Result<EngineKind, String> {
         "gpu" | "wgpu" | "webgpu" => Ok(EngineKind::Gpu),
         "cpu" => Ok(EngineKind::Cpu),
         other => Err(format!("unknown --engine {other:?}; expected gpu or cpu")),
+    }
+}
+
+pub(crate) fn parse_engine_request(val: &str) -> Result<EngineRequest, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "auto" => Ok(EngineRequest::Auto),
+        "gpu" | "wgpu" | "webgpu" => Ok(EngineRequest::Gpu),
+        "cpu" => Ok(EngineRequest::Cpu),
+        other => Err(format!(
+            "unknown --engine {other:?}; expected auto, gpu, or cpu"
+        )),
+    }
+}
+
+pub(crate) fn parse_regime(val: &str) -> Result<RegimeKind, String> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "globular" => Ok(RegimeKind::Globular),
+        "idp-13c" | "idp_13c" | "idp13c" => Ok(RegimeKind::Idp13C),
+        "paramagnetic" => Ok(RegimeKind::Paramagnetic),
+        other => Err(format!(
+            "unknown --regime {other:?}; expected globular, idp-13c, or paramagnetic"
+        )),
     }
 }
 
@@ -783,15 +855,1006 @@ fn cmd_simulate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn classify_caco_peak_kind(ca_ppm: f64, sign: i32) -> CacoPeakKind {
+    if sign < 0 {
+        CacoPeakKind::GlyOppositePhase
+    } else if ca_ppm <= 47.8 {
+        CacoPeakKind::GlyRegion
+    } else if ca_ppm >= 58.0 {
+        CacoPeakKind::SerThrProDownfield
+    } else {
+        CacoPeakKind::GeneralAliphatic
+    }
+}
+
+pub(crate) fn parse_c13_detected_tsv_str(
+    text: &str,
+    default_exp: Option<C13DetectedExp>,
+) -> Result<C13PickedDataset, String> {
+    let mut ds = C13PickedDataset::default();
+    for (line_no, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let cols: Vec<&str> = if cols.len() <= 1 {
+            line.split_whitespace().collect()
+        } else {
+            cols
+        };
+        if cols.is_empty() {
+            continue;
+        }
+        let low0 = cols[0].to_ascii_lowercase();
+        if matches!(
+            low0.as_str(),
+            "experiment" | "exp" | "spectrum" | "peak_id" | "id"
+        ) {
+            continue;
+        }
+
+        let (exp, start_col) = if let Some(parsed_exp) = C13DetectedExp::from_name(cols[0]) {
+            (parsed_exp, 1usize)
+        } else if let Some(def) = default_exp {
+            if cols[0].parse::<f64>().is_ok() {
+                (def, 0usize)
+            } else {
+                return Err(format!(
+                    "line {}: unknown 13C-detected experiment {:?}",
+                    line_no + 1,
+                    cols[0]
+                ));
+            }
+        } else {
+            return Err(format!(
+                "line {}: unknown 13C-detected experiment {:?} (expected CON, CACO, CANCO, CBCACON, CCCON, or NCACO)",
+                line_no + 1,
+                cols[0]
+            ));
+        };
+
+        let rem = &cols[start_col..];
+        let parse_opt_f64 = |tok: &str| -> Result<Option<f64>, String> {
+            let t = tok.trim();
+            if t.is_empty() || t == "." || t == "-" || t.eq_ignore_ascii_case("nan") {
+                Ok(None)
+            } else {
+                t.parse::<f64>()
+                    .map(Some)
+                    .map_err(|e| format!("line {}: invalid float {t:?}: {e}", line_no + 1))
+            }
+        };
+
+        match exp {
+            C13DetectedExp::Con2D => {
+                if rem.len() < 2 {
+                    return Err(format!(
+                        "line {}: CON row needs at least C_prev and N_curr columns",
+                        line_no + 1
+                    ));
+                }
+                let c_prev_ppm = parse_opt_f64(rem[0])?
+                    .ok_or_else(|| format!("line {}: missing CON C_prev ppm", line_no + 1))?;
+                let n_curr_ppm = parse_opt_f64(rem[1])?
+                    .ok_or_else(|| format!("line {}: missing CON N_curr ppm", line_no + 1))?;
+                let has_dummy_col2 = rem.len() >= 6
+                    && (parse_opt_f64(rem[2])?.is_none()
+                        || (!matches!(rem[2], "1" | "-1" | "+1")
+                            && matches!(rem[3], "1" | "-1" | "+1")));
+                let meta_offset = if has_dummy_col2 { 3usize } else { 2usize };
+                let height = rem
+                    .get(meta_offset + 1)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1.0e5);
+                let volume = rem
+                    .get(meta_offset + 2)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(height);
+                ds.con_roots.push(Con2DPeak {
+                    c_prev_ppm,
+                    n_curr_ppm,
+                    height,
+                    volume,
+                    is_proline_imino_region: n_curr_ppm >= 131.5,
+                    deconvolved_from_cluster: false,
+                });
+            }
+            C13DetectedExp::Caco2D => {
+                if rem.len() < 2 {
+                    return Err(format!(
+                        "line {}: CACO row needs at least C_curr and CA_curr columns",
+                        line_no + 1
+                    ));
+                }
+                let f0 = parse_opt_f64(rem[0])?
+                    .ok_or_else(|| format!("line {}: missing CACO C_curr ppm", line_no + 1))?;
+                let (d1, d2, meta_offset) = if rem.len() >= 3 && parse_opt_f64(rem[1])?.is_none() {
+                    let ca = parse_opt_f64(rem[2])?
+                        .ok_or_else(|| format!("line {}: missing CACO CA_curr ppm", line_no + 1))?;
+                    (f0, ca, 3usize)
+                } else {
+                    let ca = parse_opt_f64(rem[1])?
+                        .ok_or_else(|| format!("line {}: missing CACO CA_curr ppm", line_no + 1))?;
+                    let off = if rem.len() >= 6 && parse_opt_f64(rem[2])?.is_none() {
+                        3usize
+                    } else {
+                        2usize
+                    };
+                    (f0, ca, off)
+                };
+                let (c_curr_ppm, ca_curr_ppm) = if d1 < 100.0 && d2 > 140.0 {
+                    (d2, d1)
+                } else {
+                    (d1, d2)
+                };
+                let sign = rem
+                    .get(meta_offset)
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(1);
+                let height = rem
+                    .get(meta_offset + 1)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1.0e5);
+                let volume = rem
+                    .get(meta_offset + 2)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(height);
+                ds.caco_peaks.push(Caco2DPeak {
+                    c_curr_ppm,
+                    ca_curr_ppm,
+                    sign,
+                    height,
+                    volume,
+                    kind: classify_caco_peak_kind(ca_curr_ppm, sign),
+                });
+            }
+            C13DetectedExp::Canco3D
+            | C13DetectedExp::Cbcaco3D
+            | C13DetectedExp::Cccon3D
+            | C13DetectedExp::Ncaco3D => {
+                if rem.len() < 3 {
+                    return Err(format!(
+                        "line {}: {} row needs C_prime, N, and C_indirect columns",
+                        line_no + 1,
+                        exp.as_str()
+                    ));
+                }
+                let c_prime_ppm = parse_opt_f64(rem[0])?.ok_or_else(|| {
+                    format!("line {}: missing {} C_prime ppm", line_no + 1, exp.as_str())
+                })?;
+                let n_ppm = parse_opt_f64(rem[1])?.ok_or_else(|| {
+                    format!("line {}: missing {} N ppm", line_no + 1, exp.as_str())
+                })?;
+                let c_indirect_ppm = parse_opt_f64(rem[2])?.ok_or_else(|| {
+                    format!(
+                        "line {}: missing {} C_indirect ppm",
+                        line_no + 1,
+                        exp.as_str()
+                    )
+                })?;
+                let sign = rem.get(3).and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                let height = rem
+                    .get(4)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1.0e5);
+                let volume = rem
+                    .get(5)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(height);
+                let anchor_root_idx = rem.get(6).and_then(|s| {
+                    let t = s.trim();
+                    if t.is_empty() || t == "." || t == "-" {
+                        None
+                    } else {
+                        t.parse::<usize>().ok()
+                    }
+                });
+                ds.strip_peaks.push(C13Strip3DPeak {
+                    exp,
+                    c_prime_ppm,
+                    n_ppm,
+                    c_indirect_ppm,
+                    sign,
+                    height,
+                    volume,
+                    anchor_root_idx,
+                });
+            }
+        }
+    }
+    Ok(ds)
+}
+
+pub(crate) fn write_c13_detected_tsv(path: &Path, ds: &C13PickedDataset) -> Result<(), String> {
+    let mut lines = vec![
+        "experiment\tc_prime\tn15\tc_aliph\tsign\theight\tvolume\tanchor_root_idx".to_string(),
+    ];
+    for r in &ds.con_roots {
+        lines.push(format!(
+            "CON\t{:.4}\t{:.4}\t.\t1\t{:.1}\t{:.1}\t.",
+            r.c_prev_ppm, r.n_curr_ppm, r.height, r.volume
+        ));
+    }
+    for p in &ds.caco_peaks {
+        lines.push(format!(
+            "CACO\t{:.4}\t.\t{:.4}\t{}\t{:.1}\t{:.1}\t.",
+            p.c_curr_ppm, p.ca_curr_ppm, p.sign, p.height, p.volume
+        ));
+    }
+    for p in &ds.strip_peaks {
+        let anc = p
+            .anchor_root_idx
+            .map(|idx| idx.to_string())
+            .unwrap_or_else(|| ".".to_string());
+        lines.push(format!(
+            "{}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.1}\t{:.1}\t{}",
+            p.exp.as_str(),
+            p.c_prime_ppm,
+            p.n_ppm,
+            p.c_indirect_ppm,
+            p.sign,
+            p.height,
+            p.volume,
+            anc
+        ));
+    }
+    fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{e}"))
+}
+
+fn merge_c13_datasets(dst: &mut C13PickedDataset, src: C13PickedDataset) {
+    let root_offset = dst.con_roots.len();
+    dst.con_roots.extend(src.con_roots);
+    dst.caco_peaks.extend(src.caco_peaks);
+    for mut p in src.strip_peaks {
+        if root_offset > 0 {
+            if let Some(idx) = p.anchor_root_idx.as_mut() {
+                *idx += root_offset;
+            }
+        }
+        dst.strip_peaks.push(p);
+    }
+}
+
+pub(crate) fn anchor_unanchored_c13_strip_peaks(ds: &mut C13PickedDataset) {
+    if ds.con_roots.is_empty() {
+        return;
+    }
+    for exp in [
+        C13DetectedExp::Canco3D,
+        C13DetectedExp::Cbcaco3D,
+        C13DetectedExp::Cccon3D,
+    ] {
+        let unanchored_indices: Vec<usize> = ds
+            .strip_peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.exp == exp && p.anchor_root_idx.is_none())
+            .map(|(idx, _)| idx)
+            .collect();
+        if unanchored_indices.is_empty() {
+            continue;
+        }
+        let mut dcs = Vec::new();
+        let mut dns = Vec::new();
+        for &idx in &unanchored_indices {
+            let p = &ds.strip_peaks[idx];
+            let mut best: Option<(f64, f64, f64)> = None;
+            for r in &ds.con_roots {
+                let dc = r.c_prev_ppm - p.c_prime_ppm;
+                let dn = r.n_curr_ppm - p.n_ppm;
+                if dc.abs() <= 0.65 && dn.abs() <= 0.95 {
+                    let d2 = (dc / 0.08).powi(2) + (dn / 0.30).powi(2);
+                    if best.is_none_or(|b| d2 < b.0) {
+                        best = Some((d2, dc, dn));
+                    }
+                }
+            }
+            if let Some((_, dc, dn)) = best {
+                dcs.push(dc);
+                dns.push(dn);
+            }
+        }
+        let median_of = |mut v: Vec<f64>| -> f64 {
+            if v.is_empty() {
+                return 0.0;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        };
+        let dc_est = median_of(dcs);
+        let dn_est = median_of(dns);
+
+        for idx in unanchored_indices {
+            let p = &mut ds.strip_peaks[idx];
+            let c_corr = p.c_prime_ppm + dc_est;
+            let n_corr = p.n_ppm + dn_est;
+            let mut best_root: Option<(usize, f64)> = None;
+            for (r_idx, r) in ds.con_roots.iter().enumerate() {
+                let dc = (c_corr - r.c_prev_ppm).abs();
+                let dn = (n_corr - r.n_curr_ppm).abs();
+                if dc <= 0.18 && dn <= 0.58 {
+                    let d2 = (dc / 0.055).powi(2) + (dn / 0.24).powi(2);
+                    if best_root.is_none_or(|(_, b)| d2 < b) {
+                        best_root = Some((r_idx, d2));
+                    }
+                }
+            }
+            p.anchor_root_idx = best_root.map(|(r_idx, _)| r_idx);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_c13_input_bundle(
+    peaks_paths: &[PathBuf],
+    con_path: Option<&Path>,
+    caco_path: Option<&Path>,
+    canco_path: Option<&Path>,
+    cbcacon_path: Option<&Path>,
+    cccon_path: Option<&Path>,
+    ncaco_path: Option<&Path>,
+    triples: &[(String, PathBuf)],
+    snr: f32,
+) -> Result<C13PickedDataset, String> {
+    let picker_cfg = C13PickerConfig {
+        snr_2d: snr,
+        snr_3d: (snr * 0.90).max(3.5),
+        ..C13PickerConfig::default()
+    };
+    let mut ds = C13PickedDataset::default();
+
+    let load_one_2d = |path: &Path,
+                       exp: C13DetectedExp,
+                       out: &mut C13PickedDataset|
+     -> Result<(), String> {
+        if is_probable_peak_tsv(path) {
+            let txt = fs::read_to_string(path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            let sub = parse_c13_detected_tsv_str(&txt, Some(exp))?;
+            merge_c13_datasets(out, sub);
+        } else {
+            let spec2 = load_2d_spectrum_any(path)?;
+            match exp {
+                C13DetectedExp::Con2D => out.con_roots.extend(pick_con_2d(&spec2, &picker_cfg)),
+                C13DetectedExp::Caco2D => out.caco_peaks.extend(pick_caco_2d(&spec2, &picker_cfg)),
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(p) = con_path {
+        load_one_2d(p, C13DetectedExp::Con2D, &mut ds)?;
+    }
+    if let Some(p) = caco_path {
+        load_one_2d(p, C13DetectedExp::Caco2D, &mut ds)?;
+    }
+
+    for raw_p in peaks_paths {
+        let s = raw_p.to_string_lossy();
+        for part in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let p = Path::new(part);
+            let txt = fs::read_to_string(p)
+                .map_err(|e| format!("failed to read {}: {e}", p.display()))?;
+            let sub = parse_c13_detected_tsv_str(&txt, None)?;
+            merge_c13_datasets(&mut ds, sub);
+        }
+    }
+
+    for (exp_name, path) in triples {
+        if let Some(exp) = C13DetectedExp::from_name(exp_name) {
+            if exp.is_2d() {
+                load_one_2d(path, exp, &mut ds)?;
+            }
+        }
+    }
+
+    let mut specs_3d: Vec<(C13DetectedExp, &Path)> = Vec::new();
+    if let Some(p) = canco_path {
+        specs_3d.push((C13DetectedExp::Canco3D, p));
+    }
+    if let Some(p) = cbcacon_path {
+        specs_3d.push((C13DetectedExp::Cbcaco3D, p));
+    }
+    if let Some(p) = cccon_path {
+        specs_3d.push((C13DetectedExp::Cccon3D, p));
+    }
+    if let Some(p) = ncaco_path {
+        specs_3d.push((C13DetectedExp::Ncaco3D, p));
+    }
+    for (exp_name, path) in triples {
+        let exp = C13DetectedExp::from_name(exp_name).ok_or_else(|| {
+            format!(
+                "unknown 13C-detected --triple experiment {exp_name:?} (expected CON, CACO, CANCO, CBCACON, CCCON, or NCACO)"
+            )
+        })?;
+        if exp.is_3d() {
+            specs_3d.push((exp, path.as_path()));
+        }
+    }
+
+    for (exp, path) in specs_3d {
+        if is_probable_peak_tsv(path) {
+            let txt = fs::read_to_string(path)
+                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+            let sub = parse_c13_detected_tsv_str(&txt, Some(exp))?;
+            merge_c13_datasets(&mut ds, sub);
+        } else {
+            if ds.con_roots.is_empty() && exp != C13DetectedExp::Ncaco3D {
+                return Err(format!(
+                    "picking 3D {} spectrum {} requires 2D CON roots (--con <path> or CON peaks in --peaks)",
+                    exp.as_str(),
+                    path.display()
+                ));
+            }
+            let spec3 = load_3d_spectrum_any(path, exp.as_str())?;
+            let strips = pick_con_anchored_3d(&spec3, exp, &ds.con_roots, &picker_cfg);
+            ds.strip_peaks.extend(strips);
+        }
+    }
+
+    anchor_unanchored_c13_strip_peaks(&mut ds);
+    if ds.con_roots.is_empty() {
+        return Err(
+            "assign --regime idp-13c requires 2D CON roots (via --peaks <c13_peaks.tsv> or --con <spectrum>)"
+                .to_string(),
+        );
+    }
+    Ok(ds)
+}
+
+pub(crate) struct IdpWorkflowOutput {
+    pub(crate) systems: Vec<ConDipeptideSystem>,
+    pub(crate) result: IdpAssignResult,
+    pub(crate) pred: Reference,
+    pub(crate) conf: BTreeMap<usize, f64>,
+    pub(crate) engine_label: String,
+    pub(crate) star_header: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_idp_13c_workflow(
+    dataset: &C13PickedDataset,
+    sequence: &[String],
+    seq_ids: &[i32],
+    engine_req: EngineRequest,
+    temp_k: f64,
+    ph_opt: Option<f64>,
+    runs: Option<usize>,
+    steps: Option<usize>,
+    seed: u64,
+) -> Result<IdpWorkflowOutput, String> {
+    if !temp_k.is_finite() || !(250.0..=360.0).contains(&temp_k) {
+        return Err(format!(
+            "invalid --temp-k {temp_k}: expected finite temperature in 250..=360 K"
+        ));
+    }
+    if let Some(ph) = ph_opt {
+        if !ph.is_finite() || !(1.0..=12.0).contains(&ph) {
+            return Err(format!(
+                "invalid --ph {ph}: expected finite pH in 1.0..=12.0"
+            ));
+        }
+    }
+
+    let systems = register_and_build_con_dipeptide_systems(dataset);
+    if systems.is_empty() {
+        return Err(
+            "no CON dipeptide spin systems could be built from 13C-detected input".to_string(),
+        );
+    }
+
+    let mut idp_cfg = IdpSolverConfig {
+        temperature_k: temp_k,
+        ph: ph_opt.unwrap_or(6.5),
+        seed,
+        ..IdpSolverConfig::default()
+    };
+    if let Some(r) = runs {
+        idp_cfg.replicas = r.max(4);
+    }
+    if let Some(st) = steps {
+        idp_cfg.steps_per_system = st.max(200);
+    }
+
+    let (result, engine_label) = match engine_req {
+        EngineRequest::Gpu => {
+            let gpu = GpuEngine::new_headless()?;
+            let label = format!(
+                "idp-13c WebGPU ({}, {})",
+                gpu.adapter_name, gpu.backend_name
+            );
+            let res = nmr_gpu::idp_gpu::assign_idp_13c_gpu(&gpu, &systems, sequence, &idp_cfg)?;
+            (res, label)
+        }
+        EngineRequest::Auto => match GpuEngine::new_headless() {
+            Ok(gpu) => {
+                let label = format!(
+                    "idp-13c WebGPU ({}, {})",
+                    gpu.adapter_name, gpu.backend_name
+                );
+                match nmr_gpu::idp_gpu::assign_idp_13c_gpu(&gpu, &systems, sequence, &idp_cfg) {
+                    Ok(res) => (res, label),
+                    Err(err) => {
+                        eprintln!(
+                            "Warning: WebGPU idp-13c solver failed ({err}); falling back to CPU (f64) solver."
+                        );
+                        (
+                            assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
+                            "idp-13c CPU (f64, auto-fallback)".to_string(),
+                        )
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: WebGPU unavailable for --regime idp-13c ({err}); falling back to CPU (f64) solver."
+                );
+                (
+                    assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
+                    "idp-13c CPU (f64, auto-fallback)".to_string(),
+                )
+            }
+        },
+        EngineRequest::Cpu => (
+            assign_idp_13c_cpu(&systems, sequence, &idp_cfg),
+            "idp-13c CPU (f64)".to_string(),
+        ),
+    };
+
+    let (pred, conf) = idp_to_reference(&result, &systems, sequence, seq_ids, 0.0, false);
+    let n_pro_total = (1..sequence.len())
+        .filter(|&k| sequence[k] == "PRO" || sequence[k - 1] == "PRO")
+        .count();
+    let n_pro_assigned = result
+        .position
+        .iter()
+        .filter_map(|&p| usize::try_from(p).ok())
+        .filter(|&k| {
+            k > 0 && k < sequence.len() && (sequence[k] == "PRO" || sequence[k - 1] == "PRO")
+        })
+        .count();
+    let star_header = format!(
+        "# nmrassign solver: {engine_label}\n\
+         # regime: idp-13c (temp_k={temp_k:.2}, ph={:.2}, pro_transitions={n_pro_assigned}/{n_pro_total})\n\
+         # qc_verdict: {}\n\
+         # fitted_offsets (peak_ppm - BMRB_prior_ppm): dCA={:+.3}, dCB={:+.3}, dC={:+.3}, dN={:+.3} ppm",
+        idp_cfg.ph,
+        result.qc_verdict,
+        result.fitted_offsets.d_ca,
+        result.fitted_offsets.d_cb,
+        result.fitted_offsets.d_c,
+        result.fitted_offsets.d_n
+    );
+
+    Ok(IdpWorkflowOutput {
+        systems,
+        result,
+        pred,
+        conf,
+        engine_label,
+        star_header,
+    })
+}
+
+type PdbAtomCoordsBundle = (BTreeMap<(i32, String), Vec3>, Option<Vec3>, Vec<Vec3>);
+
+fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
+    let mut atom_map: BTreeMap<(i32, String), Vec3> = BTreeMap::new();
+    let mut metal_coord: Option<Vec3> = None;
+    let mut ca_coords: Vec<Vec3> = Vec::new();
+    let mut active_chain: Option<char> = None;
+
+    const METAL_RES_OR_ELEMS: &[&str] = &[
+        "FE", "FE2", "FES", "SF4", "F3S", "HEM", "HEC", "ZN", "CO", "CU", "NI", "MN", "LA", "CE",
+        "PR", "ND", "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB", "LU", "CA", "MG",
+    ];
+
+    for line in pdb_text.lines() {
+        if line.starts_with("ENDMDL") {
+            break;
+        }
+        let is_atom = line.starts_with("ATOM  ");
+        let is_het = line.starts_with("HETATM");
+        if (!is_atom && !is_het) || line.len() < 54 {
+            continue;
+        }
+        let alt = line.as_bytes().get(16).copied().unwrap_or(b' ') as char;
+        if alt != ' ' && alt != 'A' && alt != '1' {
+            continue;
+        }
+        let Ok(x) = line[30..38].trim().parse::<f64>() else {
+            continue;
+        };
+        let Ok(y) = line[38..46].trim().parse::<f64>() else {
+            continue;
+        };
+        let Ok(z) = line[46..54].trim().parse::<f64>() else {
+            continue;
+        };
+        let pos = [x, y, z];
+
+        if is_het {
+            let res_name = line[17..20].trim().to_ascii_uppercase();
+            let atom_name = line[12..16].trim().to_ascii_uppercase();
+            let elem = if line.len() >= 78 {
+                line[76..78].trim().to_ascii_uppercase()
+            } else {
+                String::new()
+            };
+            if metal_coord.is_none()
+                && (METAL_RES_OR_ELEMS.contains(&res_name.as_str())
+                    || METAL_RES_OR_ELEMS.contains(&elem.as_str())
+                    || (res_name != "HOH"
+                        && res_name != "WAT"
+                        && METAL_RES_OR_ELEMS.contains(&atom_name.as_str())))
+            {
+                metal_coord = Some(pos);
+            }
+            continue;
+        }
+
+        let ch = line.as_bytes()[21] as char;
+        if let Some(c0) = active_chain {
+            if ch != c0 {
+                continue;
+            }
+        } else {
+            active_chain = Some(ch);
+        }
+        let Ok(seq_id) = line[22..26].trim().parse::<i32>() else {
+            continue;
+        };
+        let mut atom_name = line[12..16].trim().to_ascii_uppercase();
+        if atom_name == "HN" {
+            atom_name = "H".to_string();
+        }
+        atom_map.entry((seq_id, atom_name.clone())).or_insert(pos);
+        if atom_name == "CA" {
+            ca_coords.push(pos);
+        }
+    }
+
+    if let Ok(chain) = parse_pdb_str_first_model(pdb_text) {
+        for r in &chain.residues {
+            for (aname, opt_coord) in [
+                ("H", r.h),
+                ("N", Some(r.n)),
+                ("CA", Some(r.ca)),
+                ("CB", r.cb),
+                ("C", Some(r.c)),
+            ] {
+                if let Some(coord) = opt_coord {
+                    atom_map
+                        .entry((r.seq_id, aname.to_string()))
+                        .or_insert(coord);
+                }
+            }
+        }
+    }
+
+    (atom_map, metal_coord, ca_coords)
+}
+
+fn fit_and_report_pcs_tensor_cli(
+    pcs_path: &Path,
+    pdb_text: &str,
+    para_report: &ParamagneticAssignReport,
+) -> Result<DeltaChiTensor, String> {
+    let raw_pcs = fs::read_to_string(pcs_path)
+        .map_err(|e| format!("failed to read PCS file {}: {e}", pcs_path.display()))?;
+    let (atom_map, pdb_metal, ca_coords) = parse_pdb_atom_coords_first_model(pdb_text);
+    if atom_map.is_empty() {
+        return Err("no ATOM records parsed from --pdb for PCS tensor SVD fitting".to_string());
+    }
+
+    let mut observations = Vec::new();
+    for (line_no, raw_line) in raw_pcs.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(['\t', ',']).map(str::trim).collect();
+        let cols: Vec<&str> = if cols.len() <= 1 {
+            line.split_whitespace().collect()
+        } else {
+            cols
+        };
+        if cols.is_empty() {
+            continue;
+        }
+        let low0 = cols[0].to_ascii_lowercase();
+        if matches!(low0.as_str(), "seq_id" | "resid" | "residue" | "seq") {
+            continue;
+        }
+        if cols.len() < 2 {
+            return Err(format!(
+                "PCS line {}: expected at least seq_id and pcs_ppm columns",
+                line_no + 1
+            ));
+        }
+
+        let seq_id: i32 = cols[0].parse().map_err(|e| {
+            format!(
+                "PCS line {}: invalid seq_id {:?}: {e}",
+                line_no + 1,
+                cols[0]
+            )
+        })?;
+
+        let (atom_name, pcs_ppm, sigma_ppm) = if let Ok(v) = cols[1].parse::<f64>() {
+            let sig = cols
+                .get(2)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.05);
+            ("H".to_string(), v, sig)
+        } else if cols.len() >= 3 && cols[2].parse::<f64>().is_ok() {
+            let mut at = cols[1].to_ascii_uppercase();
+            if at == "HN" {
+                at = "H".to_string();
+            }
+            let v: f64 = cols[2].parse().unwrap();
+            let sig = cols
+                .get(3)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.05);
+            (at, v, sig)
+        } else if cols.len() >= 4 {
+            let mut at = cols[2].to_ascii_uppercase();
+            if at == "HN" {
+                at = "H".to_string();
+            }
+            let v: f64 = cols[3].parse().map_err(|e| {
+                format!(
+                    "PCS line {}: invalid pcs_ppm {:?}: {e}",
+                    line_no + 1,
+                    cols[3]
+                )
+            })?;
+            let sig = cols
+                .get(4)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.05);
+            (at, v, sig)
+        } else {
+            return Err(format!(
+                "PCS line {}: unable to parse row {:?}",
+                line_no + 1,
+                raw_line
+            ));
+        };
+
+        let coord = atom_map
+            .get(&(seq_id, atom_name.clone()))
+            .or_else(|| {
+                if atom_name == "H" {
+                    atom_map.get(&(seq_id, "N".to_string()))
+                } else {
+                    None
+                }
+            })
+            .copied();
+        if let Some(pos) = coord {
+            observations
+                .push(PcsObservation::new(seq_id, pos, pcs_ppm).with_uncertainty(sigma_ppm));
+        }
+    }
+
+    if observations.len() < 5 {
+        return Err(format!(
+            "PCS 5-parameter SVD fit requires at least 5 matched PDB nuclear coordinates, found {}",
+            observations.len()
+        ));
+    }
+
+    let cluster_metal = para_report
+        .detected_clusters
+        .iter()
+        .find_map(|c| c.metal_coord);
+
+    let tensor = if let Some(mpos) = pdb_metal.or(cluster_metal) {
+        fit_pcs_tensor_svd(&observations, mpos)?
+    } else {
+        let ca_centroid = if ca_coords.is_empty() {
+            [0.0, 0.0, 0.0]
+        } else {
+            let inv = 1.0 / (ca_coords.len() as f64);
+            let sx: f64 = ca_coords.iter().map(|c| c[0]).sum();
+            let sy: f64 = ca_coords.iter().map(|c| c[1]).sum();
+            let sz: f64 = ca_coords.iter().map(|c| c[2]).sum();
+            [sx * inv, sy * inv, sz * inv]
+        };
+        if observations.len() >= 8 {
+            refine_metal_position_and_tensor(&observations, ca_centroid, 8.0, 2.0)?
+        } else {
+            fit_pcs_tensor_svd(&observations, ca_centroid)?
+        }
+    };
+
+    let deg = |r: f64| r.to_degrees();
+    println!(
+        "PCS 5-param Δχ SVD fit ({} obs, metal=[{:.2}, {:.2}, {:.2}] Å): Δχ_ax={:+.3}, Δχ_rh={:+.3} (10^-32 m^3, rhombicity={:.3}) | PCS Q-factor={:.4} (RMSD={:.4} ppm) | Euler ZYZ=({:.1}°, {:.1}°, {:.1}°)",
+        observations.len(),
+        tensor.metal_pos_angstrom[0],
+        tensor.metal_pos_angstrom[1],
+        tensor.metal_pos_angstrom[2],
+        tensor.dchi_ax,
+        tensor.dchi_rh,
+        tensor.rhombicity,
+        tensor.q_factor,
+        tensor.rmsd_ppm,
+        deg(tensor.euler_zyz_rad[0]),
+        deg(tensor.euler_zyz_rad[1]),
+        deg(tensor.euler_zyz_rad[2]),
+    );
+    Ok(tensor)
+}
+
+pub(crate) type ParamagneticWorkflowOutput = (
+    Vec<SpinSystem>,
+    AssignResult,
+    Priors,
+    ParamagneticAssignReport,
+    Option<DeltaChiTensor>,
+    String,
+);
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_paramagnetic_workflow(
+    solver: SolverKind,
+    engine_req: EngineRequest,
+    peaks: &[Peak],
+    sequence: &[String],
+    seq_ids: &[i32],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    metal_ligands_spec: Option<&str>,
+    pdb_path: Option<&Path>,
+    pcs_path: Option<&Path>,
+    runs: Option<usize>,
+    steps: Option<usize>,
+    seed: u64,
+) -> Result<ParamagneticWorkflowOutput, String> {
+    if engine_req == EngineRequest::Gpu {
+        return Err(
+            "--engine gpu is not supported with --regime paramagnetic (CPU-only); use --engine cpu or --engine auto"
+                .to_string(),
+        );
+    }
+    if pcs_path.is_some() && pdb_path.is_none() {
+        return Err(
+            "--pcs requires --pdb <model.pdb> for 5-parameter Δχ PCS tensor SVD fitting"
+                .to_string(),
+        );
+    }
+
+    let explicit_ligand_indices = if let Some(spec) = metal_ligands_spec {
+        parse_metal_ligands(spec, sequence, seq_ids)?
+    } else {
+        Vec::new()
+    };
+
+    let pdb_coordinates = if let Some(p) = pdb_path {
+        Some(
+            fs::read_to_string(p)
+                .map_err(|e| format!("failed to read PDB {}: {e}", p.display()))?,
+        )
+    } else {
+        None
+    };
+
+    let explicit_metal_coords = if let Some(ref txt) = pdb_coordinates {
+        let (_, m_opt, _) = parse_pdb_atom_coords_first_model(txt);
+        m_opt.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+
+    let mode = match solver {
+        SolverKind::Standard => ParamagneticSolverMode::Standard,
+        SolverKind::EvoGraph => ParamagneticSolverMode::EvoGraph,
+    };
+    let mut anneal_cfg = AnnealConfig {
+        seed,
+        ..AnnealConfig::default()
+    };
+    if let Some(r) = runs {
+        anneal_cfg.runs = r.max(4);
+    }
+    if let Some(st) = steps {
+        anneal_cfg.steps_per_system = st.max(200);
+    }
+
+    let para_cfg = ParamagneticAssignConfig {
+        mode,
+        explicit_ligand_indices: explicit_ligand_indices.clone(),
+        auto_detect_motifs: explicit_ligand_indices.is_empty(),
+        pdb_coordinates: pdb_coordinates.clone(),
+        explicit_metal_coords,
+        score_cfg: score_cfg.clone(),
+        anneal_cfg,
+        seed,
+        ..ParamagneticAssignConfig::default()
+    };
+
+    let (systems, result, para_report, eff_priors, engine_label) = match solver {
+        SolverKind::Standard => {
+            let sys = build_spin_systems(peaks, &Tolerances::default(), 3, false)?;
+            if sys.is_empty() {
+                return Err("no spin systems built from peaks".to_string());
+            }
+            let (eff, _) = prepare_scoring_priors(&sys, sequence, priors, score_cfg);
+            let (res, rep) = assign_paramagnetic_backbone(&sys, sequence, priors, &para_cfg);
+            (
+                sys,
+                res,
+                rep,
+                eff,
+                "paramagnetic-standard CPU (f64)".to_string(),
+            )
+        }
+        SolverKind::EvoGraph => {
+            let (sys, res, rep) =
+                assign_paramagnetic_from_peaks(peaks, sequence, priors, &para_cfg);
+            if sys.is_empty() {
+                return Err("no spin systems built from peaks".to_string());
+            }
+            let eff = rep
+                .evo_report
+                .as_ref()
+                .map(|er| er.shifted_priors(priors))
+                .unwrap_or_else(|| prepare_scoring_priors(&sys, sequence, priors, score_cfg).0);
+            (
+                sys,
+                res,
+                rep,
+                eff,
+                "paramagnetic-evo-graph CPU (f64)".to_string(),
+            )
+        }
+    };
+
+    let fitted_tensor = if let (Some(pcs_p), Some(pdb_txt)) = (pcs_path, pdb_coordinates.as_deref())
+    {
+        Some(fit_and_report_pcs_tensor_cli(pcs_p, pdb_txt, &para_report)?)
+    } else {
+        None
+    };
+
+    Ok((
+        systems,
+        result,
+        eff_priors,
+        para_report,
+        fitted_tensor,
+        engine_label,
+    ))
+}
+
 fn cmd_assign(args: &[String]) -> Result<(), String> {
-    let mut peaks_path: Option<String> = None;
+    let mut peaks_paths: Vec<PathBuf> = Vec::new();
     let mut seq_arg: Option<String> = None;
     let mut star_arg: Option<String> = None;
     let mut out_arg: Option<String> = None;
     let mut priors_path: Option<String> = None;
     let mut first_seq_id = 1i32;
+    let mut regime = RegimeKind::Globular;
+    let mut metal_ligands_spec: Option<String> = None;
+    let mut pdb_path: Option<PathBuf> = None;
+    let mut pcs_path: Option<PathBuf> = None;
+    let mut temp_k = 298.15f64;
+    let mut ph_opt: Option<f64> = None;
+    let mut con_path: Option<PathBuf> = None;
+    let mut caco_path: Option<PathBuf> = None;
+    let mut canco_path: Option<PathBuf> = None;
+    let mut cbcacon_path: Option<PathBuf> = None;
+    let mut cccon_path: Option<PathBuf> = None;
+    let mut ncaco_path: Option<PathBuf> = None;
+    let mut c13_triples: Vec<(String, PathBuf)> = Vec::new();
+    let mut snr = 5.0f32;
     let mut solver = SolverKind::EvoGraph;
-    let mut engine_opt: Option<EngineKind> = None;
+    let mut engine_req_opt: Option<EngineRequest> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
@@ -801,9 +1864,14 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                println!("{}", usage());
+                return Ok(());
+            }
             "--peaks" => {
                 i += 1;
-                peaks_path = args.get(i).cloned();
+                let p = args.get(i).ok_or("missing --peaks")?;
+                peaks_paths.push(PathBuf::from(p));
             }
             "--seq" | "--sequence" => {
                 i += 1;
@@ -821,6 +1889,82 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 i += 1;
                 priors_path = args.get(i).cloned();
             }
+            "--regime" => {
+                i += 1;
+                regime = parse_regime(args.get(i).ok_or("missing --regime")?)?;
+            }
+            "--metal-ligands" => {
+                i += 1;
+                metal_ligands_spec = Some(args.get(i).ok_or("missing --metal-ligands")?.clone());
+            }
+            "--pdb" => {
+                i += 1;
+                pdb_path = Some(PathBuf::from(args.get(i).ok_or("missing --pdb")?));
+            }
+            "--pcs" => {
+                i += 1;
+                pcs_path = Some(PathBuf::from(args.get(i).ok_or("missing --pcs")?));
+            }
+            "--temp-k" | "--temperature-k" => {
+                i += 1;
+                temp_k = args
+                    .get(i)
+                    .ok_or("missing --temp-k")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--ph" => {
+                i += 1;
+                ph_opt = Some(
+                    args.get(i)
+                        .ok_or("missing --ph")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
+            }
+            "--con" => {
+                i += 1;
+                con_path = Some(PathBuf::from(args.get(i).ok_or("missing --con")?));
+            }
+            "--caco" => {
+                i += 1;
+                caco_path = Some(PathBuf::from(args.get(i).ok_or("missing --caco")?));
+            }
+            "--canco" => {
+                i += 1;
+                canco_path = Some(PathBuf::from(args.get(i).ok_or("missing --canco")?));
+            }
+            "--cbcacon" | "--cbcaco" => {
+                i += 1;
+                cbcacon_path = Some(PathBuf::from(args.get(i).ok_or("missing --cbcacon")?));
+            }
+            "--cccon" => {
+                i += 1;
+                cccon_path = Some(PathBuf::from(args.get(i).ok_or("missing --cccon")?));
+            }
+            "--ncaco" => {
+                i += 1;
+                ncaco_path = Some(PathBuf::from(args.get(i).ok_or("missing --ncaco")?));
+            }
+            "--triple" => {
+                i += 1;
+                let spec = args.get(i).ok_or("missing EXP=path for --triple")?;
+                let (exp, p) = spec
+                    .split_once('=')
+                    .ok_or("expected EXP=path format for --triple")?;
+                c13_triples.push((
+                    exp.trim().to_ascii_uppercase().replace(['(', ')'], ""),
+                    PathBuf::from(p),
+                ));
+            }
+            "--snr" => {
+                i += 1;
+                snr = args
+                    .get(i)
+                    .ok_or("missing --snr")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
             "--solver" => {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
@@ -835,7 +1979,9 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             }
             "--engine" => {
                 i += 1;
-                engine_opt = Some(parse_engine(args.get(i).ok_or("missing --engine")?)?);
+                engine_req_opt = Some(parse_engine_request(
+                    args.get(i).ok_or("missing --engine")?,
+                )?);
             }
             "--runs" => {
                 i += 1;
@@ -877,7 +2023,21 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let p_path = peaks_path.ok_or("assign requires --peaks <peaks.tsv>")?;
+    if regime != RegimeKind::Paramagnetic {
+        if pdb_path.is_some() {
+            return Err(
+                "--pdb is only supported with --regime paramagnetic (globular and idp-13c backbone assignment are strictly structure-free)"
+                    .to_string(),
+            );
+        }
+        if pcs_path.is_some() {
+            return Err("--pcs is only supported with --regime paramagnetic".to_string());
+        }
+        if metal_ligands_spec.is_some() {
+            return Err("--metal-ligands is only supported with --regime paramagnetic".to_string());
+        }
+    }
+
     let out_prefix = PathBuf::from(out_arg.ok_or("assign requires --out <prefix>")?);
     let (sequence, seq_ids) = if let Some(st) = star_arg {
         let r = read_star(st, None)?;
@@ -888,60 +2048,184 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         return Err("assign needs --seq or --star".to_string());
     };
 
-    let peaks = read_peaks(p_path)?;
-    let pri = load_priors(priors_path.as_deref())?;
-    let score_cfg = ScoreConfig {
-        assign_cost,
-        ..ScoreConfig::default()
-    };
-    let wf = execute_assignment_workflow(
-        solver, engine_opt, &peaks, &sequence, &pri, &score_cfg, runs, steps, 12, seed,
-    )?;
-    log_workflow_diagnostics(
-        &wf.engine_label,
-        &wf.offsets,
-        &wf.detailed_offsets,
-        &wf.qc_report,
-        verbose,
-    );
-
-    let (pred, conf) = to_reference(
-        &wf.result,
-        &wf.systems,
-        &sequence,
-        &seq_ids,
-        0.0,
-        Some(&wf.effective_priors),
-    );
-
     let str_out = out_prefix.with_extension("str");
     let tsv_out = out_prefix.with_extension("tsv");
-    let star_hdr = format_star_offset_header(
-        &wf.engine_label,
-        &wf.offsets,
-        &wf.detailed_offsets,
-        &wf.qc_report,
-    );
-    write_star_with_header(&str_out, &pred, Some(&conf), star_hdr.as_deref())?;
-    write_shifts_tsv(&tsv_out, &pred, &conf)?;
 
-    let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
-    let hc_msg = if n_hc == 0 && wf.qc_report.verdict == DatasetQcVerdict::Abstain {
-        "ABSTAIN (0 high-confidence calls; QC capped <= 0.45)".to_string()
-    } else {
-        format!("{n_hc} with confidence >= 0.8")
-    };
-    println!(
-        "[{}] QC={} | {} spin systems; {} residues assigned, {} | offsets: {}",
-        wf.engine_label,
-        wf.qc_report.verdict,
-        wf.systems.len(),
-        conf.len(),
-        hc_msg,
-        wf.detailed_offsets.format_compact()
-    );
-    println!("wrote {} and {}", str_out.display(), tsv_out.display());
-    Ok(())
+    match regime {
+        RegimeKind::Idp13C => {
+            let ds = load_c13_input_bundle(
+                &peaks_paths,
+                con_path.as_deref(),
+                caco_path.as_deref(),
+                canco_path.as_deref(),
+                cbcacon_path.as_deref(),
+                cccon_path.as_deref(),
+                ncaco_path.as_deref(),
+                &c13_triples,
+                snr,
+            )?;
+            let engine_req = engine_req_opt.unwrap_or(EngineRequest::Auto);
+            let wf = execute_idp_13c_workflow(
+                &ds, &sequence, &seq_ids, engine_req, temp_k, ph_opt, runs, steps, seed,
+            )?;
+            write_star_with_header(&str_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
+            write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
+            let n_hc = wf.conf.values().filter(|&&c| c >= 0.8).count();
+            let n_pro_res = sequence.iter().filter(|r| r.as_str() == "PRO").count();
+            let n_pro_with_shifts = sequence
+                .iter()
+                .enumerate()
+                .filter(|&(k, r)| {
+                    r == "PRO"
+                        && (wf.pred.shifts.contains_key(&(k, "N".to_string()))
+                            || wf.pred.shifts.contains_key(&(k, "CA".to_string())))
+                })
+                .count();
+            println!(
+                "[{}] regime=idp-13c QC={} | {} CON dipeptide systems; {} residues with shifts ({n_hc} with confidence >= 0.8; {n_pro_with_shifts}/{n_pro_res} Pro assigned) | offsets: dCA={:+.3}, dCB={:+.3}, dC={:+.3}, dN={:+.3} ppm",
+                wf.engine_label,
+                wf.result.qc_verdict,
+                wf.systems.len(),
+                wf.conf.len(),
+                wf.result.fitted_offsets.d_ca,
+                wf.result.fitted_offsets.d_cb,
+                wf.result.fitted_offsets.d_c,
+                wf.result.fitted_offsets.d_n,
+            );
+            println!("wrote {} and {}", str_out.display(), tsv_out.display());
+            Ok(())
+        }
+        RegimeKind::Paramagnetic => {
+            let p_path = peaks_paths
+                .first()
+                .ok_or("assign --regime paramagnetic requires --peaks <peaks.tsv>")?;
+            let peaks = read_peaks(p_path)?;
+            let pri = load_priors(priors_path.as_deref())?;
+            let score_cfg = ScoreConfig {
+                assign_cost,
+                ..ScoreConfig::default()
+            };
+            let engine_req = engine_req_opt.unwrap_or(EngineRequest::Auto);
+            let (systems, result, eff_priors, para_rep, pcs_tensor_opt, engine_label) =
+                execute_paramagnetic_workflow(
+                    solver,
+                    engine_req,
+                    &peaks,
+                    &sequence,
+                    &seq_ids,
+                    &pri,
+                    &score_cfg,
+                    metal_ligands_spec.as_deref(),
+                    pdb_path.as_deref(),
+                    pcs_path.as_deref(),
+                    runs,
+                    steps,
+                    seed,
+                )?;
+            let (pred, conf) = to_reference(
+                &result,
+                &systems,
+                &sequence,
+                &seq_ids,
+                0.0,
+                Some(&eff_priors),
+            );
+            let mut hdr = format!(
+                "# nmrassign solver: {engine_label}\n\
+                 # regime: paramagnetic (clusters={}, blind_zone_residues={}, abstentions={})",
+                para_rep.detected_clusters.len(),
+                para_rep.blind_zone_residues.len(),
+                para_rep.n_blind_zone_abstentions,
+            );
+            if let Some(ref t) = pcs_tensor_opt {
+                hdr.push_str(&format!(
+                    "\n# pcs_delta_chi: dchi_ax={:+.3}, dchi_rh={:+.3} (10^-32 m^3), q_factor={:.4}, euler_zyz_deg=({:.1},{:.1},{:.1})",
+                    t.dchi_ax,
+                    t.dchi_rh,
+                    t.q_factor,
+                    t.euler_zyz_rad[0].to_degrees(),
+                    t.euler_zyz_rad[1].to_degrees(),
+                    t.euler_zyz_rad[2].to_degrees(),
+                ));
+            }
+            write_star_with_header(&str_out, &pred, Some(&conf), Some(&hdr))?;
+            write_shifts_tsv(&tsv_out, &pred, &conf)?;
+            let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+            println!(
+                "[{}] regime=paramagnetic | {} clusters, {} blind-zone residues ({} abstained) | {} spin systems; {} residues assigned ({n_hc} with confidence >= 0.8)",
+                engine_label,
+                para_rep.detected_clusters.len(),
+                para_rep.blind_zone_residues.len(),
+                para_rep.n_blind_zone_abstentions,
+                systems.len(),
+                conf.len(),
+            );
+            println!("wrote {} and {}", str_out.display(), tsv_out.display());
+            Ok(())
+        }
+        RegimeKind::Globular => {
+            let p_path = peaks_paths
+                .first()
+                .ok_or("assign requires --peaks <peaks.tsv>")?;
+            let peaks = read_peaks(p_path)?;
+            let pri = load_priors(priors_path.as_deref())?;
+            let score_cfg = ScoreConfig {
+                assign_cost,
+                ..ScoreConfig::default()
+            };
+            let engine_opt = match engine_req_opt {
+                None | Some(EngineRequest::Auto) => None,
+                Some(EngineRequest::Gpu) => Some(EngineKind::Gpu),
+                Some(EngineRequest::Cpu) => Some(EngineKind::Cpu),
+            };
+            let wf = execute_assignment_workflow(
+                solver, engine_opt, &peaks, &sequence, &pri, &score_cfg, runs, steps, 12, seed,
+            )?;
+            log_workflow_diagnostics(
+                &wf.engine_label,
+                &wf.offsets,
+                &wf.detailed_offsets,
+                &wf.qc_report,
+                verbose,
+            );
+
+            let (pred, conf) = to_reference(
+                &wf.result,
+                &wf.systems,
+                &sequence,
+                &seq_ids,
+                0.0,
+                Some(&wf.effective_priors),
+            );
+
+            let star_hdr = format_star_offset_header(
+                &wf.engine_label,
+                &wf.offsets,
+                &wf.detailed_offsets,
+                &wf.qc_report,
+            );
+            write_star_with_header(&str_out, &pred, Some(&conf), star_hdr.as_deref())?;
+            write_shifts_tsv(&tsv_out, &pred, &conf)?;
+
+            let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+            let hc_msg = if n_hc == 0 && wf.qc_report.verdict == DatasetQcVerdict::Abstain {
+                "ABSTAIN (0 high-confidence calls; QC capped <= 0.45)".to_string()
+            } else {
+                format!("{n_hc} with confidence >= 0.8")
+            };
+            println!(
+                "[{}] QC={} | {} spin systems; {} residues assigned, {} | offsets: {}",
+                wf.engine_label,
+                wf.qc_report.verdict,
+                wf.systems.len(),
+                conf.len(),
+                hc_msg,
+                wf.detailed_offsets.format_compact()
+            );
+            println!("wrote {} and {}", str_out.display(), tsv_out.display());
+            Ok(())
+        }
+    }
 }
 
 fn parse_sequence_arg(sq: &str, first_seq_id: i32) -> Result<(Vec<String>, Vec<i32>), String> {
@@ -2218,7 +3502,8 @@ fn load_aromatic_input_peaks(
 
 fn run_sidechain(args: &[String]) -> Result<(), String> {
     use nmr_core::aromatic::{
-        assign_aromatic_rings, default_his_tautomer_map, simulate_aromatic_peaks,
+        assign_aromatic_rings, default_his_tautomer_map,
+        merge_aromatic_assignments_preserving_existing, simulate_aromatic_peaks,
         synthesize_aromatic_reference, AromaticSimConfig, AromaticSolverConfig,
         AROMATIC_EXPERIMENTS,
     };
@@ -2585,29 +3870,56 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             (assigned_ref, conf, None)
         };
 
-    let mut ambiguity_codes: BTreeMap<(usize, String), u8> = working_ref.ambiguity_codes.clone();
+    let mut ambiguity_codes: BTreeMap<(usize, String), u8> = if !synthetic_benchmark_mode {
+        let mut base_amb = raw_ref.ambiguity_codes.clone();
+        base_amb.extend(working_ref.ambiguity_codes.clone());
+        base_amb
+    } else {
+        working_ref.ambiguity_codes.clone()
+    };
     let mut stereo_posteriors: BTreeMap<(usize, String), f64> = BTreeMap::new();
     let run_arom_stage = !bundled_arom_peaks.is_empty();
 
     if run_arom_stage {
         // Clear heuristic ring-atom placeholders synthesized or placed by `assign_sidechains`,
-        // while preserving 100% of untouched ring atoms that came from the user's input STAR!
+        // while preserving 100% of pre-existing ring shifts & ambiguity codes from the user's input STAR (`P1-12`)!
         const RING_ATOMS: &[&str] = &[
             "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
             "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
         ];
-        working_ref.shifts.retain(|&(k, ref atom), _| {
-            let is_arom_res = matches!(
-                working_ref.sequence.get(k).map(String::as_str),
+        let is_arom_ring_key = |seq_len_ref: &Reference, k: usize, atom: &str| -> bool {
+            matches!(
+                seq_len_ref.sequence.get(k).map(String::as_str),
                 Some("PHE" | "TYR" | "TRP" | "HIS")
-            );
-            if !is_arom_res || !RING_ATOMS.contains(&atom.as_str()) {
-                return true;
+            ) && RING_ATOMS.contains(&atom)
+        };
+
+        let mut backbone_for_arom = working_ref.clone();
+        backbone_for_arom
+            .shifts
+            .retain(|&(k, ref atom), _| !is_arom_ring_key(&working_ref, k, atom));
+        backbone_for_arom
+            .ambiguity_codes
+            .retain(|&(k, ref atom), _| !is_arom_ring_key(&working_ref, k, atom));
+
+        let mut pre_arom_user_ref = backbone_for_arom.clone();
+        if !synthetic_benchmark_mode {
+            for (&(k, ref atom), &v) in &raw_ref.shifts {
+                if is_arom_ring_key(&raw_ref, k, atom) {
+                    pre_arom_user_ref.shifts.insert((k, atom.clone()), v);
+                }
             }
-            !synthetic_benchmark_mode && raw_ref.shifts.contains_key(&(k, atom.clone()))
-        });
+            for (&(k, ref atom), &code) in &raw_ref.ambiguity_codes {
+                if is_arom_ring_key(&raw_ref, k, atom) {
+                    pre_arom_user_ref
+                        .ambiguity_codes
+                        .insert((k, atom.clone()), code);
+                }
+            }
+        }
+
         let arom_res = assign_aromatic_rings(
-            &working_ref,
+            &backbone_for_arom,
             Some(&bb_conf),
             &bundled_arom_peaks,
             &sc_priors,
@@ -2624,7 +3936,11 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             .iter()
             .filter(|r| r.his_tautomer.is_some())
             .count();
-        working_ref = arom_res.reference;
+        working_ref = merge_aromatic_assignments_preserving_existing(
+            &pre_arom_user_ref,
+            &arom_res.reference,
+            &arom_res.atom_confidence,
+        );
         for (k, atom) in arom_res.atom_confidence.keys() {
             let res_name = working_ref
                 .sequence
@@ -2633,8 +3949,8 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
                 .unwrap_or("");
             let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
             working_ref.ambiguity_codes.insert((*k, atom.clone()), code);
-            ambiguity_codes.insert((*k, atom.clone()), code);
         }
+        ambiguity_codes = working_ref.ambiguity_codes.clone();
         println!(
             "Aromatic rings: assigned {n_arom_assigned}/{n_arom_total} aromatic residues ({n_his_taut} His tautomers classified)"
         );
@@ -2978,17 +4294,121 @@ fn cmd_nef_export(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn build_propensity_config(temp_k: f64, ph_opt: Option<f64>) -> Result<PropensityConfig, String> {
+    if !temp_k.is_finite() || !(250.0..=360.0).contains(&temp_k) {
+        return Err(format!(
+            "invalid --temp-k {temp_k}: expected finite temperature in 250..=360 K"
+        ));
+    }
+    let mut cfg = PropensityConfig::default().with_temperature_kelvin(temp_k);
+    if let Some(ph) = ph_opt {
+        if !ph.is_finite() || !(1.0..=12.0).contains(&ph) {
+            return Err(format!(
+                "invalid --ph {ph}: expected finite pH in 1.0..=12.0"
+            ));
+        }
+        cfg = cfg.with_sample_ph(ph);
+    }
+    Ok(cfg)
+}
+
+fn cmd_propensity(args: &[String]) -> Result<(), String> {
+    let mut shifts_path: Option<PathBuf> = None;
+    let mut temp_k = 298.15f64;
+    let mut ph_opt: Option<f64> = None;
+    let mut format = "tsv".to_string();
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: nmrassign propensity --shifts <assigned.str> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]"
+                );
+                return Ok(());
+            }
+            "--shifts" | "--star" => {
+                i += 1;
+                shifts_path = args.get(i).map(PathBuf::from);
+            }
+            "--temp-k" | "--temperature-k" => {
+                i += 1;
+                temp_k = args
+                    .get(i)
+                    .ok_or("missing --temp-k")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--ph" => {
+                i += 1;
+                ph_opt = Some(
+                    args.get(i)
+                        .ok_or("missing --ph")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
+            }
+            "--format" => {
+                i += 1;
+                format = args
+                    .get(i)
+                    .ok_or("missing --format")?
+                    .trim()
+                    .to_ascii_lowercase();
+            }
+            "-o" | "--out" => {
+                i += 1;
+                out_path = args.get(i).map(PathBuf::from);
+            }
+            other => return Err(format!("unknown propensity flag {other:?}")),
+        }
+        i += 1;
+    }
+
+    let shifts_p = shifts_path.ok_or("propensity requires --shifts <assigned.str>")?;
+    let prop_cfg = build_propensity_config(temp_k, ph_opt)?;
+    let ref_data = read_star_all_atoms(&shifts_p, None)?;
+    let report = compute_idp_propensity(&ref_data, &prop_cfg);
+
+    let rendered = match format.as_str() {
+        "tsv" => format_propensity_tsv(&report),
+        "json" => format_propensity_json(&report)?,
+        other => return Err(format!("unknown --format {other:?}; expected tsv or json")),
+    };
+
+    if let Some(out_p) = out_path {
+        if let Some(parent) = out_p.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+            }
+        }
+        let body = if rendered.ends_with('\n') {
+            rendered
+        } else {
+            format!("{rendered}\n")
+        };
+        fs::write(&out_p, body).map_err(|e| format!("failed to write {}: {e}", out_p.display()))?;
+    } else if rendered.ends_with('\n') {
+        print!("{rendered}");
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
 fn cmd_report(args: &[String]) -> Result<(), String> {
     let mut star_path: Option<PathBuf> = None;
     let mut peaks_path: Option<PathBuf> = None;
     let mut pdb_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut title: Option<String> = None;
+    let mut report_opts = ReportOptions::default();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--star" => {
+            "--star" | "--shifts" => {
                 i += 1;
                 star_path = args.get(i).map(PathBuf::from);
             }
@@ -3008,6 +4428,26 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 i += 1;
                 title = args.get(i).cloned();
             }
+            "--idp-propensity" | "--propensity" => {
+                report_opts.include_idp_propensity_track = true;
+            }
+            "--temp-k" | "--temperature-k" => {
+                i += 1;
+                report_opts.temp_k = args
+                    .get(i)
+                    .ok_or("missing --temp-k")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--ph" => {
+                i += 1;
+                report_opts.ph = Some(
+                    args.get(i)
+                        .ok_or("missing --ph")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
+            }
             other => return Err(format!("unknown report flag {other:?}")),
         }
         i += 1;
@@ -3019,9 +4459,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 
     let mut conf = BTreeMap::new();
     for k in 0..ref_data.sequence.len() {
-        if ref_data.shifts.contains_key(&(k, "H".to_string()))
-            && ref_data.shifts.contains_key(&(k, "N".to_string()))
-        {
+        let has_hn = ref_data.shifts.contains_key(&(k, "H".to_string()))
+            && ref_data.shifts.contains_key(&(k, "N".to_string()));
+        let has_c13_bb = ref_data.shifts.contains_key(&(k, "N".to_string()))
+            && (ref_data.shifts.contains_key(&(k, "CA".to_string()))
+                || ref_data.shifts.contains_key(&(k, "C".to_string())));
+        if has_hn || has_c13_bb {
             conf.insert(k, 0.95);
         }
     }
@@ -3048,6 +4491,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     } else {
         input.dihedrals = predict_csi_dihedrals(&ref_data);
     }
+    if report_opts.include_idp_propensity_track {
+        let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
+        let prop_rep = compute_idp_propensity(&ref_data, &prop_cfg);
+        input = input.with_propensity_report(prop_rep);
+    }
 
     write_quality_report_html(&out_p, &input)?;
     println!(
@@ -3069,6 +4517,17 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut fid_triples: Vec<(String, PathBuf)> = Vec::new();
     let mut fid_opts = FidCliOpts::default();
     let mut peaks_path: Option<PathBuf> = None;
+    let mut con_path: Option<PathBuf> = None;
+    let mut caco_path: Option<PathBuf> = None;
+    let mut canco_path: Option<PathBuf> = None;
+    let mut cbcacon_path: Option<PathBuf> = None;
+    let mut cccon_path: Option<PathBuf> = None;
+    let mut ncaco_path: Option<PathBuf> = None;
+    let mut regime = RegimeKind::Globular;
+    let mut metal_ligands_spec: Option<String> = None;
+    let mut pdb_para_path: Option<PathBuf> = None;
+    let mut pcs_path: Option<PathBuf> = None;
+    let mut report_opts = ReportOptions::default();
     let mut method = "classical".to_string();
     let mut snr = 5.0f32;
     let mut prob = 0.45f32;
@@ -3082,7 +4541,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut out_dir: Option<PathBuf> = None;
     let mut pdb_ref_path: Option<PathBuf> = None;
     let mut noesy_peaks_path: Option<PathBuf> = None;
-    let mut engine_opt: Option<EngineKind> = None;
+    let mut engine_req_opt: Option<EngineRequest> = None;
     let mut fold = false;
     let mut verbose = false;
 
@@ -3108,6 +4567,66 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --first-seq-id")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+            }
+            "--regime" => {
+                i += 1;
+                regime = parse_regime(args.get(i).ok_or("missing --regime")?)?;
+            }
+            "--metal-ligands" => {
+                i += 1;
+                metal_ligands_spec = Some(args.get(i).ok_or("missing --metal-ligands")?.clone());
+            }
+            "--pdb" => {
+                i += 1;
+                pdb_para_path = Some(PathBuf::from(args.get(i).ok_or("missing --pdb")?));
+            }
+            "--pcs" => {
+                i += 1;
+                pcs_path = Some(PathBuf::from(args.get(i).ok_or("missing --pcs")?));
+            }
+            "--temp-k" | "--temperature-k" => {
+                i += 1;
+                report_opts.temp_k = args
+                    .get(i)
+                    .ok_or("missing --temp-k")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
+            "--ph" => {
+                i += 1;
+                report_opts.ph = Some(
+                    args.get(i)
+                        .ok_or("missing --ph")?
+                        .parse()
+                        .map_err(|e| format!("{e}"))?,
+                );
+            }
+            "--idp-propensity" | "--propensity" => {
+                report_opts.include_idp_propensity_track = true;
+            }
+            "--con" => {
+                i += 1;
+                con_path = Some(PathBuf::from(args.get(i).ok_or("missing --con")?));
+            }
+            "--caco" => {
+                i += 1;
+                caco_path = Some(PathBuf::from(args.get(i).ok_or("missing --caco")?));
+            }
+            "--canco" => {
+                i += 1;
+                canco_path = Some(PathBuf::from(args.get(i).ok_or("missing --canco")?));
+            }
+            "--cbcacon" | "--cbcaco" => {
+                i += 1;
+                cbcacon_path = Some(PathBuf::from(args.get(i).ok_or("missing --cbcacon")?));
+            }
+            "--cccon" => {
+                i += 1;
+                cccon_path = Some(PathBuf::from(args.get(i).ok_or("missing --cccon")?));
+            }
+            "--ncaco" => {
+                i += 1;
+                ncaco_path = Some(PathBuf::from(args.get(i).ok_or("missing --ncaco")?));
             }
             "--hsqc" => {
                 i += 1;
@@ -3245,7 +4764,9 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
             "--engine" => {
                 i += 1;
-                engine_opt = Some(parse_engine(args.get(i).ok_or("missing --engine")?)?);
+                engine_req_opt = Some(parse_engine_request(
+                    args.get(i).ok_or("missing --engine")?,
+                )?);
             }
             "--fold" => fold = true,
             "-v" | "--verbose" => verbose = true,
@@ -3254,11 +4775,173 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let _validated_solver_engine = resolve_solver_engine(solver, engine_opt)?;
-    let picker_engine = engine_opt.unwrap_or(EngineKind::Gpu);
+    if regime == RegimeKind::Idp13C {
+        report_opts.include_idp_propensity_track = true;
+    }
+    if regime != RegimeKind::Paramagnetic {
+        if pdb_para_path.is_some() {
+            return Err("--pdb is only supported with --regime paramagnetic (use --pdb-ref for globular --fold)".to_string());
+        }
+        if pcs_path.is_some() {
+            return Err("--pcs is only supported with --regime paramagnetic".to_string());
+        }
+        if metal_ligands_spec.is_some() {
+            return Err("--metal-ligands is only supported with --regime paramagnetic".to_string());
+        }
+    }
 
     let dir = out_dir.ok_or("pipeline requires --out-dir <dir>")?;
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+
+    if regime == RegimeKind::Idp13C {
+        let t_total = Instant::now();
+        let (sequence, seq_ids, project_name, star_ref_opt) = if let Some(sq) = &seq_arg {
+            let (s, ids) = parse_sequence_arg(sq, first_seq_id)?;
+            let nm = name_arg.unwrap_or_else(|| "idp_13c_pipeline".to_string());
+            (s, ids, nm, None)
+        } else if let Some(sp) = &star_path {
+            let r = read_star_all_atoms(sp, None)?;
+            let nm = name_arg.unwrap_or_else(|| {
+                sp.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("idp_13c_pipeline")
+                    .to_string()
+            });
+            let seq = r.sequence.clone();
+            let ids = r.seq_ids.clone();
+            (seq, ids, nm, Some(r))
+        } else {
+            return Err("pipeline --regime idp-13c requires --seq or --star".to_string());
+        };
+
+        let has_explicit_c13 = peaks_path.is_some()
+            || con_path.is_some()
+            || caco_path.is_some()
+            || canco_path.is_some()
+            || cbcacon_path.is_some()
+            || cccon_path.is_some()
+            || ncaco_path.is_some()
+            || !triples.is_empty();
+
+        let ds = if has_explicit_c13 {
+            let pp_vec: Vec<PathBuf> = peaks_path.into_iter().collect();
+            load_c13_input_bundle(
+                &pp_vec,
+                con_path.as_deref(),
+                caco_path.as_deref(),
+                canco_path.as_deref(),
+                cbcacon_path.as_deref(),
+                cccon_path.as_deref(),
+                ncaco_path.as_deref(),
+                &triples,
+                snr,
+            )?
+        } else if let Some(ref r) = star_ref_opt {
+            let cubes = simulate_idp_13c_cubes(
+                r,
+                &IdpCubeSimConfig {
+                    seed,
+                    ..IdpCubeSimConfig::default()
+                },
+            );
+            let pcfg = C13PickerConfig::default();
+            let con_roots = pick_con_2d(&cubes.con_2d, &pcfg);
+            let caco_peaks = cubes
+                .caco_2d
+                .as_ref()
+                .map(|sp| pick_caco_2d(sp, &pcfg))
+                .unwrap_or_default();
+            let mut strip_peaks = Vec::new();
+            for (exp, ref sp3) in &cubes.cubes_3d {
+                strip_peaks.extend(pick_con_anchored_3d(sp3, *exp, &con_roots, &pcfg));
+            }
+            C13PickedDataset {
+                con_roots,
+                caco_peaks,
+                strip_peaks,
+            }
+        } else {
+            return Err(
+                "pipeline --regime idp-13c requires 13C-detected peaks/spectra (or --star)"
+                    .to_string(),
+            );
+        };
+
+        let t_solve = Instant::now();
+        let wf = execute_idp_13c_workflow(
+            &ds,
+            &sequence,
+            &seq_ids,
+            engine_req_opt.unwrap_or(EngineRequest::Auto),
+            report_opts.temp_k,
+            report_opts.ph,
+            runs,
+            steps,
+            seed,
+        )?;
+        let dt_solve = t_solve.elapsed().as_secs_f64();
+
+        let peaks_out = dir.join("peaks.tsv");
+        let star_out = dir.join("shifts.str");
+        let tsv_out = dir.join("shifts.tsv");
+        let nef_out = dir.join("result.nef");
+        let html_out = dir.join("report.html");
+        let prop_out = dir.join("propensity.tsv");
+
+        write_c13_detected_tsv(&peaks_out, &ds)?;
+        write_star_with_header(&star_out, &wf.pred, Some(&wf.conf), Some(&wf.star_header))?;
+        write_shifts_tsv(&tsv_out, &wf.pred, &wf.conf)?;
+        let nef_doc =
+            NefDocument::from_reference_and_peaks(&project_name, &wf.pred, Some(&wf.conf), &[]);
+        write_nef_file(&nef_out, &nef_doc)?;
+
+        let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
+        let prop_rep = compute_idp_propensity(&wf.pred, &prop_cfg);
+        fs::write(&prop_out, format!("{}\n", format_propensity_tsv(&prop_rep)))
+            .map_err(|e| format!("{e}"))?;
+
+        let mut rep = ReportInput::new(&project_name, wf.pred.clone(), wf.conf.clone());
+        rep.n_peaks = Some(ds.con_roots.len() + ds.caco_peaks.len() + ds.strip_peaks.len());
+        rep.n_spin_systems = Some(wf.systems.len());
+        rep.solver_score = Some(wf.result.score);
+        rep.elapsed_secs = Some(dt_solve);
+        rep.engine_label = Some(wf.engine_label.clone());
+        rep.dihedrals = predict_csi_dihedrals(&wf.pred);
+        rep = rep.with_propensity_report(prop_rep);
+        write_quality_report_html(&html_out, &rep)?;
+
+        let dt_total = t_total.elapsed().as_secs_f64();
+        println!(
+            "[{}] Pipeline '{}' (idp-13c) completed in {:.2}s (solve {:.2}s) -> {}, {}, {}, {}, {}, {}",
+            wf.engine_label,
+            project_name,
+            dt_total,
+            dt_solve,
+            star_out.display(),
+            tsv_out.display(),
+            peaks_out.display(),
+            prop_out.display(),
+            nef_out.display(),
+            html_out.display()
+        );
+        return Ok(());
+    }
+
+    let engine_opt = match engine_req_opt {
+        None | Some(EngineRequest::Auto) => None,
+        Some(EngineRequest::Gpu) => Some(EngineKind::Gpu),
+        Some(EngineRequest::Cpu) => Some(EngineKind::Cpu),
+    };
+    if regime == RegimeKind::Paramagnetic && engine_req_opt == Some(EngineRequest::Gpu) {
+        return Err(
+            "--engine gpu is not supported with --regime paramagnetic (CPU-only); use --engine cpu or --engine auto"
+                .to_string(),
+        );
+    }
+    if regime == RegimeKind::Globular {
+        let _validated_solver_engine = resolve_solver_engine(solver, engine_opt)?;
+    }
+    let picker_engine = engine_opt.unwrap_or(EngineKind::Gpu);
 
     let resolved_fid: Option<(PathBuf, Vec<(String, PathBuf)>)> = if let Some(fhsqc) = fid_hsqc_path
     {
@@ -3456,35 +5139,6 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         ..ScoreConfig::default()
     };
     let t_solve = Instant::now();
-    let wf = execute_assignment_workflow(
-        solver,
-        engine_opt,
-        &peaks,
-        &base_ref.sequence,
-        &pri,
-        &scfg,
-        runs,
-        steps,
-        32,
-        seed,
-    )?;
-    let dt_solve = t_solve.elapsed().as_secs_f64();
-    log_workflow_diagnostics(
-        &wf.engine_label,
-        &wf.offsets,
-        &wf.detailed_offsets,
-        &wf.qc_report,
-        verbose,
-    );
-
-    let (pred_ref, conf) = to_reference(
-        &wf.result,
-        &wf.systems,
-        &base_ref.sequence,
-        &base_ref.seq_ids,
-        0.0,
-        Some(&wf.effective_priors),
-    );
     let peaks_out = dir.join("peaks.tsv");
     let star_out = dir.join("shifts.str");
     let tsv_out = dir.join("shifts.tsv");
@@ -3492,35 +5146,119 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let html_out = dir.join("report.html");
     let qc_out = dir.join("qc_report.json");
 
+    let (pred_ref, conf, systems, result, engine_label, dt_solve, star_hdr, qc_opt) = if regime
+        == RegimeKind::Paramagnetic
+    {
+        let (sys, res, eff_priors, para_rep, pcs_tensor_opt, elbl) = execute_paramagnetic_workflow(
+            solver,
+            engine_req_opt.unwrap_or(EngineRequest::Auto),
+            &peaks,
+            &base_ref.sequence,
+            &base_ref.seq_ids,
+            &pri,
+            &scfg,
+            metal_ligands_spec.as_deref(),
+            pdb_para_path.as_deref(),
+            pcs_path.as_deref(),
+            runs,
+            steps,
+            seed,
+        )?;
+        let dt = t_solve.elapsed().as_secs_f64();
+        let (pr, cf) = to_reference(
+            &res,
+            &sys,
+            &base_ref.sequence,
+            &base_ref.seq_ids,
+            0.0,
+            Some(&eff_priors),
+        );
+        let mut hdr = format!(
+                "# nmrassign solver: {elbl}\n# regime: paramagnetic (clusters={}, blind_zone_residues={}, abstentions={})",
+                para_rep.detected_clusters.len(),
+                para_rep.blind_zone_residues.len(),
+                para_rep.n_blind_zone_abstentions,
+            );
+        if let Some(ref t) = pcs_tensor_opt {
+            hdr.push_str(&format!(
+                "\n# pcs_delta_chi: dchi_ax={:+.3}, dchi_rh={:+.3} (10^-32 m^3), q_factor={:.4}",
+                t.dchi_ax, t.dchi_rh, t.q_factor,
+            ));
+        }
+        (pr, cf, sys, res, elbl, dt, Some(hdr), None)
+    } else {
+        let wf = execute_assignment_workflow(
+            solver,
+            engine_opt,
+            &peaks,
+            &base_ref.sequence,
+            &pri,
+            &scfg,
+            runs,
+            steps,
+            32,
+            seed,
+        )?;
+        let dt = t_solve.elapsed().as_secs_f64();
+        log_workflow_diagnostics(
+            &wf.engine_label,
+            &wf.offsets,
+            &wf.detailed_offsets,
+            &wf.qc_report,
+            verbose,
+        );
+        let (pr, cf) = to_reference(
+            &wf.result,
+            &wf.systems,
+            &base_ref.sequence,
+            &base_ref.seq_ids,
+            0.0,
+            Some(&wf.effective_priors),
+        );
+        let hdr = format_star_offset_header(
+            &wf.engine_label,
+            &wf.offsets,
+            &wf.detailed_offsets,
+            &wf.qc_report,
+        );
+        (
+            pr,
+            cf,
+            wf.systems,
+            wf.result,
+            wf.engine_label,
+            dt,
+            hdr,
+            Some(wf.qc_report),
+        )
+    };
+
     write_peaks(&peaks_out, &peaks)?;
-    let star_hdr = format_star_offset_header(
-        &wf.engine_label,
-        &wf.offsets,
-        &wf.detailed_offsets,
-        &wf.qc_report,
-    );
     write_star_with_header(&star_out, &pred_ref, Some(&conf), star_hdr.as_deref())?;
     write_shifts_tsv(&tsv_out, &pred_ref, &conf)?;
-    let _ = fs::write(
-        &qc_out,
-        format!(
-            "{}\n",
-            real_benchmark::render_qc_report_json(&wf.qc_report, 0)
-        ),
-    );
+    if let Some(ref qcr) = qc_opt {
+        let _ = fs::write(
+            &qc_out,
+            format!("{}\n", real_benchmark::render_qc_report_json(qcr, 0)),
+        );
+    }
     let nef_doc =
         NefDocument::from_reference_and_peaks(&project_name, &pred_ref, Some(&conf), &peaks);
     write_nef_file(&nef_out, &nef_doc)?;
 
-    let engine_label = wf.engine_label;
     let mut rep = ReportInput::new(&project_name, pred_ref.clone(), conf.clone());
     rep.n_peaks = Some(peaks.len());
-    rep.n_spin_systems = Some(wf.systems.len());
-    rep.solver_score = Some(wf.result.score);
+    rep.n_spin_systems = Some(systems.len());
+    rep.solver_score = Some(result.score);
     rep.elapsed_secs = Some(dt_solve);
     rep.engine_label = Some(engine_label.clone());
-    rep.systems_and_assignment = Some((wf.systems, wf.result));
+    rep.systems_and_assignment = Some((systems, result));
     rep.dihedrals = predict_csi_dihedrals(&pred_ref);
+    if report_opts.include_idp_propensity_track {
+        let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
+        let prop_rep = compute_idp_propensity(&pred_ref, &prop_cfg);
+        rep = rep.with_propensity_report(prop_rep);
+    }
 
     if fold {
         let pdb_ref = match &pdb_ref_path {
@@ -4593,6 +6331,7 @@ fn main() {
         "e2e-benchmark" => cmd_e2e_benchmark(&args[1..]),
         "simulate" => cmd_simulate(&args[1..]),
         "assign" => cmd_assign(&args[1..]),
+        "propensity" => cmd_propensity(&args[1..]),
         "score" => cmd_score(&args[1..]),
         "pick" => cmd_pick(&args[1..]),
         "priors" => cmd_priors(&args[1..]),
@@ -4884,7 +6623,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             "expected loud CPU-only GPU rejection for evo-graph, got: {err}"
         );
 
-        // 2. Loud rejection of removed `--pdb` flag and removed `tripeptide` solver
+        // 2. Loud rejection of `--pdb` without `--regime paramagnetic` and removed `tripeptide` solver
         let pdb_err = cmd_assign(&[
             "--peaks".into(),
             peaks_path.to_string_lossy().into_owned(),
@@ -4897,8 +6636,8 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         ])
         .unwrap_err();
         assert!(
-            pdb_err.contains("unknown assign flag"),
-            "expected unknown flag rejection for --pdb, got: {pdb_err}"
+            pdb_err.contains("--regime paramagnetic"),
+            "expected structure-free rejection for --pdb without --regime paramagnetic, got: {pdb_err}"
         );
 
         let tri_err = cmd_assign(&[
