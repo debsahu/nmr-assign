@@ -28,7 +28,10 @@ use crate::peaks::Peak;
 use crate::picker::estimate_noise_mad;
 use crate::rng::Rng;
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
-use crate::topology::{residue_topology, CarbonRegion, ProchiralGroup, SidechainPriors};
+use crate::topology::{
+    residue_topology, CarbonRegion, HisVariantPriors, ProchiralGroup, SidechainPriors,
+    HIS_DOUBLY_PROTONATED_PRIORS, HIS_ND1H_PRIORS, HIS_NE2H_PRIORS,
+};
 
 /// Canonical experiment identifiers for aromatic sidechain assignment.
 pub const AROMATIC_EXPERIMENTS: [&str; 6] = [
@@ -90,16 +93,16 @@ impl AromaticExperiment {
     #[inline]
     pub const fn spectral_window(self) -> ((f64, f64), (f64, f64)) {
         match self {
-            Self::AromC13Hsqc | Self::AromHcchTocsy => ((5.4, 9.25), (108.0, 143.5)),
-            Self::Hbcbcgcdhd | Self::Hbcbcgcdcehe => ((5.4, 9.25), (24.0, 48.0)),
-            Self::HisLrN15Hmqc => ((6.2, 9.25), (155.0, 265.0)),
-            Self::TrpIndN15Hsqc => ((9.0, 11.6), (122.0, 136.5)),
+            Self::AromC13Hsqc | Self::AromHcchTocsy => ((4.8, 9.45), (108.0, 143.5)),
+            Self::Hbcbcgcdhd | Self::Hbcbcgcdcehe => ((4.8, 9.45), (24.0, 48.0)),
+            Self::HisLrN15Hmqc => ((6.0, 9.35), (155.0, 265.0)),
+            Self::TrpIndN15Hsqc => ((8.8, 12.5), (120.0, 140.0)),
         }
     }
 }
 
 // ============================================================================
-// 1. Histidine Imidazole Tautomeric & Protonation State Model (Pelton et al. 1993)
+// 1. Histidine Imidazole Tautomeric, Exchange & Metal-Coordination State Model
 // ============================================================================
 
 /// Tautomeric and protonation state of a histidine imidazole ring in solution.
@@ -128,7 +131,18 @@ impl HisTautomer {
 
     pub const ALL: [Self; 3] = [Self::Ne2H, Self::Nd1H, Self::DoublyProtonated];
 
-    /// Canonical `(mean_ppm, std_ppm)` priors `(ND1, NE2, CD2, HD2, CE1, HE1, CB)` per Pelton et al. (1993).
+    /// Authoritative unified Pelton et al. (1993) + BMRB prior record shared with `crate::topology`.
+    #[inline]
+    pub const fn variant_priors(self) -> HisVariantPriors {
+        match self {
+            Self::Ne2H => HIS_NE2H_PRIORS,
+            Self::Nd1H => HIS_ND1H_PRIORS,
+            Self::DoublyProtonated => HIS_DOUBLY_PROTONATED_PRIORS,
+        }
+    }
+
+    /// Canonical `(mean_ppm, std_ppm)` priors `(ND1, NE2, CD2, HD2, CE1, HE1, CB)` per Pelton et al. (1993),
+    /// read directly from the single authoritative `HisVariantPriors` table in `crate::topology`.
     #[inline]
     #[allow(clippy::type_complexity)]
     pub const fn shift_priors(
@@ -142,48 +156,58 @@ impl HisTautomer {
         (f64, f64),
         (f64, f64),
     ) {
+        let vp = self.variant_priors();
+        (vp.nd1, vp.ne2, vp.cd2, vp.hd2, vp.ce1, vp.he1, vp.cb)
+    }
+}
+
+/// High-level chemical regime of a histidine imidazole ring:
+/// - `Resolved(HisTautomer)`: well-resolved Pelton $\tau$ (`Ne2H`), $\pi$ (`Nd1H`), or cationic (`DoublyProtonated`) state.
+/// - `FastExchangeUncommitted`: dynamic neutral $\tau \leftrightarrow \pi$ fast tautomer averaging (`ND1`/`NE2` coalesced into `~195–225 ppm`).
+/// - `MetalCoordinatedCandidate`: `Zn(II)`/`Cu(I)`/`Cu(II)`-ligated imidazole (`=N–M` shifted `20–45 ppm` upfield from `249.5 ppm` with neutral `HE1`, or basic-pH contradiction; Barraud et al., *J. Biomol. NMR* 53, 95–108, 2012).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HisStateClassification {
+    Resolved(HisTautomer),
+    FastExchangeUncommitted,
+    MetalCoordinatedCandidate,
+}
+
+impl HisStateClassification {
+    #[inline]
+    pub const fn resolved_tautomer(self) -> Option<HisTautomer> {
         match self {
-            Self::Ne2H => (
-                (249.5, 3.2), // ND1
-                (168.5, 3.2), // NE2
-                (118.2, 1.8), // CD2 (< 122 ppm)
-                (7.02, 0.25), // HD2
-                (138.2, 1.5), // CE1
-                (7.80, 0.28), // HE1
-                (31.2, 2.2),  // CB
-            ),
-            Self::Nd1H => (
-                (169.5, 3.5), // ND1
-                (249.5, 3.2), // NE2
-                (125.0, 2.0), // CD2 (downfield > 122.5 ppm)
-                (7.14, 0.25), // HD2
-                (137.8, 1.5), // CE1
-                (7.88, 0.28), // HE1
-                (30.4, 2.2),  // CB
-            ),
-            Self::DoublyProtonated => (
-                (177.0, 2.8), // ND1 (173..182 ppm)
-                (173.5, 2.8), // NE2 (170..180 ppm)
-                (119.2, 1.8), // CD2 (< 122 ppm)
-                (7.32, 0.25), // HD2
-                (136.0, 1.5), // CE1
-                (8.56, 0.28), // HE1 (downfield imidazolium shift)
-                (29.2, 2.0),  // CB (upfield imidazolium shift)
-            ),
+            Self::Resolved(t) => Some(t),
+            Self::FastExchangeUncommitted | Self::MetalCoordinatedCandidate => None,
+        }
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved(HisTautomer::Ne2H) => "Ne2H",
+            Self::Resolved(HisTautomer::Nd1H) => "Nd1H",
+            Self::Resolved(HisTautomer::DoublyProtonated) => "DoublyProtonated",
+            Self::FastExchangeUncommitted => "FastExchangeUncommitted",
+            Self::MetalCoordinatedCandidate => "MetalCoordinatedCandidate",
         }
     }
 }
 
-/// Experimental shifts and cross-peak evidence for classifying a histidine's tautomeric state.
+/// Experimental shifts, sample conditions, and cross-peak evidence for classifying a histidine ring.
 #[derive(Clone, Debug, Default)]
 pub struct HisTautomerEvidence {
     pub nd1_ppm: Option<f64>,
     pub ne2_ppm: Option<f64>,
+    /// Quaternary `13CG` shift (`~135.5 ppm` `Ne2H` $\tau$, `~127.2 ppm` `Nd1H` $\pi$, `~129.8 ppm` `DoublyProtonated`;
+    /// Reynolds et al., *J. Am. Chem. Soc.* 95, 328–331, 1973; Sudmeier et al., *J. Magn. Reson.* 163, 194–198, 2003).
+    pub cg_ppm: Option<f64>,
     pub cd2_ppm: Option<f64>,
     pub hd2_ppm: Option<f64>,
     pub ce1_ppm: Option<f64>,
     pub he1_ppm: Option<f64>,
     pub cb_ppm: Option<f64>,
+    pub sample_ph: Option<f64>,
+    pub metal_coordinated_hint: bool,
 }
 
 #[inline]
@@ -192,37 +216,45 @@ fn gauss_logpdf(x: f64, mu: f64, sd: f64) -> f64 {
     -0.5 * z * z - (sd * TAU.sqrt()).ln()
 }
 
-/// Classify histidine `HisTautomer` and compute its calibrated posterior probability in `[0.0, 1.0]`
-/// from Pelton et al. (1993) `(ND1, NE2)` `15N-HMQC` shifts and corroborating `CD2`/`CE1`/`HE1`/`CB` shifts.
-pub fn classify_his_tautomer(ev: &HisTautomerEvidence) -> (HisTautomer, f64) {
-    // Mild biological prior (~0.45 Ne2H, ~0.25 Nd1H, ~0.30 DoublyProtonated across pH 5..7.5)
-    let log_priors = [0.45_f64.ln(), 0.25_f64.ln(), 0.30_f64.ln()];
-    let mut log_post = [0.0; 3];
+fn raw_pelton_three_state_posterior(ev: &HisTautomerEvidence) -> ([f64; 3], HisTautomer, f64) {
+    let log_priors = if let Some(ph) = ev.sample_ph.filter(|v| v.is_finite()) {
+        // Mild Henderson-Hasselbalch modulation around average protein His pKa ~ 6.3,
+        // clamped conservatively because buried/salt-bridged His pKa values span ~4.5..8.5.
+        let p_prot = (1.0 / (1.0 + 10.0_f64.powf(ph - 6.3))).clamp(0.06, 0.90);
+        let p_neut = 1.0 - p_prot;
+        [(0.64 * p_neut).ln(), (0.36 * p_neut).ln(), p_prot.ln()]
+    } else {
+        [0.45_f64.ln(), 0.25_f64.ln(), 0.30_f64.ln()]
+    };
 
+    let mut log_post = [0.0; 3];
     for (idx, &state) in HisTautomer::ALL.iter().enumerate() {
-        let (p_nd1, p_ne2, p_cd2, p_hd2, p_ce1, p_he1, p_cb) = state.shift_priors();
+        let vp = state.variant_priors();
         let mut lp = log_priors[idx];
 
         if let Some(v) = ev.nd1_ppm {
-            lp += gauss_logpdf(v, p_nd1.0, p_nd1.1);
+            lp += gauss_logpdf(v, vp.nd1.0, vp.nd1.1);
         }
         if let Some(v) = ev.ne2_ppm {
-            lp += gauss_logpdf(v, p_ne2.0, p_ne2.1);
+            lp += gauss_logpdf(v, vp.ne2.0, vp.ne2.1);
+        }
+        if let Some(v) = ev.cg_ppm {
+            lp += gauss_logpdf(v, vp.cg.0, vp.cg.1);
         }
         if let Some(v) = ev.cd2_ppm {
-            lp += gauss_logpdf(v, p_cd2.0, p_cd2.1);
+            lp += gauss_logpdf(v, vp.cd2.0, vp.cd2.1);
         }
         if let Some(v) = ev.hd2_ppm {
-            lp += gauss_logpdf(v, p_hd2.0, p_hd2.1);
+            lp += gauss_logpdf(v, vp.hd2.0, vp.hd2.1);
         }
         if let Some(v) = ev.ce1_ppm {
-            lp += gauss_logpdf(v, p_ce1.0, p_ce1.1);
+            lp += gauss_logpdf(v, vp.ce1.0, vp.ce1.1);
         }
         if let Some(v) = ev.he1_ppm {
-            lp += gauss_logpdf(v, p_he1.0, p_he1.1);
+            lp += gauss_logpdf(v, vp.he1.0, vp.he1.1);
         }
         if let Some(v) = ev.cb_ppm {
-            lp += 0.35 * gauss_logpdf(v, p_cb.0, p_cb.1);
+            lp += 0.35 * gauss_logpdf(v, vp.cb.0, vp.cb.1);
         }
         log_post[idx] = lp;
     }
@@ -234,18 +266,108 @@ pub fn classify_his_tautomer(ev: &HisTautomerEvidence) -> (HisTautomer, f64) {
         probs[i] = (log_post[i] - max_lp).exp();
         sum += probs[i];
     }
+    if sum > 0.0 {
+        for p in &mut probs {
+            *p = (*p / sum).clamp(0.0, 1.0);
+        }
+    } else {
+        probs = [1.0 / 3.0; 3];
+    }
     let mut best_i = 0;
     for i in 1..3 {
         if probs[i] > probs[best_i] {
             best_i = i;
         }
     }
-    let post = if sum > 0.0 {
-        (probs[best_i] / sum).clamp(0.0, 1.0)
-    } else {
-        1.0 / 3.0
+    (probs, HisTautomer::ALL[best_i], probs[best_i])
+}
+
+/// Classify histidine imidazole state (`Resolved(HisTautomer)`, `FastExchangeUncommitted`, or
+/// `MetalCoordinatedCandidate`) and return the calibrated static-tautomer commitment confidence
+/// in `[0.0, 1.0]` (`< 0.80` whenever fast tautomer exchange or metal ligation makes static
+/// two-tautomer/imidazolium commitment physically invalid).
+pub fn classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, f64) {
+    let (_probs, best_taut, raw_post) = raw_pelton_three_state_posterior(ev);
+
+    // 1. Explicit metal-coordination hint from sample/domain metadata
+    if ev.metal_coordinated_hint {
+        return (
+            HisStateClassification::MetalCoordinatedCandidate,
+            raw_post.min(0.58),
+        );
+    }
+
+    // 2. Fast neutral tautomer averaging (Ne2H <-> Nd1H):
+    //    - Both ND1 and NE2 lie in the 195..=225 ppm intermediate averaging zone, OR
+    //    - A single observed 15N lies in 198..=222 ppm with intermediate CD2 (~120..124 ppm) and neutral HE1 (< 8.25 ppm).
+    match (ev.nd1_ppm, ev.ne2_ppm) {
+        (Some(nd1), Some(ne2))
+            if (195.0..=225.0).contains(&nd1) && (195.0..=225.0).contains(&ne2) =>
+        {
+            let spread = (nd1 - ne2).abs();
+            // Closer to 209.5 ppm midpoint => closer to 50:50 uncommitted tautomer population
+            let conf = (0.38 + 0.14 * (spread / 30.0).min(1.0)).clamp(0.35, 0.52);
+            return (HisStateClassification::FastExchangeUncommitted, conf);
+        }
+        (Some(n_single), None) | (None, Some(n_single))
+            if (198.0..=222.0).contains(&n_single)
+                && ev.cd2_ppm.is_none_or(|c| (119.5..=124.2).contains(&c))
+                && ev.he1_ppm.is_none_or(|h| h < 8.25) =>
+        {
+            return (HisStateClassification::FastExchangeUncommitted, 0.48);
+        }
+        _ => {}
+    }
+
+    // 3. Zn(II) / Cu(I) / metal-coordinated histidine mimicry (Barraud et al., JBNMR 2012):
+    //    - Asymmetric pair: one protonated pyrrole-like >NH (160..=183.5 ppm) paired with a
+    //      metal-ligated =N-M shifted 20..48 ppm upfield from 249.5 into ~185..230 ppm (split 18..=68 ppm)
+    //      and non-cationic HE1 (< 8.30 ppm).
+    //    - Basic-pH contradiction: DoublyProtonated-like upfield 15N (< 192 ppm, neither >= 235 ppm)
+    //      conflicting with basic sample_ph >= 7.4 and neutral HE1 < 8.15 ppm.
+    if let (Some(nd1), Some(ne2)) = (ev.nd1_ppm, ev.ne2_ppm) {
+        let n_lo = nd1.min(ne2);
+        let n_hi = nd1.max(ne2);
+        let split = n_hi - n_lo;
+        let neutral_he1 = ev.he1_ppm.is_none_or(|h| h < 8.30);
+        let asymmetric_metal_pair = (160.0..=183.5).contains(&n_lo)
+            && (((202.0..=230.0).contains(&n_hi) && neutral_he1)
+                || ((185.0..=230.0).contains(&n_hi)
+                    && (18.0..=68.0).contains(&split)
+                    && neutral_he1));
+        if asymmetric_metal_pair {
+            return (
+                HisStateClassification::MetalCoordinatedCandidate,
+                raw_post.min(0.60),
+            );
+        }
+    }
+    let has_upfield_only_n = match (ev.nd1_ppm, ev.ne2_ppm) {
+        (Some(a), Some(b)) => a <= 192.0 && b <= 192.0,
+        (Some(a), None) | (None, Some(a)) => a <= 192.0,
+        (None, None) => false,
     };
-    (HisTautomer::ALL[best_i], post)
+    if has_upfield_only_n
+        && ev.sample_ph.is_some_and(|ph| ph >= 7.4)
+        && ev.he1_ppm.is_some_and(|h| h < 8.15)
+    {
+        return (
+            HisStateClassification::MetalCoordinatedCandidate,
+            raw_post.min(0.56),
+        );
+    }
+
+    (HisStateClassification::Resolved(best_taut), raw_post)
+}
+
+/// Classify histidine `HisTautomer` and compute its calibrated static-tautomer posterior in `[0.0, 1.0]`
+/// from Pelton et al. (1993) `(ND1, NE2, CG)` shifts and corroborating `CD2`/`CE1`/`HE1`/`CB` shifts.
+/// When `classify_his_state` detects `FastExchangeUncommitted` or `MetalCoordinatedCandidate`,
+/// confidence is capped `< 0.80` (`<= 0.55` on fast exchange) so callers never over-commit.
+pub fn classify_his_tautomer(ev: &HisTautomerEvidence) -> (HisTautomer, f64) {
+    let (_probs, best_taut, _raw_post) = raw_pelton_three_state_posterior(ev);
+    let (_state, calibrated_conf) = classify_his_state(ev);
+    (best_taut, calibrated_conf)
 }
 
 // ============================================================================
@@ -510,12 +632,16 @@ struct RingChSpin {
 fn collect_residue_aromatic_chs(ref_data: &Reference, k: usize) -> Vec<RingChSpin> {
     let res = ref_data.sequence[k].as_str();
     let mut out = Vec::new();
+    let get_sym = |a1: &str, a2: &str| -> Option<f64> {
+        ref_data
+            .shifts
+            .get(&(k, a1.to_string()))
+            .or_else(|| ref_data.shifts.get(&(k, a2.to_string())))
+            .copied()
+    };
     match res {
         "PHE" => {
-            if let (Some(&c), Some(&h)) = (
-                ref_data.shifts.get(&(k, "CD1".to_string())),
-                ref_data.shifts.get(&(k, "HD1".to_string())),
-            ) {
+            if let (Some(c), Some(h)) = (get_sym("CD1", "CD2"), get_sym("HD1", "HD2")) {
                 out.push(RingChSpin {
                     carbon: "CD1",
                     c_ppm: c,
@@ -523,10 +649,7 @@ fn collect_residue_aromatic_chs(ref_data: &Reference, k: usize) -> Vec<RingChSpi
                     equiv_protons: 2,
                 });
             }
-            if let (Some(&c), Some(&h)) = (
-                ref_data.shifts.get(&(k, "CE1".to_string())),
-                ref_data.shifts.get(&(k, "HE1".to_string())),
-            ) {
+            if let (Some(c), Some(h)) = (get_sym("CE1", "CE2"), get_sym("HE1", "HE2")) {
                 out.push(RingChSpin {
                     carbon: "CE1",
                     c_ppm: c,
@@ -547,10 +670,7 @@ fn collect_residue_aromatic_chs(ref_data: &Reference, k: usize) -> Vec<RingChSpi
             }
         }
         "TYR" => {
-            if let (Some(&c), Some(&h)) = (
-                ref_data.shifts.get(&(k, "CD1".to_string())),
-                ref_data.shifts.get(&(k, "HD1".to_string())),
-            ) {
+            if let (Some(c), Some(h)) = (get_sym("CD1", "CD2"), get_sym("HD1", "HD2")) {
                 out.push(RingChSpin {
                     carbon: "CD1",
                     c_ppm: c,
@@ -558,10 +678,7 @@ fn collect_residue_aromatic_chs(ref_data: &Reference, k: usize) -> Vec<RingChSpi
                     equiv_protons: 2,
                 });
             }
-            if let (Some(&c), Some(&h)) = (
-                ref_data.shifts.get(&(k, "CE1".to_string())),
-                ref_data.shifts.get(&(k, "HE1".to_string())),
-            ) {
+            if let (Some(c), Some(h)) = (get_sym("CE1", "CE2"), get_sym("HE1", "HE2")) {
                 out.push(RingChSpin {
                     carbon: "CE1",
                     c_ppm: c,
@@ -686,12 +803,17 @@ pub fn simulate_aromatic_peaks(
         // 2. Yamazaki 2D (HB)CB(CGCD)HD & (HB)CB(CGCDCE)HE
         if let Some(cb) = cb_opt {
             if cfg.include_hbcbcgcdhd {
-                let hd_atom = match res.as_str() {
-                    "PHE" | "TYR" | "TRP" => "HD1",
-                    "HIS" => "HD2",
-                    _ => "",
+                let hd_val = match res.as_str() {
+                    "PHE" | "TYR" => ref_data
+                        .shifts
+                        .get(&(k, "HD1".to_string()))
+                        .or_else(|| ref_data.shifts.get(&(k, "HD2".to_string())))
+                        .copied(),
+                    "TRP" => ref_data.shifts.get(&(k, "HD1".to_string())).copied(),
+                    "HIS" => ref_data.shifts.get(&(k, "HD2".to_string())).copied(),
+                    _ => None,
                 };
-                if let Some(&hd) = ref_data.shifts.get(&(k, hd_atom.to_string())) {
+                if let Some(hd) = hd_val {
                     if rng.f64() >= cfg.p_missing_peak * 0.5 {
                         let mult = if matches!(res.as_str(), "PHE" | "TYR") {
                             1.85
@@ -714,29 +836,41 @@ pub fn simulate_aromatic_peaks(
             }
 
             if cfg.include_hbcbcgcdcehe {
-                let he_spec: Option<(&str, f64, f64)> = match res.as_str() {
-                    "PHE" | "TYR" => Some(("HE1", 1.70, cfg.p_missing_peak * 0.6)),
-                    "TRP" => Some(("HE3", 0.78, cfg.p_missing_peak)),
-                    "HIS" if cfg.include_weak_his_he1_yamazaki => {
-                        Some(("HE1", 0.42, (cfg.p_missing_peak * 2.0).min(0.35)))
-                    }
+                let he_spec: Option<(Option<f64>, f64, f64)> = match res.as_str() {
+                    "PHE" | "TYR" => Some((
+                        ref_data
+                            .shifts
+                            .get(&(k, "HE1".to_string()))
+                            .or_else(|| ref_data.shifts.get(&(k, "HE2".to_string())))
+                            .copied(),
+                        1.70,
+                        cfg.p_missing_peak * 0.6,
+                    )),
+                    "TRP" => Some((
+                        ref_data.shifts.get(&(k, "HE3".to_string())).copied(),
+                        0.78,
+                        cfg.p_missing_peak,
+                    )),
+                    "HIS" if cfg.include_weak_his_he1_yamazaki => Some((
+                        ref_data.shifts.get(&(k, "HE1".to_string())).copied(),
+                        0.42,
+                        (cfg.p_missing_peak * 2.0).min(0.35),
+                    )),
                     _ => None,
                 };
-                if let Some((he_atom, amp_scale, miss_p)) = he_spec {
-                    if let Some(&he) = ref_data.shifts.get(&(k, he_atom.to_string())) {
-                        if rng.f64() >= miss_p {
-                            let ht = 90.0 * amp_scale * (rng.normal(0.0, 0.14)).exp();
-                            peaks.push(Peak {
-                                exp: "HBCBCGCDCEHE".to_string(),
-                                h: he + rng.normal(0.0, cfg.jitter_h_ppm),
-                                n: 0.0,
-                                c: Some(cb + rng.normal(0.0, cfg.jitter_c_ppm)),
-                                sign: 1,
-                                height: Some(ht),
-                                volume: Some(ht * 4.5),
-                                h2: None,
-                            });
-                        }
+                if let Some((Some(he), amp_scale, miss_p)) = he_spec {
+                    if rng.f64() >= miss_p {
+                        let ht = 90.0 * amp_scale * (rng.normal(0.0, 0.14)).exp();
+                        peaks.push(Peak {
+                            exp: "HBCBCGCDCEHE".to_string(),
+                            h: he + rng.normal(0.0, cfg.jitter_h_ppm),
+                            n: 0.0,
+                            c: Some(cb + rng.normal(0.0, cfg.jitter_c_ppm)),
+                            sign: 1,
+                            height: Some(ht),
+                            volume: Some(ht * 4.5),
+                            h2: None,
+                        });
                     }
                 }
             }
@@ -781,7 +915,10 @@ pub fn simulate_aromatic_peaks(
             }
         }
 
-        // 4. Pelton 2D HIS_LR_N15HMQC (HE1 -> ND1 & NE2; HD2 -> NE2 strong & ND1 weak)
+        // 4. Pelton 2D HIS_LR_N15HMQC (Pelton et al., Protein Sci. 1993, 2, 543-558, Table 1):
+        //    Large long-range J_NH (~8.8-10.6 Hz) occurs to the unprotonated pyridine-type =N-
+        //    (~249.5 ppm), whereas coupling to protonated pyrrole >NH (~168-177 ppm) is smaller
+        //    (~5.2-5.4 Hz, and 3J(HD2, ND1H) ~ 1.4-2.0 Hz).
         if cfg.include_his_lr_hmqc && res == "HIS" {
             let st = his_tautomers.get(&k).copied().unwrap_or(HisTautomer::Ne2H);
             let nd1 = ref_data.shifts.get(&(k, "ND1".to_string())).copied();
@@ -795,11 +932,11 @@ pub fn simulate_aromatic_peaks(
 
                 if let Some(he1_v) = he1 {
                     let j_he1 = he1_v + rng.normal(0.0, cfg.jitter_h_ppm);
-                    // Unprotonated =N- has slightly larger 2J_NH (~10 Hz) than protonated >NH (~7 Hz)
+                    // 2J(HE1, =N-) ~ 10.6 Hz vs 2J(HE1, >NH) ~ 5.2-5.4 Hz (Pelton 1993 Table 1)
                     let (a_nd1, a_ne2) = match st {
-                        HisTautomer::Ne2H => (1.15, 0.82),
-                        HisTautomer::Nd1H => (0.82, 1.15),
-                        HisTautomer::DoublyProtonated => (0.90, 0.88),
+                        HisTautomer::Ne2H => (1.22, 0.65),
+                        HisTautomer::Nd1H => (0.65, 1.22),
+                        HisTautomer::DoublyProtonated => (0.85, 0.85),
                     };
                     for &(n_t, amp) in &[(j_nd1, a_nd1), (j_ne2, a_ne2)] {
                         if rng.f64() >= cfg.p_missing_peak * 0.3 {
@@ -820,9 +957,32 @@ pub fn simulate_aromatic_peaks(
 
                 if let Some(hd2_v) = hd2 {
                     let j_hd2 = hd2_v + rng.normal(0.0, cfg.jitter_h_ppm);
-                    // HD2 -> NE2 is strong 2J_NH (~8.5 Hz); HD2 -> ND1 is weak 3J_NH (~2 Hz)
-                    if rng.f64() >= cfg.p_missing_peak * 0.3 {
-                        let ht_ne2 = 92.0 * (rng.normal(0.0, 0.12)).exp();
+                    // Pelton 1993 Table 1 HD2 couplings:
+                    // - Ne2H (tau): 3J(HD2, ND1) ~ 8.8 Hz > 2J(HD2, NE2H) ~ 5.2 Hz
+                    // - Nd1H (pi):  2J(HD2, NE2) ~ 9.8 Hz >> 3J(HD2, ND1H) ~ 1.4 Hz
+                    // - DoublyProtonated (+1): 2J(HD2, NE2H) ~ 5.4 Hz > 3J(HD2, ND1H) ~ 1.4 Hz
+                    let (amp_nd1, miss_nd1, amp_ne2, miss_ne2) = match st {
+                        HisTautomer::Ne2H => (
+                            1.02,
+                            cfg.p_missing_peak * 0.30,
+                            0.56,
+                            cfg.p_missing_peak * 0.45,
+                        ),
+                        HisTautomer::Nd1H => (
+                            0.22,
+                            (cfg.p_missing_peak * 2.5).min(0.42),
+                            1.14,
+                            cfg.p_missing_peak * 0.30,
+                        ),
+                        HisTautomer::DoublyProtonated => (
+                            0.24,
+                            (cfg.p_missing_peak * 2.5).min(0.42),
+                            0.78,
+                            cfg.p_missing_peak * 0.35,
+                        ),
+                    };
+                    if rng.f64() >= miss_ne2 {
+                        let ht_ne2 = 92.0 * amp_ne2 * (rng.normal(0.0, 0.12)).exp();
                         peaks.push(Peak {
                             exp: "HIS_LR_N15HMQC".to_string(),
                             h: j_hd2,
@@ -834,8 +994,8 @@ pub fn simulate_aromatic_peaks(
                             h2: None,
                         });
                     }
-                    if rng.f64() >= (cfg.p_missing_peak * 2.5).min(0.40) {
-                        let ht_nd1 = 24.0 * (rng.normal(0.0, 0.15)).exp();
+                    if rng.f64() >= miss_nd1 {
+                        let ht_nd1 = 92.0 * amp_nd1 * (rng.normal(0.0, 0.14)).exp();
                         peaks.push(Peak {
                             exp: "HIS_LR_N15HMQC".to_string(),
                             h: j_hd2,
@@ -1661,10 +1821,11 @@ pub struct AromaticRingCluster {
     pub cb_hd: Option<f64>,
     /// Yamazaki `(HB)CB(CGCDCE)HE` observed `13CB` shift(s) linked to this ring's `HE*`/`HE3`/`HE1`.
     pub cb_he: Option<f64>,
-    /// Imidazole `15ND1` and `15NE2` shifts + classified `HisTautomer` (`HIS` clusters).
+    /// Imidazole `15ND1` and `15NE2` shifts + classified `HisTautomer` / `HisStateClassification` (`HIS` clusters).
     pub nd1_ppm: Option<(f64, f64)>,
     pub ne2_ppm: Option<(f64, f64)>,
     pub his_tautomer: Option<(HisTautomer, f64)>,
+    pub his_state: Option<(HisStateClassification, f64)>,
     /// Indole `(15NE1, 1HE1, intra_conf)` root (`TRP` clusters).
     pub trp_indole: Option<(f64, f64, f64)>,
     /// Internal spin-network consistency log-score (TOCSY + Yamazaki triad agreement).
@@ -1686,8 +1847,12 @@ pub struct AromaticSolverConfig {
     pub sigma_cb: f64,
     /// Minimum backbone confidence to trust `backbone_ref` `CB(k)` as a hard anchor (default `0.50`).
     pub min_backbone_conf: f64,
-    /// Calibration temperature mapping Hungarian leave-one-out margin `ΔS` to posterior probability.
+    /// Calibration temperature mapping bipartite Boltzmann energies to marginal posterior probability.
     pub calibration_temp: f64,
+    /// Optional sample pH for Pelton / Henderson-Hasselbalch histidine state disambiguation.
+    pub sample_ph: Option<f64>,
+    /// Optional hint that the protein binds `Zn(II)` / transition metal ions via histidine sidechains.
+    pub metal_coordinated_hint: bool,
 }
 
 impl Default for AromaticSolverConfig {
@@ -1700,6 +1865,8 @@ impl Default for AromaticSolverConfig {
             sigma_cb: 0.055,
             min_backbone_conf: 0.50,
             calibration_temp: 1.85,
+            sample_ph: None,
+            metal_coordinated_hint: false,
         }
     }
 }
@@ -1710,8 +1877,9 @@ struct AromHcNode {
     c: f64,
     height: f64,
     tocsy_h: Vec<f64>,
-    cb_hd_cands: Vec<(f64, f64)>, // (cb_ppm, dh_abs)
-    cb_he_cands: Vec<(f64, f64)>, // (cb_ppm, dh_abs)
+    tocsy_relays: Vec<(f64, f64)>, // (h2_ppm, max_height)
+    cb_hd_cands: Vec<(f64, f64)>,  // (cb_ppm, dh_abs)
+    cb_he_cands: Vec<(f64, f64)>,  // (cb_ppm, dh_abs)
 }
 
 impl AromHcNode {
@@ -1720,6 +1888,14 @@ impl AromHcNode {
             .iter()
             .filter(|&&th| (th - self.h).abs() > tol_h * 1.05)
             .count()
+    }
+
+    fn tocsy_amp_to(&self, target_h: f64, tol_h: f64) -> f64 {
+        self.tocsy_relays
+            .iter()
+            .filter(|&&(h2, _)| (h2 - target_h).abs() <= tol_h * 1.25)
+            .map(|&(_, ht)| ht)
+            .fold(0.0_f64, f64::max)
     }
 }
 
@@ -1772,6 +1948,7 @@ fn build_arom_hc_nodes(peaks: &[Peak], cfg: &AromaticSolverConfig) -> Vec<AromHc
                 c,
                 height: p.height.unwrap_or(100.0),
                 tocsy_h: Vec::new(),
+                tocsy_relays: Vec::new(),
                 cb_hd_cands: Vec::new(),
                 cb_he_cands: Vec::new(),
             });
@@ -1779,7 +1956,8 @@ fn build_arom_hc_nodes(peaks: &[Peak], cfg: &AromaticSolverConfig) -> Vec<AromHc
     }
 
     // Attach 3D AROM_HCCH_TOCSY (and HCCHTOCSY aromatic strips), rescuing missing HSQC roots
-    let mut orphans: Vec<(f64, f64, Vec<f64>, f64)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut orphans: Vec<(f64, f64, Vec<f64>, Vec<(f64, f64)>, f64)> = Vec::new();
     for p in peaks {
         let is_tocsy = p.exp == "AROM_HCCH_TOCSY"
             || (p.exp == "HCCHTOCSY" && p.c.is_some_and(|c| (105.0..=146.0).contains(&c)));
@@ -1789,10 +1967,12 @@ fn build_arom_hc_nodes(peaks: &[Peak], cfg: &AromaticSolverConfig) -> Vec<AromHc
         let (Some(c), Some(h2)) = (p.c, p.h2) else {
             continue;
         };
+        let p_ht = p.height.unwrap_or(70.0).max(1.0);
         let mut attached = false;
         for n in &mut nodes {
             if ((n.h - p.h) / cfg.tol_h).hypot((n.c - c) / cfg.tol_c) <= 1.15 {
                 n.tocsy_h.push(h2);
+                n.tocsy_relays.push((h2, p_ht));
                 attached = true;
             }
         }
@@ -1805,19 +1985,27 @@ fn build_arom_hc_nodes(peaks: &[Peak], cfg: &AromaticSolverConfig) -> Vec<AromHc
                 o.0 = (o.0 * cnt + p.h) / (cnt + 1.0);
                 o.1 = (o.1 * cnt + c) / (cnt + 1.0);
                 o.2.push(h2);
-                o.3 = o.3.max(p.height.unwrap_or(70.0));
+                o.3.push((h2, p_ht));
+                o.4 = o.4.max(p_ht);
             } else {
-                orphans.push((p.h, c, vec![h2], p.height.unwrap_or(70.0)));
+                orphans.push((p.h, c, vec![h2], vec![(h2, p_ht)], p_ht));
             }
         }
     }
-    for (oh, oc, h2s, ht) in orphans {
-        if h2s.len() >= 2 {
+    for (oh, oc, h2s, relays, ht) in orphans {
+        let reciprocated_single = h2s.len() == 1
+            && (oh - h2s[0]).abs() > cfg.tol_h * 1.4
+            && nodes.iter().any(|n| {
+                (n.h - h2s[0]).abs() <= cfg.tol_h * 1.1
+                    && has_h_in_ladder(&n.tocsy_h, oh, cfg.tol_h * 1.15).is_some()
+            });
+        if h2s.len() >= 2 || reciprocated_single {
             nodes.push(AromHcNode {
                 h: oh,
                 c: oc,
                 height: ht,
                 tocsy_h: h2s,
+                tocsy_relays: relays,
                 cb_hd_cands: Vec::new(),
                 cb_he_cands: Vec::new(),
             });
@@ -1866,6 +2054,46 @@ fn has_h_in_ladder(ladder: &[f64], target: f64, tol: f64) -> Option<f64> {
         .min_by(|a, b| a.total_cmp(b))
 }
 
+#[inline]
+fn count_third_party_tocsy_relays(u: &AromHcNode, v: &AromHcNode, tol_h: f64) -> usize {
+    let mut cnt = 0usize;
+    for &hu in &u.tocsy_h {
+        if (hu - u.h).abs() > tol_h * 1.1
+            && (hu - v.h).abs() > tol_h * 1.1
+            && has_h_in_ladder(&v.tocsy_h, hu, tol_h * 1.15).is_some()
+        {
+            cnt += 1;
+        }
+    }
+    cnt
+}
+
+#[inline]
+fn is_verified_tocsy_link(u: &AromHcNode, v: &AromHcNode, tol_h: f64) -> bool {
+    let uv = has_h_in_ladder(&u.tocsy_h, v.h, tol_h * 1.2);
+    let vu = has_h_in_ladder(&v.tocsy_h, u.h, tol_h * 1.2);
+    if uv.is_some() && vu.is_some() {
+        return true;
+    }
+    if uv.is_none() && vu.is_none() {
+        return false;
+    }
+    if count_third_party_tocsy_relays(u, v, tol_h) >= 1 {
+        return true;
+    }
+    // Allow 1-sided TOCSY when the unreciprocated strip has <= 1 off-diagonal peak
+    // (e.g. 2-spin TYR or weak 3-spin PHE CZ strip near contour threshold), while
+    // rejecting multi-relay (>= 2 off-diagonal peaks) strips from another ring that
+    // share zero third-party relays.
+    if uv.is_some() && v.off_diag_tocsy_count(tol_h) <= 1 {
+        return true;
+    }
+    if vu.is_some() && u.off_diag_tocsy_count(tol_h) <= 1 {
+        return true;
+    }
+    false
+}
+
 fn arom_tocsy_edge_score(u: &AromHcNode, v: &AromHcNode, directly_bonded: bool, tol_h: f64) -> f64 {
     let uv = has_h_in_ladder(&u.tocsy_h, v.h, tol_h * 1.2);
     let vu = has_h_in_ladder(&v.tocsy_h, u.h, tol_h * 1.2);
@@ -1883,13 +2111,19 @@ fn arom_tocsy_edge_score(u: &AromHcNode, v: &AromHcNode, directly_bonded: bool, 
         0.0
     };
 
+    let verified = is_verified_tocsy_link(u, v, tol_h);
     let w = if directly_bonded { 3.2 } else { 1.8 };
-    let mut sc = 2.4 * jaccard;
-    if let Some(d) = uv {
-        sc += w * (1.0 - 0.35 * (d / tol_h).min(1.2));
-    }
-    if let Some(d) = vu {
-        sc += w * (1.0 - 0.35 * (d / tol_h).min(1.2));
+    let mut sc = if verified { 2.4 * jaccard } else { 0.0 };
+    if verified {
+        if let Some(d) = uv {
+            sc += w * (1.0 - 0.35 * (d / tol_h).min(1.2));
+        }
+        if let Some(d) = vu {
+            sc += w * (1.0 - 0.35 * (d / tol_h).min(1.2));
+        }
+    } else if uv.is_some() ^ vu.is_some() {
+        // Unverified 1-sided 1D 1H collision whose partner strip sees unrelated off-diagonal protons
+        sc -= if directly_bonded { 2.6 } else { 1.5 };
     }
     if uv.is_none()
         && vu.is_none()
@@ -1900,6 +2134,29 @@ fn arom_tocsy_edge_score(u: &AromHcNode, v: &AromHcNode, directly_bonded: bool, 
         sc -= if directly_bonded { 5.5 } else { 2.8 };
     }
     sc
+}
+
+fn pick_best_single_yamazaki_cb(
+    cands: &[(f64, f64)],
+    known_cbs: &[f64],
+    base_ok: f64,
+    base_miss: f64,
+    cfg: &AromaticSolverConfig,
+) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64)> = None;
+    for &(cb, dh) in cands {
+        let bb_ok =
+            known_cbs.is_empty() || known_cbs.iter().any(|&kcb| (kcb - cb).abs() <= cfg.tol_cb);
+        let sc = if bb_ok {
+            base_ok - dh / cfg.tol_h
+        } else {
+            base_miss - 0.5 * (dh / cfg.tol_h)
+        };
+        if best.is_none_or(|(_, b)| sc > b) {
+            best = Some((cb, sc));
+        }
+    }
+    best
 }
 
 /// Evaluate best `(cb_hd, cb_he)` Yamazaki agreement between an `HD` node and an `HE` node,
@@ -1927,7 +2184,7 @@ fn best_shared_yamazaki_cb(
                 } else {
                     0.0
                 };
-                let sc = 8.5 - 0.5 * z_cb * z_cb - 0.6 * z_h + bb_bonus;
+                let sc = 8.5 - 0.5 * z_cb * z_cb - 2.2 * z_h + bb_bonus;
                 if best.is_none_or(|(_, _, b)| sc > b) {
                     best = Some((cb1, cb2, sc));
                 }
@@ -1939,24 +2196,19 @@ fn best_shared_yamazaki_cb(
     }
 
     // Single-sided fallback if either HD or HE Yamazaki cross-peak dropped out
-    let best_hd = hd_node.cb_hd_cands.first().map(|&(cb, dh)| {
-        let bb_ok =
-            known_cbs.is_empty() || known_cbs.iter().any(|&kcb| (kcb - cb).abs() <= cfg.tol_cb);
-        (cb, if bb_ok { 2.5 - dh / cfg.tol_h } else { 0.5 })
-    });
-    let best_he = he_node.cb_he_cands.first().map(|&(cb, dh)| {
-        let bb_ok =
-            known_cbs.is_empty() || known_cbs.iter().any(|&kcb| (kcb - cb).abs() <= cfg.tol_cb);
-        (cb, if bb_ok { 2.2 - dh / cfg.tol_h } else { 0.4 })
-    });
+    let best_hd = pick_best_single_yamazaki_cb(&hd_node.cb_hd_cands, known_cbs, 2.5, 0.5, cfg);
+    let best_he = pick_best_single_yamazaki_cb(&he_node.cb_he_cands, known_cbs, 2.2, 0.4, cfg);
 
-    // If BOTH have unambiguous distinct CBs that disagree strongly, penalize pairing them!
+    // If BOTH have Yamazaki CB candidates and NO pair agrees within 1.25 * tol_cb, strongly penalize pairing them!
     if let (Some((c1, _)), Some((c2, _))) = (best_hd, best_he) {
-        if hd_node.cb_hd_cands.len() == 1
-            && he_node.cb_he_cands.len() == 1
-            && (c1 - c2).abs() > cfg.tol_cb
-        {
-            return (Some(c1), Some(c2), -7.5);
+        let any_close = hd_node.cb_hd_cands.iter().any(|&(cb1, _)| {
+            he_node
+                .cb_he_cands
+                .iter()
+                .any(|&(cb2, _)| (cb1 - cb2).abs() <= cfg.tol_cb * 1.25)
+        });
+        if !any_close {
+            return (Some(c1), Some(c2), -9.5);
         }
     }
     if let Some((c1, s1)) = best_hd {
@@ -1973,8 +2225,78 @@ fn margin_to_intra_conf(margin: f64) -> f64 {
     (1.0 / (1.0 + (-margin / 1.8).exp())).clamp(0.35, 1.0)
 }
 
-/// Infer `(ND1, NE2, HisTautomer, posterior)` for a paired `(opt_cd2, opt_ce1)` histidine ring
-/// from `HIS_LR_N15HMQC` cross-peaks and `(CD2, CE1, HE1, HD2, CB)` shifts.
+/// Score long-range `1H-15N` HMQC cross-peak intensity pattern `(hd_d1, hd_e2, he_d1, he_e2)`
+/// under a specific `HisTautomer` hypothesis per Pelton et al. (*Protein Sci.* 1993, 2, 543–558, Table 1):
+/// - `Ne2H` ($\tau$, `ND1` unprotonated `~249.5`, `NE2H` protonated `~168.5`):
+///   `3J(HD2, ND1) ~ 8.8 Hz` > `2J(HD2, NE2H) ~ 5.2 Hz`, and `2J(HE1, ND1) ~ 10.6 Hz` >= `2J(HE1, NE2H) ~ 5.2 Hz`.
+/// - `Nd1H` ($\pi$, `ND1H` protonated `~169.5`, `NE2` unprotonated `~249.5`):
+///   `2J(HD2, NE2) ~ 9.8 Hz` >> `3J(HD2, ND1H) ~ 1.4 Hz`, and `2J(HE1, NE2) ~ 10.6 Hz` >= `2J(HE1, ND1H) ~ 5.2 Hz`.
+/// - `DoublyProtonated` (`+1`, both `ND1H` and `NE2H` protonated):
+///   `2J(HE1, ND1H) ~ 5.4 Hz` ≈ `2J(HE1, NE2H) ~ 5.4 Hz`, and `2J(HD2, NE2H) ~ 5.4 Hz` > `3J(HD2, ND1H) ~ 1.4 Hz`.
+fn pelton_hmqc_coupling_llr(
+    st: HisTautomer,
+    hd_d1: f64,
+    hd_e2: f64,
+    he_d1: f64,
+    he_e2: f64,
+) -> f64 {
+    let mut lp = 0.0;
+    if he_d1 > 0.0 {
+        lp += 1.1;
+    }
+    if he_e2 > 0.0 {
+        lp += 1.1;
+    }
+    match st {
+        HisTautomer::Ne2H => {
+            if hd_d1 > 0.0 && (hd_e2 == 0.0 || hd_d1 >= 1.12 * hd_e2) {
+                lp += 3.4;
+            } else if hd_e2 > 1.35 * hd_d1 && hd_e2 > 0.0 {
+                lp -= 2.8;
+            }
+            if he_d1 > 0.0 && he_e2 > 0.0 {
+                if he_d1 >= 1.08 * he_e2 {
+                    lp += 1.4;
+                } else if he_e2 > 1.35 * he_d1 {
+                    lp -= 1.2;
+                }
+            }
+        }
+        HisTautomer::Nd1H => {
+            if hd_e2 > 0.0 && (hd_d1 == 0.0 || hd_e2 >= 1.45 * hd_d1) {
+                lp += 3.6;
+            } else if hd_d1 > 1.15 * hd_e2 && hd_d1 > 0.0 {
+                lp -= 3.6;
+            }
+            if he_d1 > 0.0 && he_e2 > 0.0 {
+                if he_e2 >= 1.08 * he_d1 {
+                    lp += 1.4;
+                } else if he_d1 > 1.35 * he_e2 {
+                    lp -= 1.2;
+                }
+            }
+        }
+        HisTautomer::DoublyProtonated => {
+            if hd_e2 > 0.0 && (hd_d1 == 0.0 || hd_e2 >= 1.35 * hd_d1) {
+                lp += 3.4;
+            } else if hd_d1 > 1.20 * hd_e2 && hd_d1 > 0.0 {
+                lp -= 3.4;
+            }
+            if he_d1 > 0.0 && he_e2 > 0.0 {
+                let ratio = he_d1.max(he_e2) / he_d1.min(he_e2).max(1e-6);
+                if ratio <= 1.45 {
+                    lp += 1.0;
+                } else {
+                    lp -= 0.6;
+                }
+            }
+        }
+    }
+    lp
+}
+
+/// Infer `(ND1, NE2, (HisStateClassification, confidence), shared_link_score)` for a paired
+/// `(opt_cd2, opt_ce1)` histidine ring from `HIS_LR_N15HMQC` cross-peaks and `(CD2, CE1, HE1, HD2, CB)` shifts.
 #[allow(clippy::type_complexity)]
 fn infer_his_nitrogens_and_tautomer(
     cd2_node: Option<&AromHcNode>,
@@ -1985,7 +2307,7 @@ fn infer_his_nitrogens_and_tautomer(
 ) -> (
     Option<(f64, f64)>,
     Option<(f64, f64)>,
-    (HisTautomer, f64),
+    (HisStateClassification, f64),
     f64,
 ) {
     // Gather HMQC (n_ppm, height) near HE1 and near HD2
@@ -2040,8 +2362,9 @@ fn infer_his_nitrogens_and_tautomer(
     let he1_ppm = ce1_node.map(|n| n.h);
 
     if all_ns.len() >= 2 {
-        // Evaluate all ordered pairs (i_nd1, i_ne2) with i_nd1 != i_ne2
-        let mut best_hyp: Option<(usize, usize, HisTautomer, f64, f64)> = None;
+        // Evaluate all ordered pairs (i_nd1, i_ne2) with i_nd1 != i_ne2 across canonical Pelton
+        // states AND Zn(II)-ligated / fast-exchange 15N sub-hypotheses.
+        let mut best_pair: Option<(usize, usize, f64)> = None;
         let mut second_lp = f64::NEG_INFINITY;
 
         for (i_d, &(n_d1, he_d1, hd_d1)) in all_ns.iter().enumerate() {
@@ -2049,102 +2372,189 @@ fn infer_his_nitrogens_and_tautomer(
                 if i_d == i_e {
                     continue;
                 }
-                let ev = HisTautomerEvidence {
-                    nd1_ppm: Some(n_d1),
-                    ne2_ppm: Some(n_e2),
-                    cd2_ppm,
-                    hd2_ppm,
-                    ce1_ppm,
-                    he1_ppm,
-                    cb_ppm: cb_hint,
-                };
-                let (st, post) = classify_his_tautomer(&ev);
-                let (p_nd1, p_ne2, p_cd2, _, p_ce1, p_he1, _) = st.shift_priors();
-                let mut lp =
-                    gauss_logpdf(n_d1, p_nd1.0, p_nd1.1) + gauss_logpdf(n_e2, p_ne2.0, p_ne2.1);
-                if let Some(v) = cd2_ppm {
-                    lp += gauss_logpdf(v, p_cd2.0, p_cd2.1);
-                }
-                if let Some(v) = ce1_ppm {
-                    lp += gauss_logpdf(v, p_ce1.0, p_ce1.1);
-                }
-                if let Some(v) = he1_ppm {
-                    lp += gauss_logpdf(v, p_he1.0, p_he1.1);
-                }
-                // Pelton 2J vs 3J rule: HD2 correlates much more strongly to NE2 (2J ~ 8.5 Hz) than ND1 (3J ~ 2 Hz)!
-                if hd_e2 > 0.0 && (hd_d1 == 0.0 || hd_e2 >= 1.5 * hd_d1) {
-                    lp += 3.6;
-                } else if hd_d1 > 1.5 * hd_e2 && hd_d1 > 0.0 {
-                    lp -= 3.6;
-                }
-                if he_d1 > 0.0 {
-                    lp += 1.2;
-                }
-                if he_e2 > 0.0 {
-                    lp += 1.2;
+                let mut lp_best_sub = f64::NEG_INFINITY;
+                let log_priors = [0.45_f64.ln(), 0.25_f64.ln(), 0.30_f64.ln()];
+                for (s_idx, &st) in HisTautomer::ALL.iter().enumerate() {
+                    let vp = st.variant_priors();
+                    let mut lp = log_priors[s_idx]
+                        + gauss_logpdf(n_d1, vp.nd1.0, vp.nd1.1)
+                        + gauss_logpdf(n_e2, vp.ne2.0, vp.ne2.1);
+                    if let Some(v) = cd2_ppm {
+                        lp += gauss_logpdf(v, vp.cd2.0, vp.cd2.1);
+                    }
+                    if let Some(v) = ce1_ppm {
+                        lp += gauss_logpdf(v, vp.ce1.0, vp.ce1.1);
+                    }
+                    if let Some(v) = he1_ppm {
+                        lp += gauss_logpdf(v, vp.he1.0, vp.he1.1);
+                    }
+                    lp += pelton_hmqc_coupling_llr(st, hd_d1, hd_e2, he_d1, he_e2);
+                    lp_best_sub = lp_best_sub.max(lp);
                 }
 
-                if best_hyp.is_none_or(|(_, _, _, _, blp)| lp > blp) {
-                    if let Some((_, _, _, _, blp)) = best_hyp {
+                // Zn(II)-ligated / fast-exchange sub-hypotheses so intermediate 185..230 ppm
+                // coordinating =N-M nitrogens still map accurately to ND1 vs NE2:
+                // (a) Zn-ND1 (tau-like, NE2-H protonated ~172 ppm, ND1-Zn ~208 ppm, CD2 ~118.5 ppm)
+                {
+                    let mut lp_zn_d1 = (0.08_f64).ln()
+                        + gauss_logpdf(n_d1, 208.0, 12.0)
+                        + gauss_logpdf(n_e2, 172.0, 5.5);
+                    if let Some(v) = cd2_ppm {
+                        lp_zn_d1 += gauss_logpdf(v, 118.5, 2.2);
+                    }
+                    if let Some(v) = he1_ppm {
+                        lp_zn_d1 += gauss_logpdf(v, 7.82, 0.35);
+                    }
+                    lp_zn_d1 +=
+                        pelton_hmqc_coupling_llr(HisTautomer::Ne2H, hd_d1, hd_e2, he_d1, he_e2);
+                    lp_best_sub = lp_best_sub.max(lp_zn_d1);
+                }
+                // (b) Zn-NE2 (pi-like, ND1-H protonated ~172 ppm, NE2-Zn ~208 ppm, CD2 ~124.5 ppm)
+                {
+                    let mut lp_zn_e2 = (0.06_f64).ln()
+                        + gauss_logpdf(n_d1, 172.0, 5.5)
+                        + gauss_logpdf(n_e2, 208.0, 12.0);
+                    if let Some(v) = cd2_ppm {
+                        lp_zn_e2 += gauss_logpdf(v, 124.5, 2.4);
+                    }
+                    if let Some(v) = he1_ppm {
+                        lp_zn_e2 += gauss_logpdf(v, 7.88, 0.35);
+                    }
+                    lp_zn_e2 +=
+                        pelton_hmqc_coupling_llr(HisTautomer::Nd1H, hd_d1, hd_e2, he_d1, he_e2);
+                    lp_best_sub = lp_best_sub.max(lp_zn_e2);
+                }
+
+                if best_pair.is_none_or(|(_, _, blp)| lp_best_sub > blp) {
+                    if let Some((_, _, blp)) = best_pair {
                         second_lp = second_lp.max(blp);
                     }
-                    best_hyp = Some((i_d, i_e, st, post, lp));
-                } else if lp > second_lp {
-                    second_lp = lp;
+                    best_pair = Some((i_d, i_e, lp_best_sub));
+                } else if lp_best_sub > second_lp {
+                    second_lp = lp_best_sub;
                 }
             }
         }
 
-        if let Some((i_d, i_e, st, post, blp)) = best_hyp {
+        if let Some((i_d, i_e, blp)) = best_pair {
             let n_conf = margin_to_intra_conf((blp - second_lp).max(0.0));
+            let ev = HisTautomerEvidence {
+                nd1_ppm: Some(all_ns[i_d].0),
+                ne2_ppm: Some(all_ns[i_e].0),
+                cg_ppm: None,
+                cd2_ppm,
+                hd2_ppm,
+                ce1_ppm,
+                he1_ppm,
+                cb_ppm: cb_hint,
+                sample_ph: cfg.sample_ph,
+                metal_coordinated_hint: cfg.metal_coordinated_hint,
+            };
+            let state = classify_his_state(&ev);
             return (
                 Some((all_ns[i_d].0, n_conf)),
                 Some((all_ns[i_e].0, n_conf)),
-                (st, post),
+                state,
                 shared_link_score,
             );
         }
     } else if all_ns.len() == 1 {
-        let (n_only, _, hd_ht) = all_ns[0];
-        // Test whether n_only is NE2 (preferred if HD2 sees it strongly) or ND1
-        let ev_as_ne2 = HisTautomerEvidence {
-            nd1_ppm: None,
-            ne2_ppm: Some(n_only),
-            cd2_ppm,
-            hd2_ppm,
-            ce1_ppm,
-            he1_ppm,
-            cb_ppm: cb_hint,
+        let (n_only, he_ht, hd_ht) = all_ns[0];
+        let score_single = |as_nd1: bool| -> f64 {
+            let mut best = f64::NEG_INFINITY;
+            for &st in &HisTautomer::ALL {
+                let vp = st.variant_priors();
+                let mut lp = if as_nd1 {
+                    gauss_logpdf(n_only, vp.nd1.0, vp.nd1.1)
+                } else {
+                    gauss_logpdf(n_only, vp.ne2.0, vp.ne2.1)
+                };
+                if let Some(v) = cd2_ppm {
+                    lp += gauss_logpdf(v, vp.cd2.0, vp.cd2.1);
+                }
+                if let Some(v) = ce1_ppm {
+                    lp += gauss_logpdf(v, vp.ce1.0, vp.ce1.1);
+                }
+                if let Some(v) = he1_ppm {
+                    lp += gauss_logpdf(v, vp.he1.0, vp.he1.1);
+                }
+                if hd_ht > 0.0 {
+                    lp += match (as_nd1, st) {
+                        (true, HisTautomer::Ne2H) => 2.0,
+                        (true, HisTautomer::Nd1H | HisTautomer::DoublyProtonated) => {
+                            if he_ht == 0.0 || hd_ht >= 0.75 * he_ht {
+                                -2.2
+                            } else {
+                                -0.6
+                            }
+                        }
+                        (false, HisTautomer::Nd1H | HisTautomer::DoublyProtonated) => 2.2,
+                        (false, HisTautomer::Ne2H) => 0.8,
+                    };
+                }
+                best = best.max(lp);
+            }
+            best
         };
-        let ev_as_nd1 = HisTautomerEvidence {
-            nd1_ppm: Some(n_only),
-            ne2_ppm: None,
-            cd2_ppm,
-            hd2_ppm,
-            ce1_ppm,
-            he1_ppm,
-            cb_ppm: cb_hint,
-        };
-        let (st_e2, p_e2) = classify_his_tautomer(&ev_as_ne2);
-        let (st_d1, p_d1) = classify_his_tautomer(&ev_as_nd1);
-        if hd_ht > 0.0 || p_e2 >= p_d1 {
-            return (None, Some((n_only, 0.82)), (st_e2, p_e2), shared_link_score);
+        let lp_d1 = score_single(true);
+        let lp_e2 = score_single(false);
+        if lp_e2 >= lp_d1 {
+            let ev_as_ne2 = HisTautomerEvidence {
+                nd1_ppm: None,
+                ne2_ppm: Some(n_only),
+                cg_ppm: None,
+                cd2_ppm,
+                hd2_ppm,
+                ce1_ppm,
+                he1_ppm,
+                cb_ppm: cb_hint,
+                sample_ph: cfg.sample_ph,
+                metal_coordinated_hint: cfg.metal_coordinated_hint,
+            };
+            let n_conf = margin_to_intra_conf((lp_e2 - lp_d1).max(0.4)).min(0.88);
+            return (
+                None,
+                Some((n_only, n_conf)),
+                classify_his_state(&ev_as_ne2),
+                shared_link_score,
+            );
         } else {
-            return (Some((n_only, 0.78)), None, (st_d1, p_d1), shared_link_score);
+            let ev_as_nd1 = HisTautomerEvidence {
+                nd1_ppm: Some(n_only),
+                ne2_ppm: None,
+                cg_ppm: None,
+                cd2_ppm,
+                hd2_ppm,
+                ce1_ppm,
+                he1_ppm,
+                cb_ppm: cb_hint,
+                sample_ph: cfg.sample_ph,
+                metal_coordinated_hint: cfg.metal_coordinated_hint,
+            };
+            let n_conf = margin_to_intra_conf((lp_d1 - lp_e2).max(0.4)).min(0.88);
+            return (
+                Some((n_only, n_conf)),
+                None,
+                classify_his_state(&ev_as_nd1),
+                shared_link_score,
+            );
         }
     }
 
     let ev_fallback = HisTautomerEvidence {
         nd1_ppm: None,
         ne2_ppm: None,
+        cg_ppm: None,
         cd2_ppm,
         hd2_ppm,
         ce1_ppm,
         he1_ppm,
         cb_ppm: cb_hint,
+        sample_ph: cfg.sample_ph,
+        metal_coordinated_hint: cfg.metal_coordinated_hint,
     };
-    let (st, post) = classify_his_tautomer(&ev_fallback);
-    (None, None, (st, post), shared_link_score)
+    let state = classify_his_state(&ev_fallback);
+    (None, None, state, shared_link_score)
 }
 
 /// Cluster observed 2D/3D aromatic peaks into candidate `PHE`, `TYR`, `TRP`, and `HIS`
@@ -2162,12 +2572,27 @@ pub fn cluster_aromatic_rings(
 
     // Collect known aromatic CB shifts from backbone_ref (only as unlabelled set of valid CB frequencies!)
     let mut known_arom_cbs: Vec<f64> = Vec::new();
+    let mut known_his_cbs: Vec<f64> = Vec::new();
+    let mut known_trp_cbs: Vec<f64> = Vec::new();
+    let mut known_tyr_cbs: Vec<f64> = Vec::new();
+    let mut known_phe_cbs: Vec<f64> = Vec::new();
     let (mut n_his_seq, mut n_trp_seq, mut n_tyr_seq, mut n_phe_seq) =
         (0usize, 0usize, 0usize, 0usize);
+    let mut n_his_anchored = 0usize;
     if let Some(bb) = backbone_ref {
+        let any_bb_global = !bb.shifts.is_empty();
         for (k, r) in bb.sequence.iter().enumerate() {
             match r.as_str() {
-                "HIS" => n_his_seq += 1,
+                "HIS" => {
+                    n_his_seq += 1;
+                    let has_bb_k = !any_bb_global
+                        || ["H", "N", "CA", "CB", "C"]
+                            .iter()
+                            .any(|a| bb.shifts.contains_key(&(k, (*a).to_string())));
+                    if has_bb_k {
+                        n_his_anchored += 1;
+                    }
+                }
                 "TRP" => n_trp_seq += 1,
                 "TYR" => n_tyr_seq += 1,
                 "PHE" => n_phe_seq += 1,
@@ -2175,6 +2600,13 @@ pub fn cluster_aromatic_rings(
             }
             if let Some(&cb) = bb.shifts.get(&(k, "CB".to_string())) {
                 known_arom_cbs.push(cb);
+                match r.as_str() {
+                    "HIS" => known_his_cbs.push(cb),
+                    "TRP" => known_trp_cbs.push(cb),
+                    "TYR" => known_tyr_cbs.push(cb),
+                    "PHE" => known_phe_cbs.push(cb),
+                    _ => {}
+                }
             }
         }
     }
@@ -2191,8 +2623,21 @@ pub fn cluster_aromatic_rings(
     } else {
         heights[heights.len() / 2]
     };
-    // If PHE/TYR dominate, median is closer to 1.6x; use 25th percentile as robust 1-proton scale
-    let h_1x = if heights.len() >= 4 {
+    // If PHE/TYR dominate, median is closer to ~2.0x; use sequence multiplicity balance or 25th percentile
+    let n_1x_exp = n_phe_seq + 5 * n_trp_seq + 2 * n_his_seq;
+    let n_2x_exp = 2 * n_phe_seq + 2 * n_tyr_seq;
+    let h_1x = if backbone_ref.is_some() && n_2x_exp > n_1x_exp {
+        let low_vals: Vec<f64> = heights
+            .iter()
+            .copied()
+            .filter(|&x| x < raw_med * 0.72)
+            .collect();
+        if !low_vals.is_empty() {
+            low_vals[low_vals.len() / 2].max(raw_med * 0.45)
+        } else {
+            raw_med * 0.53
+        }
+    } else if heights.len() >= 4 {
         heights[heights.len() / 4].max(raw_med * 0.52)
     } else {
         raw_med * 0.65
@@ -2207,13 +2652,13 @@ pub fn cluster_aromatic_rings(
         .iter()
         .filter(|p| {
             p.exp == "TRP_IND_N15HSQC"
-                || (p.exp == "HSQC" && p.h > 9.3 && (124.0..=136.0).contains(&p.n))
+                || (p.exp == "HSQC" && p.h > 8.8 && (120.0..=140.0).contains(&p.n))
         })
         .cloned()
         .collect();
     let trp_noes: Vec<Peak> = aromatic_peaks
         .iter()
-        .filter(|p| (p.exp == "NOESY15N" || p.exp == "TRP_IND_NOE") && p.h > 9.3 && p.h2.is_some())
+        .filter(|p| (p.exp == "NOESY15N" || p.exp == "TRP_IND_NOE") && p.h > 8.8 && p.h2.is_some())
         .cloned()
         .collect();
 
@@ -2221,7 +2666,7 @@ pub fn cluster_aromatic_rings(
     let mut clusters: Vec<AromaticRingCluster> = Vec::new();
 
     // ------------------------------------------------------------------------
-    // Family 1: Histidine Imidazole Rings (CD2/HD2, CE1/HE1, ND1, NE2, Tautomer)
+    // Family 1: Histidine Imidazole Rings (CD2/HD2, CE1/HE1, ND1, NE2, State)
     // ------------------------------------------------------------------------
     if backbone_ref.is_none() || n_his_seq > 0 {
         let is_trp_noe_proton = |h_val: f64| -> bool {
@@ -2237,17 +2682,25 @@ pub fn cluster_aromatic_rings(
                 let hmqc_hit = hmqc_peaks
                     .iter()
                     .any(|p| (p.h - n.h).abs() <= cfg.tol_h * 1.35);
+                let singlet_ce1_rescue = (134.8..=142.5).contains(&n.c)
+                    && (7.05..=9.45).contains(&n.h)
+                    && n.height < 1.45 * h_1x;
                 n.off_diag_tocsy_count(cfg.tol_h) == 0
                     && !is_trp_noe_proton(n.h)
-                    && ((hmqc_peaks.is_empty() && (133.5..=144.0).contains(&n.c))
-                        || (hmqc_hit && (131.5..=144.5).contains(&n.c)))
+                    && ((hmqc_peaks.is_empty()
+                        && (133.5..=144.0).contains(&n.c)
+                        && (7.05..=9.45).contains(&n.h))
+                        || (hmqc_hit
+                            && (131.5..=144.5).contains(&n.c)
+                            && (6.80..=9.50).contains(&n.h))
+                        || singlet_ce1_rescue)
             })
             .collect();
-        if backbone_ref.is_some() && ce1_cands.len() < n_his_seq {
+        if backbone_ref.is_some() && ce1_cands.len() < n_his_anchored {
             let mut by_ht = ce1_cands.clone();
             by_ht.sort_by(|&a, &b| nodes[b].height.total_cmp(&nodes[a].height));
             for u in by_ht {
-                if ce1_cands.len() < n_his_seq && nodes[u].height >= 1.32 * h_1x {
+                if ce1_cands.len() < n_his_anchored && nodes[u].height >= 1.75 * h_1x {
                     ce1_cands.push(u);
                 }
             }
@@ -2262,21 +2715,40 @@ pub fn cluster_aromatic_rings(
                 let hmqc_hit = hmqc_peaks
                     .iter()
                     .any(|p| (p.h - n.h).abs() <= cfg.tol_h * 1.35);
+                let his_cb_rescue = n.height < 1.45 * h_1x
+                    && (113.5..=126.6).contains(&n.c)
+                    && n.cb_hd_cands.iter().any(|&(cb, _)| {
+                        known_his_cbs
+                            .iter()
+                            .any(|&hcb| (hcb - cb).abs() <= cfg.tol_cb)
+                    });
+                let c_ok = if hmqc_hit {
+                    (112.5..=131.2).contains(&n.c)
+                } else {
+                    (113.5..=126.6).contains(&n.c)
+                };
                 n.off_diag_tocsy_count(cfg.tol_h) == 0
                     && !is_trp_noe_proton(n.h)
-                    && (112.5..=131.2).contains(&n.c)
-                    && (hmqc_hit || hmqc_peaks.is_empty())
+                    && (6.15..=8.35).contains(&n.h)
+                    && c_ok
+                    && (hmqc_hit || hmqc_peaks.is_empty() || his_cb_rescue)
             })
             .collect();
-        if backbone_ref.is_some() && cd2_cands.len() < n_his_seq {
+        if backbone_ref.is_some() && cd2_cands.len() < n_his_anchored {
             let mut by_ht = cd2_cands.clone();
             by_ht.sort_by(|&a, &b| nodes[b].height.total_cmp(&nodes[a].height));
             for u in by_ht {
-                if cd2_cands.len() < n_his_seq && nodes[u].height >= 1.32 * h_1x {
+                if cd2_cands.len() < n_his_anchored && nodes[u].height >= 1.75 * h_1x {
                     cd2_cands.push(u);
                 }
             }
         }
+
+        let make_his_taut_and_state = |st_pair: (HisStateClassification, f64), scale: f64| {
+            let conf = (st_pair.1 * scale).clamp(0.0, 1.0);
+            let resolved = st_pair.0.resolved_tautomer().map(|t| (t, conf));
+            (resolved, Some((st_pair.0, conf)))
+        };
 
         if !cd2_cands.is_empty() || !ce1_cands.is_empty() {
             let nr = cd2_cands.len();
@@ -2285,7 +2757,14 @@ pub fn cluster_aromatic_rings(
                 let mut w = vec![vec![FORBID_SCORE; nc]; nr];
                 for (ir, &u_cd2) in cd2_cands.iter().enumerate() {
                     for (ic, &u_ce1) in ce1_cands.iter().enumerate() {
-                        let cb_hint = nodes[u_cd2].cb_hd_cands.first().map(|x| x.0);
+                        let cb_hint = pick_best_single_yamazaki_cb(
+                            &nodes[u_cd2].cb_hd_cands,
+                            &known_arom_cbs,
+                            2.5,
+                            0.5,
+                            cfg,
+                        )
+                        .map(|x| x.0);
                         let (_, _, (_, t_post), link_sc) = infer_his_nitrogens_and_tautomer(
                             Some(&nodes[u_cd2]),
                             Some(&nodes[u_ce1]),
@@ -2306,9 +2785,40 @@ pub fn cluster_aromatic_rings(
                                     "HE1",
                                     CarbonRegion::Aromatic,
                                     nodes[u_ce1].h,
+                                )
+                                + priors.llr_c13(
+                                    "HIS",
+                                    "CD2",
+                                    CarbonRegion::Aromatic,
+                                    nodes[u_cd2].c,
                                 );
-                        let mut pair_sc = link_sc + 0.5 * cb_sc + 0.35 * prior_sc + t_post;
-                        if !hmqc_peaks.is_empty() && link_sc == 0.0 && cb_sc <= 0.0 {
+                        let his_cb_bonus = if !known_his_cbs.is_empty() {
+                            let matches_his = nodes[u_cd2].cb_hd_cands.iter().any(|&(cb, _)| {
+                                known_his_cbs.iter().any(|&h| (h - cb).abs() <= cfg.tol_cb)
+                            });
+                            let matches_only_trp = !matches_his
+                                && !known_trp_cbs.is_empty()
+                                && nodes[u_cd2].cb_hd_cands.iter().any(|&(cb, _)| {
+                                    known_trp_cbs.iter().any(|&w| (w - cb).abs() <= cfg.tol_cb)
+                                });
+                            if matches_his {
+                                4.5
+                            } else if matches_only_trp {
+                                -4.5
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+                        let prior_w = if hmqc_peaks.is_empty() { 0.65 } else { 0.35 };
+                        let mut pair_sc =
+                            link_sc + 0.5 * cb_sc + prior_w * prior_sc + his_cb_bonus + t_post;
+                        if !hmqc_peaks.is_empty()
+                            && link_sc == 0.0
+                            && cb_sc <= 0.0
+                            && !(nr == 1 && nc == 1 && n_his_seq == 1)
+                        {
                             pair_sc -= 5.0;
                         }
                         w[ir][ic] = pair_sc;
@@ -2317,9 +2827,10 @@ pub fn cluster_aromatic_rings(
                 let (r2c, best_tot) = hungarian_max_weight(&w);
                 let pair_margins = hungarian_margins(&w, &r2c, best_tot);
                 let mut matched_ce1 = vec![false; nc];
+                let min_pair_sc = if hmqc_peaks.is_empty() { 1.0 } else { -3.5 };
 
                 for (ir, &u_cd2) in cd2_cands.iter().enumerate() {
-                    let paired_ic = r2c[ir].filter(|&ic| w[ir][ic] > -3.5);
+                    let paired_ic = r2c[ir].filter(|&ic| w[ir][ic] > min_pair_sc);
                     if let Some(ic) = paired_ic {
                         matched_ce1[ic] = true;
                         let u_ce1 = ce1_cands[ic];
@@ -2331,7 +2842,7 @@ pub fn cluster_aromatic_rings(
                             &known_arom_cbs,
                             cfg,
                         );
-                        let (nd1, ne2, taut, link_sc) = infer_his_nitrogens_and_tautomer(
+                        let (nd1, ne2, st_pair, link_sc) = infer_his_nitrogens_and_tautomer(
                             Some(&nodes[u_cd2]),
                             Some(&nodes[u_ce1]),
                             cb_hd.or(cb_he),
@@ -2343,6 +2854,8 @@ pub fn cluster_aromatic_rings(
                         } else {
                             margin_to_intra_conf(pair_margins[ir])
                         };
+                        let (his_tautomer, his_state) =
+                            make_his_taut_and_state(st_pair, pair_conf.max(0.85));
                         let mut slots = BTreeMap::new();
                         slots.insert(
                             "CD2",
@@ -2367,20 +2880,45 @@ pub fn cluster_aromatic_rings(
                             cb_he,
                             nd1_ppm: nd1.map(|(v, c)| (v, c * pair_conf)),
                             ne2_ppm: ne2.map(|(v, c)| (v, c * pair_conf)),
-                            his_tautomer: Some((taut.0, taut.1 * pair_conf.max(0.85))),
+                            his_tautomer,
+                            his_state,
                             trp_indole: None,
                             internal_coherence: link_sc + cb_sc.max(0.0),
                         });
-                    } else if !used[u_cd2] {
+                    } else if !used[u_cd2]
+                        && (backbone_ref.is_none()
+                            || clusters
+                                .iter()
+                                .filter(|c| c.kind == AromaticRingKind::His)
+                                .count()
+                                < n_his_anchored)
+                        && (!hmqc_peaks.is_empty()
+                            || (n_trp_seq == 0 && n_phe_seq == 0)
+                            || nodes[u_cd2].cb_hd_cands.iter().any(|&(cb, _)| {
+                                known_his_cbs.iter().any(|&h| (h - cb).abs() <= cfg.tol_cb)
+                                    && ((113.5..=121.8).contains(&nodes[u_cd2].c)
+                                        || !known_trp_cbs
+                                            .iter()
+                                            .any(|&w| (w - cb).abs() <= cfg.tol_cb))
+                            }))
+                    {
                         used[u_cd2] = true;
-                        let cb_hd = nodes[u_cd2].cb_hd_cands.first().map(|x| x.0);
-                        let (nd1, ne2, taut, link_sc) = infer_his_nitrogens_and_tautomer(
+                        let cb_hd = pick_best_single_yamazaki_cb(
+                            &nodes[u_cd2].cb_hd_cands,
+                            &known_arom_cbs,
+                            2.5,
+                            0.5,
+                            cfg,
+                        )
+                        .map(|x| x.0);
+                        let (nd1, ne2, st_pair, link_sc) = infer_his_nitrogens_and_tautomer(
                             Some(&nodes[u_cd2]),
                             None,
                             cb_hd,
                             &hmqc_peaks,
                             cfg,
                         );
+                        let (his_tautomer, his_state) = make_his_taut_and_state(st_pair, 1.0);
                         let mut slots = BTreeMap::new();
                         slots.insert(
                             "CD2",
@@ -2397,23 +2935,77 @@ pub fn cluster_aromatic_rings(
                             cb_he: None,
                             nd1_ppm: nd1,
                             ne2_ppm: ne2,
-                            his_tautomer: Some(taut),
+                            his_tautomer,
+                            his_state,
                             trp_indole: None,
                             internal_coherence: link_sc,
                         });
                     }
                 }
+                let bridge_cb_hd_from_hmqc = |he1_h: f64,
+                                              nd1_opt: Option<(f64, f64)>,
+                                              ne2_opt: Option<(f64, f64)>|
+                 -> Option<f64> {
+                    let ns: Vec<f64> = [nd1_opt.map(|x| x.0), ne2_opt.map(|x| x.0)]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    if ns.is_empty() {
+                        return None;
+                    }
+                    let mut hd2_hs: Vec<f64> = Vec::new();
+                    for p in &hmqc_peaks {
+                        if (p.h - he1_h).abs() > cfg.tol_h * 1.5
+                            && ns.iter().any(|&nt| (p.n - nt).abs() <= cfg.tol_n)
+                        {
+                            hd2_hs.push(p.h);
+                        }
+                    }
+                    let mut cands: Vec<(f64, f64)> = Vec::new();
+                    for p in aromatic_peaks {
+                        if p.exp == "HBCBCGCDHD" {
+                            if let Some(cb) = p.c {
+                                if let Some(dh) = hd2_hs
+                                    .iter()
+                                    .map(|&hh| (hh - p.h).abs())
+                                    .filter(|&d| d <= cfg.tol_h * 1.25)
+                                    .min_by(|a, b| a.total_cmp(b))
+                                {
+                                    cands.push((cb, dh));
+                                }
+                            }
+                        }
+                    }
+                    pick_best_single_yamazaki_cb(&cands, &known_arom_cbs, 2.5, 0.5, cfg)
+                        .map(|x| x.0)
+                };
+
                 for (ic, &u_ce1) in ce1_cands.iter().enumerate() {
-                    if !matched_ce1[ic] && !used[u_ce1] {
+                    if !matched_ce1[ic]
+                        && !used[u_ce1]
+                        && (!hmqc_peaks.is_empty()
+                            || !nodes[u_ce1].cb_he_cands.is_empty()
+                            || ((7.35..=9.25).contains(&nodes[u_ce1].h)
+                                && (135.0..=140.5).contains(&nodes[u_ce1].c)))
+                    {
                         used[u_ce1] = true;
-                        let cb_he = nodes[u_ce1].cb_he_cands.first().map(|x| x.0);
-                        let (nd1, ne2, taut, link_sc) = infer_his_nitrogens_and_tautomer(
+                        let cb_he = pick_best_single_yamazaki_cb(
+                            &nodes[u_ce1].cb_he_cands,
+                            &known_arom_cbs,
+                            2.2,
+                            0.4,
+                            cfg,
+                        )
+                        .map(|x| x.0);
+                        let (nd1, ne2, st_pair, link_sc) = infer_his_nitrogens_and_tautomer(
                             None,
                             Some(&nodes[u_ce1]),
                             cb_he,
                             &hmqc_peaks,
                             cfg,
                         );
+                        let cb_hd = bridge_cb_hd_from_hmqc(nodes[u_ce1].h, nd1, ne2);
+                        let (his_tautomer, his_state) = make_his_taut_and_state(st_pair, 1.0);
                         let mut slots = BTreeMap::new();
                         slots.insert(
                             "CE1",
@@ -2426,11 +3018,12 @@ pub fn cluster_aromatic_rings(
                         clusters.push(AromaticRingCluster {
                             kind: AromaticRingKind::His,
                             ch_slots: slots,
-                            cb_hd: None,
+                            cb_hd,
                             cb_he,
                             nd1_ppm: nd1,
                             ne2_ppm: ne2,
-                            his_tautomer: Some(taut),
+                            his_tautomer,
+                            his_state,
                             trp_indole: None,
                             internal_coherence: link_sc,
                         });
@@ -2438,15 +3031,42 @@ pub fn cluster_aromatic_rings(
                 }
             } else {
                 for &u_cd2 in &cd2_cands {
+                    if used[u_cd2]
+                        || (backbone_ref.is_some()
+                            && clusters
+                                .iter()
+                                .filter(|c| c.kind == AromaticRingKind::His)
+                                .count()
+                                >= n_his_anchored)
+                        || (hmqc_peaks.is_empty()
+                            && (n_trp_seq > 0 || n_phe_seq > 0)
+                            && !nodes[u_cd2].cb_hd_cands.iter().any(|&(cb, _)| {
+                                known_his_cbs.iter().any(|&h| (h - cb).abs() <= cfg.tol_cb)
+                                    && ((113.5..=121.8).contains(&nodes[u_cd2].c)
+                                        || !known_trp_cbs
+                                            .iter()
+                                            .any(|&w| (w - cb).abs() <= cfg.tol_cb))
+                            }))
+                    {
+                        continue;
+                    }
                     used[u_cd2] = true;
-                    let cb_hd = nodes[u_cd2].cb_hd_cands.first().map(|x| x.0);
-                    let (nd1, ne2, taut, link_sc) = infer_his_nitrogens_and_tautomer(
+                    let cb_hd = pick_best_single_yamazaki_cb(
+                        &nodes[u_cd2].cb_hd_cands,
+                        &known_arom_cbs,
+                        2.5,
+                        0.5,
+                        cfg,
+                    )
+                    .map(|x| x.0);
+                    let (nd1, ne2, st_pair, link_sc) = infer_his_nitrogens_and_tautomer(
                         Some(&nodes[u_cd2]),
                         None,
                         cb_hd,
                         &hmqc_peaks,
                         cfg,
                     );
+                    let (his_tautomer, his_state) = make_his_taut_and_state(st_pair, 1.0);
                     let mut slots = BTreeMap::new();
                     slots.insert(
                         "CD2",
@@ -2463,21 +3083,59 @@ pub fn cluster_aromatic_rings(
                         cb_he: None,
                         nd1_ppm: nd1,
                         ne2_ppm: ne2,
-                        his_tautomer: Some(taut),
+                        his_tautomer,
+                        his_state,
                         trp_indole: None,
                         internal_coherence: link_sc,
                     });
                 }
                 for &u_ce1 in &ce1_cands {
                     used[u_ce1] = true;
-                    let cb_he = nodes[u_ce1].cb_he_cands.first().map(|x| x.0);
-                    let (nd1, ne2, taut, link_sc) = infer_his_nitrogens_and_tautomer(
+                    let cb_he = pick_best_single_yamazaki_cb(
+                        &nodes[u_ce1].cb_he_cands,
+                        &known_arom_cbs,
+                        2.2,
+                        0.4,
+                        cfg,
+                    )
+                    .map(|x| x.0);
+                    let (nd1, ne2, st_pair, link_sc) = infer_his_nitrogens_and_tautomer(
                         None,
                         Some(&nodes[u_ce1]),
                         cb_he,
                         &hmqc_peaks,
                         cfg,
                     );
+                    let mut cb_hd = None;
+                    if let Some(n1) = nd1.or(ne2).map(|x| x.0) {
+                        let hd2_hs: Vec<f64> = hmqc_peaks
+                            .iter()
+                            .filter(|p| {
+                                (p.h - nodes[u_ce1].h).abs() > cfg.tol_h * 1.5
+                                    && (p.n - n1).abs() <= cfg.tol_n
+                            })
+                            .map(|p| p.h)
+                            .collect();
+                        let mut cands: Vec<(f64, f64)> = Vec::new();
+                        for p in aromatic_peaks {
+                            if p.exp == "HBCBCGCDHD" {
+                                if let Some(cb) = p.c {
+                                    if let Some(dh) = hd2_hs
+                                        .iter()
+                                        .map(|&hh| (hh - p.h).abs())
+                                        .filter(|&d| d <= cfg.tol_h * 1.25)
+                                        .min_by(|a, b| a.total_cmp(b))
+                                    {
+                                        cands.push((cb, dh));
+                                    }
+                                }
+                            }
+                        }
+                        cb_hd =
+                            pick_best_single_yamazaki_cb(&cands, &known_arom_cbs, 2.5, 0.5, cfg)
+                                .map(|x| x.0);
+                    }
+                    let (his_tautomer, his_state) = make_his_taut_and_state(st_pair, 1.0);
                     let mut slots = BTreeMap::new();
                     slots.insert(
                         "CE1",
@@ -2490,11 +3148,12 @@ pub fn cluster_aromatic_rings(
                     clusters.push(AromaticRingCluster {
                         kind: AromaticRingKind::His,
                         ch_slots: slots,
-                        cb_hd: None,
+                        cb_hd,
                         cb_he,
                         nd1_ppm: nd1,
                         ne2_ppm: ne2,
-                        his_tautomer: Some(taut),
+                        his_tautomer,
+                        his_state,
                         trp_indole: None,
                         internal_coherence: link_sc,
                     });
@@ -2507,47 +3166,137 @@ pub fn cluster_aromatic_rings(
     // Family 2: Tryptophan Bicyclic Indole Rings (CD1 + CE3-CZ3-CH2-CZ2 + NE1/HE1)
     // ------------------------------------------------------------------------
     if backbone_ref.is_none() || n_trp_seq > 0 {
-        // Seed benzenoid 4-spin chains from unclaimed CZ2 (~114.4 ppm) or multi-TOCSY nodes in 108.5..119.5 ppm
+        let is_likely_tyr_ce = |u: usize| -> bool {
+            n_tyr_seq > 0 && (114.5..=120.8).contains(&nodes[u].c) && {
+                nodes[u].cb_he_cands.iter().any(|&(cb, _)| {
+                    if !known_tyr_cbs.is_empty() || !known_trp_cbs.is_empty() {
+                        known_tyr_cbs
+                            .iter()
+                            .any(|&tcb| (tcb - cb).abs() <= cfg.tol_cb)
+                            && !known_trp_cbs
+                                .iter()
+                                .any(|&wcb| (wcb - cb).abs() <= cfg.tol_cb)
+                    } else {
+                        cb >= 36.2
+                    }
+                })
+            }
+        };
+
+        let has_tocsy_exp = aromatic_peaks
+            .iter()
+            .any(|p| p.exp == "AROM_HCCH_TOCSY" || p.exp == "HCCHTOCSY");
+
+        // Seed benzenoid 4-spin chains from unclaimed CZ2 (~114.4 ppm, 108.5..119.8 ppm)
         let mut cz2_seeds: Vec<usize> = (0..nodes.len())
             .filter(|&u| {
                 !used[u]
-                    && (108.5..=119.5).contains(&nodes[u].c)
+                    && !is_likely_tyr_ce(u)
+                    && (108.5..=119.8).contains(&nodes[u].c)
                     && (nodes[u].off_diag_tocsy_count(cfg.tol_h) >= 1
-                        || nodes[u].height < 1.55 * h_1x)
+                        || (!has_tocsy_exp && nodes[u].height < 1.55 * h_1x))
             })
             .collect();
-        cz2_seeds.sort_by(|&a, &b| nodes[a].c.total_cmp(&nodes[b].c));
-        if backbone_ref.is_some() && cz2_seeds.len() > n_trp_seq {
-            cz2_seeds.truncate(n_trp_seq);
-        }
+        cz2_seeds.sort_by(|&a, &b| {
+            let multi_a = u8::from(nodes[a].off_diag_tocsy_count(cfg.tol_h) >= 2);
+            let multi_b = u8::from(nodes[b].off_diag_tocsy_count(cfg.tol_h) >= 2);
+            let one_x_a = u8::from(nodes[a].height < 1.55 * h_1x);
+            let one_x_b = u8::from(nodes[b].height < 1.55 * h_1x);
+            let core_cz2_a = u8::from((110.5..=117.6).contains(&nodes[a].c));
+            let core_cz2_b = u8::from((110.5..=117.6).contains(&nodes[b].c));
+            let conn_a = u8::from(nodes[a].off_diag_tocsy_count(cfg.tol_h) >= 1)
+                + u8::from(trp_noes.iter().any(|np| {
+                    np.h2
+                        .is_some_and(|h2| (h2 - nodes[a].h).abs() <= cfg.tol_h * 1.25)
+                }));
+            let conn_b = u8::from(nodes[b].off_diag_tocsy_count(cfg.tol_h) >= 1)
+                + u8::from(trp_noes.iter().any(|np| {
+                    np.h2
+                        .is_some_and(|h2| (h2 - nodes[b].h).abs() <= cfg.tol_h * 1.25)
+                }));
+            multi_b
+                .cmp(&multi_a)
+                .then_with(|| one_x_b.cmp(&one_x_a))
+                .then_with(|| core_cz2_b.cmp(&core_cz2_a))
+                .then_with(|| conn_b.cmp(&conn_a))
+                .then_with(|| nodes[a].c.total_cmp(&nodes[b].c))
+        });
+
+        let active_cz2_seeds: Vec<usize> = if backbone_ref.is_some() {
+            cz2_seeds.iter().copied().take(n_trp_seq).collect()
+        } else {
+            cz2_seeds.clone()
+        };
+
+        let has_trp_cb_he = |u: usize| -> bool {
+            nodes[u].cb_he_cands.iter().any(|&(cb, _)| {
+                if !known_trp_cbs.is_empty() {
+                    known_trp_cbs
+                        .iter()
+                        .any(|&wcb| (wcb - cb).abs() <= cfg.tol_cb)
+                } else {
+                    cb < 36.2
+                }
+            })
+        };
+
+        let tocsy_pair_amp = |u: usize, v: usize| -> f64 {
+            let a1 = nodes[u].tocsy_amp_to(nodes[v].h, cfg.tol_h);
+            let a2 = nodes[v].tocsy_amp_to(nodes[u].h, cfg.tol_h);
+            if a1 > 0.0 && a2 > 0.0 {
+                0.5 * (a1 + a2)
+            } else {
+                a1.max(a2)
+            }
+        };
+
+        let is_reserved_other_cz2 = |v: usize, u_self: usize| -> bool {
+            v != u_self
+                && nodes[v].c <= 117.2
+                && active_cz2_seeds.contains(&v)
+                && (backbone_ref.is_none() || active_cz2_seeds.len() <= n_trp_seq)
+        };
 
         #[allow(clippy::type_complexity)]
         let mut benz_chains: Vec<([Option<usize>; 4], f64, [f64; 4])> = Vec::new();
+        let mut trp_node_uses = vec![0usize; nodes.len()];
         for &u_cz2 in &cz2_seeds {
-            if used[u_cz2] {
+            if used[u_cz2] || (backbone_ref.is_some() && benz_chains.len() >= n_trp_seq) {
                 continue;
             }
-            // Candidate pool for (CE3, CZ3, CH2) connected to u_cz2 in 114.5..129.5 ppm
+            // Candidate pool for (CE3, CZ3, CH2) connected to u_cz2 in 114.0..130.5 ppm
             let mut pool: Vec<usize> = (0..nodes.len())
                 .filter(|&v| {
                     !used[v]
                         && v != u_cz2
-                        && (114.5..=129.5).contains(&nodes[v].c)
-                        && (arom_tocsy_edge_score(&nodes[u_cz2], &nodes[v], false, cfg.tol_h) > 0.5
-                            || nodes[u_cz2].off_diag_tocsy_count(cfg.tol_h) == 0)
+                        && !is_reserved_other_cz2(v, u_cz2)
+                        && !is_likely_tyr_ce(v)
+                        && (114.0..=130.5).contains(&nodes[v].c)
+                        && (is_verified_tocsy_link(&nodes[u_cz2], &nodes[v], cfg.tol_h)
+                            || (!has_tocsy_exp
+                                && nodes[u_cz2].off_diag_tocsy_count(cfg.tol_h) == 0
+                                && nodes[v].height < 1.62 * h_1x))
                 })
                 .collect();
-            // Expand by 1 more TOCSY hop (for CE3 which is 3 bonds from CZ2)
-            let hop1 = pool.clone();
-            for &m in &hop1 {
-                for v in 0..nodes.len() {
-                    if !used[v]
-                        && v != u_cz2
-                        && !pool.contains(&v)
-                        && (114.5..=129.5).contains(&nodes[v].c)
-                        && arom_tocsy_edge_score(&nodes[m], &nodes[v], true, cfg.tol_h) > 1.8
-                    {
-                        pool.push(v);
+            if has_tocsy_exp && pool.is_empty() {
+                continue;
+            }
+            // Expand by up to 2 TOCSY hops (CZ2 -> CH2 -> CZ3 -> CE3 when 2-/3-bond relays drop out)
+            for _ in 0..2 {
+                let cur = pool.clone();
+                for &m in &cur {
+                    for v in 0..nodes.len() {
+                        if !used[v]
+                            && v != u_cz2
+                            && !is_reserved_other_cz2(v, u_cz2)
+                            && !is_likely_tyr_ce(v)
+                            && !pool.contains(&v)
+                            && (114.0..=130.5).contains(&nodes[v].c)
+                            && is_verified_tocsy_link(&nodes[m], &nodes[v], cfg.tol_h)
+                            && arom_tocsy_edge_score(&nodes[m], &nodes[v], true, cfg.tol_h) > 1.8
+                        {
+                            pool.push(v);
+                        }
                     }
                 }
             }
@@ -2582,8 +3331,10 @@ pub fn cluster_aromatic_rings(
                         if let Some(u) = o_ce3 {
                             sc += priors.llr_c13("TRP", "CE3", CarbonRegion::Aromatic, nodes[u].c)
                                 + priors.llr_h1("TRP", "HE3", CarbonRegion::Aromatic, nodes[u].h);
-                            if !nodes[u].cb_he_cands.is_empty() {
-                                sc += 3.8;
+                            if has_trp_cb_he(u) {
+                                sc += 5.6;
+                            } else if !nodes[u].cb_he_cands.is_empty() {
+                                sc += 2.2;
                             }
                         } else {
                             sc -= 2.2;
@@ -2604,8 +3355,54 @@ pub fn cluster_aromatic_rings(
                         if let (Some(u1), Some(u2)) = (o_ce3, o_cz3) {
                             sc += arom_tocsy_edge_score(&nodes[u1], &nodes[u2], true, cfg.tol_h);
                         }
+                        if let (Some(u1), Some(u3)) = (o_ce3, o_ch2) {
+                            let w23 = if o_cz3.is_none() { 0.90 } else { 0.55 };
+                            sc += w23
+                                * arom_tocsy_edge_score(&nodes[u1], &nodes[u3], false, cfg.tol_h);
+                        }
                         if let (Some(u2), Some(u3)) = (o_cz3, o_ch2) {
                             sc += arom_tocsy_edge_score(&nodes[u2], &nodes[u3], true, cfg.tol_h);
+                        }
+                        if let Some(u2) = o_cz3 {
+                            let w24 = if o_ch2.is_none() { 0.90 } else { 0.55 };
+                            sc += w24
+                                * arom_tocsy_edge_score(
+                                    &nodes[u2],
+                                    &nodes[u_cz2],
+                                    false,
+                                    cfg.tol_h,
+                                );
+                        }
+                        if let Some(u1) = o_ce3 {
+                            sc += 0.35
+                                * arom_tocsy_edge_score(
+                                    &nodes[u1],
+                                    &nodes[u_cz2],
+                                    false,
+                                    cfg.tol_h,
+                                );
+                        }
+                        // Mild isotropic-mixing 13C-13C TOCSY step-attenuation bonus along CE3(0)-CZ3(1)-CH2(2)-CZ2(3)
+                        if let (Some(u_ch2), Some(u_cz3)) = (o_ch2, o_cz3) {
+                            let i1 = tocsy_pair_amp(u_cz2, u_ch2);
+                            let i2 = tocsy_pair_amp(u_cz2, u_cz3);
+                            if i1 > 0.0 && i2 > 0.0 && i1 >= 1.28 * i2 {
+                                sc += 0.9;
+                            }
+                        }
+                        if let (Some(u_ch2), Some(u_ce3)) = (o_ch2, o_ce3) {
+                            let i1 = tocsy_pair_amp(u_cz2, u_ch2);
+                            let i3 = tocsy_pair_amp(u_cz2, u_ce3);
+                            if i1 > 0.0 && i3 > 0.0 && i1 >= 1.35 * i3 {
+                                sc += 1.1;
+                            }
+                        }
+                        if let (Some(u_ce3), Some(u_cz3), Some(u_ch2)) = (o_ce3, o_cz3, o_ch2) {
+                            let j1 = tocsy_pair_amp(u_ce3, u_cz3);
+                            let j2 = tocsy_pair_amp(u_ce3, u_ch2);
+                            if j1 > 0.0 && j2 > 0.0 && j1 >= 1.28 * j2 {
+                                sc += 0.9;
+                            }
                         }
                         let arr = [o_ce3, o_cz3, o_ch2, Some(u_cz2)];
                         if sc > best_sc {
@@ -2631,23 +3428,147 @@ pub fn cluster_aromatic_rings(
                 };
             }
             for u in best_arr.into_iter().flatten() {
-                used[u] = true;
+                trp_node_uses[u] += 1;
+                let cap = if u != u_cz2 && nodes[u].height >= 1.72 * h_1x {
+                    2
+                } else {
+                    1
+                };
+                if trp_node_uses[u] >= cap {
+                    used[u] = true;
+                }
             }
             benz_chains.push((best_arr, best_sc, slot_confs));
         }
 
+        // Rescue partial TRP benzenoid chains when CZ2 dropped out in AROM_C13HSQC
+        if backbone_ref.is_none() || benz_chains.len() < n_trp_seq {
+            let mut ce3_rescue_seeds: Vec<usize> = (0..nodes.len())
+                .filter(|&u| {
+                    !used[u]
+                        && !is_likely_tyr_ce(u)
+                        && (117.5..=125.8).contains(&nodes[u].c)
+                        && has_trp_cb_he(u)
+                        && nodes[u].height < 1.58 * h_1x
+                })
+                .collect();
+            ce3_rescue_seeds.sort_by(|&a, &b| {
+                nodes[b]
+                    .off_diag_tocsy_count(cfg.tol_h)
+                    .cmp(&nodes[a].off_diag_tocsy_count(cfg.tol_h))
+            });
+            for u_ce3 in ce3_rescue_seeds {
+                if used[u_ce3] || (backbone_ref.is_some() && benz_chains.len() >= n_trp_seq) {
+                    continue;
+                }
+                let mut pool: Vec<usize> = (0..nodes.len())
+                    .filter(|&v| {
+                        !used[v]
+                            && v != u_ce3
+                            && !is_likely_tyr_ce(v)
+                            && (118.0..=130.2).contains(&nodes[v].c)
+                            && is_verified_tocsy_link(&nodes[u_ce3], &nodes[v], cfg.tol_h)
+                    })
+                    .collect();
+                let cur = pool.clone();
+                for &m in &cur {
+                    for v in 0..nodes.len() {
+                        if !used[v]
+                            && v != u_ce3
+                            && !is_likely_tyr_ce(v)
+                            && !pool.contains(&v)
+                            && (118.0..=130.2).contains(&nodes[v].c)
+                            && is_verified_tocsy_link(&nodes[m], &nodes[v], cfg.tol_h)
+                            && arom_tocsy_edge_score(&nodes[m], &nodes[v], true, cfg.tol_h) > 1.8
+                        {
+                            pool.push(v);
+                        }
+                    }
+                }
+                let mut opts: Vec<Option<usize>> = pool.iter().copied().map(Some).collect();
+                opts.push(None);
+                let mut best_arr = [Some(u_ce3), None, None, None];
+                let mut best_sc =
+                    priors.llr_c13("TRP", "CE3", CarbonRegion::Aromatic, nodes[u_ce3].c)
+                        + priors.llr_h1("TRP", "HE3", CarbonRegion::Aromatic, nodes[u_ce3].h)
+                        + 2.0;
+                for &o_cz3 in &opts {
+                    for &o_ch2 in &opts {
+                        if o_cz3.is_some() && o_cz3 == o_ch2 {
+                            continue;
+                        }
+                        let mut sc =
+                            priors.llr_c13("TRP", "CE3", CarbonRegion::Aromatic, nodes[u_ce3].c)
+                                + priors.llr_h1(
+                                    "TRP",
+                                    "HE3",
+                                    CarbonRegion::Aromatic,
+                                    nodes[u_ce3].h,
+                                )
+                                + 5.6;
+                        if let Some(u) = o_cz3 {
+                            sc += priors.llr_c13("TRP", "CZ3", CarbonRegion::Aromatic, nodes[u].c)
+                                + priors.llr_h1("TRP", "HZ3", CarbonRegion::Aromatic, nodes[u].h)
+                                + arom_tocsy_edge_score(&nodes[u_ce3], &nodes[u], true, cfg.tol_h);
+                        } else {
+                            sc -= 2.2;
+                        }
+                        if let Some(u) = o_ch2 {
+                            sc += priors.llr_c13("TRP", "CH2", CarbonRegion::Aromatic, nodes[u].c)
+                                + priors.llr_h1("TRP", "HH2", CarbonRegion::Aromatic, nodes[u].h);
+                        } else {
+                            sc -= 2.2;
+                        }
+                        if let (Some(u2), Some(u3)) = (o_cz3, o_ch2) {
+                            sc += arom_tocsy_edge_score(&nodes[u2], &nodes[u3], true, cfg.tol_h);
+                        }
+                        if sc > best_sc {
+                            best_sc = sc;
+                            best_arr = [Some(u_ce3), o_cz3, o_ch2, None];
+                        }
+                    }
+                }
+                for u in best_arr.into_iter().flatten() {
+                    used[u] = true;
+                }
+                benz_chains.push((best_arr, best_sc, [0.92, 0.88, 0.88, 0.0]));
+            }
+        }
+
         // Pair each benzenoid chain with pyrrole CD1/HD1 and TRP_IND_N15HSQC (NE1, HE1)
-        let cd1_cands: Vec<usize> = (0..nodes.len())
-            .filter(|&u| {
-                !used[u]
-                    && (119.5..=132.5).contains(&nodes[u].c)
-                    && nodes[u].off_diag_tocsy_count(cfg.tol_h) == 0
-                    && (!nodes[u].cb_hd_cands.is_empty() || nodes[u].height < 1.65 * h_1x)
-            })
-            .collect();
+        let mut cd1_cands: Vec<usize> = Vec::new();
+        for u in 0..nodes.len() {
+            if !used[u]
+                && (119.5..=133.2).contains(&nodes[u].c)
+                && nodes[u].off_diag_tocsy_count(cfg.tol_h) == 0
+                && (!nodes[u].cb_hd_cands.is_empty() || nodes[u].height < 1.65 * h_1x)
+            {
+                cd1_cands.push(u);
+                if nodes[u].height >= 1.75 * h_1x {
+                    cd1_cands.push(u);
+                }
+            }
+        }
 
         let nb = benz_chains.len();
         if nb > 0 {
+            let ce3_h_overlapped: Vec<bool> = (0..nb)
+                .map(|ib| {
+                    nb > 1
+                        && benz_chains[ib].0[0].is_some_and(|u_ce3| {
+                            benz_chains
+                                .iter()
+                                .enumerate()
+                                .any(|(jb, &(other_arr, _, _))| {
+                                    jb != ib
+                                        && other_arr[0].is_some_and(|u2| {
+                                            (nodes[u_ce3].h - nodes[u2].h).abs() <= cfg.tol_h * 1.25
+                                        })
+                                })
+                        })
+                })
+                .collect();
+
             let mut w_cd1 = vec![vec![FORBID_SCORE; cd1_cands.len().max(1)]; nb];
             if !cd1_cands.is_empty() {
                 for (ib, &(arr, _, _)) in benz_chains.iter().enumerate() {
@@ -2667,7 +3588,20 @@ pub fn cluster_aromatic_rings(
                                 &known_arom_cbs,
                                 cfg,
                             );
-                            sc += cb_sc;
+                            if cb_sc <= -8.0 && ce3_h_overlapped[ib] {
+                                // u_ce3's true cb_he may have dropped out while a 1H-degenerate neighbor CE3's cb_he bled onto u_ce3
+                                if let Some((_, hd_sc)) = pick_best_single_yamazaki_cb(
+                                    &nodes[u_cd1].cb_hd_cands,
+                                    &known_trp_cbs,
+                                    2.5,
+                                    0.5,
+                                    cfg,
+                                ) {
+                                    sc += hd_sc - 0.5;
+                                }
+                            } else {
+                                sc += cb_sc;
+                            }
                         }
                         // Bonus if an indole NH root sees BOTH HD1 and HZ2 via NOE!
                         if let Some(u_cz2) = arr[3] {
@@ -2703,6 +3637,38 @@ pub fn cluster_aromatic_rings(
             let mut used_ind = vec![false; trp_ind_roots.len()];
 
             for (ib, &(arr, b_sc, s_confs)) in benz_chains.iter().enumerate() {
+                let ce3_cb_ambig = if nb <= 1 {
+                    false
+                } else if let Some(u_ce3) = arr[0] {
+                    let cands = &nodes[u_ce3].cb_he_cands;
+                    let h_overlapped_other_ce3 =
+                        benz_chains
+                            .iter()
+                            .enumerate()
+                            .any(|(jb, &(other_arr, _, _))| {
+                                jb != ib
+                                    && other_arr[0].is_some_and(|u2| {
+                                        (nodes[u_ce3].h - nodes[u2].h).abs() <= cfg.tol_h * 1.25
+                                    })
+                            });
+                    if cands.is_empty() || h_overlapped_other_ce3 {
+                        trp_noes.is_empty()
+                    } else {
+                        cands.iter().enumerate().any(|(i, &(cb1, _))| {
+                            cands[(i + 1)..]
+                                .iter()
+                                .any(|&(cb2, _)| (cb1 - cb2).abs() > cfg.tol_cb * 0.65)
+                        }) && trp_noes.is_empty()
+                    }
+                } else {
+                    trp_noes.is_empty()
+                };
+                let benz_link_scale = if ce3_cb_ambig {
+                    margin_to_intra_conf(d_margins[ib])
+                } else {
+                    1.0
+                };
+
                 let mut slots = BTreeMap::new();
                 let names = ["CE3", "CZ3", "CH2", "CZ2"];
                 for (si, &c_name) in names.iter().enumerate() {
@@ -2712,14 +3678,23 @@ pub fn cluster_aromatic_rings(
                             RingChSlot {
                                 c_ppm: nodes[u].c,
                                 h_ppm: nodes[u].h,
-                                intra_conf: s_confs[si],
+                                intra_conf: s_confs[si] * benz_link_scale,
                             },
                         );
                     }
                 }
 
                 let mut cb_hd = None;
-                let mut cb_he = arr[0].and_then(|u| nodes[u].cb_he_cands.first().map(|x| x.0));
+                let mut cb_he = arr[0].and_then(|u| {
+                    pick_best_single_yamazaki_cb(
+                        &nodes[u].cb_he_cands,
+                        &known_arom_cbs,
+                        2.2,
+                        0.4,
+                        cfg,
+                    )
+                    .map(|x| x.0)
+                });
 
                 if !cd1_cands.is_empty() {
                     if let Some(id) = b2d[ib].filter(|&id| w_cd1[ib][id] > -4.0) {
@@ -2739,16 +3714,50 @@ pub fn cluster_aromatic_rings(
                             },
                         );
                         if let Some(u_ce3) = arr[0] {
-                            let (c1, c2, _) = best_shared_yamazaki_cb(
+                            let (c1, c2, sh_sc) = best_shared_yamazaki_cb(
                                 &nodes[u_cd1],
                                 &nodes[u_ce3],
                                 &known_arom_cbs,
                                 cfg,
                             );
-                            cb_hd = c1.or_else(|| nodes[u_cd1].cb_hd_cands.first().map(|x| x.0));
-                            cb_he = c2.or(cb_he);
+                            cb_hd = c1.or_else(|| {
+                                pick_best_single_yamazaki_cb(
+                                    &nodes[u_cd1].cb_hd_cands,
+                                    &known_arom_cbs,
+                                    2.5,
+                                    0.5,
+                                    cfg,
+                                )
+                                .map(|x| x.0)
+                            });
+                            if sh_sc <= -8.0 && ce3_h_overlapped[ib] {
+                                cb_he = None;
+                            } else {
+                                cb_he = c2.or(cb_he);
+                            }
                         } else {
-                            cb_hd = nodes[u_cd1].cb_hd_cands.first().map(|x| x.0);
+                            cb_hd = pick_best_single_yamazaki_cb(
+                                &nodes[u_cd1].cb_hd_cands,
+                                &known_arom_cbs,
+                                2.5,
+                                0.5,
+                                cfg,
+                            )
+                            .map(|x| x.0);
+                        }
+                    } else if ce3_h_overlapped[ib] {
+                        if let Some(c_spill) = cb_he {
+                            let claimed_by_other = (0..nb).any(|jb| {
+                                jb != ib
+                                    && benz_chains[jb].0[0].is_some_and(|u2| {
+                                        nodes[u2].cb_he_cands.iter().any(|&(cb2, _)| {
+                                            (cb2 - c_spill).abs() <= cfg.tol_cb * 0.75
+                                        })
+                                    })
+                            });
+                            if claimed_by_other {
+                                cb_he = None;
+                            }
                         }
                     }
                 }
@@ -2814,8 +3823,64 @@ pub fn cluster_aromatic_rings(
                     nd1_ppm: None,
                     ne2_ppm: None,
                     his_tautomer: None,
+                    his_state: None,
                     trp_indole,
                     internal_coherence: b_sc,
+                });
+            }
+        }
+
+        // Rescue remaining unambiguous TRP CD1 singlets when benzenoid CZ2/CE3 dropped out
+        for &u_cd1 in &cd1_cands {
+            if used[u_cd1]
+                || (backbone_ref.is_some()
+                    && clusters
+                        .iter()
+                        .filter(|c| c.kind == AromaticRingKind::Trp)
+                        .count()
+                        >= n_trp_seq)
+            {
+                continue;
+            }
+            let matches_trp_cb = !known_trp_cbs.is_empty()
+                && nodes[u_cd1].cb_hd_cands.iter().any(|&(cb, _)| {
+                    known_trp_cbs.iter().any(|&w| (w - cb).abs() <= cfg.tol_cb)
+                        && !known_phe_cbs.iter().any(|&f| (f - cb).abs() <= cfg.tol_cb)
+                        && !known_tyr_cbs.iter().any(|&y| (y - cb).abs() <= cfg.tol_cb)
+                });
+            if (121.5..=130.5).contains(&nodes[u_cd1].c)
+                && nodes[u_cd1].height < 1.55 * h_1x
+                && matches_trp_cb
+            {
+                used[u_cd1] = true;
+                let cb_hd = pick_best_single_yamazaki_cb(
+                    &nodes[u_cd1].cb_hd_cands,
+                    &known_trp_cbs,
+                    2.5,
+                    0.5,
+                    cfg,
+                )
+                .map(|x| x.0);
+                let mut slots = BTreeMap::new();
+                slots.insert(
+                    "CD1",
+                    RingChSlot {
+                        c_ppm: nodes[u_cd1].c,
+                        h_ppm: nodes[u_cd1].h,
+                        intra_conf: 0.90,
+                    },
+                );
+                clusters.push(AromaticRingCluster {
+                    kind: AromaticRingKind::Trp,
+                    ch_slots: slots,
+                    cb_hd,
+                    cb_he: None,
+                    nd1_ppm: None,
+                    ne2_ppm: None,
+                    his_tautomer: None,
+                    his_state: None,
+                    trp_indole: None,
+                    internal_coherence: 3.5,
                 });
             }
         }
@@ -2827,7 +3892,13 @@ pub fn cluster_aromatic_rings(
     if backbone_ref.is_none() || n_tyr_seq > 0 {
         let mut tyr_ce_slots: Vec<usize> = Vec::new();
         for (u, n) in nodes.iter().enumerate() {
-            if used[u] || !(112.0..=124.2).contains(&n.c) {
+            if used[u] || !(111.0..=124.5).contains(&n.c) {
+                continue;
+            }
+            let plausible_tyr_ce = n.height >= 1.32 * h_1x
+                || ((112.5..=121.8).contains(&n.c)
+                    && (n.off_diag_tocsy_count(cfg.tol_h) >= 1 || !n.cb_he_cands.is_empty()));
+            if !plausible_tyr_ce {
                 continue;
             }
             tyr_ce_slots.push(u);
@@ -2843,7 +3914,7 @@ pub fn cluster_aromatic_rings(
         }
         let mut tyr_cd_slots: Vec<usize> = Vec::new();
         for (u, n) in nodes.iter().enumerate() {
-            if used[u] || !(126.0..=138.2).contains(&n.c) {
+            if used[u] || !(125.5..=138.8).contains(&n.c) {
                 continue;
             }
             let linked_to_tyr_ce = tyr_ce_slots.iter().any(|&u_ce| {
@@ -2920,11 +3991,19 @@ pub fn cluster_aromatic_rings(
                         nd1_ppm: None,
                         ne2_ppm: None,
                         his_tautomer: None,
+                        his_state: None,
                         trp_indole: None,
                         internal_coherence: w[ir][ic],
                     });
                 } else {
-                    let cb_he = nodes[u_ce].cb_he_cands.first().map(|x| x.0);
+                    let cb_he = pick_best_single_yamazaki_cb(
+                        &nodes[u_ce].cb_he_cands,
+                        &known_arom_cbs,
+                        2.2,
+                        0.4,
+                        cfg,
+                    )
+                    .map(|x| x.0);
                     clusters.push(AromaticRingCluster {
                         kind: AromaticRingKind::Tyr,
                         ch_slots: slots,
@@ -2933,8 +4012,64 @@ pub fn cluster_aromatic_rings(
                         nd1_ppm: None,
                         ne2_ppm: None,
                         his_tautomer: None,
+                        his_state: None,
                         trp_indole: None,
                         internal_coherence: 0.0,
+                    });
+                }
+            }
+        }
+
+        // Rescue unclaimed TYR CD* nodes whose CE* partner dropped out in AROM_C13HSQC
+        if backbone_ref.is_some()
+            && clusters
+                .iter()
+                .filter(|c| c.kind == AromaticRingKind::Tyr)
+                .count()
+                < n_tyr_seq
+        {
+            for u in 0..nodes.len() {
+                if used[u] || !(129.0..=137.5).contains(&nodes[u].c) {
+                    continue;
+                }
+                let matches_tyr_cb_uniquely = nodes[u].cb_hd_cands.iter().any(|&(cb, _)| {
+                    known_tyr_cbs
+                        .iter()
+                        .any(|&tcb| (tcb - cb).abs() <= cfg.tol_cb * 0.75)
+                        && !known_phe_cbs
+                            .iter()
+                            .any(|&pcb| (pcb - cb).abs() <= cfg.tol_cb * 0.75)
+                });
+                if matches_tyr_cb_uniquely {
+                    used[u] = true;
+                    let cb_hd = pick_best_single_yamazaki_cb(
+                        &nodes[u].cb_hd_cands,
+                        &known_tyr_cbs,
+                        2.5,
+                        0.5,
+                        cfg,
+                    )
+                    .map(|x| x.0);
+                    let mut slots = BTreeMap::new();
+                    slots.insert(
+                        "CD1",
+                        RingChSlot {
+                            c_ppm: nodes[u].c,
+                            h_ppm: nodes[u].h,
+                            intra_conf: 0.90,
+                        },
+                    );
+                    clusters.push(AromaticRingCluster {
+                        kind: AromaticRingKind::Tyr,
+                        ch_slots: slots,
+                        cb_hd,
+                        cb_he: None,
+                        nd1_ppm: None,
+                        ne2_ppm: None,
+                        his_tautomer: None,
+                        his_state: None,
+                        trp_indole: None,
+                        internal_coherence: 1.0,
                     });
                 }
             }
@@ -2946,7 +4081,7 @@ pub fn cluster_aromatic_rings(
     // ------------------------------------------------------------------------
     if backbone_ref.is_none() || n_phe_seq > 0 {
         let rem: Vec<usize> = (0..nodes.len())
-            .filter(|&u| !used[u] && (123.0..=138.0).contains(&nodes[u].c))
+            .filter(|&u| !used[u] && (122.5..=138.8).contains(&nodes[u].c))
             .collect();
 
         if !rem.is_empty() {
@@ -2956,9 +4091,29 @@ pub fn cluster_aromatic_rings(
 
             for &u in &rem {
                 let n = &nodes[u];
-                let has_hd = !n.cb_hd_cands.is_empty();
-                let has_he = !n.cb_he_cands.is_empty();
                 let is_2x = n.height >= 1.38 * h_1x;
+                let shadowed_by_2x = !is_2x
+                    && rem.iter().any(|&v| {
+                        v != u
+                            && nodes[v].height >= 1.38 * h_1x
+                            && (nodes[v].h - n.h).abs() <= cfg.tol_h * 1.25
+                    });
+                let has_hd = !shadowed_by_2x
+                    && (is_2x || n.c >= 129.4)
+                    && n.cb_hd_cands.iter().any(|&(cb, _)| {
+                        known_phe_cbs.is_empty()
+                            || known_phe_cbs
+                                .iter()
+                                .any(|&pcb| (pcb - cb).abs() <= cfg.tol_cb)
+                    });
+                let has_he = !shadowed_by_2x
+                    && (is_2x || n.c >= 127.8)
+                    && n.cb_he_cands.iter().any(|&(cb, _)| {
+                        known_phe_cbs.is_empty()
+                            || known_phe_cbs
+                                .iter()
+                                .any(|&pcb| (pcb - cb).abs() <= cfg.tol_cb)
+                    });
                 if has_hd || is_2x {
                     cd_pool.push(u);
                     if n.height >= 2.90 * h_1x {
@@ -2994,6 +4149,9 @@ pub fn cluster_aromatic_rings(
                         if u_cd == u_ce && nodes[u_cd].height < 2.55 * h_1x {
                             continue;
                         }
+                        if nodes[u_cd].height < 1.38 * h_1x && nodes[u_ce].height < 1.38 * h_1x {
+                            continue;
+                        }
                         let tocsy =
                             arom_tocsy_edge_score(&nodes[u_cd], &nodes[u_ce], true, cfg.tol_h);
                         let (_, _, cb_sc) = best_shared_yamazaki_cb(
@@ -3002,6 +4160,9 @@ pub fn cluster_aromatic_rings(
                             &known_arom_cbs,
                             cfg,
                         );
+                        if cb_sc <= -8.0 && tocsy < 1.0 {
+                            continue;
+                        }
                         let pr =
                             priors.llr_c13("PHE", "CD1", CarbonRegion::Aromatic, nodes[u_cd].c)
                                 + priors.llr_h1(
@@ -3089,18 +4250,58 @@ pub fn cluster_aromatic_rings(
             }
 
             // Rescue any remaining single-sided 2x / Yamazaki-anchored PHE nodes whose partner dropped out
-            for &u in &rem {
-                if stem_used.contains_key(&u) {
-                    continue;
-                }
-                if !nodes[u].cb_hd_cands.is_empty() {
-                    *stem_used.entry(u).or_insert(0) += 1;
-                    let cb_hd = nodes[u].cb_hd_cands.first().map(|x| x.0);
-                    stems.push((Some(u), None, cb_hd, None, 1.0, 0.88));
-                } else if !nodes[u].cb_he_cands.is_empty() {
-                    *stem_used.entry(u).or_insert(0) += 1;
-                    let cb_he = nodes[u].cb_he_cands.first().map(|x| x.0);
-                    stems.push((None, Some(u), None, cb_he, 1.0, 0.88));
+            if backbone_ref.is_none() || stems.len() < n_phe_seq {
+                for &u in &rem {
+                    if stem_used.contains_key(&u)
+                        || (backbone_ref.is_some() && stems.len() >= n_phe_seq)
+                    {
+                        continue;
+                    }
+                    let is_2x = nodes[u].height >= 1.38 * h_1x;
+                    let shadowed_by_stem = !is_2x
+                        && stem_used.keys().any(|&v| {
+                            v != u && (nodes[v].h - nodes[u].h).abs() <= cfg.tol_h * 1.25
+                        });
+                    if shadowed_by_stem {
+                        continue;
+                    }
+                    let hd_phe_ok = (is_2x || nodes[u].c >= 129.4)
+                        && nodes[u].cb_hd_cands.iter().any(|&(cb, _)| {
+                            known_phe_cbs.is_empty()
+                                || known_phe_cbs
+                                    .iter()
+                                    .any(|&pcb| (pcb - cb).abs() <= cfg.tol_cb)
+                        });
+                    let he_phe_ok = (is_2x || nodes[u].c >= 127.8)
+                        && nodes[u].cb_he_cands.iter().any(|&(cb, _)| {
+                            known_phe_cbs.is_empty()
+                                || known_phe_cbs
+                                    .iter()
+                                    .any(|&pcb| (pcb - cb).abs() <= cfg.tol_cb)
+                        });
+                    if hd_phe_ok {
+                        *stem_used.entry(u).or_insert(0) += 1;
+                        let cb_hd = pick_best_single_yamazaki_cb(
+                            &nodes[u].cb_hd_cands,
+                            &known_phe_cbs,
+                            2.5,
+                            0.5,
+                            cfg,
+                        )
+                        .map(|x| x.0);
+                        stems.push((Some(u), None, cb_hd, None, 1.0, 0.88));
+                    } else if he_phe_ok {
+                        *stem_used.entry(u).or_insert(0) += 1;
+                        let cb_he = pick_best_single_yamazaki_cb(
+                            &nodes[u].cb_he_cands,
+                            &known_phe_cbs,
+                            2.2,
+                            0.4,
+                            cfg,
+                        )
+                        .map(|x| x.0);
+                        stems.push((None, Some(u), None, cb_he, 1.0, 0.88));
+                    }
                 }
             }
 
@@ -3211,6 +4412,7 @@ pub fn cluster_aromatic_rings(
                         nd1_ppm: None,
                         ne2_ppm: None,
                         his_tautomer: None,
+                        his_state: None,
                         trp_indole: None,
                         internal_coherence: st_sc,
                     });
@@ -3233,27 +4435,235 @@ pub struct AssignedAromaticRing {
     pub seq_id: i32,
     pub res_name: String,
     pub cluster_idx: Option<usize>,
-    /// Bipartite ring-to-residue posterior confidence in `[0.0, 1.0]`.
+    /// Multi-candidate Boltzmann bipartite ring-to-residue posterior confidence in `[0.0, 1.0]`.
     pub ring_confidence: f64,
     /// Log-likelihood ratio score of `(cluster_idx, residue_idx)`.
     pub score: f64,
     /// Leave-one-out bipartite margin `S* - S_alt(k)` against the best competing ring/residue swap.
     pub margin: f64,
-    /// Classified histidine tautomeric state and posterior confidence (`Some` for assigned `HIS`).
+    /// Classified static histidine tautomer and posterior confidence (`None` if non-`HIS`,
+    /// unassigned, `FastExchangeUncommitted`, or `MetalCoordinatedCandidate`).
     pub his_tautomer: Option<(HisTautomer, f64)>,
+    /// Full histidine state classification (`Resolved`, `FastExchangeUncommitted`, or `MetalCoordinatedCandidate`).
+    pub his_state: Option<(HisStateClassification, f64)>,
 }
 
 /// Complete output of `assign_aromatic_rings`.
 #[derive(Clone, Debug)]
 pub struct AromaticAssignResult {
-    /// Updated `Reference` combining input backbone shifts with assigned aromatic `1H`/`13C`/`15N` shifts.
+    /// Updated `Reference` combining input shifts with newly assigned aromatic `1H`/`13C`/`15N` shifts
+    /// while preserving pre-existing shifts and ambiguity codes on untouched atoms.
     pub reference: Reference,
-    /// Calibrated per-atom confidence in `[0.0, 1.0]` keyed by `(residue_idx, iupac_atom_name)`.
+    /// Calibrated per-atom confidence in `[0.0, 1.0]` keyed ONLY by newly assigned `(residue_idx, iupac_atom_name)` atoms.
     pub atom_confidence: BTreeMap<(usize, String), f64>,
-    /// Per-aromatic-residue assignment details and `HisTautomer` calls.
+    /// Per-aromatic-residue assignment details, `HisTautomer` calls, and `HisStateClassification`.
     pub rings: Vec<AssignedAromaticRing>,
     /// Assembled experimental ring clusters.
     pub clusters: Vec<AromaticRingCluster>,
+}
+
+/// Merge newly assigned aromatic chemical shifts into `existing_ref` while strictly preserving
+/// all pre-existing shifts and ambiguity codes on atoms NOT present in `newly_assigned_atoms`.
+pub fn merge_aromatic_assignments_preserving_existing(
+    existing_ref: &Reference,
+    newly_assigned: &Reference,
+    newly_assigned_atoms: &BTreeMap<(usize, String), f64>,
+) -> Reference {
+    let mut merged = existing_ref.clone();
+    for key in newly_assigned_atoms.keys() {
+        if let Some(&val) = newly_assigned.shifts.get(key) {
+            merged.shifts.insert(key.clone(), val);
+        }
+        if let Some(&code) = newly_assigned.ambiguity_codes.get(key) {
+            merged.ambiguity_codes.insert(key.clone(), code);
+        }
+    }
+    merged
+}
+
+/// Estimate an unlabelled systematic `13CB` referencing offset `δ` (`obs_cb - bb_cb`, in ppm)
+/// between 2D Yamazaki `(HB)CB(CGCD)HD` / `(HB)CB(CGCDCE)HE` cross-peaks and `backbone_ref`
+/// aromatic `CB` shifts via 1-to-1 injective Gaussian kernel consensus + median refinement.
+/// Returns `0.0` unless at least 2 independent 1-to-1 pairs agree on `|δ| >= 0.04 ppm` and
+/// strictly improve over `δ = 0.0`.
+pub fn estimate_unlabelled_yamazaki_cb_offset(
+    backbone_ref: &Reference,
+    backbone_conf: Option<&BTreeMap<usize, f64>>,
+    aromatic_peaks: &[Peak],
+    exp_filter: Option<&str>,
+    min_backbone_conf: f64,
+) -> f64 {
+    let mut bb_cbs: Vec<f64> = Vec::new();
+    for (k, r) in backbone_ref.sequence.iter().enumerate() {
+        if !matches!(r.as_str(), "PHE" | "TYR" | "TRP" | "HIS") {
+            continue;
+        }
+        let a_conf = backbone_conf
+            .and_then(|m| m.get(&k).copied())
+            .unwrap_or(1.0);
+        if a_conf < min_backbone_conf {
+            continue;
+        }
+        if let Some(&cb) = backbone_ref.shifts.get(&(k, "CB".to_string())) {
+            if cb.is_finite() {
+                bb_cbs.push(cb);
+            }
+        }
+    }
+    if bb_cbs.len() < 2 {
+        return 0.0;
+    }
+
+    let mut obs_cbs: Vec<f64> = Vec::new();
+    for p in aromatic_peaks {
+        let ok_exp = match exp_filter {
+            Some(e) => p.exp == e,
+            None => p.exp == "HBCBCGCDHD" || p.exp == "HBCBCGCDCEHE",
+        };
+        if !ok_exp {
+            continue;
+        }
+        if let Some(cb) = p.c.filter(|v| v.is_finite()) {
+            obs_cbs.push(cb);
+        }
+    }
+    if obs_cbs.len() < 2 {
+        return 0.0;
+    }
+
+    let eval_delta = |delta: f64| -> (f64, Vec<f64>) {
+        // Build all candidate (residual_abs, obs_idx, bb_idx, raw_diff) pairs within 0.095 ppm
+        let mut pairs: Vec<(f64, usize, usize, f64)> = Vec::new();
+        for (oi, &oy) in obs_cbs.iter().enumerate() {
+            for (bi, &bc) in bb_cbs.iter().enumerate() {
+                let diff = oy - bc;
+                let res = (diff - delta).abs();
+                if res <= 0.095 {
+                    pairs.push((res, oi, bi, diff));
+                }
+            }
+        }
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut used_o = vec![false; obs_cbs.len()];
+        let mut used_b = vec![false; bb_cbs.len()];
+        let mut score = 0.0;
+        let mut matched_diffs = Vec::new();
+        for (res, oi, bi, diff) in pairs {
+            if used_o[oi] || used_b[bi] {
+                continue;
+            }
+            used_o[oi] = true;
+            used_b[bi] = true;
+            let z = res / 0.045;
+            score += (-0.5 * z * z).exp();
+            matched_diffs.push(diff);
+        }
+        (score, matched_diffs)
+    };
+
+    let (score_zero, _) = eval_delta(0.0);
+    let mut cands: Vec<f64> = vec![0.0];
+    for &oy in &obs_cbs {
+        for &bc in &bb_cbs {
+            let d = oy - bc;
+            if d.abs() <= 0.45 {
+                cands.push(d);
+            }
+        }
+    }
+    cands.sort_by(|a, b| a.total_cmp(b));
+    cands.dedup_by(|a, b| (*a - *b).abs() < 0.002);
+
+    let mut best_delta = 0.0;
+    let mut best_score = score_zero;
+    let mut best_diffs: Vec<f64> = Vec::new();
+    for d in cands {
+        let (sc, diffs) = eval_delta(d);
+        if sc > best_score {
+            best_score = sc;
+            best_delta = d;
+            best_diffs = diffs;
+        }
+    }
+
+    if best_diffs.len() < 2 {
+        return 0.0;
+    }
+    best_diffs.sort_by(|a, b| a.total_cmp(b));
+    let n = best_diffs.len();
+    let refined = if n % 2 == 1 {
+        best_diffs[n / 2]
+    } else {
+        0.5 * (best_diffs[n / 2 - 1] + best_diffs[n / 2])
+    };
+    let (refined_score, refined_diffs) = eval_delta(refined);
+    let final_delta = if refined_score >= best_score - 1e-6 && refined_diffs.len() >= 2 {
+        refined
+    } else {
+        best_delta
+    };
+    let final_inliers = refined_diffs.len().max(n);
+    let min_cap = obs_cbs.len().min(bb_cbs.len());
+
+    if final_inliers >= 2
+        && final_inliers * 3 >= min_cap
+        && final_delta.abs() >= 0.04
+        && refined_score.max(best_score) > score_zero + 0.65
+    {
+        final_delta
+    } else {
+        0.0
+    }
+}
+
+fn align_yamazaki_cb_peaks(
+    backbone_ref: &Reference,
+    backbone_conf: Option<&BTreeMap<usize, f64>>,
+    aromatic_peaks: &[Peak],
+    cfg: &AromaticSolverConfig,
+) -> Vec<Peak> {
+    let d_joint = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        None,
+        cfg.min_backbone_conf,
+    );
+    let d_hd_raw = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        Some("HBCBCGCDHD"),
+        cfg.min_backbone_conf,
+    );
+    let d_he_raw = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        Some("HBCBCGCDCEHE"),
+        cfg.min_backbone_conf,
+    );
+    let d_hd = if d_hd_raw != 0.0 { d_hd_raw } else { d_joint };
+    let d_he = if d_he_raw != 0.0 { d_he_raw } else { d_joint };
+    if d_hd == 0.0 && d_he == 0.0 {
+        return aromatic_peaks.to_vec();
+    }
+    aromatic_peaks
+        .iter()
+        .map(|p| {
+            let mut q = p.clone();
+            if p.exp == "HBCBCGCDHD" && d_hd != 0.0 {
+                if let Some(cb) = q.c {
+                    q.c = Some(cb - d_hd);
+                }
+            } else if p.exp == "HBCBCGCDCEHE" && d_he != 0.0 {
+                if let Some(cb) = q.c {
+                    q.c = Some(cb - d_he);
+                }
+            }
+            q
+        })
+        .collect()
 }
 
 /// Compute pairwise log-likelihood ratio `S(cluster, residue_k)` combining Yamazaki
@@ -3261,12 +4671,15 @@ pub struct AromaticAssignResult {
 /// coherence, and BMRB per-atom `(1H, 13C, 15N)` priors.
 #[allow(clippy::too_many_arguments)]
 fn score_cluster_for_residue(
+    ci: usize,
     c: &AromaticRingCluster,
+    all_clusters: &[AromaticRingCluster],
     k: usize,
     res_name: &str,
     backbone_ref: &Reference,
     anchor_conf: f64,
     aromatic_peaks: &[Peak],
+    has_link_exps: bool,
     priors: &SidechainPriors,
     cfg: &AromaticSolverConfig,
 ) -> f64 {
@@ -3308,6 +4721,9 @@ fn score_cluster_for_residue(
                         - priors.background_h1(CarbonRegion::Aromatic, slot.h_ppm))
                     .max(-8.0);
                 }
+            } else {
+                llr += priors.llr_c13("HIS", c_atom, CarbonRegion::Aromatic, slot.c_ppm);
+                llr += priors.llr_h1("HIS", p_atom, CarbonRegion::Aromatic, slot.h_ppm);
             }
         } else {
             llr += priors.llr_c13(res_name, c_atom, CarbonRegion::Aromatic, slot.c_ppm);
@@ -3321,6 +4737,24 @@ fn score_cluster_for_residue(
         .flatten();
 
     if let Some(target_cb) = bb_cb {
+        let same_aa_cbs: Vec<f64> = backbone_ref
+            .sequence
+            .iter()
+            .enumerate()
+            .filter_map(|(j, r)| {
+                (r == res_name)
+                    .then(|| backbone_ref.shifts.get(&(j, "CB".to_string())).copied())
+                    .flatten()
+                    .filter(|v| v.is_finite())
+            })
+            .collect();
+        let cb_plausible_for_aa = |cb: f64| -> bool {
+            same_aa_cbs.is_empty()
+                || same_aa_cbs
+                    .iter()
+                    .any(|&scb| (scb - cb).abs() <= cfg.tol_cb)
+        };
+
         let hd_h = c
             .ch_slots
             .get("CD1")
@@ -3330,12 +4764,43 @@ fn score_cluster_for_residue(
             "TRP" => c.ch_slots.get("CE3").map(|s| s.h_ppm),
             _ => c.ch_slots.get("CE1").map(|s| s.h_ppm),
         };
+        let owned_by_closer_cluster = |exp_name: &str, h0: f64, p_h: f64, p_cb: f64| -> bool {
+            let dh0 = (p_h - h0).abs();
+            all_clusters.iter().enumerate().any(|(oj, oc)| {
+                if oj == ci {
+                    return false;
+                }
+                let oh_opt = if exp_name == "HBCBCGCDHD" {
+                    oc.ch_slots
+                        .get("CD1")
+                        .or_else(|| oc.ch_slots.get("CD2"))
+                        .map(|s| s.h_ppm)
+                } else if oc.kind == AromaticRingKind::Trp {
+                    oc.ch_slots.get("CE3").map(|s| s.h_ppm)
+                } else {
+                    oc.ch_slots.get("CE1").map(|s| s.h_ppm)
+                };
+                let Some(oh) = oh_opt else { return false };
+                let claims_cb = oc
+                    .cb_hd
+                    .is_some_and(|v| (v - p_cb).abs() <= cfg.tol_cb * 0.85)
+                    || oc
+                        .cb_he
+                        .is_some_and(|v| (v - p_cb).abs() <= cfg.tol_cb * 0.85);
+                claims_cb && (p_h - oh).abs() + 0.004 < dh0
+            })
+        };
         let best_yamazaki_for_h = |exp_name: &str, h_opt: Option<f64>, fallback: Option<f64>| {
-            let mut best = fallback;
+            let mut best = fallback.filter(|&fb| cb_plausible_for_aa(fb));
             if let Some(h0) = h_opt {
                 for p in aromatic_peaks {
                     if p.exp == exp_name && (p.h - h0).abs() <= cfg.tol_h * 1.20 {
                         if let Some(cb) = p.c {
+                            if !cb_plausible_for_aa(cb)
+                                || owned_by_closer_cluster(exp_name, h0, p.h, cb)
+                            {
+                                continue;
+                            }
                             if best
                                 .is_none_or(|cur| (cb - target_cb).abs() < (cur - target_cb).abs())
                             {
@@ -3348,10 +4813,10 @@ fn score_cluster_for_residue(
             best
         };
         // Only search alternative 1H-overlapped Yamazaki peaks when the cluster does NOT already
-        // possess a self-consistent two-channel (cb_hd, cb_he) Yamazaki pair!
+        // possess a self-consistent two-channel (cb_hd, cb_he) Yamazaki pair plausible for this AA!
         let corroborated_pair = matches!(
             (c.cb_hd, c.cb_he),
-            (Some(a), Some(b)) if (a - b).abs() <= cfg.tol_cb * 0.85
+            (Some(a), Some(b)) if (a - b).abs() <= cfg.tol_cb * 0.85 && cb_plausible_for_aa(a)
         );
         let (eff_cb_hd, eff_cb_he) = if corroborated_pair {
             (c.cb_hd, c.cb_he)
@@ -3391,16 +4856,39 @@ fn score_cluster_for_residue(
             }
             (None, None) => {
                 llr -= 2.0;
+                // Reject bare 1-peak noise blips lacking TOCSY, Yamazaki CB, and 15N links
+                if has_link_exps
+                    && c.ch_slots.len() <= 1
+                    && c.nd1_ppm.is_none()
+                    && c.ne2_ppm.is_none()
+                    && c.trp_indole.is_none()
+                    && c.internal_coherence <= 0.1
+                {
+                    llr -= 6.5;
+                }
             }
         }
-    } else if let Some(obs_cb) = c.cb_hd.or(c.cb_he) {
-        // Missing backbone CB(k): score Yamazaki CB against amino-acid BMRB CB prior!
-        llr += priors.llr_c13(res_name, "CB", CarbonRegion::AliphaticCaConnected, obs_cb);
-        if res_name == "HIS" {
-            if let Some((st, _)) = c.his_tautomer {
-                let p_cb = st.shift_priors().6;
-                llr += 0.5 * gauss_logpdf(obs_cb, p_cb.0, p_cb.1);
+    } else {
+        if !backbone_ref.shifts.is_empty() {
+            let has_any_bb = ["H", "N", "CA", "CB", "C"]
+                .iter()
+                .any(|a| backbone_ref.shifts.contains_key(&(k, (*a).to_string())));
+            if !has_any_bb {
+                // Unassigned backbone residue (e.g. disordered terminal His6 purification tag)
+                llr -= 4.0;
             }
+        }
+        if let Some(obs_cb) = c.cb_hd.or(c.cb_he) {
+            // Missing backbone CB(k): score Yamazaki CB against amino-acid BMRB CB prior!
+            llr += priors.llr_c13(res_name, "CB", CarbonRegion::AliphaticCaConnected, obs_cb);
+            if res_name == "HIS" {
+                if let Some((st, _)) = c.his_tautomer {
+                    let p_cb = st.shift_priors().6;
+                    llr += 0.5 * gauss_logpdf(obs_cb, p_cb.0, p_cb.1);
+                }
+            }
+        } else {
+            llr -= 2.0;
         }
     }
 
@@ -3443,9 +4931,196 @@ fn score_cluster_for_residue(
     llr
 }
 
+#[inline]
+fn log_add_exp(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        b
+    } else if b == f64::NEG_INFINITY {
+        a
+    } else if a >= b {
+        a + (1.0 + (b - a).exp()).ln()
+    } else {
+        b + (1.0 + (a - b).exp()).ln()
+    }
+}
+
+/// Exact bitmask-DP Boltzmann permanent marginal `P(π(target_r_local) = target_c_local)` over all
+/// valid 1-to-1 matchings + per-residue null slots within an amino-acid sub-block (`m <= 11`).
+fn exact_block_boltzmann_marginal(
+    rows: &[usize],
+    cols: &[usize],
+    n_clu: usize,
+    weights: &[Vec<f64>],
+    temp: f64,
+    target_r_local: usize,
+    target_c_local: usize,
+) -> Option<f64> {
+    let k_len = rows.len();
+    let m_len = cols.len();
+    if k_len == 0 || m_len == 0 || k_len > 12 || m_len > 11 {
+        return None;
+    }
+    let inv_t = 1.0 / temp.max(0.15);
+    let n_masks = 1usize << m_len;
+
+    let run_dp = |forced: Option<(usize, usize)>| -> f64 {
+        let mut dp = vec![f64::NEG_INFINITY; n_masks];
+        dp[0] = 0.0;
+        for (ri_loc, &r_glob) in rows.iter().enumerate() {
+            let mut next = vec![f64::NEG_INFINITY; n_masks];
+            if let Some((f_r, f_c)) = forced {
+                if ri_loc == f_r {
+                    let c_glob = cols[f_c];
+                    let w = weights[r_glob][c_glob];
+                    if w > FORBID_SCORE * 0.5 {
+                        let bit = 1usize << f_c;
+                        let wt = w * inv_t;
+                        for mask in 0..n_masks {
+                            if (mask & bit) == 0 && dp[mask] > f64::NEG_INFINITY {
+                                next[mask | bit] = log_add_exp(next[mask | bit], dp[mask] + wt);
+                            }
+                        }
+                    }
+                    dp = next;
+                    continue;
+                }
+            }
+
+            let w_null = weights[r_glob][n_clu + r_glob] * inv_t;
+            for mask in 0..n_masks {
+                let base = dp[mask];
+                if base == f64::NEG_INFINITY {
+                    continue;
+                }
+                next[mask] = log_add_exp(next[mask], base + w_null);
+                for (ci_loc, &c_glob) in cols.iter().enumerate() {
+                    let bit = 1usize << ci_loc;
+                    if (mask & bit) != 0 {
+                        continue;
+                    }
+                    if let Some((_, f_c)) = forced {
+                        if ci_loc == f_c {
+                            continue;
+                        }
+                    }
+                    let w = weights[r_glob][c_glob];
+                    if w > FORBID_SCORE * 0.5 {
+                        next[mask | bit] = log_add_exp(next[mask | bit], base + w * inv_t);
+                    }
+                }
+            }
+            dp = next;
+        }
+        dp.into_iter().fold(f64::NEG_INFINITY, log_add_exp)
+    };
+
+    let log_z_total = run_dp(None);
+    if !log_z_total.is_finite() {
+        return None;
+    }
+    let log_z_num = run_dp(Some((target_r_local, target_c_local)));
+    if !log_z_num.is_finite() {
+        return Some(0.0);
+    }
+    Some((log_z_num - log_z_total).exp().clamp(0.0, 1.0))
+}
+
+/// Compute calibrated multi-candidate Boltzmann posterior confidences in `[0.0, 1.0]` combining
+/// exact amino-acid block Boltzmann permanent (`m <= 11`) and global swap/free/null/LOO softmax
+/// so any symmetric `K`-way tie yields `<= 1 / K` while unique high-margin matches achieve `>= 0.95`.
+fn compute_calibrated_ring_confidences(
+    arom_positions: &[usize],
+    backbone_ref: &Reference,
+    clusters: &[AromaticRingCluster],
+    weights: &[Vec<f64>],
+    win_cols: &[Option<usize>],
+    margins: &[f64],
+    temp: f64,
+) -> Vec<f64> {
+    let n_res = arom_positions.len();
+    let n_clu = clusters.len();
+    let t = temp.max(0.15);
+    let mut confs = vec![0.0; n_res];
+
+    for kind in [
+        AromaticRingKind::Phe,
+        AromaticRingKind::Tyr,
+        AromaticRingKind::Trp,
+        AromaticRingKind::His,
+    ] {
+        let aa = kind.res_name();
+        let rows_aa: Vec<usize> = (0..n_res)
+            .filter(|&ri| backbone_ref.sequence[arom_positions[ri]] == aa)
+            .collect();
+        if rows_aa.is_empty() {
+            continue;
+        }
+        let cols_aa: Vec<usize> = (0..n_clu).filter(|&ci| clusters[ci].kind == kind).collect();
+
+        let mut matched_clusters: BTreeSet<usize> = BTreeSet::new();
+        for &ri in &rows_aa {
+            if let Some(ci) = win_cols[ri].filter(|&c| c < n_clu) {
+                matched_clusters.insert(ci);
+            }
+        }
+
+        for (r_loc, &ri) in rows_aa.iter().enumerate() {
+            let Some(ci) = win_cols[ri].filter(|&c| c < n_clu) else {
+                continue;
+            };
+            let w_win = weights[ri][ci];
+            let w_null = weights[ri][n_clu + ri];
+
+            // Multi-competitor partition across null + all 2-swaps + all free clusters + global LOO
+            let mut z_denom = 1.0 + (-(w_win - w_null).max(0.0) / t).exp();
+
+            for &rj in &rows_aa {
+                if rj == ri {
+                    continue;
+                }
+                if let Some(cj) = win_cols[rj].filter(|&c| c < n_clu) {
+                    let delta_swap =
+                        ((w_win + weights[rj][cj]) - (weights[ri][cj] + weights[rj][ci])).max(0.0);
+                    z_denom += (-delta_swap / t).exp();
+                } else {
+                    let w_rj_null = weights[rj][n_clu + rj];
+                    let delta_shift = ((w_win + w_rj_null) - (w_null + weights[rj][ci])).max(0.0);
+                    z_denom += (-delta_shift / t).exp();
+                }
+            }
+
+            for &c_alt in &cols_aa {
+                if c_alt != ci && !matched_clusters.contains(&c_alt) {
+                    let delta_free = (w_win - weights[ri][c_alt]).max(0.0);
+                    z_denom += (-delta_free / t).exp();
+                }
+            }
+
+            let z_loo = 1.0 + (-margins[ri].max(0.0) / t).exp();
+            let p_multi = (1.0 / z_denom.max(z_loo)).clamp(0.0, 1.0);
+
+            let p_perm = cols_aa.iter().position(|&c| c == ci).and_then(|c_loc| {
+                exact_block_boltzmann_marginal(&rows_aa, &cols_aa, n_clu, weights, t, r_loc, c_loc)
+            });
+
+            confs[ri] = p_perm.map_or(p_multi, |pp| pp.min(p_multi));
+        }
+    }
+
+    confs
+}
+
+fn default_aromatic_atom_ambiguity_code(res_name: &str, atom: &str) -> u8 {
+    match (res_name, atom) {
+        ("PHE" | "TYR", "CD1" | "CD2" | "HD1" | "HD2" | "CE1" | "CE2" | "HE1" | "HE2") => 3,
+        _ => 1,
+    }
+}
+
 /// Assign aromatic ring spin systems (`PHE`, `TYR`, `TRP`, `HIS`) to sequence positions via
-/// exact maximum-weight bipartite matching (Kuhn–Munkres) with leave-one-out marginal confidence
-/// calibration (`[0.0, 1.0]`).
+/// exact maximum-weight bipartite matching (Kuhn–Munkres) with multi-candidate Boltzmann
+/// marginal confidence calibration (`[0.0, 1.0]`), unlabelled inter-experiment `CB` offset
+/// alignment, and strict preservation of pre-existing user shifts on untouched atoms.
 pub fn assign_aromatic_rings(
     backbone_ref: &Reference,
     backbone_conf: Option<&BTreeMap<usize, f64>>,
@@ -3453,7 +5128,8 @@ pub fn assign_aromatic_rings(
     priors: &SidechainPriors,
     cfg: &AromaticSolverConfig,
 ) -> AromaticAssignResult {
-    let clusters = cluster_aromatic_rings(aromatic_peaks, Some(backbone_ref), priors, cfg);
+    let aligned_peaks = align_yamazaki_cb_peaks(backbone_ref, backbone_conf, aromatic_peaks, cfg);
+    let clusters = cluster_aromatic_rings(&aligned_peaks, Some(backbone_ref), priors, cfg);
     let arom_positions: Vec<usize> = backbone_ref
         .sequence
         .iter()
@@ -3461,25 +5137,31 @@ pub fn assign_aromatic_rings(
         .filter_map(|(k, r)| matches!(r.as_str(), "PHE" | "TYR" | "TRP" | "HIS").then_some(k))
         .collect();
 
-    let mut out_ref = backbone_ref.clone();
+    let mut newly_assigned_ref = backbone_ref.clone();
     let mut atom_confidence: BTreeMap<(usize, String), f64> = BTreeMap::new();
-    for &(k, ref a) in backbone_ref.shifts.keys() {
-        let bc = backbone_conf
-            .and_then(|m| m.get(&k).copied())
-            .unwrap_or(1.0);
-        atom_confidence.insert((k, a.clone()), bc);
-    }
 
     let n_res = arom_positions.len();
     let n_clu = clusters.len();
     if n_res == 0 {
         return AromaticAssignResult {
-            reference: out_ref,
+            reference: newly_assigned_ref,
             atom_confidence,
             rings: Vec::new(),
             clusters,
         };
     }
+
+    let has_link_exps = aligned_peaks.iter().any(|p| {
+        matches!(
+            p.exp.as_str(),
+            "AROM_HCCH_TOCSY"
+                | "HCCHTOCSY"
+                | "HBCBCGCDHD"
+                | "HBCBCGCDCEHE"
+                | "HIS_LR_N15HMQC"
+                | "TRP_IND_N15HSQC"
+        )
+    });
 
     // Build n_res x (n_clu + n_res) bipartite weight matrix:
     // Columns 0..n_clu are observed ring clusters; columns n_clu..(n_clu + n_res) are per-residue
@@ -3495,12 +5177,15 @@ pub fn assign_aromatic_rings(
             .unwrap_or(1.0);
         for (ci, clu) in clusters.iter().enumerate() {
             weights[ri][ci] = score_cluster_for_residue(
+                ci,
                 clu,
+                &clusters,
                 k,
                 res_name,
                 backbone_ref,
                 a_conf,
-                aromatic_peaks,
+                &aligned_peaks,
+                has_link_exps,
                 priors,
                 cfg,
             );
@@ -3511,6 +5196,15 @@ pub fn assign_aromatic_rings(
 
     let (win_cols, best_total) = hungarian_max_weight(&weights);
     let margins = hungarian_margins(&weights, &win_cols, best_total);
+    let raw_bip_confs = compute_calibrated_ring_confidences(
+        &arom_positions,
+        backbone_ref,
+        &clusters,
+        &weights,
+        &win_cols,
+        &margins,
+        cfg.calibration_temp,
+    );
 
     let mut rings = Vec::with_capacity(n_res);
     for (ri, &k) in arom_positions.iter().enumerate() {
@@ -3536,42 +5230,45 @@ pub fn assign_aromatic_rings(
                 score: null_score,
                 margin: 0.0,
                 his_tautomer: None,
+                his_state: None,
             });
             continue;
         };
 
         let mrg = margins[ri];
         let win_sc = weights[ri][ci];
-        // Exact leave-one-out Boltzmann marginal probability P(π(k) = ci) = 1 / (1 + exp(-ΔS / T_cal))
-        // Note: when ΔS == 0 (e.g. identical CB on two PHEs in unfolded ubiquitin), P = 0.50 (< 0.80)!
-        let bip_conf = (1.0 / (1.0 + (-mrg / cfg.calibration_temp).exp())) * a_conf;
+        let bip_conf = (raw_bip_confs[ri] * a_conf).clamp(0.0, 1.0);
         let clu = &clusters[ci];
 
-        // Populate assigned IUPAC shifts & calibrated per-atom confidences into out_ref
+        let mut record_new_atom = |atom_name: &str, val: f64, conf: f64| {
+            let key = (k, atom_name.to_string());
+            newly_assigned_ref.shifts.insert(key.clone(), val);
+            newly_assigned_ref.ambiguity_codes.insert(
+                key.clone(),
+                default_aromatic_atom_ambiguity_code(&res_name, atom_name),
+            );
+            atom_confidence.insert(key, conf);
+        };
+
+        // Populate newly assigned IUPAC shifts & calibrated per-atom confidences
         for (&c_atom, slot) in &clu.ch_slots {
             let at_conf = (bip_conf * slot.intra_conf).clamp(0.0, 1.0);
             match (res_name.as_str(), c_atom) {
                 ("PHE" | "TYR", "CD1") => {
                     for &(ca, pa) in &[("CD1", "HD1"), ("CD2", "HD2")] {
-                        out_ref.shifts.insert((k, ca.to_string()), slot.c_ppm);
-                        out_ref.shifts.insert((k, pa.to_string()), slot.h_ppm);
-                        atom_confidence.insert((k, ca.to_string()), at_conf);
-                        atom_confidence.insert((k, pa.to_string()), at_conf);
+                        record_new_atom(ca, slot.c_ppm, at_conf);
+                        record_new_atom(pa, slot.h_ppm, at_conf);
                     }
                 }
                 ("PHE" | "TYR", "CE1") => {
                     for &(ca, pa) in &[("CE1", "HE1"), ("CE2", "HE2")] {
-                        out_ref.shifts.insert((k, ca.to_string()), slot.c_ppm);
-                        out_ref.shifts.insert((k, pa.to_string()), slot.h_ppm);
-                        atom_confidence.insert((k, ca.to_string()), at_conf);
-                        atom_confidence.insert((k, pa.to_string()), at_conf);
+                        record_new_atom(ca, slot.c_ppm, at_conf);
+                        record_new_atom(pa, slot.h_ppm, at_conf);
                     }
                 }
                 ("PHE", "CZ") => {
-                    out_ref.shifts.insert((k, "CZ".to_string()), slot.c_ppm);
-                    out_ref.shifts.insert((k, "HZ".to_string()), slot.h_ppm);
-                    atom_confidence.insert((k, "CZ".to_string()), at_conf);
-                    atom_confidence.insert((k, "HZ".to_string()), at_conf);
+                    record_new_atom("CZ", slot.c_ppm, at_conf);
+                    record_new_atom("HZ", slot.h_ppm, at_conf);
                 }
                 ("TRP", ca) => {
                     let pa = match ca {
@@ -3582,17 +5279,13 @@ pub fn assign_aromatic_rings(
                         "CZ2" => "HZ2",
                         _ => continue,
                     };
-                    out_ref.shifts.insert((k, ca.to_string()), slot.c_ppm);
-                    out_ref.shifts.insert((k, pa.to_string()), slot.h_ppm);
-                    atom_confidence.insert((k, ca.to_string()), at_conf);
-                    atom_confidence.insert((k, pa.to_string()), at_conf);
+                    record_new_atom(ca, slot.c_ppm, at_conf);
+                    record_new_atom(pa, slot.h_ppm, at_conf);
                 }
                 ("HIS", ca) => {
                     let pa = if ca == "CD2" { "HD2" } else { "HE1" };
-                    out_ref.shifts.insert((k, ca.to_string()), slot.c_ppm);
-                    out_ref.shifts.insert((k, pa.to_string()), slot.h_ppm);
-                    atom_confidence.insert((k, ca.to_string()), at_conf);
-                    atom_confidence.insert((k, pa.to_string()), at_conf);
+                    record_new_atom(ca, slot.c_ppm, at_conf);
+                    record_new_atom(pa, slot.h_ppm, at_conf);
                 }
                 _ => {}
             }
@@ -3601,33 +5294,26 @@ pub fn assign_aromatic_rings(
         if res_name == "TRP" {
             if let Some((ne1, he1, icf)) = clu.trp_indole {
                 let c_ind = (bip_conf * icf).clamp(0.0, 1.0);
-                out_ref.shifts.insert((k, "NE1".to_string()), ne1);
-                out_ref.shifts.insert((k, "HE1".to_string()), he1);
-                atom_confidence.insert((k, "NE1".to_string()), c_ind);
-                atom_confidence.insert((k, "HE1".to_string()), c_ind);
+                record_new_atom("NE1", ne1, c_ind);
+                record_new_atom("HE1", he1, c_ind);
             }
         }
 
         if res_name == "HIS" {
             if let Some((nd1, ncf)) = clu.nd1_ppm {
                 let c_n = (bip_conf * ncf).clamp(0.0, 1.0);
-                out_ref.shifts.insert((k, "ND1".to_string()), nd1);
-                atom_confidence.insert((k, "ND1".to_string()), c_n);
+                record_new_atom("ND1", nd1, c_n);
             }
             if let Some((ne2, ncf)) = clu.ne2_ppm {
                 let c_n = (bip_conf * ncf).clamp(0.0, 1.0);
-                out_ref.shifts.insert((k, "NE2".to_string()), ne2);
-                atom_confidence.insert((k, "NE2".to_string()), c_n);
+                record_new_atom("NE2", ne2, c_n);
             }
         }
 
-        // Populate CB if missing on backbone_ref
-        if let std::collections::btree_map::Entry::Vacant(e) =
-            out_ref.shifts.entry((k, "CB".to_string()))
-        {
+        // Populate CB ONLY if missing on backbone_ref
+        if !backbone_ref.shifts.contains_key(&(k, "CB".to_string())) {
             if let Some(cb_y) = clu.cb_hd.or(clu.cb_he) {
-                e.insert(cb_y);
-                atom_confidence.insert((k, "CB".to_string()), bip_conf);
+                record_new_atom("CB", cb_y, bip_conf);
             }
         }
 
@@ -3640,11 +5326,18 @@ pub fn assign_aromatic_rings(
             score: win_sc,
             margin: mrg,
             his_tautomer: clu.his_tautomer,
+            his_state: clu.his_state,
         });
     }
 
+    let merged_ref = merge_aromatic_assignments_preserving_existing(
+        backbone_ref,
+        &newly_assigned_ref,
+        &atom_confidence,
+    );
+
     AromaticAssignResult {
-        reference: out_ref,
+        reference: merged_ref,
         atom_confidence,
         rings,
         clusters,
@@ -3789,7 +5482,27 @@ pub fn evaluate_aromatic_assignment(
             if !handled.insert(atom) {
                 continue;
             }
-            let Some(&tv) = truth.shifts.get(&(k, atom.to_string())) else {
+            // In 1H/13C-only depositions lacking 15N indole shifts (e.g. BMRB 4562), TRP HE1 has no
+            // heteronuclear (1H, 15N/13C) correlation peak unless NE1 is also present.
+            if aa == "TRP"
+                && atom == "HE1"
+                && !truth.shifts.contains_key(&(k, "NE1".to_string()))
+                && !res.reference.shifts.contains_key(&(k, "HE1".to_string()))
+            {
+                continue;
+            }
+            let sym_alt = match (aa, atom) {
+                ("PHE" | "TYR", "CD1") => Some("CD2"),
+                ("PHE" | "TYR", "HD1") => Some("HD2"),
+                ("PHE" | "TYR", "CE1") => Some("CE2"),
+                ("PHE" | "TYR", "HE1") => Some("HE2"),
+                _ => None,
+            };
+            let Some(&tv) = truth
+                .shifts
+                .get(&(k, atom.to_string()))
+                .or_else(|| sym_alt.and_then(|alt| truth.shifts.get(&(k, alt.to_string()))))
+            else {
                 continue;
             };
             m.assignable_atoms += 1;

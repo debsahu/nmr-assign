@@ -11,6 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eframe::egui;
+use nmr_core::aromatic::{
+    classify_his_state, HisStateClassification, HisTautomer, HisTautomerEvidence,
+};
 use nmr_core::nmrstar::Reference;
 use nmr_core::priors::{three_to_one, Priors};
 use nmr_core::topology::{
@@ -30,6 +33,8 @@ pub enum AtomZScoreClass {
     WarningAmber,
     /// Assigned shift in `|z| > 3.0` outlier regime (crimson outlier fill).
     OutlierCrimson,
+    /// Assigned NMR-observable atom lacking a finite positive-sigma BMRB prior — calm slate neutral fill.
+    NoPriorNeutral,
     /// Unassigned spin-1/2 NMR-active atom (`1H`, `13C`, `15N`) — hollow circle.
     UnassignedHollow,
     /// Non-observable heteroatom (`O`, `S`) or unprotonated sidechain carbonyl/quaternary carbon
@@ -57,6 +62,7 @@ impl AtomZScoreClass {
             Self::NormalGreen => "Normal (|z| <= 1.5)",
             Self::WarningAmber => "Warning (1.5 < |z| <= 3.0)",
             Self::OutlierCrimson => "Outlier (|z| > 3.0)",
+            Self::NoPriorNeutral => "No BMRB prior",
             Self::UnassignedHollow => "Unassigned (NMR-active)",
             Self::MutedNonObservable => "Non-observable / Quaternary",
         }
@@ -68,6 +74,7 @@ impl AtomZScoreClass {
             Self::NormalGreen => egui::Color32::from_rgb(22, 163, 74),
             Self::WarningAmber => egui::Color32::from_rgb(217, 119, 6),
             Self::OutlierCrimson => egui::Color32::from_rgb(220, 38, 38),
+            Self::NoPriorNeutral => egui::Color32::from_rgb(59, 82, 114),
             // Hollow interior matches canvas background so covalent bond lines terminate cleanly at rim
             Self::UnassignedHollow => egui::Color32::from_rgb(18, 22, 31),
             Self::MutedNonObservable => egui::Color32::from_rgb(36, 42, 54),
@@ -80,6 +87,7 @@ impl AtomZScoreClass {
             Self::NormalGreen => egui::Stroke::new(1.8, egui::Color32::from_rgb(134, 239, 172)),
             Self::WarningAmber => egui::Stroke::new(1.8, egui::Color32::from_rgb(253, 224, 71)),
             Self::OutlierCrimson => egui::Stroke::new(2.0, egui::Color32::from_rgb(252, 165, 165)),
+            Self::NoPriorNeutral => egui::Stroke::new(1.8, egui::Color32::from_rgb(148, 184, 226)),
             Self::UnassignedHollow => {
                 let ring_col = match element {
                     Element::C => egui::Color32::from_rgb(125, 211, 252),
@@ -98,7 +106,10 @@ impl AtomZScoreClass {
     /// Foreground atom-label color inside the node circle.
     pub const fn label_color(self) -> egui::Color32 {
         match self {
-            Self::NormalGreen | Self::WarningAmber | Self::OutlierCrimson => egui::Color32::WHITE,
+            Self::NormalGreen
+            | Self::WarningAmber
+            | Self::OutlierCrimson
+            | Self::NoPriorNeutral => egui::Color32::WHITE,
             Self::UnassignedHollow => egui::Color32::from_rgb(226, 232, 240),
             Self::MutedNonObservable => egui::Color32::from_rgb(138, 148, 168),
         }
@@ -210,6 +221,7 @@ impl EvaluatedAtomNode {
 
         let bmrb_prior = match self.bmrb_mu_sd {
             Some((mu, sd)) => format!("{mu:.3} +- {sd:.3} ppm"),
+            None if self.is_nmr_observable => "No BMRB prior".to_string(),
             None => "N/A (non-observable)".to_string(),
         };
 
@@ -251,6 +263,7 @@ pub fn evaluate_atom_node(
             compute_atom_bmrb_zscore(res_name, variant, node.name, info.ppm, priors, sc_priors);
         let (bmrb_mu_sd, z_score, class) = match z_tuple {
             Some((mu, sd, z)) => (Some((mu, sd)), Some(z), AtomZScoreClass::from_zscore(z)),
+            None if node.is_nmr_observable => (None, None, AtomZScoreClass::NoPriorNeutral),
             None => (None, None, AtomZScoreClass::MutedNonObservable),
         };
         return EvaluatedAtomNode {
@@ -507,7 +520,12 @@ impl<'a> SidechainWorkspaceInput<'a> {
 pub struct SequenceRibbonState {
     /// Currently selected `0`-based residue index.
     pub selected_residue: usize,
-    /// Per-residue chemical state overrides (`CysReduced`, `CysOxidized`, `HisNd1H`, `HisNe2H`, `HisDoublyProtonated`).
+    /// Automatically inferred per-residue chemical state variants (`Cys` redox, `His` Pelton tautomer)
+    /// recomputed from chemical shifts via [`Self::sync_inferred_variants_from_reference`].
+    pub auto_inferred_variants: BTreeMap<usize, ResidueVariant>,
+    /// Explicit user-selected per-residue chemical state overrides taking precedence over auto-inference.
+    pub user_variant_overrides: BTreeMap<usize, ResidueVariant>,
+    /// Legacy combined per-residue chemical state map kept synced for backward compatibility.
     pub variant_overrides: BTreeMap<usize, ResidueVariant>,
     /// Whether to display `ppm +- uncertainty` captions next to assigned nodes in the 2D diagram.
     pub show_ppm_captions: bool,
@@ -521,6 +539,9 @@ pub struct SequenceRibbonState {
     pub last_canvas_rect: Option<egui::Rect>,
 }
 
+/// Alias for [`SequenceRibbonState`] representing the persistent state of the 2D sidechain inspector.
+pub type SidechainInspectorState = SequenceRibbonState;
+
 impl Default for SequenceRibbonState {
     fn default() -> Self {
         Self::new()
@@ -532,6 +553,8 @@ impl SequenceRibbonState {
     pub fn new() -> Self {
         Self {
             selected_residue: 0,
+            auto_inferred_variants: BTreeMap::new(),
+            user_variant_overrides: BTreeMap::new(),
             variant_overrides: BTreeMap::new(),
             show_ppm_captions: true,
             last_ribbon_cell_rects: Vec::new(),
@@ -541,21 +564,136 @@ impl SequenceRibbonState {
         }
     }
 
-    /// Active [`ResidueVariant`] for `residue_idx` (`Canonical` when not overridden).
+    fn rebuild_legacy_variant_overrides(&mut self) {
+        for (&k, &v) in &self.auto_inferred_variants {
+            if !self.user_variant_overrides.contains_key(&k) {
+                self.variant_overrides.insert(k, v);
+            }
+        }
+        for (&k, &v) in &self.user_variant_overrides {
+            if v == ResidueVariant::Canonical {
+                self.variant_overrides.remove(&k);
+            } else {
+                self.variant_overrides.insert(k, v);
+            }
+        }
+    }
+
+    /// Active [`ResidueVariant`] for `residue_idx`, checking `user_variant_overrides` first,
+    /// then `auto_inferred_variants`, then legacy `variant_overrides`, then `Canonical`.
     pub fn variant_for(&self, residue_idx: usize) -> ResidueVariant {
+        if let Some(&v) = self.user_variant_overrides.get(&residue_idx) {
+            return v;
+        }
+        if let Some(&v) = self.auto_inferred_variants.get(&residue_idx) {
+            return v;
+        }
         self.variant_overrides
             .get(&residue_idx)
             .copied()
             .unwrap_or(ResidueVariant::Canonical)
     }
 
-    /// Set or clear the chemical state variant override for `residue_idx`.
+    /// Set an explicit user chemical state variant override for `residue_idx`.
     pub fn set_variant(&mut self, residue_idx: usize, variant: ResidueVariant) {
         if variant == ResidueVariant::Canonical {
+            if self.auto_inferred_variants.contains_key(&residue_idx) {
+                self.user_variant_overrides
+                    .insert(residue_idx, ResidueVariant::Canonical);
+            } else {
+                self.user_variant_overrides.remove(&residue_idx);
+            }
             self.variant_overrides.remove(&residue_idx);
         } else {
+            self.user_variant_overrides.insert(residue_idx, variant);
             self.variant_overrides.insert(residue_idx, variant);
         }
+    }
+
+    /// Clear any explicit user variant override on `residue_idx`, falling back to `auto_inferred_variants` or `Canonical`.
+    pub fn clear_user_variant_override(&mut self, residue_idx: usize) {
+        self.user_variant_overrides.remove(&residue_idx);
+        if let Some(&auto_v) = self.auto_inferred_variants.get(&residue_idx) {
+            self.variant_overrides.insert(residue_idx, auto_v);
+        } else {
+            self.variant_overrides.remove(&residue_idx);
+        }
+    }
+
+    /// Recompute `auto_inferred_variants` from `reference` (`Cys` `13CB` redox regime + `His`
+    /// Pelton `classify_his_state` `Resolved` tautomer), clearing stale auto-inferred entries
+    /// whenever shifts change or abstain, WITHOUT ever overwriting `user_variant_overrides`.
+    pub fn sync_inferred_variants_from_reference(&mut self, reference: &Reference) {
+        let prev_auto_keys: Vec<usize> = self.auto_inferred_variants.keys().copied().collect();
+        self.auto_inferred_variants.clear();
+        for k in prev_auto_keys {
+            if !self.user_variant_overrides.contains_key(&k) {
+                self.variant_overrides.remove(&k);
+            }
+        }
+
+        for (k, res_raw) in reference.sequence.iter().enumerate() {
+            let Some(topo) = residue_topology(res_raw) else {
+                continue;
+            };
+            match topo.three_letter {
+                "CYS" => {
+                    if let Some(&cb) = reference
+                        .shifts
+                        .get(&(k, "CB".to_string()))
+                        .filter(|v| v.is_finite())
+                    {
+                        // Kornhaber et al. (2006) / Sharma & Rajarathnam (2000):
+                        // reduced Cys SH CB ~ 28.0 +- 2.1 ppm; oxidized disulfide CB ~ 40.7 +- 3.4 ppm.
+                        if cb <= 32.5 {
+                            self.auto_inferred_variants
+                                .insert(k, ResidueVariant::CysReduced);
+                        } else if cb >= 35.5 {
+                            self.auto_inferred_variants
+                                .insert(k, ResidueVariant::CysOxidized);
+                        }
+                    }
+                }
+                "HIS" => {
+                    let ev = HisTautomerEvidence {
+                        nd1_ppm: reference.shifts.get(&(k, "ND1".to_string())).copied(),
+                        ne2_ppm: reference.shifts.get(&(k, "NE2".to_string())).copied(),
+                        cg_ppm: reference.shifts.get(&(k, "CG".to_string())).copied(),
+                        cd2_ppm: reference.shifts.get(&(k, "CD2".to_string())).copied(),
+                        hd2_ppm: reference.shifts.get(&(k, "HD2".to_string())).copied(),
+                        ce1_ppm: reference.shifts.get(&(k, "CE1".to_string())).copied(),
+                        he1_ppm: reference.shifts.get(&(k, "HE1".to_string())).copied(),
+                        cb_ppm: reference.shifts.get(&(k, "CB".to_string())).copied(),
+                        sample_ph: None,
+                        metal_coordinated_hint: false,
+                    };
+                    let has_ring_evidence = ev.nd1_ppm.is_some()
+                        || ev.ne2_ppm.is_some()
+                        || ev.cg_ppm.is_some()
+                        || ev.cd2_ppm.is_some()
+                        || ev.ce1_ppm.is_some()
+                        || ev.he1_ppm.is_some();
+                    if has_ring_evidence {
+                        let (state, conf) = classify_his_state(&ev);
+                        if conf >= 0.75 {
+                            if let HisStateClassification::Resolved(taut) = state {
+                                let var = match taut {
+                                    HisTautomer::Ne2H => ResidueVariant::HisNe2H,
+                                    HisTautomer::Nd1H => ResidueVariant::HisNd1H,
+                                    HisTautomer::DoublyProtonated => {
+                                        ResidueVariant::HisDoublyProtonated
+                                    }
+                                };
+                                self.auto_inferred_variants.insert(k, var);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.rebuild_legacy_variant_overrides();
     }
 }
 
@@ -1055,6 +1193,7 @@ impl SidechainInspectorPanel {
                 (AtomZScoreClass::NormalGreen, "|z|<=1.5"),
                 (AtomZScoreClass::WarningAmber, "1.5..3.0"),
                 (AtomZScoreClass::OutlierCrimson, "|z|>3.0"),
+                (AtomZScoreClass::NoPriorNeutral, "No BMRB prior"),
                 (AtomZScoreClass::UnassignedHollow, "Unassigned"),
                 (AtomZScoreClass::MutedNonObservable, "Quat/O/S"),
             ] {

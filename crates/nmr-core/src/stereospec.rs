@@ -17,13 +17,20 @@
 //!   measuring homonuclear three-bond J(HNHa) coupling constants in 15N-enriched proteins."
 //!   *J. Am. Chem. Soc.* 115, 7772–7777 (quantitative `3J_HAHB`, `3J_NHB`, and `3J_HNHA` curves).
 //! - Hu, J.-S. & Bax, A. (1997). *J. Biomol. NMR* 9, 323–328; Hu, J.-S. & Bax, A. (1997).
-//!   *J. Am. Chem. Soc.* 119, 6360–6368; and Chou, J. J., Case, D. A. & Bax, A. (2003).
+//!   *J. Am. Chem. Soc.* 119, 6360–6368; Pérez, C., Löhr, F., Rüterjans, H. & Schmidt, J. M.
+//!   (2001). *J. Am. Chem. Soc.* 123, 7081–7093; and Chou, J. J., Case, D. A. & Bax, A. (2003).
 //!   *J. Am. Chem. Soc.* 125, 8959–8966 (`3J_NCG` and `3J_C'CG` / `3J_CC` Karplus relations for
-//!   `Val`, `Ile`, `Thr`, and `Leu`).
+//!   `Val`, `Ile`, `Thr`, `Leu`, and non-branched `CB` sidechains).
+//! - Lange, K. L., Little, R. J. A. & Taylor, J. M. G. (1989). "Robust statistical modeling
+//!   using the t distribution." *J. Am. Stat. Assoc.* 84, 881–896 (heavy-tailed Student-t
+//!   `nu = 4` scalar-coupling likelihood for robustness against systematic Karplus
+//!   parameterization error and substituent effects, paired with an exact `3-sigma` quadratic
+//!   reduced-`chi^2` outlier abstention guard).
 //! - Nilges, M. (1995). *J. Mol. Biol.* 245, 645–660 (`r^-6` expectation and ambiguous
 //!   prochiral / floating-chirality treatment).
 //! - Lovell, S. C., Word, J. M., Richardson, J. S. & Richardson, D. C. (2000). "The penultimate
-//!   rotamer library." *Proteins* 40, 389–408 (backbone-dependent sidechain rotamer priors).
+//!   rotamer library." *Proteins* 40, 389–408 (power-law tempered backbone-dependent sidechain
+//!   rotamer priors so minor/rare rotamers supported by `3J`/NOE evidence are never overridden).
 //! - Markley, J. L. et al. (1998). *J. Mol. Biol.* 280, 933–952 (*J. Biomol. NMR* 1998, 12, 1–23)
 //!   and Gutmanas, A. et al. (2015). *Nat. Struct. Mol. Biol.* 22, 433–434 (IUPAC `HB2`/`HB3`
 //!   stereospecific nomenclature, NMR-STAR `Ambiguity_code`, and NEF v1.1 `HBx`/`HBy` wildcards).
@@ -466,6 +473,20 @@ pub fn karplus_3j_ccg_hz(res_name: &str, theta_deg: f64) -> f64 {
     }
 }
 
+/// Residue-hybridization-specific `3J(13C', 13C_gamma)` Karplus curve in Hz for non-branched `CB`
+/// sidechains (`Hu, Grzesiek & Bax, J. Am. Chem. Soc. 1997, 119, 1803-1804`; `Hu & Bax, J. Am.
+/// Chem. Soc. 1997, 119, 6360-6368`, Table 2; `Pérez et al., J. Am. Chem. Soc. 2001, 123, 7081-7093`),
+/// distinguishing carbonyl/carboxamide `sp2` `CG` (`Asp`/`Asn`), aromatic `sp2` `CG`
+/// (`Phe`/`Tyr`/`Trp`/`His`), and aliphatic `sp3` `CG` (`Leu`/`Glu`/`Gln`/`Lys`/`Arg`/`Met`).
+#[inline]
+fn karplus_3j_ccg_cb_hz(res_name: &str, theta_deg: f64) -> f64 {
+    match res_name.to_ascii_uppercase().as_str() {
+        "ASP" | "ASN" => karplus_hz(theta_deg, 3.69, -1.16, 0.55, 0.0).max(0.0),
+        "PHE" | "TYR" | "TRP" | "HIS" => karplus_hz(theta_deg, 2.31, -0.87, 0.49, 0.0).max(0.0),
+        _ => karplus_hz(theta_deg, 2.31, -0.87, 0.29, 0.0).max(0.0),
+    }
+}
+
 #[inline]
 fn librational_avg<F: Fn(f64) -> f64>(f: F, center_deg: f64, sigma_deg: f64) -> f64 {
     let mut acc = 0.0;
@@ -479,8 +500,25 @@ fn librational_avg<F: Fn(f64) -> f64>(f: F, center_deg: f64, sigma_deg: f64) -> 
 // 2. Lovell et al. (2000) Backbone-Dependent Sidechain Rotamer Priors
 // ============================================================================
 
+/// Power-law tempering exponent `gamma in [0.55, 0.75]` applied to Lovell et al. (2000) rotamer
+/// library probabilities `pi_r^gamma / sum_k pi_k^gamma` so strong empirical library preferences
+/// (e.g. `> 88%` `t` on helical `Val` or `<= 3%` `g+` on helical aromatics) never overwhelm genuine
+/// multi-pathway scalar couplings or NOEs on rare/minor sidechain rotamers, while preserving exact
+/// `[1/3, 1/3, 1/3]` uniformity when unconditioned.
+const LOVELL_PRIOR_TEMPER_GAMMA: f64 = 0.65;
+
+#[inline]
+fn temper_rotamer_prior(raw: [f64; 3]) -> [f64; 3] {
+    let t0 = raw[0].max(1e-4).powf(LOVELL_PRIOR_TEMPER_GAMMA);
+    let t1 = raw[1].max(1e-4).powf(LOVELL_PRIOR_TEMPER_GAMMA);
+    let t2 = raw[2].max(1e-4).powf(LOVELL_PRIOR_TEMPER_GAMMA);
+    let s = t0 + t1 + t2;
+    [t0 / s, t1 / s, t2 / s]
+}
+
 /// Backbone-conditioned `chi1` rotamer prior `[P(g-), P(t), P(g+)]` derived from the Penultimate
-/// Rotamer Library (Lovell, Word, Richardson & Richardson, *Proteins* 2000, 40, 389–408).
+/// Rotamer Library (Lovell, Word, Richardson & Richardson, *Proteins* 2000, 40, 389–408), tempered
+/// by `LOVELL_PRIOR_TEMPER_GAMMA` for rare-rotamer robustness.
 pub fn lovell_chi1_prior(
     res_name: &str,
     phi_deg: Option<f64>,
@@ -490,7 +528,7 @@ pub fn lovell_chi1_prior(
     let up = res_name.trim().to_ascii_uppercase();
     if up == "PRO" {
         // Pyrrolidine puckers: Cg-exo (~ -25 deg) vs planar transition (~ 0 deg) vs Cg-endo (~ +26 deg)
-        return [0.51, 0.03, 0.46];
+        return temper_rotamer_prior([0.51, 0.03, 0.46]);
     }
 
     // Determine secondary-structure basin from explicit (phi, psi) when available, else ss_hint
@@ -543,11 +581,11 @@ pub fn lovell_chi1_prior(
         (_, _) => [0.55, 0.33, 0.12],
     };
 
-    let s = raw[0] + raw[1] + raw[2];
-    [raw[0] / s, raw[1] / s, raw[2] / s]
+    temper_rotamer_prior(raw)
 }
 
-/// Conditional `chi2` rotamer prior `[P(g- | chi1), P(t | chi1), P(g+ | chi1)]` from Lovell et al. (2000).
+/// Conditional `chi2` rotamer prior `[P(g- | chi1), P(t | chi1), P(g+ | chi1)]` from Lovell et al. (2000),
+/// tempered by `LOVELL_PRIOR_TEMPER_GAMMA`.
 pub fn lovell_chi2_prior(res_name: &str, chi1: RotamerState) -> [f64; 3] {
     let up = res_name.trim().to_ascii_uppercase();
     let raw = match (up.as_str(), chi1) {
@@ -568,8 +606,7 @@ pub fn lovell_chi2_prior(res_name: &str, chi1: RotamerState) -> [f64; 3] {
         (_, RotamerState::Trans) => [0.15, 0.70, 0.15],
         (_, RotamerState::GauchePlus) => [0.14, 0.70, 0.16],
     };
-    let s = raw[0] + raw[1] + raw[2];
-    [raw[0] / s, raw[1] / s, raw[2] / s]
+    temper_rotamer_prior(raw)
 }
 
 // ============================================================================
@@ -940,6 +977,9 @@ pub struct ProchiralObservables {
     pub j_cc_vicinal_hz: Option<(f64, f64)>,
     /// Optional single methine `3J_HAHB` coupling in Hz (`VAL` / `ILE`), constraining `chi1`.
     pub j_methine_hahb_hz: Option<f64>,
+    /// Optional single-`CG` heteronuclear `3J_C'CG` (`C'-CA-CB-CG`) coupling in Hz for non-branched
+    /// `CB`-methylene sidechains (`Hu & Bax, J. Am. Chem. Soc. 1997, 119, 6360-6368`), constraining `chi1`.
+    pub j_ccg_single_hz: Option<f64>,
     /// Intraresidue and sequential NOE cross-peak intensity pairs `(I_a, I_b)`.
     pub noe_pairs: Vec<NoePairObs>,
     /// Whether residue `i+1` is `PRO` (suppresses `SeqNextAmideH`).
@@ -983,9 +1023,9 @@ impl Default for StereospecConfig {
             noe_log_sigma: 0.42,
             libration_sigma_deg: 10.0,
             simplex_divisions: 20,
-            dominant_rotamer_prior_weight: 0.56,
+            dominant_rotamer_prior_weight: 0.54,
             isotropic_averaging_prior_weight: 0.24,
-            dirichlet_concentration: 3.0,
+            dirichlet_concentration: 2.2,
             use_carboxamide_shift_prior: true,
         }
     }
@@ -1202,6 +1242,7 @@ struct RotamerBasisPredictions {
     j_ncg: Option<[(f64, f64); 3]>,
     j_cc: Option<[(f64, f64); 3]>,
     j_methine_hahb: Option<[f64; 3]>,
+    j_ccg_single: Option<[f64; 3]>,
     noe_r6: BTreeMap<AnchorProton, [(f64, f64); 3]>,
 }
 
@@ -1224,6 +1265,7 @@ fn compute_cb_basis(
 
     let mut j_hh = [(0.0, 0.0); 3];
     let mut j_nhb = [(0.0, 0.0); 3];
+    let mut j_ccg_s = [0.0; 3];
     let mut r6_h = [(0.0, 0.0); 3];
     let mut r6_ha = [(0.0, 0.0); 3];
     let mut r6_hn1 = [(0.0, 0.0); 3];
@@ -1237,6 +1279,9 @@ fn compute_cb_basis(
             librational_avg(karplus_3j_nhb_mag_hz, chi1 + 120.0, sig_lib),
             librational_avg(karplus_3j_nhb_mag_hz, chi1 - 120.0, sig_lib),
         );
+        // L-amino acid tetrahedral phase: dihedral(N, CA, CB, X_gamma) = chi1,
+        // so dihedral(C', CA, CB, X_gamma) = chi1 - 120 deg (trans ~ -180 deg in g-).
+        j_ccg_s[r] = librational_avg(|t| karplus_3j_ccg_cb_hz(res_name, t), chi1 - 120.0, sig_lib);
         let hb2 = nerf_place_atom(
             frame.n,
             frame.ca,
@@ -1271,12 +1316,17 @@ fn compute_cb_basis(
         noe_r6.insert(AnchorProton::SeqNextAmideH, r6_hn1);
     }
 
+    let has_acyclic_cg = !matches!(
+        res_name.to_ascii_uppercase().as_str(),
+        "PRO" | "SER" | "CYS" | "ALA" | "GLY"
+    );
     RotamerBasisPredictions {
         j_hh: Some(j_hh),
         j_nhb: Some(j_nhb),
         j_ncg: None,
         j_cc: None,
         j_methine_hahb: None,
+        j_ccg_single: if has_acyclic_cg { Some(j_ccg_s) } else { None },
         noe_r6,
     }
 }
@@ -1360,6 +1410,7 @@ fn compute_val_basis(frame: &LocalPeptideFrame, sig_lib: f64) -> RotamerBasisPre
         j_ncg: Some(j_ncg),
         j_cc: Some(j_cc),
         j_methine_hahb: Some(j_meth),
+        j_ccg_single: None,
         noe_r6,
     }
 }
@@ -1469,6 +1520,7 @@ fn compute_leu_basis_for_chi1(
         j_ncg: None,
         j_cc: Some(j_cc),
         j_methine_hahb: None,
+        j_ccg_single: None,
         noe_r6,
     }
 }
@@ -1625,8 +1677,21 @@ fn compute_gamma_methylene_basis_for_chi1(
         j_ncg: None,
         j_cc: None,
         j_methine_hahb: None,
+        j_ccg_single: None,
         noe_r6,
     }
+}
+
+/// Degrees of freedom `nu = 4` for the heavy-tailed Student-t scalar-coupling likelihood
+/// (Lange, Little & Taylor, J. Am. Stat. Assoc. 1989, 84, 881-896), absorbing substituent and
+/// local valence-angle Karplus perturbations (Perez et al., JACS 2001) without collapsing
+/// stereospecific posterior calibration.
+const STUDENT_T_J_DOF: f64 = 4.0;
+
+#[inline]
+fn student_t_j_log_likelihood(residual_hz: f64, sigma_hz: f64) -> f64 {
+    let z = residual_hz / sigma_hz;
+    -0.5 * (STUDENT_T_J_DOF + 1.0) * ((z * z) / STUDENT_T_J_DOF).ln_1p()
 }
 
 fn evaluate_basis_simplex_log_likelihood(
@@ -1649,38 +1714,42 @@ fn evaluate_basis_simplex_log_likelihood(
         let (o1, o2) = map_pair(obs_j);
         let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
         let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
-        let iv = 1.0 / (cfg.homonuclear_j_sigma_hz * cfg.homonuclear_j_sigma_hz);
-        ll -= 0.5 * ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(o1 - p1, cfg.homonuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(o2 - p2, cfg.homonuclear_j_sigma_hz);
     }
 
     if let (Some(obs_j), Some(pred_j)) = (obs.j_nhb_hz, &basis.j_nhb) {
         let (o1, o2) = map_pair((obs_j.0.abs(), obs_j.1.abs()));
         let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
         let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
-        let iv = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
-        ll -= 0.5 * ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(o1 - p1, cfg.heteronuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(o2 - p2, cfg.heteronuclear_j_sigma_hz);
     }
 
     if let (Some(obs_j), Some(pred_j)) = (obs.j_ncg_hz, &basis.j_ncg) {
         let (o1, o2) = map_pair((obs_j.0.abs(), obs_j.1.abs()));
         let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
         let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
-        let iv = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
-        ll -= 0.5 * ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(o1 - p1, cfg.heteronuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(o2 - p2, cfg.heteronuclear_j_sigma_hz);
     }
 
     if let (Some(obs_j), Some(pred_j)) = (obs.j_cc_vicinal_hz, &basis.j_cc) {
         let (o1, o2) = map_pair((obs_j.0.abs(), obs_j.1.abs()));
         let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
         let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
-        let iv = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
-        ll -= 0.5 * ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(o1 - p1, cfg.heteronuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(o2 - p2, cfg.heteronuclear_j_sigma_hz);
     }
 
     if let (Some(om), Some(pm)) = (obs.j_methine_hahb_hz, &basis.j_methine_hahb) {
         let p = w[0] * pm[0] + w[1] * pm[1] + w[2] * pm[2];
-        let iv = 1.0 / (cfg.homonuclear_j_sigma_hz * cfg.homonuclear_j_sigma_hz);
-        ll -= 0.5 * (om - p).powi(2) * iv;
+        ll += student_t_j_log_likelihood(om - p, cfg.homonuclear_j_sigma_hz);
+    }
+
+    if let (Some(oc), Some(pc)) = (obs.j_ccg_single_hz, &basis.j_ccg_single) {
+        let p = w[0] * pc[0] + w[1] * pc[1] + w[2] * pc[2];
+        ll += student_t_j_log_likelihood(oc.abs() - p, cfg.heteronuclear_j_sigma_hz);
     }
 
     // Baseline spin-diffusion / detection floor r_max = 5.5 A
@@ -1704,6 +1773,82 @@ fn evaluate_basis_simplex_log_likelihood(
     ll
 }
 
+fn evaluate_basis_quadratic_chi2(
+    basis: &RotamerBasisPredictions,
+    w: [f64; 3],
+    hyp: SwapHypothesis,
+    obs: &ProchiralObservables,
+    cfg: &StereospecConfig,
+) -> f64 {
+    let map_pair = |(va, vb): (f64, f64)| -> (f64, f64) {
+        match hyp {
+            SwapHypothesis::Direct => (va, vb),
+            SwapHypothesis::Swapped => (vb, va),
+        }
+    };
+
+    let mut chi2 = 0.0;
+    let iv_hh = 1.0 / (cfg.homonuclear_j_sigma_hz * cfg.homonuclear_j_sigma_hz);
+    let iv_het = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
+
+    if let (Some(obs_j), Some(pred_j)) = (obs.j_hh_vicinal_hz, &basis.j_hh) {
+        let (o1, o2) = map_pair(obs_j);
+        let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
+        let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
+        chi2 += ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv_hh;
+    }
+
+    if let (Some(obs_j), Some(pred_j)) = (obs.j_nhb_hz, &basis.j_nhb) {
+        let (o1, o2) = map_pair((obs_j.0.abs(), obs_j.1.abs()));
+        let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
+        let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
+        chi2 += ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv_het;
+    }
+
+    if let (Some(obs_j), Some(pred_j)) = (obs.j_ncg_hz, &basis.j_ncg) {
+        let (o1, o2) = map_pair((obs_j.0.abs(), obs_j.1.abs()));
+        let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
+        let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
+        chi2 += ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv_het;
+    }
+
+    if let (Some(obs_j), Some(pred_j)) = (obs.j_cc_vicinal_hz, &basis.j_cc) {
+        let (o1, o2) = map_pair((obs_j.0.abs(), obs_j.1.abs()));
+        let p1 = w[0] * pred_j[0].0 + w[1] * pred_j[1].0 + w[2] * pred_j[2].0;
+        let p2 = w[0] * pred_j[0].1 + w[1] * pred_j[1].1 + w[2] * pred_j[2].1;
+        chi2 += ((o1 - p1).powi(2) + (o2 - p2).powi(2)) * iv_het;
+    }
+
+    if let (Some(om), Some(pm)) = (obs.j_methine_hahb_hz, &basis.j_methine_hahb) {
+        let p = w[0] * pm[0] + w[1] * pm[1] + w[2] * pm[2];
+        chi2 += (om - p).powi(2) * iv_hh;
+    }
+
+    if let (Some(oc), Some(pc)) = (obs.j_ccg_single_hz, &basis.j_ccg_single) {
+        let p = w[0] * pc[0] + w[1] * pc[1] + w[2] * pc[2];
+        chi2 += (oc.abs() - p).powi(2) * iv_het;
+    }
+
+    let floor_r6 = 5.5_f64.powi(-6);
+    for np in &obs.noe_pairs {
+        if np.intensity_a <= 0.0 || np.intensity_b <= 0.0 {
+            continue;
+        }
+        let Some(pred_r6) = basis.noe_r6.get(&np.anchor) else {
+            continue;
+        };
+        let (ia, ib) = map_pair((np.intensity_a, np.intensity_b));
+        let u1 = w[0] * pred_r6[0].0 + w[1] * pred_r6[1].0 + w[2] * pred_r6[2].0 + floor_r6;
+        let u2 = w[0] * pred_r6[0].1 + w[1] * pred_r6[1].1 + w[2] * pred_r6[2].1 + floor_r6;
+        let obs_lr = (ia / ib).ln();
+        let pred_lr = (u1 / u2).ln();
+        let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
+        chi2 += (obs_lr - pred_lr).powi(2) / (2.0 * sig * sig);
+    }
+
+    chi2
+}
+
 fn evaluate_isotropic_null_log_likelihood(
     basis: &RotamerBasisPredictions,
     obs: &ProchiralObservables,
@@ -1718,28 +1863,31 @@ fn evaluate_isotropic_null_log_likelihood(
 
     if let (Some((oa, ob)), Some(pred_j)) = (obs.j_hh_vicinal_hz, &basis.j_hh) {
         let p = avg_sym(pred_j);
-        let iv = 1.0 / (cfg.homonuclear_j_sigma_hz * cfg.homonuclear_j_sigma_hz);
-        ll -= 0.5 * ((oa - p).powi(2) + (ob - p).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(oa - p, cfg.homonuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(ob - p, cfg.homonuclear_j_sigma_hz);
     }
     if let (Some((oa, ob)), Some(pred_j)) = (obs.j_nhb_hz, &basis.j_nhb) {
         let p = avg_sym(pred_j);
-        let iv = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
-        ll -= 0.5 * ((oa.abs() - p).powi(2) + (ob.abs() - p).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(oa.abs() - p, cfg.heteronuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(ob.abs() - p, cfg.heteronuclear_j_sigma_hz);
     }
     if let (Some((oa, ob)), Some(pred_j)) = (obs.j_ncg_hz, &basis.j_ncg) {
         let p = avg_sym(pred_j);
-        let iv = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
-        ll -= 0.5 * ((oa.abs() - p).powi(2) + (ob.abs() - p).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(oa.abs() - p, cfg.heteronuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(ob.abs() - p, cfg.heteronuclear_j_sigma_hz);
     }
     if let (Some((oa, ob)), Some(pred_j)) = (obs.j_cc_vicinal_hz, &basis.j_cc) {
         let p = avg_sym(pred_j);
-        let iv = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
-        ll -= 0.5 * ((oa.abs() - p).powi(2) + (ob.abs() - p).powi(2)) * iv;
+        ll += student_t_j_log_likelihood(oa.abs() - p, cfg.heteronuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(ob.abs() - p, cfg.heteronuclear_j_sigma_hz);
     }
     if let (Some(om), Some(pm)) = (obs.j_methine_hahb_hz, &basis.j_methine_hahb) {
         let p = (pm[0] + pm[1] + pm[2]) / 3.0;
-        let iv = 1.0 / (cfg.homonuclear_j_sigma_hz * cfg.homonuclear_j_sigma_hz);
-        ll -= 0.5 * (om - p).powi(2) * iv;
+        ll += student_t_j_log_likelihood(om - p, cfg.homonuclear_j_sigma_hz);
+    }
+    if let (Some(oc), Some(pc)) = (obs.j_ccg_single_hz, &basis.j_ccg_single) {
+        let p = (pc[0] + pc[1] + pc[2]) / 3.0;
+        ll += student_t_j_log_likelihood(oc.abs() - p, cfg.heteronuclear_j_sigma_hz);
     }
     for np in &obs.noe_pairs {
         if np.intensity_a <= 0.0 || np.intensity_b <= 0.0 {
@@ -1753,6 +1901,56 @@ fn evaluate_isotropic_null_log_likelihood(
         ll -= 0.5 * obs_lr.powi(2) / (2.0 * sig * sig);
     }
     ll
+}
+
+fn evaluate_isotropic_quadratic_chi2(
+    basis: &RotamerBasisPredictions,
+    obs: &ProchiralObservables,
+    cfg: &StereospecConfig,
+) -> f64 {
+    let mut chi2 = 0.0;
+    let avg_sym = |arr: &[(f64, f64); 3]| -> f64 {
+        (arr[0].0 + arr[0].1 + arr[1].0 + arr[1].1 + arr[2].0 + arr[2].1) / 6.0
+    };
+    let iv_hh = 1.0 / (cfg.homonuclear_j_sigma_hz * cfg.homonuclear_j_sigma_hz);
+    let iv_het = 1.0 / (cfg.heteronuclear_j_sigma_hz * cfg.heteronuclear_j_sigma_hz);
+
+    if let (Some((oa, ob)), Some(pred_j)) = (obs.j_hh_vicinal_hz, &basis.j_hh) {
+        let p = avg_sym(pred_j);
+        chi2 += ((oa - p).powi(2) + (ob - p).powi(2)) * iv_hh;
+    }
+    if let (Some((oa, ob)), Some(pred_j)) = (obs.j_nhb_hz, &basis.j_nhb) {
+        let p = avg_sym(pred_j);
+        chi2 += ((oa.abs() - p).powi(2) + (ob.abs() - p).powi(2)) * iv_het;
+    }
+    if let (Some((oa, ob)), Some(pred_j)) = (obs.j_ncg_hz, &basis.j_ncg) {
+        let p = avg_sym(pred_j);
+        chi2 += ((oa.abs() - p).powi(2) + (ob.abs() - p).powi(2)) * iv_het;
+    }
+    if let (Some((oa, ob)), Some(pred_j)) = (obs.j_cc_vicinal_hz, &basis.j_cc) {
+        let p = avg_sym(pred_j);
+        chi2 += ((oa.abs() - p).powi(2) + (ob.abs() - p).powi(2)) * iv_het;
+    }
+    if let (Some(om), Some(pm)) = (obs.j_methine_hahb_hz, &basis.j_methine_hahb) {
+        let p = (pm[0] + pm[1] + pm[2]) / 3.0;
+        chi2 += (om - p).powi(2) * iv_hh;
+    }
+    if let (Some(oc), Some(pc)) = (obs.j_ccg_single_hz, &basis.j_ccg_single) {
+        let p = (pc[0] + pc[1] + pc[2]) / 3.0;
+        chi2 += (oc.abs() - p).powi(2) * iv_het;
+    }
+    for np in &obs.noe_pairs {
+        if np.intensity_a <= 0.0 || np.intensity_b <= 0.0 {
+            continue;
+        }
+        if !basis.noe_r6.contains_key(&np.anchor) {
+            continue;
+        }
+        let obs_lr = (np.intensity_a / np.intensity_b).ln();
+        let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
+        chi2 += obs_lr.powi(2) / (2.0 * sig * sig);
+    }
+    chi2
 }
 
 fn log_sum_exp(xs: &[f64]) -> f64 {
@@ -1852,6 +2050,11 @@ fn has_invalid_or_out_of_range_observables(
             return true;
         }
     }
+    if let Some(jc) = obs.j_ccg_single_hz {
+        if !is_valid_3j_hz(jc) {
+            return true;
+        }
+    }
     for np in &obs.noe_pairs {
         if !np.intensity_a.is_finite()
             || !np.intensity_b.is_finite()
@@ -1909,6 +2112,9 @@ fn count_basis_observations(basis: &RotamerBasisPredictions, obs: &ProchiralObse
         n += 2;
     }
     if basis.j_methine_hahb.is_some() && obs.j_methine_hahb_hz.is_some() {
+        n += 1;
+    }
+    if basis.j_ccg_single.is_some() && obs.j_ccg_single_hz.is_some() {
         n += 1;
     }
     for np in &obs.noe_pairs {
@@ -1986,7 +2192,20 @@ fn has_multi_pathway_prochiral_evidence(
 ) -> bool {
     let n_paired_j = match spec.kind {
         ProchiralSiteKind::BetaMethylene => {
-            usize::from(obs.j_hh_vicinal_hz.is_some()) + usize::from(obs.j_nhb_hz.is_some())
+            let paired =
+                usize::from(obs.j_hh_vicinal_hz.is_some()) + usize::from(obs.j_nhb_hz.is_some());
+            let has_acyclic_cg = !matches!(
+                spec.residue.to_ascii_uppercase().as_str(),
+                "PRO" | "SER" | "CYS" | "ALA" | "GLY"
+            );
+            // Paired 3J_HAHB / 3J_NHB plus Hu & Bax (1997) single-CG 3J(C'-CA-CB-CG) on acyclic
+            // gamma-carbon sidechains measures two independent dihedral pathways, breaking
+            // (g-, Direct) <-> (t, Swapped) degeneracy.
+            if paired >= 1 && has_acyclic_cg && obs.j_ccg_single_hz.is_some() {
+                paired + 1
+            } else {
+                paired
+            }
         }
         ProchiralSiteKind::ValIsopropyl => {
             usize::from(obs.j_ncg_hz.is_some()) + usize::from(obs.j_cc_vicinal_hz.is_some())
@@ -2129,6 +2348,7 @@ fn infer_chi1_simplex_pair(
     let mut unif_dir_terms: Vec<f64> = Vec::new();
     let mut unif_swp_terms: Vec<f64> = Vec::new();
     let mut max_data_ll = f64::NEG_INFINITY;
+    let mut min_chi2 = f64::INFINITY;
     let mut n_obs = 0usize;
 
     for &(phi, psi, w_bb, ss_hint) in &bb_pts {
@@ -2153,9 +2373,10 @@ fn infer_chi1_simplex_pair(
         for (si, sp) in simplex.iter().enumerate() {
             let base_lp = ln_wbb + log_priors[si] + ln_half;
             let unif_lp = ln_wbb + uniform_log_priors[si] + ln_half;
-            let (raw_d, raw_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
+            let (raw_d, raw_s, chi2_d, chi2_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
                 let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
-                (r0, r0)
+                let c0 = evaluate_isotropic_quadratic_chi2(&basis, obs, cfg);
+                (r0, r0, c0, c0)
             } else {
                 (
                     evaluate_basis_simplex_log_likelihood(
@@ -2172,9 +2393,12 @@ fn infer_chi1_simplex_pair(
                         obs,
                         cfg,
                     ),
+                    evaluate_basis_quadratic_chi2(&basis, sp.w, SwapHypothesis::Direct, obs, cfg),
+                    evaluate_basis_quadratic_chi2(&basis, sp.w, SwapHypothesis::Swapped, obs, cfg),
                 )
             };
             max_data_ll = max_data_ll.max(raw_d).max(raw_s);
+            min_chi2 = min_chi2.min(chi2_d).min(chi2_s);
             joint_log[0][si] = log_sum_exp(&[joint_log[0][si], base_lp + raw_d]);
             joint_log[1][si] = log_sum_exp(&[joint_log[1][si], base_lp + raw_s]);
             unif_dir_terms.push(unif_lp + raw_d);
@@ -2183,7 +2407,9 @@ fn infer_chi1_simplex_pair(
     }
 
     if n_obs > 0
-        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+        && (!max_data_ll.is_finite()
+            || !min_chi2.is_finite()
+            || min_chi2 / (n_obs as f64) > MAX_REDUCED_CHI2)
     {
         return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
@@ -2256,6 +2482,7 @@ fn infer_chi1_chi2_simplex_pair(
     let mut unif_dir_terms: Vec<f64> = Vec::new();
     let mut unif_swp_terms: Vec<f64> = Vec::new();
     let mut max_data_ll = f64::NEG_INFINITY;
+    let mut min_chi2 = f64::INFINITY;
     let mut n_obs = 0usize;
 
     for &(phi, psi, w_bb, ss_hint) in &bb_pts {
@@ -2290,45 +2517,65 @@ fn infer_chi1_chi2_simplex_pair(
 
             // Include Ile single methine 3J_HAHB(chi1) when supplied:
             // In (2S,3S)-Ile, dihedral(N,CA,CB,HB) = chi1 + 120 deg => dihedral(HA,CA,CB,HB) = chi1 - 120 deg.
-            let ll_meth = if let Some(jm) = obs.j_methine_hahb_hz {
+            let (ll_meth, chi2_meth) = if let Some(jm) = obs.j_methine_hahb_hz {
                 if spec.residue.eq_ignore_ascii_case("ILE") {
                     let pred = librational_avg(
                         karplus_3j_hahb_hz,
                         chi1_deg - 120.0,
                         cfg.libration_sigma_deg,
                     );
-                    -0.5 * (jm - pred).powi(2) / cfg.homonuclear_j_sigma_hz.powi(2)
+                    (
+                        student_t_j_log_likelihood(jm - pred, cfg.homonuclear_j_sigma_hz),
+                        (jm - pred).powi(2) / cfg.homonuclear_j_sigma_hz.powi(2),
+                    )
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 }
             } else {
-                0.0
+                (0.0, 0.0)
             };
 
             let unif_prefix = w_bb.ln() + ln_third + ll_meth + ln_half;
             for (si, sp) in simplex.iter().enumerate() {
-                let (raw_d, raw_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
-                    let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
-                    (r0, r0)
-                } else {
-                    (
-                        evaluate_basis_simplex_log_likelihood(
-                            &basis,
-                            sp.w,
-                            SwapHypothesis::Direct,
-                            obs,
-                            cfg,
-                        ),
-                        evaluate_basis_simplex_log_likelihood(
-                            &basis,
-                            sp.w,
-                            SwapHypothesis::Swapped,
-                            obs,
-                            cfg,
-                        ),
-                    )
-                };
+                let (raw_d, raw_s, chi2_d, chi2_s) =
+                    if matches!(sp.kind, SimplexPointKind::Isotropic) {
+                        let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
+                        let c0 = evaluate_isotropic_quadratic_chi2(&basis, obs, cfg);
+                        (r0, r0, c0, c0)
+                    } else {
+                        (
+                            evaluate_basis_simplex_log_likelihood(
+                                &basis,
+                                sp.w,
+                                SwapHypothesis::Direct,
+                                obs,
+                                cfg,
+                            ),
+                            evaluate_basis_simplex_log_likelihood(
+                                &basis,
+                                sp.w,
+                                SwapHypothesis::Swapped,
+                                obs,
+                                cfg,
+                            ),
+                            evaluate_basis_quadratic_chi2(
+                                &basis,
+                                sp.w,
+                                SwapHypothesis::Direct,
+                                obs,
+                                cfg,
+                            ),
+                            evaluate_basis_quadratic_chi2(
+                                &basis,
+                                sp.w,
+                                SwapHypothesis::Swapped,
+                                obs,
+                                cfg,
+                            ),
+                        )
+                    };
                 max_data_ll = max_data_ll.max(ll_meth + raw_d).max(ll_meth + raw_s);
+                min_chi2 = min_chi2.min(chi2_meth + chi2_d).min(chi2_meth + chi2_s);
                 unif_dir_terms.push(unif_prefix + uniform_log_priors[si] + raw_d);
                 unif_swp_terms.push(unif_prefix + uniform_log_priors[si] + raw_s);
                 if w_c1 > 1e-6 {
@@ -2341,7 +2588,9 @@ fn infer_chi1_chi2_simplex_pair(
     }
 
     if n_obs > 0
-        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+        && (!max_data_ll.is_finite()
+            || !min_chi2.is_finite()
+            || min_chi2 / (n_obs as f64) > MAX_REDUCED_CHI2)
     {
         return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
@@ -2408,10 +2657,12 @@ fn infer_gly_pair(
     let p_iso = cfg.isotropic_averaging_prior_weight.clamp(0.02, 0.40);
     let p_struct = 1.0 - p_iso;
     let floor_r6 = 5.5_f64.powi(-6);
+    let iv_hh = 1.0 / cfg.homonuclear_j_sigma_hz.powi(2);
 
     let mut terms_dir = Vec::with_capacity(bb_pts.len() + 1);
     let mut terms_swp = Vec::with_capacity(bb_pts.len() + 1);
     let mut max_data_ll = f64::NEG_INFINITY;
+    let mut min_chi2 = f64::INFINITY;
     let mut n_obs = usize::from(obs.j_hh_vicinal_hz.is_some()) * 2
         + obs
             .noe_pairs
@@ -2436,14 +2687,16 @@ fn infer_gly_pair(
 
         for hyp in [SwapHypothesis::Direct, SwapHypothesis::Swapped] {
             let mut data_ll = 0.0;
+            let mut data_chi2 = 0.0;
             if let Some((ja, jb)) = obs.j_hh_vicinal_hz {
                 let (o2, o3) = if hyp == SwapHypothesis::Direct {
                     (ja, jb)
                 } else {
                     (jb, ja)
                 };
-                data_ll -= 0.5 * ((o2 - j2).powi(2) + (o3 - j3).powi(2))
-                    / cfg.homonuclear_j_sigma_hz.powi(2);
+                data_ll += student_t_j_log_likelihood(o2 - j2, cfg.homonuclear_j_sigma_hz)
+                    + student_t_j_log_likelihood(o3 - j3, cfg.homonuclear_j_sigma_hz);
+                data_chi2 += ((o2 - j2).powi(2) + (o3 - j3).powi(2)) * iv_hh;
             }
             for np in &obs.noe_pairs {
                 if np.intensity_a <= 0.0 || np.intensity_b <= 0.0 {
@@ -2465,9 +2718,12 @@ fn infer_gly_pair(
                     (np.intensity_b, np.intensity_a)
                 };
                 let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
-                data_ll -= 0.5 * ((ia / ib).ln() - (u2 / u3).ln()).powi(2) / (2.0 * sig * sig);
+                let noe_q = ((ia / ib).ln() - (u2 / u3).ln()).powi(2) / (2.0 * sig * sig);
+                data_ll -= 0.5 * noe_q;
+                data_chi2 += noe_q;
             }
             max_data_ll = max_data_ll.max(data_ll);
+            min_chi2 = min_chi2.min(data_chi2);
             let ll = (p_struct * w_bb * 0.5).ln() + data_ll;
             if hyp == SwapHypothesis::Direct {
                 terms_dir.push(ll);
@@ -2479,10 +2735,12 @@ fn infer_gly_pair(
 
     // Isotropic conformational-averaging null term (J_avg = 5.95 Hz, equal NOE distances)
     let mut iso_data_ll = 0.0;
+    let mut iso_chi2 = 0.0;
     if let Some((ja, jb)) = obs.j_hh_vicinal_hz {
         let j_iso = 5.95;
-        iso_data_ll -= 0.5 * ((ja - j_iso).powi(2) + (jb - j_iso).powi(2))
-            / cfg.homonuclear_j_sigma_hz.powi(2);
+        iso_data_ll += student_t_j_log_likelihood(ja - j_iso, cfg.homonuclear_j_sigma_hz)
+            + student_t_j_log_likelihood(jb - j_iso, cfg.homonuclear_j_sigma_hz);
+        iso_chi2 += ((ja - j_iso).powi(2) + (jb - j_iso).powi(2)) * iv_hh;
     }
     for np in &obs.noe_pairs {
         if np.intensity_a > 0.0
@@ -2491,13 +2749,18 @@ fn infer_gly_pair(
                 || (!obs.next_is_pro && np.anchor == AnchorProton::SeqNextAmideH))
         {
             let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
-            iso_data_ll -= 0.5 * (np.intensity_a / np.intensity_b).ln().powi(2) / (2.0 * sig * sig);
+            let noe_q = (np.intensity_a / np.intensity_b).ln().powi(2) / (2.0 * sig * sig);
+            iso_data_ll -= 0.5 * noe_q;
+            iso_chi2 += noe_q;
         }
     }
     max_data_ll = max_data_ll.max(iso_data_ll);
+    min_chi2 = min_chi2.min(iso_chi2);
     let _ = &mut n_obs;
     if n_obs > 0
-        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+        && (!max_data_ll.is_finite()
+            || !min_chi2.is_finite()
+            || min_chi2 / (n_obs as f64) > MAX_REDUCED_CHI2)
     {
         return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
@@ -2733,6 +2996,7 @@ fn infer_distal_methylene_pair(
         j_ncg: None,
         j_cc: None,
         j_methine_hahb: None,
+        j_ccg_single: None,
         noe_r6,
     };
     let n_obs = count_basis_observations(&basis, obs);
@@ -2744,12 +3008,14 @@ fn infer_distal_methylene_pair(
     let mut u_dir = Vec::with_capacity(n_s);
     let mut u_swp = Vec::with_capacity(n_s);
     let mut max_data_ll = f64::NEG_INFINITY;
+    let mut min_chi2 = f64::INFINITY;
     for (si, sp) in simplex.iter().enumerate() {
         let base = log_priors[si] + ln_half;
         let ubase = uniform_log_priors[si] + ln_half;
-        let (raw_d, raw_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
+        let (raw_d, raw_s, chi2_d, chi2_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
             let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
-            (r0, r0)
+            let c0 = evaluate_isotropic_quadratic_chi2(&basis, obs, cfg);
+            (r0, r0, c0, c0)
         } else {
             (
                 evaluate_basis_simplex_log_likelihood(
@@ -2766,9 +3032,12 @@ fn infer_distal_methylene_pair(
                     obs,
                     cfg,
                 ),
+                evaluate_basis_quadratic_chi2(&basis, sp.w, SwapHypothesis::Direct, obs, cfg),
+                evaluate_basis_quadratic_chi2(&basis, sp.w, SwapHypothesis::Swapped, obs, cfg),
             )
         };
         max_data_ll = max_data_ll.max(raw_d).max(raw_s);
+        min_chi2 = min_chi2.min(chi2_d).min(chi2_s);
         l_dir.push(base + raw_d);
         l_swp.push(base + raw_s);
         u_dir.push(ubase + raw_d);
@@ -2776,7 +3045,9 @@ fn infer_distal_methylene_pair(
     }
 
     if n_obs > 0
-        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+        && (!max_data_ll.is_finite()
+            || !min_chi2.is_finite()
+            || min_chi2 / (n_obs as f64) > MAX_REDUCED_CHI2)
     {
         return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
@@ -4750,6 +5021,8 @@ pub fn assign_stereospecific_dataset(
                 "3J_CCG" | "3J_C'CG" | "3J_CC" | "3J_CACD" | "J_CC" => {
                     if let Some(vb) = row.val_b_hz {
                         entry.j_cc_vicinal_hz = Some((row.val_a_hz, vb));
+                    } else if b1 == "HB2" {
+                        entry.j_ccg_single_hz = Some(row.val_a_hz);
                     }
                 }
                 _ => {

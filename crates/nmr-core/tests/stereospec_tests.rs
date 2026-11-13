@@ -6,19 +6,20 @@ use nmr_core::nef::{
     classify_nef_atom_name, read_nef_str, write_nef_str, NefAtomWildcardKind, NefDocument,
     NefMolecularSystem,
 };
-use nmr_core::nmrstar::{read_star, read_star_str_all_atoms, Reference};
+use nmr_core::nmrstar::{read_star, read_star_all_atoms, read_star_str_all_atoms, Reference};
 use nmr_core::noesy::{calc_dihedral_deg, v_add, v_dist, v_scale};
 use nmr_core::rng::Rng;
 use nmr_core::stereospec::{
-    apply_stereospec_to_reference, backbone_conditioning_from_all_atom_pdb,
-    build_local_peptide_frame, format_stereospec_nmrstar, infer_prochiral_pair,
-    infer_protein_stereospec, infer_residue_stereospec, iupac_cb_proton_dihedrals_deg,
-    iupac_gly_ha_dihedrals_deg, iupac_leu_cd_dihedrals_deg, iupac_val_cg_dihedrals_deg,
-    karplus_3j_ccg_hz, karplus_3j_hahb_hz, karplus_3j_ncg_hz, karplus_3j_nhb_mag_hz,
-    parse_pdb_all_atoms_file, prochiral_pairs_for_residue, synthesize_ideal_observables_from_pdb,
-    to_nef_shift_list_with_stereospec, to_star_chem_shift_rows, AnchorProton, BackboneConditioning,
-    NoePairObs, ProchiralObservables, ProchiralSiteKind, RotamerState, StereospecConfig,
-    SwapHypothesis,
+    apply_stereospec_to_reference, assign_stereospecific_dataset,
+    backbone_conditioning_from_all_atom_pdb, build_local_peptide_frame, format_stereospec_nmrstar,
+    infer_prochiral_pair, infer_protein_stereospec, infer_residue_stereospec,
+    iupac_cb_proton_dihedrals_deg, iupac_gly_ha_dihedrals_deg, iupac_leu_cd_dihedrals_deg,
+    iupac_val_cg_dihedrals_deg, karplus_3j_ccg_hz, karplus_3j_hahb_hz, karplus_3j_ncg_hz,
+    karplus_3j_nhb_mag_hz, parse_pdb_all_atoms_file, prochiral_pairs_for_residue,
+    read_j_couplings_tsv, synthesize_ideal_observables_from_pdb, to_nef_shift_list_with_stereospec,
+    to_star_chem_shift_rows, write_j_couplings_tsv, AllAtomPdbResidue, AnchorProton,
+    BackboneConditioning, JCouplingTsvRow, NoePairObs, ProchiralObservables, ProchiralPairSpec,
+    ProchiralSiteKind, RotamerState, StereospecConfig, StereospecDatasetInput, SwapHypothesis,
 };
 
 fn repo_file(rel: &str) -> std::path::PathBuf {
@@ -78,6 +79,9 @@ fn perturb_and_scramble_observables(
         j_methine_hahb_hz: ideal
             .j_methine_hahb_hz
             .map(|jm| (jm + rng.normal(0.0, j_sigma_hz)).max(0.0)),
+        j_ccg_single_hz: ideal
+            .j_ccg_single_hz
+            .map(|jc| (jc + rng.normal(0.0, j_sigma_hz)).max(0.0)),
         noe_pairs: Vec::with_capacity(ideal.noe_pairs.len()),
         next_is_pro: ideal.next_is_pro,
         upstream_chi1_posterior: None,
@@ -1803,4 +1807,677 @@ fn test_p1_4_ambiguity_code_seeding_wildcard_dedup_and_atomic_methyl_swaps() {
     assert_eq!(unk_amb[&(0, "CG1".to_string())], 2);
     assert_eq!(unk_amb[&(0, "MG1".to_string())], 2);
     assert_eq!(unk_amb[&(0, "HG9".to_string())], 2);
+}
+
+fn swap_shift_atoms_in_ref(ref_data: &mut Reference, res_idx: usize, a1: &str, a2: &str) {
+    let v1 = ref_data.shifts.get(&(res_idx, a1.to_string())).copied();
+    let v2 = ref_data.shifts.get(&(res_idx, a2.to_string())).copied();
+    if let (Some(x1), Some(x2)) = (v1, v2) {
+        ref_data.shifts.insert((res_idx, a1.to_string()), x2);
+        ref_data.shifts.insert((res_idx, a2.to_string()), x1);
+    }
+}
+
+fn scramble_reference_prochiral_site(ref_data: &mut Reference, res_idx: usize, site: &str) {
+    match site {
+        "HB2" => swap_shift_atoms_in_ref(ref_data, res_idx, "HB2", "HB3"),
+        "CG1" => {
+            swap_shift_atoms_in_ref(ref_data, res_idx, "CG1", "CG2");
+            for (p1, p2) in [
+                ("HG1", "HG2"),
+                ("HG11", "HG21"),
+                ("HG12", "HG22"),
+                ("HG13", "HG23"),
+                ("MG1", "MG2"),
+            ] {
+                swap_shift_atoms_in_ref(ref_data, res_idx, p1, p2);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn test_p0_2_experimental_ubiquitin_3j_couplings() {
+    let star_path = repo_file("data/fixtures/ubiquitin_bmr5387_methyl.str");
+    let exp_j_path = repo_file("data/fixtures/ubiquitin_exp_3j.tsv");
+    let pdb_path = repo_file("data/pdb_refs/1d3z.pdb");
+
+    let base_ref =
+        read_star_all_atoms(&star_path, None).expect("read ubiquitin_bmr5387_methyl.str");
+    let base_j_rows = read_j_couplings_tsv(&exp_j_path).expect("read ubiquitin_exp_3j.tsv");
+    assert!(
+        base_j_rows.len() >= 90,
+        "expected >= 90 experimental Ubiquitin 3J rows, got {}",
+        base_j_rows.len()
+    );
+
+    // Exact literature-verified stereospecific ordering of BMRB 5387 (`ubiquitin_bmr5387_methyl.str`)
+    // against BMRB 17769 / PDB 1D3Z IUPAC stereospecific assignments (Cornilescu et al., JACS 1998):
+    // 13 sites in BMRB 5387 are swapped relative to 1D3Z IUPAC (`Swapped`), 26 are `Direct`.
+    let bmrb17769_truth: BTreeMap<(i32, &'static str), SwapHypothesis> = BTreeMap::from([
+        ((4, "HB2"), SwapHypothesis::Direct),
+        ((5, "CG1"), SwapHypothesis::Swapped),
+        ((6, "HB2"), SwapHypothesis::Direct),
+        ((8, "HB2"), SwapHypothesis::Direct),
+        ((11, "HB2"), SwapHypothesis::Direct),
+        ((15, "HB2"), SwapHypothesis::Direct),
+        ((16, "HB2"), SwapHypothesis::Swapped),
+        ((17, "CG1"), SwapHypothesis::Direct),
+        ((18, "HB2"), SwapHypothesis::Swapped),
+        ((19, "HB2"), SwapHypothesis::Direct),
+        ((20, "HB2"), SwapHypothesis::Direct),
+        ((25, "HB2"), SwapHypothesis::Direct),
+        ((26, "CG1"), SwapHypothesis::Swapped),
+        ((27, "HB2"), SwapHypothesis::Direct),
+        ((29, "HB2"), SwapHypothesis::Direct),
+        ((31, "HB2"), SwapHypothesis::Swapped),
+        ((32, "HB2"), SwapHypothesis::Direct),
+        ((33, "HB2"), SwapHypothesis::Swapped),
+        ((34, "HB2"), SwapHypothesis::Direct),
+        ((37, "HB2"), SwapHypothesis::Direct),
+        ((38, "HB2"), SwapHypothesis::Swapped),
+        ((40, "HB2"), SwapHypothesis::Swapped),
+        ((42, "HB2"), SwapHypothesis::Direct),
+        ((43, "HB2"), SwapHypothesis::Direct),
+        ((45, "HB2"), SwapHypothesis::Direct),
+        ((50, "HB2"), SwapHypothesis::Direct),
+        ((51, "HB2"), SwapHypothesis::Swapped),
+        ((54, "HB2"), SwapHypothesis::Direct),
+        ((56, "HB2"), SwapHypothesis::Direct),
+        ((58, "HB2"), SwapHypothesis::Direct),
+        ((59, "HB2"), SwapHypothesis::Swapped),
+        ((60, "HB2"), SwapHypothesis::Direct),
+        ((62, "HB2"), SwapHypothesis::Swapped),
+        ((63, "HB2"), SwapHypothesis::Direct),
+        ((64, "HB2"), SwapHypothesis::Swapped),
+        ((65, "HB2"), SwapHypothesis::Direct),
+        ((69, "HB2"), SwapHypothesis::Swapped),
+        ((72, "HB2"), SwapHypothesis::Direct),
+        ((73, "HB2"), SwapHypothesis::Direct),
+    ]);
+
+    // Dynamically averaged / g+ / proline / single-pathway surface sidechains that MUST abstain
+    // (`!committed`, `Ambiguity_code = 2`) under genuine experimental 3J couplings:
+    let must_abstain_sites: &[(i32, &str)] = &[
+        (6, "HB2"),
+        (11, "HB2"),
+        (19, "HB2"),
+        (20, "HB2"),
+        (37, "HB2"),
+        (38, "HB2"),
+        (39, "HB2"),
+        (52, "HB2"),
+        (60, "HB2"),
+        (63, "HB2"),
+        (70, "CG1"),
+        (72, "HB2"),
+    ];
+
+    // Rigid hydrophobic-core / H-bonded sidechains with multi-pathway experimental 3J couplings
+    // (spanning Direct & Swapped, g- & t rotamers, and BetaMethylene + ValIsopropyl) that MUST commit:
+    let must_commit_sites: &[(i32, &str)] = &[
+        (4, "HB2"),
+        (5, "CG1"),
+        (17, "CG1"),
+        (26, "CG1"),
+        (29, "HB2"),
+        (31, "HB2"),
+        (40, "HB2"),
+        (43, "HB2"),
+        (54, "HB2"),
+        (56, "HB2"),
+        (58, "HB2"),
+        (59, "HB2"),
+        (64, "HB2"),
+    ];
+
+    let tmp_dir =
+        std::env::temp_dir().join(format!("nmr_ubq_exp_3j_p0_2_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+    for (mode_name, opt_pdb) in [
+        ("exp_Ubq_3J_1D3Z_backbone", Some(pdb_path.as_path())),
+        ("exp_Ubq_3J_CSI_only", None),
+    ] {
+        // 1. Direct unscrambled run on `ubiquitin_bmr5387_methyl.str` + `ubiquitin_exp_3j.tsv`
+        let direct_out = assign_stereospecific_dataset(&StereospecDatasetInput {
+            reference: &base_ref,
+            j_couplings_tsv: Some(&exp_j_path),
+            intra_noes_tsv: None,
+            pdb_path: opt_pdb,
+            config: StereospecConfig::default(),
+        })
+        .expect("run experimental Ubiquitin stereospec");
+
+        let mut unscrambled_committed = 0usize;
+        let mut unscrambled_correct = 0usize;
+        for r in &direct_out.pair_results {
+            if let Some(&truth) = bmrb17769_truth.get(&(r.seq_id, r.spec.iupac_branch_1)) {
+                if r.committed {
+                    unscrambled_committed += 1;
+                    if r.winning_hypothesis == truth {
+                        unscrambled_correct += 1;
+                    } else {
+                        println!(
+                            "  [{mode_name}] MISMATCH on {} {} ({}): got {:?} (p={:.3}), expected {:?}",
+                            r.res_name,
+                            r.seq_id,
+                            r.spec.iupac_branch_1,
+                            r.winning_hypothesis,
+                            r.winning_posterior,
+                            truth
+                        );
+                    }
+                }
+            } else {
+                // Degenerate or single-pathway sites outside the 39 non-degenerate paired entries
+                // must never commit under experimental 3J-only data!
+                assert!(
+                    !r.committed && r.nmr_star_ambiguity_code == 2,
+                    "[{mode_name}] non-paired/degenerate site {} {} ({}) unexpectedly committed",
+                    r.res_name,
+                    r.seq_id,
+                    r.spec.iupac_branch_1
+                );
+            }
+        }
+        let unscrambled_prec =
+            100.0 * (unscrambled_correct as f64) / (unscrambled_committed.max(1) as f64);
+        println!(
+            "[{mode_name}] unscrambled BMRB 5387 -> BMRB 17769: committed {unscrambled_committed}/39 ({:.1}% cov), precision = {unscrambled_correct}/{unscrambled_committed} ({unscrambled_prec:.2}%)",
+            100.0 * (unscrambled_committed as f64) / 39.0
+        );
+        assert!(
+            unscrambled_committed >= 14,
+            "[{mode_name}] expected >= 14 committed experimental Ubiquitin sites, got {unscrambled_committed}"
+        );
+        assert!(
+            unscrambled_prec >= 95.0,
+            "[{mode_name}] experimental Ubiquitin precision {unscrambled_prec:.2}% < 95.0%"
+        );
+
+        // 2. 10-seed random 50% `(a, b)` scrambling of BOTH `Reference` shifts and paired `3J` TSV rows
+        let mut total_eval = 0usize;
+        let mut total_committed = 0usize;
+        let mut total_correct = 0usize;
+
+        for seed in 0..10u64 {
+            let mut rng = Rng::new(0x0B10_3D32_E800_0000 ^ seed);
+            let mut scr_ref = base_ref.clone();
+            let mut flipped_sites: BTreeMap<(i32, &'static str), bool> = BTreeMap::new();
+
+            for &(seq_id, site) in bmrb17769_truth.keys() {
+                let flip = rng.f64() < 0.5;
+                flipped_sites.insert((seq_id, site), flip);
+                if flip {
+                    if let Some(res_idx) = scr_ref.seq_ids.iter().position(|&s| s == seq_id) {
+                        scramble_reference_prochiral_site(&mut scr_ref, res_idx, site);
+                    }
+                }
+            }
+
+            let scr_rows: Vec<JCouplingTsvRow> = base_j_rows
+                .iter()
+                .map(|row| {
+                    let mut out_row = row.clone();
+                    if let Some(vb) = row.val_b_hz {
+                        let flip = flipped_sites
+                            .get(&(row.seq_id, row.site.as_str()))
+                            .copied()
+                            .unwrap_or(false);
+                        if flip {
+                            out_row.val_a_hz = vb;
+                            out_row.val_b_hz = Some(row.val_a_hz);
+                        }
+                    }
+                    out_row
+                })
+                .collect();
+
+            let scr_tsv = tmp_dir.join(format!("ubq_exp_3j_seed_{seed}.tsv"));
+            write_j_couplings_tsv(&scr_tsv, &scr_rows).expect("write scrambled exp 3J TSV");
+
+            let out = assign_stereospecific_dataset(&StereospecDatasetInput {
+                reference: &scr_ref,
+                j_couplings_tsv: Some(&scr_tsv),
+                intra_noes_tsv: None,
+                pdb_path: opt_pdb,
+                config: StereospecConfig::default(),
+            })
+            .expect("run scrambled experimental Ubiquitin stereospec");
+
+            let by_site: BTreeMap<(i32, &str), _> = out
+                .pair_results
+                .iter()
+                .map(|r| ((r.seq_id, r.spec.iupac_branch_1), r))
+                .collect();
+
+            for &(sid, site) in must_abstain_sites {
+                if let Some(r) = by_site.get(&(sid, site)) {
+                    assert!(
+                        !r.committed && r.nmr_star_ambiguity_code == 2,
+                        "[{mode_name} seed {seed}] dynamically averaged / single-pathway site {sid} {site} falsely committed (p={:.3})",
+                        r.winning_posterior
+                    );
+                }
+            }
+            for &(sid, site) in must_commit_sites {
+                let r = by_site
+                    .get(&(sid, site))
+                    .unwrap_or_else(|| panic!("missing core site {sid} {site}"));
+                assert!(
+                    r.committed && r.nmr_star_ambiguity_code == 1,
+                    "[{mode_name} seed {seed}] rigid core site {} {sid} {site} failed to commit (p={:.3})",
+                    r.res_name,
+                    r.winning_posterior
+                );
+            }
+
+            for (&(sid, site), &base_truth) in &bmrb17769_truth {
+                let r = by_site
+                    .get(&(sid, site))
+                    .unwrap_or_else(|| panic!("missing truth site {sid} {site}"));
+                let flip = flipped_sites[&(sid, site)];
+                let expected = if flip {
+                    match base_truth {
+                        SwapHypothesis::Direct => SwapHypothesis::Swapped,
+                        SwapHypothesis::Swapped => SwapHypothesis::Direct,
+                    }
+                } else {
+                    base_truth
+                };
+                total_eval += 1;
+                if r.committed {
+                    total_committed += 1;
+                    if r.winning_hypothesis == expected {
+                        total_correct += 1;
+                        // Verify the output Reference chemical shifts match true BMRB 17769 IUPAC order!
+                        let k = r.residue_idx;
+                        let atom_check = if site == "CG1" { "CG1" } else { "HB2" };
+                        let partner = if site == "CG1" { "CG2" } else { "HB3" };
+                        let true_iupac_b1 = match base_truth {
+                            SwapHypothesis::Direct => base_ref.shifts[&(k, atom_check.to_string())],
+                            SwapHypothesis::Swapped => base_ref.shifts[&(k, partner.to_string())],
+                        };
+                        assert!(
+                            (out.reference.shifts[&(k, atom_check.to_string())] - true_iupac_b1)
+                                .abs()
+                                < 1e-9,
+                            "[{mode_name} seed {seed}] output shift mismatch on {sid} {atom_check}"
+                        );
+                        assert_eq!(out.ambiguity_codes[&(k, atom_check.to_string())], 1);
+                    }
+                }
+            }
+        }
+
+        let scr_prec = 100.0 * (total_correct as f64) / (total_committed.max(1) as f64);
+        let scr_cov = 100.0 * (total_committed as f64) / (total_eval as f64);
+        println!(
+            "[{mode_name}] 10-seed scrambled experimental Ubiquitin 3J: committed {total_committed}/{total_eval} ({scr_cov:.1}% cov), stereospecific precision = {total_correct}/{total_committed} ({scr_prec:.2}%)"
+        );
+        assert!(
+            scr_prec >= 95.0,
+            "[{mode_name}] 10-seed scrambled experimental Ubiquitin precision {scr_prec:.2}% < 95.0%"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+fn perturbed_karplus_eval(
+    a: f64,
+    b: f64,
+    c: f64,
+    eps_a: f64,
+    eps_b: f64,
+    phase_shift_deg: f64,
+    theta_deg: f64,
+) -> f64 {
+    let rad = (theta_deg + phase_shift_deg).to_radians();
+    let cs = rad.cos();
+    let a_pert = a * (1.0 + eps_a);
+    let b_pert = b * (1.0 + eps_b);
+    (a_pert * cs * cs + b_pert * cs + c).max(0.0)
+}
+
+fn synthesize_perturbed_karplus_observables_from_pdb(
+    pdb: &[AllAtomPdbResidue],
+    res_idx: usize,
+    spec: ProchiralPairSpec,
+    eps_a: f64,
+    eps_b: f64,
+    phase_shift_deg: f64,
+) -> Option<ProchiralObservables> {
+    let mut obs = synthesize_ideal_observables_from_pdb(pdb, res_idx, spec)?;
+    let cur = pdb.get(res_idx)?;
+
+    let j_hahb =
+        |th: f64| perturbed_karplus_eval(9.5, -1.6, 1.8, eps_a, eps_b, phase_shift_deg, th);
+    let j_hnha =
+        |th: f64| perturbed_karplus_eval(7.09, -1.42, 1.55, eps_a, eps_b, phase_shift_deg, th);
+    let j_nhb = |th: f64| {
+        let rad = (th + phase_shift_deg).to_radians();
+        let cs = rad.cos();
+        (-4.4 * (1.0 + eps_a) * cs * cs + 1.2 * (1.0 + eps_b) * cs + 0.1).abs()
+    };
+    let j_ncg_val =
+        |th: f64| perturbed_karplus_eval(2.64, -0.26, 0.05, eps_a, eps_b, phase_shift_deg, th);
+    let j_ccg_val =
+        |th: f64| perturbed_karplus_eval(4.26, -1.00, 0.27, eps_a, eps_b, phase_shift_deg, th);
+    let j_ccg_leu =
+        |th: f64| perturbed_karplus_eval(4.02, -1.16, 0.24, eps_a, eps_b, phase_shift_deg, th);
+    let j_ccg_cb = |rn: &str, th: f64| {
+        let (a, b, c) = match rn {
+            "PHE" | "TYR" | "TRP" | "HIS" => (2.31, -0.87, 0.49),
+            "ASP" | "ASN" => (3.69, -1.16, 0.55),
+            _ => (2.31, -0.87, 0.29),
+        };
+        perturbed_karplus_eval(a, b, c, eps_a, eps_b, phase_shift_deg, th)
+    };
+
+    match spec.kind {
+        ProchiralSiteKind::BetaMethylene => {
+            let (n, ca, cb, ha, hb2, hb3) = (
+                cur.coord("N")?,
+                cur.coord("CA")?,
+                cur.coord("CB")?,
+                cur.coord("HA")?,
+                cur.coord("HB2")?,
+                cur.coord("HB3")?,
+            );
+            obs.j_hh_vicinal_hz = Some((
+                j_hahb(calc_dihedral_deg(ha, ca, cb, hb2)),
+                j_hahb(calc_dihedral_deg(ha, ca, cb, hb3)),
+            ));
+            obs.j_nhb_hz = Some((
+                j_nhb(calc_dihedral_deg(n, ca, cb, hb2)),
+                j_nhb(calc_dihedral_deg(n, ca, cb, hb3)),
+            ));
+            if !matches!(cur.res_name.as_str(), "PRO" | "SER" | "CYS" | "ALA" | "GLY") {
+                if let (Some(c_prime), Some(cg)) = (cur.coord("C"), cur.coord("CG")) {
+                    obs.j_ccg_single_hz = Some(j_ccg_cb(
+                        &cur.res_name,
+                        calc_dihedral_deg(c_prime, ca, cb, cg),
+                    ));
+                }
+            }
+        }
+        ProchiralSiteKind::ValIsopropyl => {
+            let (n, ca, c, cb, ha, hb, cg1, cg2) = (
+                cur.coord("N")?,
+                cur.coord("CA")?,
+                cur.coord("C")?,
+                cur.coord("CB")?,
+                cur.coord("HA")?,
+                cur.coord("HB")?,
+                cur.coord("CG1")?,
+                cur.coord("CG2")?,
+            );
+            obs.j_ncg_hz = Some((
+                j_ncg_val(calc_dihedral_deg(n, ca, cb, cg1)),
+                j_ncg_val(calc_dihedral_deg(n, ca, cb, cg2)),
+            ));
+            obs.j_cc_vicinal_hz = Some((
+                j_ccg_val(calc_dihedral_deg(c, ca, cb, cg1)),
+                j_ccg_val(calc_dihedral_deg(c, ca, cb, cg2)),
+            ));
+            obs.j_methine_hahb_hz = Some(j_hahb(calc_dihedral_deg(ha, ca, cb, hb)));
+        }
+        ProchiralSiteKind::LeuIsopropyl => {
+            let (ca, cb, cg, cd1, cd2) = (
+                cur.coord("CA")?,
+                cur.coord("CB")?,
+                cur.coord("CG")?,
+                cur.coord("CD1")?,
+                cur.coord("CD2")?,
+            );
+            obs.j_cc_vicinal_hz = Some((
+                j_ccg_leu(calc_dihedral_deg(ca, cb, cg, cd1)),
+                j_ccg_leu(calc_dihedral_deg(ca, cb, cg, cd2)),
+            ));
+        }
+        ProchiralSiteKind::GlyAlphaMethylene => {
+            let (n, ca, ha2, ha3) = (
+                cur.coord("N")?,
+                cur.coord("CA")?,
+                cur.coord("HA2")?,
+                cur.coord("HA3")?,
+            );
+            if let Some(h) = cur.coord("H") {
+                obs.j_hh_vicinal_hz = Some((
+                    j_hnha(calc_dihedral_deg(h, n, ca, ha2)),
+                    j_hnha(calc_dihedral_deg(h, n, ca, ha3)),
+                ));
+            }
+        }
+        ProchiralSiteKind::GammaMethylene => {
+            let cb = cur.coord("CB")?;
+            let ha = cur.coord("HA")?;
+            if cur.res_name == "ILE" {
+                let (ca, cg1, hb, hg12, hg13) = (
+                    cur.coord("CA")?,
+                    cur.coord("CG1")?,
+                    cur.coord("HB")?,
+                    cur.coord("HG12")?,
+                    cur.coord("HG13")?,
+                );
+                obs.j_hh_vicinal_hz = Some((
+                    j_hahb(calc_dihedral_deg(hb, cb, cg1, hg12)),
+                    j_hahb(calc_dihedral_deg(hb, cb, cg1, hg13)),
+                ));
+                obs.j_methine_hahb_hz = Some(j_hahb(calc_dihedral_deg(ha, ca, cb, hb)));
+            } else {
+                let (cg, hg2, hg3, hb2, hb3) = (
+                    cur.coord("CG")?,
+                    cur.coord("HG2")?,
+                    cur.coord("HG3")?,
+                    cur.coord("HB2")?,
+                    cur.coord("HB3")?,
+                );
+                let j2 = 0.5
+                    * (j_hahb(calc_dihedral_deg(hb2, cb, cg, hg2))
+                        + j_hahb(calc_dihedral_deg(hb3, cb, cg, hg2)));
+                let j3 = 0.5
+                    * (j_hahb(calc_dihedral_deg(hb2, cb, cg, hg3))
+                        + j_hahb(calc_dihedral_deg(hb3, cb, cg, hg3)));
+                obs.j_hh_vicinal_hz = Some((j2, j3));
+            }
+        }
+        _ => {}
+    }
+
+    Some(obs)
+}
+
+#[test]
+fn test_p0_2_perturbed_karplus_parameter_mismatch() {
+    let pdb_path = repo_file("data/pdb_refs/1d3z.pdb");
+    let star_path = repo_file("data/fixtures/synthetic_ubiquitin.str");
+    let pdb = parse_pdb_all_atoms_file(&pdb_path).expect("parse 1d3z.pdb");
+    let star_ref = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    assert_eq!(pdb.len(), 76);
+
+    let pdb_backbones: Vec<BackboneConditioning> = (0..pdb.len())
+        .map(|i| backbone_conditioning_from_all_atom_pdb(&pdb, i))
+        .collect();
+    let csi_restraints = predict_dihedrals(&star_ref);
+    let csi_backbones: Vec<BackboneConditioning> = csi_restraints
+        .iter()
+        .map(BackboneConditioning::from_dihedral_restraint)
+        .collect();
+
+    let cfg = StereospecConfig::default();
+    let j_sigma_hz = 0.35;
+    let noe_sigma_ln = 0.18;
+
+    // 10 deterministic Karplus misspecification regimes spanning extremal ±15% (A, B) scaling
+    // and ±8 deg dihedral phase shifts simultaneously across all coupling pathways:
+    let mismatch_regimes: [(f64, f64, f64); 10] = [
+        (0.15, 0.15, 8.0),
+        (-0.15, -0.15, -8.0),
+        (0.15, -0.15, 8.0),
+        (-0.15, 0.15, -8.0),
+        (0.15, -0.10, -8.0),
+        (-0.15, 0.10, 8.0),
+        (0.12, 0.14, -6.5),
+        (-0.13, -0.11, 7.0),
+        (0.10, -0.15, 5.5),
+        (-0.11, 0.15, -7.5),
+    ];
+
+    for (mode_name, backbones) in [
+        ("perturbed_Karplus_1D3Z_backbone", &pdb_backbones),
+        ("perturbed_Karplus_CSI_backbone", &csi_backbones),
+    ] {
+        let mut meth_iso_total = 0usize;
+        let mut meth_iso_committed = 0usize;
+        let mut meth_iso_correct = 0usize;
+        let mut all_committed = 0usize;
+        let mut all_correct = 0usize;
+
+        for (seed, &(eps_a, eps_b, phase_deg)) in mismatch_regimes.iter().enumerate() {
+            let mut rng = Rng::new(0xCA20_1050_0000_0000 ^ (seed as u64));
+            let mut per_res_obs: Vec<BTreeMap<String, ProchiralObservables>> =
+                vec![BTreeMap::new(); pdb.len()];
+            let mut ground_truth: BTreeMap<(usize, &'static str), SwapHypothesis> = BTreeMap::new();
+
+            for (res_idx, res) in pdb.iter().enumerate() {
+                for spec in prochiral_pairs_for_residue(&res.res_name) {
+                    if let Some(mut pert_obs) = synthesize_perturbed_karplus_observables_from_pdb(
+                        &pdb, res_idx, spec, eps_a, eps_b, phase_deg,
+                    ) {
+                        if matches!(
+                            spec.kind,
+                            ProchiralSiteKind::AsnCarboxamide | ProchiralSiteKind::GlnCarboxamide
+                        ) {
+                            pert_obs.proton_shifts_ppm =
+                                Some((7.45 + rng.normal(0.0, 0.12), 6.85 + rng.normal(0.0, 0.12)));
+                        }
+                        let (noisy, truth) = perturb_and_scramble_observables(
+                            &pert_obs,
+                            &mut rng,
+                            j_sigma_hz,
+                            noe_sigma_ln,
+                        );
+                        per_res_obs[res_idx].insert(spec.iupac_branch_1.to_string(), noisy);
+                        ground_truth.insert((res_idx, spec.iupac_branch_1), truth);
+                    }
+                }
+            }
+
+            let results = infer_protein_stereospec(
+                &star_ref.sequence,
+                &star_ref.seq_ids,
+                backbones,
+                &per_res_obs,
+                &cfg,
+            );
+
+            for r in &results {
+                let Some(&truth) = ground_truth.get(&(r.residue_idx, r.spec.iupac_branch_1)) else {
+                    continue;
+                };
+                if r.committed {
+                    all_committed += 1;
+                    if r.winning_hypothesis == truth {
+                        all_correct += 1;
+                    }
+                }
+                if matches!(
+                    r.spec.kind,
+                    ProchiralSiteKind::BetaMethylene
+                        | ProchiralSiteKind::GammaMethylene
+                        | ProchiralSiteKind::GlyAlphaMethylene
+                        | ProchiralSiteKind::ValIsopropyl
+                        | ProchiralSiteKind::LeuIsopropyl
+                ) {
+                    meth_iso_total += 1;
+                    if r.committed {
+                        meth_iso_committed += 1;
+                        if r.winning_hypothesis == truth {
+                            meth_iso_correct += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let meth_iso_cov = 100.0 * (meth_iso_committed as f64) / (meth_iso_total as f64);
+        let meth_iso_prec = 100.0 * (meth_iso_correct as f64) / (meth_iso_committed as f64);
+        let all_prec = 100.0 * (all_correct as f64) / (all_committed as f64);
+        println!(
+            "[{mode_name}] 10-regime (±15% A,B & ±8° phase) Ubiquitin 1D3Z: meth+iso committed {meth_iso_committed}/{meth_iso_total} ({meth_iso_cov:.1}% cov), precision = {meth_iso_prec:.2}% (all sites {all_correct}/{all_committed} = {all_prec:.2}%)"
+        );
+
+        assert!(
+            meth_iso_cov >= 75.0,
+            "[{mode_name}] coverage collapsed under ±15%/±8° Karplus mismatch: {meth_iso_cov:.1}% < 75.0%"
+        );
+        assert!(
+            meth_iso_prec >= 95.0,
+            "[{mode_name}] committed meth+iso precision {meth_iso_prec:.2}% < 95.0% under ±15%/±8° Karplus mismatch"
+        );
+        assert!(
+            all_prec >= 95.0,
+            "[{mode_name}] overall committed precision {all_prec:.2}% < 95.0% under ±15%/±8° Karplus mismatch"
+        );
+    }
+
+    // Rare-Lovell-rotamer immunity under simultaneous +15% amplitude & +8° phase-shift mismatch:
+    // In alpha-helical backbone (`phi = -62°, psi = -42°`), raw Lovell 2000 prior strongly disfavors
+    // `g+` (`0.03` on VAL vs `0.90` for `t`; `0.02` on PHE vs `0.56` for `g-`). Multi-pathway `g+`
+    // couplings (scrambled to `Swapped`) MUST still commit cleanly to `Swapped` without prior override!
+    let helix_bb = BackboneConditioning::ExactTorsions {
+        phi_deg: -62.0,
+        psi_deg: -42.0,
+    };
+    let val_spec = prochiral_pairs_for_residue("VAL")[0];
+    let (th_n1, th_n2, th_c1, th_c2, th_hahb) = iupac_val_cg_dihedrals_deg(63.0);
+    let val_gplus_swapped = ProchiralObservables {
+        j_ncg_hz: Some((
+            perturbed_karplus_eval(2.64, -0.26, 0.05, 0.15, -0.15, 8.0, th_n2),
+            perturbed_karplus_eval(2.64, -0.26, 0.05, 0.15, -0.15, 8.0, th_n1),
+        )),
+        j_cc_vicinal_hz: Some((
+            perturbed_karplus_eval(4.26, -1.00, 0.27, 0.15, -0.15, 8.0, th_c2),
+            perturbed_karplus_eval(4.26, -1.00, 0.27, 0.15, -0.15, 8.0, th_c1),
+        )),
+        j_methine_hahb_hz: Some(perturbed_karplus_eval(
+            9.5, -1.6, 1.8, 0.15, -0.15, 8.0, th_hahb,
+        )),
+        ..Default::default()
+    };
+    let val_rare_res = infer_prochiral_pair(0, 1, val_spec, &helix_bb, &val_gplus_swapped, &cfg);
+    assert!(
+        val_rare_res.committed && val_rare_res.winning_hypothesis == SwapHypothesis::Swapped,
+        "alpha-helical VAL in rare g+ rotamer failed under perturbed Karplus: {:?}",
+        val_rare_res
+    );
+    assert_eq!(
+        val_rare_res.dominant_rotamer,
+        Some(RotamerState::GauchePlus)
+    );
+
+    // Also test rare alpha-helical PHE in `t` / `g-` with perturbed-Karplus `3J_HAHB` + single-CG `3J_CCG`
+    let phe_spec = prochiral_pairs_for_residue("PHE")[0];
+    let (th_hb2_t, th_hb3_t, _, _) = iupac_cb_proton_dihedrals_deg(177.0);
+    let phe_t_swapped = ProchiralObservables {
+        j_hh_vicinal_hz: Some((
+            perturbed_karplus_eval(9.5, -1.6, 1.8, 0.15, -0.15, 8.0, th_hb3_t),
+            perturbed_karplus_eval(9.5, -1.6, 1.8, 0.15, -0.15, 8.0, th_hb2_t),
+        )),
+        j_ccg_single_hz: Some(perturbed_karplus_eval(
+            2.31, -0.87, 0.49, 0.15, -0.15, 8.0, 57.0,
+        )),
+        ..Default::default()
+    };
+    let phe_res = infer_prochiral_pair(0, 1, phe_spec, &helix_bb, &phe_t_swapped, &cfg);
+    assert!(
+        phe_res.committed && phe_res.winning_hypothesis == SwapHypothesis::Swapped,
+        "PHE with perturbed-Karplus 3J_HAHB + Hu&Bax 3J_CCG failed to commit to Swapped: {:?}",
+        phe_res
+    );
 }

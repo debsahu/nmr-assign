@@ -9,20 +9,24 @@
 //! - Chao, Shi, Masterson & Veglia (*J. Magn. Reson.* 2012, 214, 103–110)
 //! - Pritišanac et al. (*J. Am. Chem. Soc.* 2017, 139, 9523–9533)
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use nmr_core::methyl_solver::{
     assign_methyl_cpu, build_methyl_contact_problem, evaluate_methyl_assignment,
-    MethylAnnealConfig, MethylScoreConfig,
+    evaluate_methyl_assignment_against_truth, evaluate_methyl_objective, evaluate_methyl_raw_score,
+    sample_methyl_mcmc_terminal_cpu, MethylAnnealConfig, MethylAssignResult, MethylContactProblem,
+    MethylScoreConfig, ObsAdjEntry, ObsNoeEdge, StructShortAdjEntry, StructShortEdge,
+    METHYL_FORBID,
 };
 use nmr_core::methyl_trosy::{
-    attach_hmcmcbca_records, classify_methyl_peak, extract_hmcmcbca_from_reference,
-    extract_methyl_structure_from_pdb_file, extract_true_site_shifts, link_hmcmcbca_geminal_pairs,
-    pick_methyl_hmqc_2d, pick_methyl_noesy_3d, pick_methyl_noesy_4d, simulate_methyl_hmqc_2d,
-    simulate_methyl_noesy_3d, simulate_methyl_noesy_4d, HmcmcbcaRecord, MethylLabelingScheme,
-    MethylNoePeak, MethylPickerConfig, MethylResidueClass, MethylRootPeak, MethylSimConfig,
-    MethylStructureModel,
+    attach_hmcmcbca_records, build_c2_homodimer_methyl_model, build_cn_homooligomer_methyl_model,
+    classify_methyl_peak, extract_hmcmcbca_from_reference, extract_methyl_structure_from_pdb_file,
+    extract_multichain_methyl_structure_from_pdb_str, extract_true_site_shifts,
+    link_hmcmcbca_geminal_pairs, pick_methyl_hmqc_2d, pick_methyl_noesy_3d, pick_methyl_noesy_4d,
+    simulate_methyl_hmqc_2d, simulate_methyl_noesy_3d, simulate_methyl_noesy_4d, HmcmcbcaRecord,
+    MethylClassPosterior, MethylLabelingScheme, MethylNoePeak, MethylPickerConfig,
+    MethylResidueClass, MethylRootPeak, MethylSimConfig, MethylStructureModel,
 };
 use nmr_core::nmrstar::read_star_all_atoms;
 
@@ -527,4 +531,451 @@ fn t10_5_cpu_solver_ubiquitin_and_mbp_1ezp_benchmarks() {
         mbp_metrics.accuracy_pct >= 90.0 && mbp_metrics.hc_precision_pct >= 95.0,
         "CPU MBP 1EZP benchmark failed: {mbp_metrics:?}"
     );
+}
+
+#[test]
+fn p1_10_methyl_bounds_guard_and_zero_hc_abstention_contract() {
+    let root = repo_root();
+    let ubq_model = extract_methyl_structure_from_pdb_file(
+        root.join("data/pdb_refs/1d3z.pdb"),
+        &MethylLabelingScheme::Ilvmat,
+    )
+    .unwrap();
+    let ubq_ref = read_star_all_atoms(
+        root.join("data/fixtures/ubiquitin_bmr5387_methyl.str"),
+        None,
+    )
+    .unwrap();
+    let ubq_hc = extract_true_site_shifts(&ubq_model, &ubq_ref);
+    let ubq_roots = pick_methyl_hmqc_2d(
+        &simulate_methyl_hmqc_2d(&ubq_hc, &MethylSimConfig::default()),
+        &MethylPickerConfig::default(),
+    );
+    let prob =
+        build_methyl_contact_problem(&ubq_model, &ubq_roots, &[], &MethylScoreConfig::default());
+
+    // 1. Out-of-bounds (`m >= m_len`, `m == i32::MAX`, `m < -1`), wrong length, and duplicate site
+    let mut oob_hi = vec![-1i32; prob.s_len];
+    oob_hi[0] = prob.m_len as i32;
+    assert_eq!(evaluate_methyl_raw_score(&prob, &oob_hi), -1.0e12);
+    assert!((evaluate_methyl_objective(&prob, &oob_hi) - (-1.0e12 * prob.norm_inv)).abs() < 1e-3);
+
+    let mut oob_max = vec![-1i32; prob.s_len];
+    oob_max[prob.s_len - 1] = i32::MAX;
+    assert_eq!(evaluate_methyl_raw_score(&prob, &oob_max), -1.0e12);
+
+    let mut oob_neg = vec![-1i32; prob.s_len];
+    oob_neg[0] = -2;
+    assert_eq!(evaluate_methyl_raw_score(&prob, &oob_neg), -1.0e12);
+
+    let wrong_len = vec![-1i32; prob.s_len - 1];
+    assert_eq!(evaluate_methyl_raw_score(&prob, &wrong_len), -1.0e12);
+
+    let mut dup = vec![-1i32; prob.s_len];
+    dup[0] = 3;
+    dup[1] = 3;
+    assert_eq!(evaluate_methyl_raw_score(&prob, &dup), -1.0e12);
+
+    // 2. Zero high-confidence predictions MUST report `hc_abstained = true`, `hc_precision_opt = None`,
+    //    `hc_precision_pct = 0.0` (NEVER claiming `100.0%` on `0/0`!).
+    let low_conf_res = MethylAssignResult {
+        position: (0..prob.s_len as i32).collect(),
+        confidence: vec![0.49; prob.s_len],
+        class_posteriors: vec![
+            MethylClassPosterior {
+                probs: [1.0 / 6.0; 6]
+            };
+            prob.s_len
+        ],
+        raw_score: 0.0,
+        score: 0.0,
+        run_scores: vec![0.0],
+    };
+    let truth: Vec<Option<usize>> = (0..prob.s_len).map(Some).collect();
+    let m_truth = evaluate_methyl_assignment_against_truth(&low_conf_res, &truth, 0.80);
+    assert_eq!(m_truth.hc_total, 0);
+    assert_eq!(m_truth.hc_correct, 0);
+    assert!(m_truth.hc_abstained);
+    assert_eq!(m_truth.hc_precision_opt, None);
+    assert_eq!(m_truth.hc_precision_pct, 0.0);
+    assert!(m_truth.reliability.is_abstained());
+
+    let m_ref = evaluate_methyl_assignment(&ubq_model, &ubq_roots, &low_conf_res, &ubq_ref, 0.80);
+    assert_eq!(m_ref.hc_total, 0);
+    assert!(m_ref.hc_abstained);
+    assert_eq!(m_ref.hc_precision_opt, None);
+    assert_eq!(m_ref.hc_precision_pct, 0.0);
+}
+
+fn build_synthetic_mcmc_test_problem(s_len: usize, m_len: usize) -> MethylContactProblem {
+    let d_cutoff = 8.5f32;
+    let sigma_d = 1.1f32;
+    let flat_bottom_d = 0.6f32;
+
+    // Coordinates for up to 5 methyl sites: two geminal pairs `(0,1)` & `(2,3)` + singleton `4`
+    let coords: [[f32; 3]; 5] = [
+        [0.0, 0.0, 0.0],
+        [2.5, 1.7, 0.0],  // d(0,1) = 3.02 A (geminal pair 0)
+        [5.2, 0.4, 0.0],  // d(0,2) = 5.22 A, d(1,2) = 3.00 A
+        [5.8, 3.3, 0.0],  // d(2,3) = 2.96 A (geminal pair 1), d(0,3) = 6.67 A
+        [10.8, 0.2, 0.0], // d(2,4) = 5.60 A <= 8.5, d(0,4) = 10.80 A > 8.5 (asymmetric cut degree!)
+    ];
+    let mut d_mat = vec![0.0f32; m_len * m_len];
+    for m1 in 0..m_len {
+        for m2 in 0..m_len {
+            if m1 == m2 {
+                continue;
+            }
+            let dx = coords[m1][0] - coords[m2][0];
+            let dy = coords[m1][1] - coords[m2][1];
+            let dz = coords[m1][2] - coords[m2][2];
+            d_mat[m1 * m_len + m2] = (dx * dx + dy * dy + dz * dz).sqrt();
+        }
+    }
+
+    let mut gem_site = vec![-1i32; m_len];
+    if m_len >= 2 {
+        gem_site[0] = 1;
+        gem_site[1] = 0;
+    }
+    if m_len >= 4 {
+        gem_site[2] = 3;
+        gem_site[3] = 2;
+    }
+
+    // Strongly unequal slot masks across roots to test Move 1E & Move 2 Hastings ratios
+    let mut u_mat = vec![METHYL_FORBID; s_len * m_len];
+    let mut slots = vec![Vec::new(); s_len];
+    for s in 0..s_len {
+        for m in 0..m_len {
+            let allowed = match s {
+                0 => true,                       // all M sites
+                1 => m != (m_len - 1),           // M - 1 sites
+                2 => true,                       // all M sites
+                3 => m < 3.min(m_len),           // 3 sites
+                _ => m == 0 || m == (m_len - 1), // 2 sites (ratio up to 2.5x!)
+            };
+            if allowed {
+                let u = 1.2 + 0.37 * ((s * 3 + m * 5) % 7) as f32 - 0.21 * (m as f32);
+                u_mat[s * m_len + m] = u;
+                slots[s].push(m as u32);
+            }
+        }
+    }
+
+    let mut gem_obs_mat = vec![0.0f32; s_len * s_len];
+    if s_len >= 2 {
+        gem_obs_mat[1] = 1.85;
+        gem_obs_mat[s_len] = 1.85;
+    }
+    if s_len >= 4 {
+        gem_obs_mat[2 * s_len + 3] = 1.40;
+        gem_obs_mat[3 * s_len + 2] = 1.40;
+    }
+
+    // Asymmetric observed NOE graph (`deg_obs` differs across roots)
+    let raw_edges: &[(usize, usize, f32, f32)] =
+        &[(0, 1, 3.2, 0.90), (0, 2, 5.4, 0.75), (1, 3, 4.8, 0.65)];
+    let mut obs_edges = Vec::new();
+    let mut adj_lists: Vec<Vec<ObsAdjEntry>> = vec![Vec::new(); s_len];
+    let mut obs_explained_mask = vec![0u32; s_len * s_len];
+    for &(s1, s2, d_hat, w) in raw_edges {
+        if s1 < s_len && s2 < s_len {
+            obs_edges.push(ObsNoeEdge {
+                s1: s1 as u32,
+                s2: s2 as u32,
+                d_hat,
+                weight: w,
+            });
+            obs_explained_mask[s1 * s_len + s2] = 1;
+            obs_explained_mask[s2 * s_len + s1] = 1;
+            adj_lists[s1].push(ObsAdjEntry {
+                peer_s: s2 as u32,
+                d_hat,
+                weight: w,
+            });
+            adj_lists[s2].push(ObsAdjEntry {
+                peer_s: s1 as u32,
+                d_hat,
+                weight: w,
+            });
+        }
+    }
+    let mut obs_adj_offsets = Vec::with_capacity(s_len + 1);
+    let mut obs_adj_entries = Vec::new();
+    obs_adj_offsets.push(0);
+    for list in &adj_lists {
+        obs_adj_entries.extend_from_slice(list);
+        obs_adj_offsets.push(obs_adj_entries.len() as u32);
+    }
+
+    let mut struct_short_edges = Vec::new();
+    let mut struct_short_lists: Vec<Vec<StructShortAdjEntry>> = vec![Vec::new(); m_len];
+    let mut struct_cut_lists: Vec<Vec<u32>> = vec![Vec::new(); m_len];
+    for m1 in 0..m_len {
+        for m2 in (m1 + 1)..m_len {
+            let d = d_mat[m1 * m_len + m2];
+            if d <= d_cutoff {
+                struct_cut_lists[m1].push(m2 as u32);
+                struct_cut_lists[m2].push(m1 as u32);
+            }
+            if d <= 5.5 {
+                let lam = 0.65f32;
+                struct_short_edges.push(StructShortEdge {
+                    m1: m1 as u32,
+                    m2: m2 as u32,
+                    lambda_miss: lam,
+                });
+                struct_short_lists[m1].push(StructShortAdjEntry {
+                    peer_m: m2 as u32,
+                    lambda_miss: lam,
+                });
+                struct_short_lists[m2].push(StructShortAdjEntry {
+                    peer_m: m1 as u32,
+                    lambda_miss: lam,
+                });
+            }
+        }
+    }
+    let mut struct_short_offsets = Vec::with_capacity(m_len + 1);
+    let mut struct_short_entries = Vec::new();
+    struct_short_offsets.push(0);
+    for list in &struct_short_lists {
+        struct_short_entries.extend_from_slice(list);
+        struct_short_offsets.push(struct_short_entries.len() as u32);
+    }
+    let mut struct_cut_offsets = Vec::with_capacity(m_len + 1);
+    let mut struct_cut_peers = Vec::new();
+    struct_cut_offsets.push(0);
+    for list in &struct_cut_lists {
+        struct_cut_peers.extend_from_slice(list);
+        struct_cut_offsets.push(struct_cut_peers.len() as u32);
+    }
+
+    MethylContactProblem {
+        s_len,
+        m_len,
+        d_cutoff,
+        sigma_d,
+        flat_bottom_d,
+        norm_inv: 1.0 / (s_len.max(1) as f64),
+        u_mat,
+        slots,
+        d_mat,
+        gem_site,
+        gem_obs_mat,
+        obs_explained_mask,
+        obs_edges,
+        obs_adj_offsets,
+        obs_adj_entries,
+        struct_short_edges,
+        struct_short_offsets,
+        struct_short_entries,
+        struct_cut_offsets,
+        struct_cut_peers,
+        class_posteriors: vec![
+            MethylClassPosterior {
+                probs: [1.0 / 6.0; 6]
+            };
+            s_len
+        ],
+    }
+}
+
+fn enumerate_boltzmann_distribution(
+    prob: &MethylContactProblem,
+    k_assigned: usize,
+    temp: f64,
+) -> BTreeMap<Vec<i32>, f64> {
+    fn rec(
+        s: usize,
+        assigned_so_far: usize,
+        k_assigned: usize,
+        prob: &MethylContactProblem,
+        used_m: &mut [bool],
+        cur: &mut Vec<i32>,
+        states: &mut Vec<Vec<i32>>,
+    ) {
+        if s == prob.s_len {
+            if assigned_so_far == k_assigned {
+                states.push(cur.clone());
+            }
+            return;
+        }
+        let rem = prob.s_len - s;
+        if assigned_so_far + rem < k_assigned {
+            return;
+        }
+        if assigned_so_far < k_assigned {
+            for &m_u32 in &prob.slots[s] {
+                let m = m_u32 as usize;
+                if !used_m[m] {
+                    used_m[m] = true;
+                    cur.push(m as i32);
+                    rec(
+                        s + 1,
+                        assigned_so_far + 1,
+                        k_assigned,
+                        prob,
+                        used_m,
+                        cur,
+                        states,
+                    );
+                    cur.pop();
+                    used_m[m] = false;
+                }
+            }
+        }
+        if assigned_so_far + (rem - 1) >= k_assigned {
+            cur.push(-1);
+            rec(
+                s + 1,
+                assigned_so_far,
+                k_assigned,
+                prob,
+                used_m,
+                cur,
+                states,
+            );
+            cur.pop();
+        }
+    }
+
+    let mut states = Vec::new();
+    let mut used_m = vec![false; prob.m_len];
+    let mut cur = Vec::with_capacity(prob.s_len);
+    rec(0, 0, k_assigned, prob, &mut used_m, &mut cur, &mut states);
+    assert!(!states.is_empty(), "valid state space must be non-empty");
+
+    let energies: Vec<f64> = states
+        .iter()
+        .map(|st| evaluate_methyl_raw_score(prob, st))
+        .collect();
+    let max_e = energies.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = energies
+        .iter()
+        .map(|&e| ((e - max_e) / temp).exp())
+        .collect();
+    let z: f64 = weights.iter().sum();
+
+    states
+        .into_iter()
+        .zip(weights)
+        .map(|(st, w)| (st, w / z))
+        .collect()
+}
+
+#[test]
+fn p1_10_cpu_mcmc_exact_boltzmann_stationary_distribution_all_four_moves() {
+    let temp = 2.5;
+
+    // Case A (`S = 4 <= M = 5`): exercises Move 1B/1C, Move 2 asymmetric contact extension,
+    // Move 3 4-body geminal involution, and Move 4 prochiral 2-flip involution.
+    let prob_a = build_synthetic_mcmc_test_problem(4, 5);
+    let exact_a = enumerate_boltzmann_distribution(&prob_a, 4, temp);
+    let n_samples = 24_000usize;
+    let samples_a = sample_methyl_mcmc_terminal_cpu(&prob_a, temp, 520, n_samples, 20261113);
+    let mut counts_a: BTreeMap<Vec<i32>, usize> = BTreeMap::new();
+    for st in samples_a {
+        assert!(
+            exact_a.contains_key(&st),
+            "sampled invalid state outside Omega_4: {st:?}"
+        );
+        *counts_a.entry(st).or_insert(0) += 1;
+    }
+    let tvd_a: f64 = 0.5
+        * exact_a
+            .iter()
+            .map(|(st, &p_true)| {
+                let p_emp = (*counts_a.get(st).unwrap_or(&0) as f64) / (n_samples as f64);
+                (p_emp - p_true).abs()
+            })
+            .sum::<f64>();
+    println!(
+        "[P1-10 CPU MCMC Stationary Boltzmann S=4,M=5] |Omega|={} | TVD={tvd_a:.4}",
+        exact_a.len()
+    );
+    assert!(
+        tvd_a < 0.025,
+        "CPU MCMC stationary Boltzmann TVD (S=4,M=5) {tvd_a:.4} >= 0.025 (detailed balance violation!)"
+    );
+
+    // Case B (`S = 5 > M = 4`): exercises Move 1E (`ms < 0, t >= 0` displace-occupied with unequal
+    // `|slots[s]| != |slots[t]|` up to 2x ratio) alongside Moves 1C, 2, 3, 4.
+    let prob_b = build_synthetic_mcmc_test_problem(5, 4);
+    let exact_b = enumerate_boltzmann_distribution(&prob_b, 4, temp);
+    let samples_b = sample_methyl_mcmc_terminal_cpu(&prob_b, temp, 520, n_samples, 20261114);
+    let mut counts_b: BTreeMap<Vec<i32>, usize> = BTreeMap::new();
+    for st in samples_b {
+        assert!(
+            exact_b.contains_key(&st),
+            "sampled invalid state outside Omega_4 (S=5,M=4): {st:?}"
+        );
+        *counts_b.entry(st).or_insert(0) += 1;
+    }
+    let tvd_b: f64 = 0.5
+        * exact_b
+            .iter()
+            .map(|(st, &p_true)| {
+                let p_emp = (*counts_b.get(st).unwrap_or(&0) as f64) / (n_samples as f64);
+                (p_emp - p_true).abs()
+            })
+            .sum::<f64>();
+    println!(
+        "[P1-10 CPU MCMC Stationary Boltzmann S=5,M=4] |Omega|={} | TVD={tvd_b:.4}",
+        exact_b.len()
+    );
+    assert!(
+        tvd_b < 0.025,
+        "CPU MCMC stationary Boltzmann TVD (S=5,M=4) {tvd_b:.4} >= 0.025 (Move 1E Hastings violation!)"
+    );
+}
+
+#[test]
+fn p1_10_multichain_pdb_and_cn_homooligomer_isometry_invariants() {
+    let root = repo_root();
+    let ubq_mono = extract_methyl_structure_from_pdb_file(
+        root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"),
+        &MethylLabelingScheme::Ilvmat,
+    )
+    .unwrap();
+    assert!(ubq_mono.sites.len() >= 42);
+
+    let c2 = build_c2_homodimer_methyl_model(&ubq_mono, 5.2);
+    let m0 = ubq_mono.sites.len();
+    assert_eq!(c2.sites.len(), 2 * m0);
+    for a in 0..m0 {
+        for b in (a + 1)..m0 {
+            let d_aa = c2.dist_cc(a, b);
+            let d_bb = c2.dist_cc(a + m0, b + m0);
+            let d_ab = c2.dist_cc(a, b + m0);
+            let d_ba = c2.dist_cc(a + m0, b);
+            assert!((d_aa - d_bb).abs() < 1e-9);
+            assert!((d_ab - d_ba).abs() < 1e-9);
+        }
+    }
+
+    let c3 = build_cn_homooligomer_methyl_model(&ubq_mono, 3, 5.5);
+    assert_eq!(c3.sites.len(), 3 * m0);
+
+    // Multi-chain PDB parser preserves both chains A and B with identical res_seq
+    let two_chain_pdb = "\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 10.00           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 10.00           C
+ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00 10.00           C
+ATOM      4  CB  ALA A   1       1.988  -0.760  -1.216  1.00 10.00           C
+TER
+ATOM      5  N   ALA B   1      10.000   0.000   0.000  1.00 10.00           N
+ATOM      6  CA  ALA B   1      11.458   0.000   0.000  1.00 10.00           C
+ATOM      7  C   ALA B   1      12.009   1.420   0.000  1.00 10.00           C
+ATOM      8  CB  ALA B   1      11.988  -0.760  -1.216  1.00 10.00           C
+END
+";
+    let mc = extract_multichain_methyl_structure_from_pdb_str(
+        two_chain_pdb,
+        &MethylLabelingScheme::Ilvmat,
+    )
+    .unwrap();
+    assert_eq!(mc.sites.len(), 2);
+    assert!((mc.dist_cc(0, 1) - 10.0).abs() < 1e-6);
 }
