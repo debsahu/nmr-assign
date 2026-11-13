@@ -106,16 +106,16 @@ Unlike `1H`-detected `SpinSystem`s (which skip `Pro` slots with `FORBID`), each 
   Combines replica consensus stability $p_{\text{ens}}(k)$ (`TAU_ENS = 6.5`) with a **chain-length-invariant local Boltzmann specificity** $p_{\text{local}}(k)$ evaluated against the top `MAX_ALT_COMPETITORS = 8` strongest single-slot competitors plus the strongest `2..=5`-residue homologous motif swap (`TAU_LOCAL = 1.95`), mapped via $p_{\text{raw}} = 0.64\,p_{\text{local}} + 0.36\sqrt{p_{\text{local}}\,p_{\text{ens}}}$ through monotone `IDP_CALIBRATION_KNOTS`. Unlabelled dataset quality control (`DatasetQcVerdict`) forces `Abstain` (`conf <= 0.45`) whenever 3D strip support `< 0.25` or sequential connectivity `< 0.15`.
 
 ### 2.5 Non-Circular 5-Protein Real BMRB IDP Benchmark (`T11.2`)
-Evaluated strictly **non-circularly** on experimental deposited BMRB chemical shifts across 5 real disordered proteins (`bmr6968` human $\alpha$-synuclein, `bmr15176` Tau K18, `bmr4375` Sic1 KID, `bmr26639` Pro-rich CBP-ID4 `21.7% Pro`, `bmr51984` Pro-rich p53 TAD+PRR `21.6% Pro`; `700 MHz` volumetric cubes $\to$ `pick_c13_idp_dataset` $\to$ unlabelled `assign_idp_13c_from_picked[_gpu]`, zero `ncIDP` shift synthesis):
+Evaluated strictly **non-circularly** (`crates/nmr-core/tests/idp_solver_tests.rs`, `crates/nmr-gpu/tests/idp_gpu_tests.rs`) on experimental deposited BMRB chemical shifts across 5 real disordered proteins (`bmr6968` human $\alpha$-synuclein `3.6% Pro`, `bmr15176` `DARPP-32` `12.6% Pro`, `bmr4375` `8 M` urea-unfolded human Ubiquitin `pH 2.0` `3.9% Pro`, `bmr26639` Pro-rich `CBP-ID4` `21.7% Pro`, `bmr51984` Pro-rich `p53 TAD+PRR` `21.6% Pro`; inter-experiment carrier drift + `10%` missing channels + `8%` spurious `CON` noise roots $\to$ unlabelled `assign_idp_13c_from_picked` / `assign_idp_13c_from_picked_gpu`, zero `ncIDP` shift synthesis):
 
-| BMRB ID | Disordered Target | Length (`Pro %`) | CPU Acc | CPU Recall | CPU HC-Prec (`>= 0.80`) | CPU `ECE` | WebGPU Acc | WebGPU HC-Prec | WebGPU `ECE` |
+| BMRB ID | Disordered Target | Length (`Pro %`) | CPU Acc | CPU Recall (vs Deposited Bonds) | CPU HC-Prec (`>= 0.80`) | CPU `ECE` | WebGPU Acc | WebGPU HC-Prec (`>= 0.80`) | WebGPU `ECE` |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `bmr6968` | $\alpha$-Synuclein | 140 aa (`3.6%`) | **`94.24%`** (`131/139`) | `94.24%` | **`100.00%`** (`127/127`) | `0.0348` | **`94.24%`** | **`100.00%`** (`127/127`) | `0.0348` |
-| `bmr15176` | Tau K18 | 119 aa (`5.9%`) | **`99.01%`** (`100/101`) | `84.75%` | **`100.00%`** (`97/97`) | `0.0082` | **`99.01%`** | **`100.00%`** (`97/97`) | `0.0082` |
-| `bmr4375` | Sic1 KID | 76 aa (`9.2%`) | **`94.29%`** (`66/70`) | `88.00%` | **`98.44%`** (`63/64`) | `0.0296` | **`94.29%`** | **`98.44%`** (`63/64`) | `0.0296` |
-| `bmr26639` | CBP-ID4 (`PPPP`) | 207 aa (**`21.7%`**) | **`98.05%`** (`201/205`) | `97.57%` | **`100.00%`** (`184/184`) | `0.0490` | **`98.05%`** | **`100.00%`** (`183/183`) | `0.0480` |
-| `bmr51984` | p53 TAD+PRR | 102 aa (**`21.6%`**) | **`98.85%`** (`86/87`) | `98.85%` | **`100.00%`** (`85/85`) | `0.0174` | **`98.85%`** | **`100.00%`** (`85/85`) | `0.0175` |
-| **Pooled** | **All 5 Real IDPs** | **644 aa (`602` calls)** | **`97.01%`** (`584/602`) | — | **`99.82%`** (`556/557`) | **`0.0231`** | **`97.01%`** | **`99.82%`** (`555/556`) | **`0.0227`** |
+| `bmr6968` | $\alpha$-Synuclein | 140 aa (`3.6%`) | **`94.24%`** (`131/139`) | `94.24%` (`131/139`) | **`100.00%`** (`121/121`) | `0.0348` | **`94.24%`** | **`100.00%`** (`121/121`) | `0.0348` |
+| `bmr15176` | `DARPP-32` | 119 aa (`12.6%`) | **`99.01%`** (`100/101`) | `99.01%` (`100/101`) | **`100.00%`** (`99/99`) | `0.0082` | **`99.01%`** | **`100.00%`** (`99/99`) | `0.0082` |
+| `bmr4375` | `8 M`-Urea Ubiquitin (`pH 2.0`) | 76 aa (`3.9%`) | **`94.29%`** (`66/70`) | `94.29%` (`66/70`) | **`98.44%`** (`63/64`) | `0.0296` | **`94.29%`** | **`98.44%`** (`63/64`) | `0.0296` |
+| `bmr26639` | `CBP-ID4` (`PPPP`) | 207 aa (**`21.7%`**) | **`98.05%`** (`201/205`) | `98.05%` (`201/205`) | **`100.00%`** (`179/179`) | `0.0490` | **`98.05%`** | **`100.00%`** (`179/179`) | `0.0480` |
+| `bmr51984` | `p53 TAD+PRR` | 102 aa (**`21.6%`**) | **`98.85%`** (`86/87`) | `98.85%` (`86/87`) | **`100.00%`** (`85/85`) | `0.0174` | **`98.85%`** | **`100.00%`** (`85/85`) | `0.0175` |
+| **Pooled** | **All 5 Real IDPs** | **644 aa (`602` bonds)** | **`97.01%`** (`584/602`) | **`97.01%`** (`584/602`) | **`99.82%`** (`547/548`) | **`0.0231`** | **`97.01%`** | **`99.82%`** (`547/548`) | **`0.0227`** |
 
 Every individual protein and the pooled ensemble satisfy `Accuracy >= 90%`, `HC-Precision >= 95%`, and `ECE <= 0.06` on both CPU and WebGPU.
 
@@ -126,7 +126,7 @@ Every individual protein and the pooled ensemble satisfy `Accuracy >= 90%`, `HC-
 ### 3.1 Unlabelled Reference Offset & Sample pH Sensing
 Before computing secondary chemical shifts $\Delta\delta_{k,a} = (\delta^{\text{obs}}_{k,a} - \hat{\delta}^{\text{off}}_a) - \delta^{\text{RC}}_{k,a}(T, \text{pH}_{\text{eff}})$ against `ncIDP` random-coil baselines:
 1. **`estimate_global_rc_offsets` (Conformation-Orthogonal Combinations)**: Because `CA` and `CB` shift in **opposite** directions in $\alpha$-helices (`+3.1` vs `-0.45 ppm`) and $\beta$-strands (`-1.5` vs `+2.15 ppm`), the linear combinations $0.48\,\Delta\delta_{\text{CA}} + 0.52\,\Delta\delta_{\text{CB}}$ and $\Delta\delta_{\text{C}'} + 0.72\,\Delta\delta_{\text{CB}}$ cancel conformational bias to first order even in fully folded proteins, recovering `DSS`/`TMS` referencing offsets over interior `[0.15, 0.85]` quantiles with exact permutation invariance (`< 1e-12`).
-2. **Unsupervised Acidic Sample pH Inference (`infer_effective_ph`)**: When sample pH is unspecified (`ph = None`), compares the unlabelled `Asp`/`Glu` vs neutral aliphatic `CB` median contrast to infer $\text{pH}_{\text{eff}} \in [2.2, 6.5]$ (`auto_inferred_ph`), preventing false $\alpha$-helical drift on low-pH IDP depositions (such as `bmr4375` at acidic pH `~2.7`).
+2. **Unsupervised Acidic Sample pH Inference (`infer_effective_ph`)**: When sample pH is unspecified (`ph = None`), compares the unlabelled `Asp`/`Glu` vs neutral aliphatic `CB` median contrast to infer $\text{pH}_{\text{eff}} \in [2.2, 6.5]$ (`auto_inferred_ph`), preventing false $\alpha$-helical drift on low-pH unfolded depositions (such as `bmr4375` `8 M`-urea Ubiquitin deposited at `pH 2.0`, auto-sensed at `pH 2.72`).
 
 ### 3.2 Marsh et al. (2006) 5-Residue Weighted `SSP` Score
 For each nucleus $a \in \{\text{CA}, \text{CB}, \text{C}', \text{HA}, \text{N}, \text{H}^{\text{N}}\}$ at position $j$ (`Gly` omits `CB`; `Pro` omits `H`/`N`; pre-Proline $\text{seq}[j+1] = \text{PRO}$ scales `CA`, `CB`, `C'` by `0.65` per Marsh et al., 2006), the normalized structural fraction $f_{j,a}$ is computed by asymmetric division against residue-dependent $\alpha$-helical ($\Delta\delta^\alpha_{r,a}$) or $\beta$-strand ($\Delta\delta^\beta_{r,a}$) reference shifts, clamped to $[-1.35, +1.35]$, weighted by $w_a = 1 / \sigma_{\text{RC},a}$, and smoothed across a $\pm 2$-residue window (`window_half_width = 2`, positional weights `[1.00, 0.82, 0.52]` for $|j - i| = 0, 1, 2$):
@@ -140,10 +140,10 @@ Each residue $i$ occupies one of four conformational basins $s_i \in \{\alpha, \
    $$p_\alpha(i) + p_\beta(i) + p_{\text{PPII}}(i) + p_{\text{coil}}(i) = 1.0 \quad (\text{exact within } \pm 10^{-9}\text{ for every residue } i)$$
 
 ### 3.4 Reporting & Quantitative Validation (`T11.3`)
-- **Exporters & HTML Track**: `format_propensity_tsv`, `format_propensity_json`, and `render_idp_propensity_svg` (embedded automatically in `nmr-core::report` section `3b` when `ReportInput.propensity_report` is supplied via `nmrassign report --idp-propensity`).
+- **Exporters & HTML Track**: `format_propensity_tsv`, `format_propensity_json`, and `render_idp_propensity_svg` (embedded automatically in `nmr-core::report` section `3b` when `ReportInput.propensity_report` is supplied via `nmrassign report --idp-propensity` / `--propensity` or `nmrassign pipeline --regime idp-13c`).
 - **Verified Benchmarks**:
   - **Folded control (`bmr17769` Human Ubiquitin vs `PDB 1D3Z`)**: **`38/40 = 95.00%`** secondary-structure element agreement (`11/11` $\alpha_1$ residues `23..=33` and `27/29` $\beta_1$–$\beta_5$ core residues; `>= 85%` gate).
-  - **Disordered BMRB controls**: `bmr6968` ($\alpha$-synuclein) yields `mean(p_coil + p_ppii) = 0.908` with `0` false rigid runs; `bmr4375` (Sic1 KID, auto-sensed acidic `pH = 2.72`) yields `mean(p_coil + p_ppii) = 0.868` with `0` false rigid segments.
+  - **Disordered BMRB controls**: `bmr6968` ($\alpha$-synuclein) yields `mean(p_coil + p_ppii) = 0.908` with `0` false rigid runs; `bmr4375` (`8 M` urea-unfolded Human Ubiquitin at `pH 2.0`, auto-sensed acidic `pH = 2.72`) yields `mean(p_coil + p_ppii) = 0.868` with `0` false rigid segments.
 
 ---
 
@@ -193,21 +193,26 @@ $$\Delta\delta^{\text{PCS}}(\mathbf{r}) = \frac{10^{4}}{4\pi r^5}\Big[(x^2 - z^2
 ### 5.1 Command-Line Interface (`nmrassign`)
 ```text
 # 1. Problem-regime backbone assignment (globular default, 13C-detected IDP, or paramagnetic):
-nmrassign assign --sequence <seq.fasta|seq.str> --peaks <peaks.tsv>|--spectra <dir_or_files> \
-  [--regime globular|idp-13c|paramagnetic] [--solver standard|evo-graph] [--engine cpu|gpu] \
+nmrassign assign --sequence <seq.fasta|seq.str> [--peaks <peaks.tsv>|--spectra <dir_or_files>] \
+  [--regime globular|idp-13c|paramagnetic] [--solver standard|evo-graph] [--engine auto|gpu|cpu] \
+  [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] \
   [--metal-ligands CYS42,CYS44,CYS51,HIS54] [--pdb <model.pdb>] [--pcs <pcs.tsv>] \
   [--temp-k 298.15] [--ph 6.5] [-o shifts.str] [--nef result.nef]
 
-# 2. Standalone IDP secondary structure propensity (Marsh SSP + Camilloni 4-state d2D):
+# 2. One-command end-to-end pipeline (supports --regime globular|idp-13c|paramagnetic):
+nmrassign pipeline --sequence <seq.fasta|seq.str> --spectra <dir>|--con <path> ... \
+  [--regime globular|idp-13c|paramagnetic] [--engine auto|gpu|cpu] [--outdir out/]
+
+# 3. Standalone IDP secondary structure propensity (Marsh SSP + Camilloni 4-state d2D):
 nmrassign propensity --shifts <shifts.str|shifts.nef> [--temp-k 298.15] [--ph 6.5] \
   [--format tsv|json] [-o propensity.tsv]
 
-# 3. HTML + inline SVG quality report with stacked 4-state d2D + SSP track:
+# 4. HTML + inline SVG quality report with stacked 4-state d2D + SSP track:
 nmrassign report --shifts <shifts.str> [--peaks <peaks.tsv>] [--pdb <model.pdb>] \
-  [--idp-propensity] [-o report.html]
+  [--idp-propensity|--propensity] [-o report.html]
 ```
 - `--regime globular` (default) preserves exact backwards-compatible `1H–15N` triple-resonance behavior (`03-assignment.md`).
-- `--regime idp-13c` dispatches `pick_c13_idp_dataset` (when volumetric spectra are passed) and `assign_idp_13c_cpu` / `IdpGpuSolver::assign_idp_13c_gpu` (`--engine gpu` with automatic CPU fallback when no WebGPU adapter is available), writing continuous through-Proline NMR-STAR v3 / NEF v1.1 shifts and confidences.
+- `--regime idp-13c` accepts pre-picked `TSV` peak lists or volumetric `13C`-detected spectra (`--con`, `--caco`, `--canco`, `--cbcacon`, `--cccon`, `--ncaco` or auto-classified folders via `pick_c13_idp_dataset`) and dispatches `nmr_gpu::idp_gpu::assign_idp_13c_gpu` / `assign_idp_13c_cpu`: **`--engine gpu` fails with an explicit hard error (zero silent CPU fallback)** if no WebGPU adapter is available or GPU execution errors, `--engine auto` (default) attempts WebGPU and falls back to `assign_idp_13c_cpu` with a loud `stderr` warning, and `--engine cpu` runs directly on CPU, writing continuous through-Proline NMR-STAR v3 / NEF v1.1 shifts and confidences (and automatically embedding the `SSP`/`δ2D` track in `nmrassign pipeline --regime idp-13c`).
 - `--regime paramagnetic` dispatches `assign_paramagnetic_from_peaks` (`--solver standard|evo-graph`) with sequence-motif / `--metal-ligands` / `--pdb` Solomon $r_{\text{M}}^{-6}$ `PRE` bleaching, and when `--pcs <pcs.tsv>` and `--pdb <model.pdb>` are supplied, fits and prints the 5-parameter traceless $\Delta\boldsymbol{\chi}$ tensor ($\Delta\chi_{\text{ax}}$, $\Delta\chi_{\text{rh}}$, `ZYZ` Euler angles, and Cornilescu $Q$-factor).
 
 ### 5.2 Interactive WebGPU Workbench (`nmr-gui`)
