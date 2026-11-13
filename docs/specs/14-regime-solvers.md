@@ -153,7 +153,7 @@ Each residue $i$ occupies one of four conformational basins $s_i \in \{\alpha, \
 Unpaired electron spins ($S \ge \frac{1}{2}$ in `[2Fe-2S]`, `[4Fe-4S]`, high-spin $\text{Fe}^{2+}/\text{Fe}^{3+}$, $\text{Co}^{2+}$, $\text{Cu}^{2+}$, and paramagnetic lanthanides $\text{Ln}^{3+}$) enhance nuclear transverse relaxation via Solomon (1955) electron–nuclear dipolar coupling $\Gamma_2 \propto r_{\text{M}}^{-6}$, bleaching `1H–15N` HSQC and 3D triple-resonance signals inside a sphere of characteristic bleach radius $r_{\text{bleach}}$ (`default = 8.5 Å`):
 
 1. **3D Multi-Cluster Coordinate Bleaching (`compute_bleach_probabilities`)**:
-   - Given explicit metal coordinates (`HETATM` ions `FE`, `FES`, `SF4`, `ZN`, `CO`, `CU`, `NI`, `MN`, `TM`, `TB`, `DY`, `ER`, `YB`, `HO`, `EU`, `CE`, `PR`, `ND`, `SM`) or coordinating ligand sidechains, donor atoms (`SG` on `Cys`, `ND1`/`NE2` on `His`, `OD*`/`OE*` on `Asp`/`Glu`) are partitioned into **single-linkage 3D spatial clusters (`<= 8.5 Å` donor–donor cutoff)** so multi-site metalloproteins (such as tandem `[2Fe-2S]` `CISD3`, whose two clusters sit `~16 Å` apart) place one metal center per cluster rather than collapsing onto an unphysical inter-cluster midpoint!
+   - Given explicit open-shell metal coordinates (`HETATM` ions `FE`, `FES`, `SF4`, `CO`, `CU`, `NI`, `MN`, `TM`, `TB`, `DY`, `ER`, `YB`, `HO`, `EU`, `GD`, `CE`, `PR`, `ND`, `SM`) or coordinating ligand sidechains, donor atoms (`SG` on `Cys`, `ND1`/`NE2` on `His`, `OD*`/`OE*` on `Asp`/`Glu`) are partitioned into **single-linkage 3D spatial clusters (`<= 8.5 Å` donor–donor cutoff)** so multi-site metalloproteins (such as tandem `[2Fe-2S]` `CISD3`, whose two clusters sit `~16 Å` apart) place one metal center per cluster rather than collapsing onto an unphysical inter-cluster midpoint!
    - For each residue $k$ at amide distance $r_{k,m}$ from metal center $m$, the cooperative bleach probability is:
      $$p_{\text{bleach}}(k) = \frac{\sum_m (r_{\text{bleach}} / r_{k,m})^6}{1 + \sum_m (r_{\text{bleach}} / r_{k,m})^6} \in [0, 1]$$
 2. **Sequence-Only Coordination Motif Detection (`detect_metal_coordination_motifs`)**:
@@ -182,9 +182,9 @@ $$\Delta\delta^{\text{PCS}}(\mathbf{r}) = \frac{10^{4}}{4\pi r^5}\Big[(x^2 - z^2
 - **Synthetic `Δχ` Tensor Recovery (`Tm3+`, `Tb3+`, `Dy3+` on `PDB 1D3Z`)**:
   - Noise-free exact recovery: **`0.000000%` error** (`Q <= 1.51e-15`).
   - Realistic `0.03 ppm` thermal PCS noise + **`0.30 Å` 3D RMS structural coordinate noise**: `Tm3+` `0.11%` ($\Delta\chi_{\text{ax}}$) / `0.60%` ($\Delta\chi_{\text{rh}}$), `Tb3+` `0.27% / 0.59%`, `Dy3+` `0.01% / 0.09%` — **all `< 0.61%` (`< 1.0%` gate)**; 8-parameter `VarPro` localizes metal coordinates from a `2.6 Å`-displaced start to `0.072 Å` error (`0.22% / 0.50%` tensor error).
-- **Non-Circular Real Experimental `CISD3` (`BMRB 51439`, Tandem `[2Fe-2S]` Metalloprotein, 5 Seeds `0..4`)**:
-  - **`Standard` solver**: `53.33%` (`28.8/54.0`) $\to$ **`60.61%` (`33.3/55.0`) accuracy (`+7.28 pp`)**, recall `37.65%` $\to$ **`39.22%` (`+1.57 pp`)**, **`100.00%` (`160/160`) HC-precision**, and **`0` false `[2Fe-2S]` loop assignments across all 5 seeds** (down from `44`).
-  - **`EvoGraph` solver**: `58.86%` (`33.2/56.4`) $\to$ **`65.60%` (`34.4/52.4`) accuracy (`+6.74 pp`)**, recall **`40.39%` (`+1.33 pp`)**, **`100.00%` (`163/163`) HC-precision**, and **`0` false `[2Fe-2S]` loop assignments across all 5 seeds** (down from `21`).
+- **Non-Circular Real Experimental `CISD3` (`BMRB 51439`, Tandem `[2Fe-2S]` Metalloprotein, 5 Seeds `0..4`, `paramagnetic_tests::test_real_cisd3_paramagnetic_5seed_gate`)**:
+  - **`Standard` solver**: `53.33%` $\to$ **`60.61%` accuracy (`+7.28 pp`)**, recall `37.65%` $\to$ **`39.22%` (`+1.57 pp`)**, **`100.00%` HC-precision**, and **`0` false `[2Fe-2S]` loop assignments across all 5 seeds** (down from `44`).
+  - **`EvoGraph` solver** (post-`P1-7a` parameter-free Pass-1): `55.43%` $\to$ **`62.26%` accuracy (`+6.83 pp`)** (identical `62.26%` under sequence-auto-detected motifs and explicit `--metal-ligands`), recall **`38.04%`**, **`100.00%` HC-precision**, and **`0` false `[2Fe-2S]` loop assignments across all 5 seeds** (down from `22`).
 
 ---
 
