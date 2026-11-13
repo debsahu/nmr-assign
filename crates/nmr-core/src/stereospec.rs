@@ -21,6 +21,13 @@
 //!   (2001). *J. Am. Chem. Soc.* 123, 7081–7093; and Chou, J. J., Case, D. A. & Bax, A. (2003).
 //!   *J. Am. Chem. Soc.* 125, 8959–8966 (`3J_NCG` and `3J_C'CG` / `3J_CC` Karplus relations for
 //!   `Val`, `Ile`, `Thr`, `Leu`, and non-branched `CB` sidechains).
+//!   *Benchmark provenance disclosure (`P2`)*: In our experimental Ubiquitin `3J` benchmark
+//!   (`data/fixtures/ubiquitin_exp_3j.tsv` vs `BMRB 17769`, Cornilescu et al. *J. Am. Chem. Soc.*
+//!   120, 6836–6837, 1998), the reference stereospecific labels in `BMRB 17769` reflect Bax-group
+//!   NMR inference from dipolar/scalar-coupling datasets rather than independent stereoselective
+//!   biosynthetic isotope labeling, and the `Val` `3J(NCg)` / `3J(C'Cg)` Karplus coefficients of
+//!   Chou, Case & Bax (*J. Am. Chem. Soc.* 125, 8959–8966, 2003) included human Ubiquitin in their
+//!   literature parameterization cohort (see `docs/specs/07b-stereospecific.md` §6.3).
 //! - Lange, K. L., Little, R. J. A. & Taylor, J. M. G. (1989). "Robust statistical modeling
 //!   using the t distribution." *J. Am. Stat. Assoc.* 84, 881–896 (heavy-tailed Student-t
 //!   `nu = 4` scalar-coupling likelihood for robustness against systematic Karplus

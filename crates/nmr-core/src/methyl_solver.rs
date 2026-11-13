@@ -15,7 +15,8 @@
 //!   & Kay, L. E. (*J. Am. Chem. Soc.* 2017, 139, 9523–9533 — probabilistic methyl NOE contact-graph
 //!   matching).
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -31,6 +32,13 @@ use crate::rng::Rng;
 
 pub const METHYL_FORBID: f32 = -1.0e9;
 pub const METHYL_FORBID_HALF: f32 = -5.0e8;
+
+/// Bitmask flags selecting individual reversible MCMC move families on $\Omega = \bigcup_k \Omega_k$.
+pub const METHYL_MOVE_SLOT: u32 = 0x1;
+pub const METHYL_MOVE_CONTACT: u32 = 0x2;
+pub const METHYL_MOVE_GEMINAL: u32 = 0x4;
+pub const METHYL_MOVE_BIRTH_DEATH: u32 = 0x8;
+pub const METHYL_MOVE_ALL: u32 = 0xF;
 
 /// Scoring hyperparameters for the methyl NOE contact-graph objective $E(\pi)$.
 #[derive(Clone, Debug)]
@@ -576,6 +584,16 @@ pub fn build_methyl_contact_problem(
     }
 
     // 3. Unary compatibility matrix U(s, m)
+    // Precompute per-root unexplained-NOE false-peak baseline `4.20 * sum_{e ni s} w_e` so that
+    // unassigning a root (`pos[s] = -1`) in variable-cardinality MCMC pays the exact same
+    // `-4.20 * w_e` false-peak noise floor on its incident observed NOE cross-peaks as a
+    // structurally unexplained long-range pair (`noe_edge_score_f32` when `d_cc > d_cutoff`),
+    // preventing high-degree core methyls from evaporating into `pos[s] = -1` during high-T annealing
+    // while keeping every cardinality-preserving `Delta E` strictly invariant.
+    let obs_unexplained_baseline: Vec<f64> = obs_adj_lists
+        .iter()
+        .map(|list| 4.20 * list.iter().map(|e| e.weight as f64).sum::<f64>())
+        .collect();
     let mut u_mat = vec![METHYL_FORBID; s_len * m_len];
     let mut slots: Vec<Vec<u32>> = vec![Vec::new(); s_len];
 
@@ -624,14 +642,22 @@ pub fn build_methyl_contact_problem(
                 if ll <= -9.5 {
                     continue;
                 }
-                ll
+                // Convert raw Gaussian log-densities to log-likelihood ratio against an
+                // `18.0 ppm` uniform aliphatic carbon background per observed channel so
+                // roots carrying `HMCM(CG)CBCA` relays have calibrated unary log-odds relative
+                // to the unassigned (`pos[s] = -1`) baseline in variable-cardinality MCMC.
+                let n_ch = usize::from(rec.ca_ppm.is_some())
+                    + usize::from(rec.cb_ppm.is_some())
+                    + usize::from(rec.cg_ppm.is_some());
+                let bg_ref = (n_ch as f64) * (18.0_f64.ln() - 0.5 * std::f64::consts::TAU.ln());
+                ll + bg_ref
             } else {
                 0.0
             };
 
             let lc = -0.5 * zc * zc - sd_c.ln();
             let lh = (-0.5 * zh * zh - sd_h.ln()).max(-7.5);
-            let u_val = (cfg.assign_bonus + lc + lh + l_hmcm) as f32;
+            let u_val = (cfg.assign_bonus + lc + lh + l_hmcm + obs_unexplained_baseline[s]) as f32;
             u_mat[s * m_len + m] = u_val;
             slots[s].push(m as u32);
         }
@@ -853,8 +879,203 @@ pub fn evaluate_methyl_raw_from_both(prob: &MethylContactProblem, at: &[i32], po
 /// Initialized replica state `(at[0..M], pos[0..S], raw_score)`.
 pub type ReplicaInitState = (Vec<i32>, Vec<i32>, f64);
 
+#[derive(Clone, Copy, Debug)]
+struct SsapEdge {
+    to: usize,
+    rev: usize,
+    cap: i32,
+    cost: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeapNode {
+    dist: f64,
+    node: usize,
+}
+
+impl PartialEq for HeapNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist.to_bits() == other.dist.to_bits() && self.node == other.node
+    }
+}
+
+impl Eq for HeapNode {}
+
+impl PartialOrd for HeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .dist
+            .total_cmp(&self.dist)
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+
+/// Compute an exact **maximum-cardinality, maximum-weight bipartite matching** between `0..s_len`
+/// observed roots and `0..m_len` structural sites over sparse finite-weight edges `row_edges[s]`
+/// via Successive Shortest Augmenting Paths (Jonker–Volgenant / Edmonds–Karp with Johnson dual
+/// potentials). Returns `(at[0..m_len], pos[0..s_len])` achieving $k = k_{\max}$ first and
+/// maximum $\sum_{s:\text{pos}[s]\ge 0} w(s, \text{pos}[s])$ among all matchings of size $k_{\max}$.
+pub fn max_cardinality_max_weight_matching(
+    s_len: usize,
+    m_len: usize,
+    row_edges: &[Vec<(usize, f64)>],
+) -> (Vec<i32>, Vec<i32>) {
+    let mut at = vec![-1i32; m_len];
+    let mut pos = vec![-1i32; s_len];
+    if s_len == 0 || m_len == 0 {
+        return (at, pos);
+    }
+
+    let mut min_w = f64::INFINITY;
+    let mut max_w = f64::NEG_INFINITY;
+    for edges in row_edges.iter().take(s_len) {
+        for &(m, w) in edges {
+            if m < m_len && w.is_finite() {
+                min_w = min_w.min(w);
+                max_w = max_w.max(w);
+            }
+        }
+    }
+    if !max_w.is_finite() {
+        return (at, pos);
+    }
+
+    let span = (max_w - min_w).max(1.0);
+    // Strict lexicographic priority: assigning one additional root saves > s_len * span + 1000.0
+    // over any weight rearrangement among already-assigned roots.
+    let unassign_cost = ((s_len + 1) as f64) * (span + 1.0) + 1_000.0;
+
+    // Node layout: 0..s_len = rows, s_len..(s_len + m_len) = cols, sink = s_len + m_len
+    let sink = s_len + m_len;
+    let v_cnt = sink + 1;
+    let mut graph: Vec<Vec<SsapEdge>> = vec![Vec::new(); v_cnt];
+    let add_edge = |g: &mut [Vec<SsapEdge>], u: usize, v: usize, cap: i32, cost: f64| {
+        let rev_u = g[v].len();
+        let rev_v = g[u].len();
+        g[u].push(SsapEdge {
+            to: v,
+            rev: rev_u,
+            cap,
+            cost,
+        });
+        g[v].push(SsapEdge {
+            to: u,
+            rev: rev_v,
+            cap: 0,
+            cost: -cost,
+        });
+    };
+
+    for (s, edges) in row_edges.iter().enumerate().take(s_len) {
+        for &(m, w) in edges {
+            if m < m_len && w.is_finite() {
+                add_edge(&mut graph, s, s_len + m, 1, (max_w - w).max(0.0));
+            }
+        }
+        add_edge(&mut graph, s, sink, 1, unassign_cost);
+    }
+    for m in 0..m_len {
+        add_edge(&mut graph, s_len + m, sink, 1, 0.0);
+    }
+
+    let mut pot = vec![0.0f64; v_cnt];
+    let mut dist = vec![f64::INFINITY; v_cnt];
+    let mut prev_node = vec![usize::MAX; v_cnt];
+    let mut prev_edge = vec![usize::MAX; v_cnt];
+    let mut touched = Vec::with_capacity(v_cnt);
+    let mut settled = Vec::with_capacity(v_cnt);
+    let mut heap = BinaryHeap::new();
+
+    for s_start in 0..s_len {
+        touched.clear();
+        settled.clear();
+        heap.clear();
+
+        dist[s_start] = 0.0;
+        touched.push(s_start);
+        heap.push(HeapNode {
+            dist: 0.0,
+            node: s_start,
+        });
+
+        let mut d_sink = f64::INFINITY;
+        while let Some(HeapNode { dist: d, node: u }) = heap.pop() {
+            if d > dist[u] {
+                continue;
+            }
+            if u == sink {
+                d_sink = d;
+                break;
+            }
+            settled.push(u);
+            let pu = pot[u];
+            for (ei, e) in graph[u].iter().enumerate() {
+                if e.cap <= 0 {
+                    continue;
+                }
+                let rc = (e.cost + pu - pot[e.to]).max(0.0);
+                let nd = d + rc;
+                if nd < dist[e.to] {
+                    if !dist[e.to].is_finite() {
+                        touched.push(e.to);
+                    }
+                    dist[e.to] = nd;
+                    prev_node[e.to] = u;
+                    prev_edge[e.to] = ei;
+                    heap.push(HeapNode {
+                        dist: nd,
+                        node: e.to,
+                    });
+                }
+            }
+        }
+
+        if d_sink.is_finite() {
+            // Partial-Dijkstra Johnson potential update: adding `dist[v] - d_sink` on settled
+            // nodes (`dist[v] < d_sink`) and `0` on unsettled nodes preserves reduced-cost
+            // non-negativity across all residual arcs in O(|settled|).
+            for &u in &settled {
+                pot[u] += dist[u] - d_sink;
+            }
+            let mut cur = sink;
+            while cur != s_start {
+                let p = prev_node[cur];
+                let ei = prev_edge[cur];
+                let rev = graph[p][ei].rev;
+                graph[p][ei].cap -= 1;
+                graph[cur][rev].cap += 1;
+                cur = p;
+            }
+        }
+
+        for &v in &touched {
+            dist[v] = f64::INFINITY;
+        }
+    }
+
+    for (s, edges) in graph.iter().enumerate().take(s_len) {
+        for e in edges {
+            if e.cap == 0 && e.to >= s_len && e.to < sink {
+                let m = e.to - s_len;
+                pos[s] = m as i32;
+                at[m] = s as i32;
+                break;
+            }
+        }
+    }
+
+    (at, pos)
+}
+
 /// Generate deterministic unary+degree-guided randomized initial replica states `(at, pos, raw_score)`
-/// shared identically by CPU and WebGPU multi-replica simulated annealing.
+/// via exact **maximum-cardinality / maximum-weight bipartite matching** (`P1-6`), shared identically
+/// by CPU and WebGPU multi-replica simulated annealing.
 pub fn build_initial_replica_states(
     prob: &MethylContactProblem,
     replicas: usize,
@@ -873,7 +1094,7 @@ pub fn build_initial_replica_states(
         .collect();
 
     // Identify mutually strongest geminal-coupled root pairs `(s1, s2)` (`gem_obs_mat > 1.5`)
-    // so replicas start with intact Leu/Val geminal pairings rather than broken HMCM links.
+    // so replicas prefer intact Leu/Val geminal pairings whenever compatible with maximum cardinality.
     let mut best_gem_partner: Vec<Option<usize>> = vec![None; s_len];
     for (s1, partner_slot) in best_gem_partner.iter_mut().enumerate() {
         let mut best: Option<(f32, usize)> = None;
@@ -889,13 +1110,10 @@ pub fn build_initial_replica_states(
         *partner_slot = best.map(|(_, idx)| idx);
     }
     let mut gem_root_pairs: Vec<(usize, usize)> = Vec::new();
-    let mut is_in_gem_pair = vec![false; s_len];
     for s1 in 0..s_len {
         if let Some(s2) = best_gem_partner[s1] {
             if s1 < s2 && best_gem_partner[s2] == Some(s1) {
                 gem_root_pairs.push((s1, s2));
-                is_in_gem_pair[s1] = true;
-                is_in_gem_pair[s2] = true;
             }
         }
     }
@@ -913,10 +1131,11 @@ pub fn build_initial_replica_states(
 
     for _ in 0..replicas {
         let mut r_rng = Rng::new(master_rng.next_u64());
-        let mut at = vec![-1i32; m_len];
-        let mut pos = vec![-1i32; s_len];
+        let mut gem_used_m = vec![false; m_len];
+        let mut gem_pref_site = vec![None::<usize>; s_len];
 
-        // 1. Place geminal-coupled root pairs `(s1, s2)` onto compatible vacant `(m1, m2)` pairs
+        // Sample soft geminal-pair target preferences `(s1 -> ma, s2 -> mb)`; exact SSAP matching
+        // honors them whenever consistent with global maximum cardinality `k_max`.
         let mut pair_order: Vec<(f64, (usize, usize))> = gem_root_pairs
             .iter()
             .copied()
@@ -931,7 +1150,7 @@ pub fn build_initial_replica_states(
             let mut best_choice: Option<(usize, usize)> = None;
             let mut best_val = f64::NEG_INFINITY;
             for &(m1, m2) in &struct_gem_pairs {
-                if at[m1] >= 0 || at[m2] >= 0 {
+                if gem_used_m[m1] || gem_used_m[m2] {
                     continue;
                 }
                 for &(ma, mb) in &[(m1, m2), (m2, m1)] {
@@ -951,29 +1170,19 @@ pub fn build_initial_replica_states(
                 }
             }
             if let Some((ma, mb)) = best_choice {
-                at[ma] = s1 as i32;
-                at[mb] = s2 as i32;
-                pos[s1] = ma as i32;
-                pos[s2] = mb as i32;
+                gem_used_m[ma] = true;
+                gem_used_m[mb] = true;
+                gem_pref_site[s1] = Some(ma);
+                gem_pref_site[s2] = Some(mb);
             }
         }
 
-        // 2. Order remaining unassigned roots from most constrained to broadest with random tie-break
-        let mut order: Vec<(f64, usize)> = (0..s_len)
-            .filter(|&s| pos[s] < 0)
-            .map(|s| {
-                let base = if is_in_gem_pair[s] { 0.0 } else { 1.0 };
-                (base + (prob.slots[s].len() as f64) + r_rng.f64(), s)
-            })
-            .collect();
-        order.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-        for &(_, s) in &order {
-            let mut best_m: Option<usize> = None;
-            let mut best_val = f64::NEG_INFINITY;
+        let mut row_edges: Vec<Vec<(usize, f64)>> = Vec::with_capacity(s_len);
+        for s in 0..s_len {
+            let mut edges = Vec::with_capacity(prob.slots[s].len());
             for &m_u32 in &prob.slots[s] {
                 let m = m_u32 as usize;
-                if at[m] >= 0 {
+                if m >= m_len {
                     continue;
                 }
                 let u = prob.u_mat[s * m_len + m] as f64;
@@ -981,18 +1190,18 @@ pub fn build_initial_replica_states(
                     continue;
                 }
                 let deg_pen = 0.18 * (obs_deg[s] - struct_deg[m]).abs();
-                let noisy_score = u - deg_pen + r_rng.normal(0.0, 1.85);
-                if noisy_score > best_val {
-                    best_val = noisy_score;
-                    best_m = Some(m);
-                }
+                let gem_bonus = if gem_pref_site[s] == Some(m) {
+                    14.0
+                } else {
+                    0.0
+                };
+                let noisy_w = u - deg_pen + gem_bonus + r_rng.normal(0.0, 1.85);
+                edges.push((m, noisy_w));
             }
-            if let Some(m) = best_m {
-                at[m] = s as i32;
-                pos[s] = m as i32;
-            }
+            row_edges.push(edges);
         }
 
+        let (at, pos) = max_cardinality_max_weight_matching(s_len, m_len, &row_edges);
         let raw_sc = evaluate_methyl_raw_from_both(prob, &at, &pos);
         out.push((at, pos, raw_sc));
     }
@@ -1205,8 +1414,44 @@ fn mh_accept_cpu(rng: &mut Rng, delta: f64, temp: f64, log_hastings: f64) -> boo
     }
 }
 
-/// Execute one exact Metropolis–Hastings transition step at temperature `temp` across the
-/// 4 reversible move kernels (`7/16` Move 1, `6/16` Move 2, `2/16` Move 3, `1/16` Move 4).
+#[inline]
+fn select_move_phase_cpu(rng: &mut Rng, move_mask: u32) -> u32 {
+    let mask = move_mask & METHYL_MOVE_ALL;
+    if mask == 0 || mask == METHYL_MOVE_ALL {
+        return (rng.next_u64() & 15) as u32;
+    }
+    let pop = mask.count_ones() as usize;
+    let pick = rng.usize(pop);
+    let mut seen = 0usize;
+    for b in 0..4u32 {
+        if (mask & (1u32 << b)) != 0 {
+            if seen == pick {
+                return match b {
+                    0 => 0,
+                    1 => 6,
+                    2 => {
+                        if (rng.next_u64() & 1) == 0 {
+                            12
+                        } else {
+                            14
+                        }
+                    }
+                    _ => 15,
+                };
+            }
+            seen += 1;
+        }
+    }
+    15
+}
+
+/// Execute one exact Metropolis–Hastings transition step at temperature `temp` on variable-cardinality
+/// $\Omega = \bigcup_{k=0}^{k_{\max}} \Omega_k$ across the 4 reversible move families:
+/// - `Move 1` (`6/16`, `0x1`): slot-guided swap / relocate-to-vacant / displace-occupied
+/// - `Move 2` (`6/16`, `0x2`): 3D NOE-contact (`7/8`) + slot-ergodic (`1/8`) move/swap
+/// - `Move 3` (`3/16`, `0x4`): state-independent geminal involutions (`2/16` 4-body + `1/16` 2-flip)
+/// - `Move 4` (`1/16`, `0x8`): paired assign/unassign (birth/death) with exact $\pm\ln(|\text{slots}[s]|)$ Hastings ratio
+#[allow(clippy::too_many_arguments)]
 fn step_methyl_mcmc_cpu(
     prob: &MethylContactProblem,
     gem_tbl: &GeminalMoveTable,
@@ -1214,16 +1459,17 @@ fn step_methyl_mcmc_cpu(
     pos: &mut [i32],
     cur: &mut f64,
     temp: f64,
+    move_mask: u32,
     rng: &mut Rng,
 ) -> bool {
     let s_len = prob.s_len;
     let m_len = prob.m_len;
     let mut m_buf = [0usize; 4];
     let mut s_buf = [0usize; 4];
-    let phase = rng.next_u64() & 15;
+    let phase = select_move_phase_cpu(rng, move_mask);
 
-    if phase < 7 {
-        // Move 1: slot-guided swap / move-to-vacant / reversible unassign-assign / displace-occupied
+    if phase < 6 {
+        // Move 1 (`6/16`): slot-guided swap / move-to-vacant / displace-occupied
         let s = rng.usize(s_len);
         let sl = &prob.slots[s];
         if sl.is_empty() {
@@ -1245,7 +1491,6 @@ fn step_methyl_mcmc_cpu(
         {
             return false;
         }
-        // Cardinality-preserving Move 1 on Omega_k (k = min(S, M)):
         // Cases 1B (ms>=0, t<0) and 1C (ms>=0, t>=0) have q_rev == q_fwd;
         // Case 1E (ms<0, t>=0, displace occupied) has q_rev / q_fwd = |slots[s]| / |slots[t]|.
         let log_hastings = if ms < 0 && t >= 0 {
@@ -1295,8 +1540,8 @@ fn step_methyl_mcmc_cpu(
             }
             false
         }
-    } else if phase < 13 {
-        // Move 2: 3D contact-guided + 1/8 slot-ergodic swap/move with exact Hastings correction
+    } else if phase < 12 {
+        // Move 2 (`6/16`): 3D contact-guided + 1/8 slot-ergodic swap/move with exact Hastings correction
         let s = rng.usize(s_len);
         let ms_i = pos[s];
         if ms_i < 0 {
@@ -1386,8 +1631,8 @@ fn step_methyl_mcmc_cpu(
             }
             false
         }
-    } else if phase < 15 {
-        // Move 3: state-independent 4-body geminal residue involution (strictly symmetric)
+    } else if phase < 14 {
+        // Move 3A (`2/16`): state-independent 4-body geminal residue involution (strictly symmetric)
         let ng = gem_tbl.pairs.len();
         if ng < 2 {
             return false;
@@ -1479,8 +1724,8 @@ fn step_methyl_mcmc_cpu(
             }
             false
         }
-    } else {
-        // Move 4: state-independent intraresidue prochiral 2-flip involution (strictly symmetric)
+    } else if phase < 15 {
+        // Move 3B (`1/16`): state-independent intraresidue prochiral 2-flip involution (strictly symmetric)
         let ng = gem_tbl.pairs.len();
         if ng == 0 {
             return false;
@@ -1533,6 +1778,55 @@ fn step_methyl_mcmc_cpu(
             }
             false
         }
+    } else {
+        // Move 4 (`1/16`): paired assign/unassign (birth/death) on variable-cardinality Omega = U_k Omega_k
+        let s = rng.usize(s_len);
+        let sl = &prob.slots[s];
+        if sl.is_empty() {
+            return false;
+        }
+        let ms = pos[s];
+        if ms < 0 {
+            let m = sl[rng.usize(sl.len())] as usize;
+            if at[m] >= 0 || prob.u_mat[s * m_len + m] <= METHYL_FORBID_HALF {
+                return false;
+            }
+            m_buf[0] = m;
+            s_buf[0] = s;
+            let before = eval_subset_contrib(prob, at, pos, &m_buf[..1], &s_buf[..1]);
+            at[m] = s as i32;
+            pos[s] = m as i32;
+            let delta = eval_subset_contrib(prob, at, pos, &m_buf[..1], &s_buf[..1]) - before;
+            let log_hastings = (sl.len() as f64).ln();
+            if mh_accept_cpu(rng, delta, temp, log_hastings) {
+                *cur += delta;
+                true
+            } else {
+                at[m] = -1;
+                pos[s] = -1;
+                false
+            }
+        } else {
+            let m = ms as usize;
+            if prob.u_mat[s * m_len + m] <= METHYL_FORBID_HALF {
+                return false;
+            }
+            m_buf[0] = m;
+            s_buf[0] = s;
+            let before = eval_subset_contrib(prob, at, pos, &m_buf[..1], &s_buf[..1]);
+            at[m] = -1;
+            pos[s] = -1;
+            let delta = eval_subset_contrib(prob, at, pos, &m_buf[..1], &s_buf[..1]) - before;
+            let log_hastings = -(sl.len() as f64).ln();
+            if mh_accept_cpu(rng, delta, temp, log_hastings) {
+                *cur += delta;
+                true
+            } else {
+                at[m] = s as i32;
+                pos[s] = m as i32;
+                false
+            }
+        }
     }
 }
 
@@ -1570,8 +1864,16 @@ fn run_single_cpu_replica(
 
     for step in 0..total_steps {
         let temp = t_start * (log_ratio * (step as f64 / denom)).exp();
-        if step_methyl_mcmc_cpu(prob, gem_tbl, &mut at, &mut pos, &mut cur, temp, &mut rng)
-            && cur > best_sc
+        if step_methyl_mcmc_cpu(
+            prob,
+            gem_tbl,
+            &mut at,
+            &mut pos,
+            &mut cur,
+            temp,
+            METHYL_MOVE_ALL,
+            &mut rng,
+        ) && cur > best_sc
         {
             best_sc = cur;
             best_pos.copy_from_slice(&pos);
@@ -1582,14 +1884,16 @@ fn run_single_cpu_replica(
     (best_pos, exact_best)
 }
 
-/// Run fixed-temperature CPU Metropolis–Hastings MCMC from `init_states` and return the
-/// terminal Markov chain states `pos[0..S]` (for stationary Boltzmann detailed-balance verification).
-pub fn sample_methyl_mcmc_terminal_cpu(
+/// Run fixed-temperature CPU Metropolis–Hastings MCMC with caller-specified `move_mask`
+/// (`METHYL_MOVE_SLOT`, `METHYL_MOVE_CONTACT`, `METHYL_MOVE_GEMINAL`, `METHYL_MOVE_BIRTH_DEATH`,
+/// or `METHYL_MOVE_ALL`) and return terminal Markov chain states `pos[0..S]`.
+pub fn sample_methyl_mcmc_terminal_cpu_with_mask(
     prob: &MethylContactProblem,
     temperature: f64,
     steps: usize,
     replicas: usize,
     seed: u64,
+    move_mask: u32,
 ) -> Vec<Vec<i32>> {
     let reps = replicas.max(1);
     if prob.s_len == 0 || prob.m_len == 0 {
@@ -1598,23 +1902,93 @@ pub fn sample_methyl_mcmc_terminal_cpu(
     let gem_tbl = build_geminal_move_table(prob);
     let init_states = build_initial_replica_states(prob, reps, seed);
     let mut seeder = Rng::new(seed ^ 0x4D43_4D43_5445_524D);
-    let mut out = Vec::with_capacity(reps);
-    for (mut at, mut pos, mut cur) in init_states {
-        let mut rng = Rng::new(seeder.next_u64());
-        for _ in 0..steps {
-            let _ = step_methyl_mcmc_cpu(
-                prob,
-                &gem_tbl,
-                &mut at,
-                &mut pos,
-                &mut cur,
-                temperature,
-                &mut rng,
-            );
+    let rep_seeds: Vec<u64> = (0..reps).map(|_| seeder.next_u64()).collect();
+
+    #[cfg(target_arch = "wasm32")]
+    let n_threads = 1usize;
+    #[cfg(not(target_arch = "wasm32"))]
+    let n_threads = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(reps)
+        .max(1);
+
+    if n_threads <= 1 {
+        let mut out = Vec::with_capacity(reps);
+        for ((mut at, mut pos, mut cur), rseed) in init_states.into_iter().zip(rep_seeds) {
+            let mut rng = Rng::new(rseed);
+            for _ in 0..steps {
+                let _ = step_methyl_mcmc_cpu(
+                    prob,
+                    &gem_tbl,
+                    &mut at,
+                    &mut pos,
+                    &mut cur,
+                    temperature,
+                    move_mask,
+                    &mut rng,
+                );
+            }
+            out.push(pos);
         }
-        out.push(pos);
+        out
+    } else {
+        let chunk = reps.div_ceil(n_threads);
+        let indexed: Vec<(ReplicaInitState, u64)> =
+            init_states.into_iter().zip(rep_seeds).collect();
+        let gem_ref = &gem_tbl;
+        let parts: Vec<Vec<Vec<i32>>> = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for slice in indexed.chunks(chunk) {
+                handles.push(scope.spawn(move || {
+                    let mut sub = Vec::with_capacity(slice.len());
+                    for &(ref st, rseed) in slice {
+                        let (mut at, mut pos, mut cur) = st.clone();
+                        let mut rng = Rng::new(rseed);
+                        for _ in 0..steps {
+                            let _ = step_methyl_mcmc_cpu(
+                                prob,
+                                gem_ref,
+                                &mut at,
+                                &mut pos,
+                                &mut cur,
+                                temperature,
+                                move_mask,
+                                &mut rng,
+                            );
+                        }
+                        sub.push(pos);
+                    }
+                    sub
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut out = Vec::with_capacity(reps);
+        for part in parts {
+            out.extend(part);
+        }
+        out
     }
-    out
+}
+
+/// Run fixed-temperature CPU Metropolis–Hastings MCMC across all 4 reversible move families
+/// on $\Omega = \bigcup_{k=0}^{k_{\max}} \Omega_k$ and return terminal chain states `pos[0..S]`.
+pub fn sample_methyl_mcmc_terminal_cpu(
+    prob: &MethylContactProblem,
+    temperature: f64,
+    steps: usize,
+    replicas: usize,
+    seed: u64,
+) -> Vec<Vec<i32>> {
+    sample_methyl_mcmc_terminal_cpu_with_mask(
+        prob,
+        temperature,
+        steps,
+        replicas,
+        seed,
+        METHYL_MOVE_ALL,
+    )
 }
 
 /// Run deterministic multi-threaded CPU multi-replica simulated annealing on `prob`.
@@ -1975,7 +2349,20 @@ pub fn consensus_and_calibrate_methyl(
             }
         }
 
-        // 1. Cardinality-preserving competition with unassigned peaks `u` (`work_pos[u] < 0`)
+        // 1a. Variable-cardinality unassignment competitor (`m' = -1`) on Omega = U_k Omega_k
+        {
+            let m_sub = [m_star];
+            let s_sub = [s];
+            let before = eval_subset_contrib(prob, &work_at, &work_pos, &m_sub, &s_sub);
+            work_at[m_star] = -1;
+            work_pos[s] = -1;
+            let delta_un = eval_subset_contrib(prob, &work_at, &work_pos, &m_sub, &s_sub) - before;
+            work_at[m_star] = s as i32;
+            work_pos[s] = m_star as i32;
+            alt_exp_sum += (delta_un / TAU_SWAP).clamp(-40.0, 20.0).exp();
+        }
+
+        // 1b. Cardinality-preserving competition with unassigned peaks `u` (`work_pos[u] < 0`)
         // when `S > M` (spurious/artifact peaks exist in the 2D HMQC peak list).
         for u in 0..s_len {
             let pu = work_pos[u];
