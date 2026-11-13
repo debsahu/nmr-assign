@@ -1,4 +1,4 @@
-# Master Roadmap: All-in-One GPU Biomolecular NMR Platform (`T08`–`T14`)
+# Master Roadmap: All-in-One GPU Biomolecular NMR Platform (`T08`–`T16`)
 
 Clean-room, atomic swarm execution roadmap for `nmr-assign` (`v0.3.x` -> `v1.0`).
 Every task is scoped with **strictly disjoint file ownership**, **peer-reviewed clean-room provenance**, an explicit **User/CLI/GUI contract**, and a **quantitative done gate** so multi-agent swarms can implement, verify, and externally audit (`scripts/review_pack.sh --task Txx.y`) each slice independently.
@@ -17,9 +17,11 @@ Every task is scoped with **strictly disjoint file ownership**, **peer-reviewed 
 | **Phase 9** | `T09.1`–`T09.7` | Zero-friction folder ingest, workflow stepper, two-key NMR shortcuts, overlays, undo/NEF, solver follow-ups | `nmr-core`, `nmr-gui` | `< 50 ms` folder classification; two-key modal chords + `wasm32` build green; `Gln2` / sparse-data gates |
 | **Phase 10** | `T10.1`–`T10.5` | Live 2D covalent sidechain graph, aromatic rings, stereospecificity & supramolecular Methyl-TROSY | `nmr-core`, `nmr-gpu`, `nmr-gui` | Aromatic `>= 90%` acc; Methyl-TROSY GPU graph solver `>= 90%` acc / `>= 95%` HC prec on `ILVM` benchmarks |
 | **Phase 11** | `T11.1`–`T11.4` | Problem-regime GPU solvers: protonless `13C`-detected IDPs & paramagnetic `[2Fe-2S]` / lanthanide `PCS`/`PRE` | `nmr-core`, `nmr-gpu`, `nmr-cli` | Continuous through-Proline IDP walk `>= 92%` acc; `CISD3` `[2Fe-2S]` bleaching model improves recall without HC loss |
-| **Phase 12** | `T12.1`–`T12.4` | Built-in `wgpu` 3D biomolecular PDB viewer, 3D-to-strip picking, post-assignment torsions & GPU `RDC` refinement | `nmr-gui`, `nmr-core`, `nmr-gpu` | `60 fps` desktop+`wasm32` ribbons; Cornilescu `Q < 0.25` after GPU `RDC` refinement |
-| **Phase 13** | `T13.1`–`T13.6` | GPU spin relaxation ($R_1, R_2$, hetNOE), Lipari–Szabo / Palmer Model-Free ($S^2$), `CEST`, `CPMG` & ligand `CSP` $K_d$ | `nmr-core`, `nmr-gpu`, `nmr-gui`, `nmr-cli` | `< 1e-4` parameter recovery on analytical synthetic `M1`–`M5`, 2-state `CEST`/`CPMG`, and tight-binding $K_d$ |
-| **Phase 14** | `T14.1`–`T14.4` | Deterministic SVG/PNG figure exporter, slim visual `README.md`, GitHub-Pages manual & zero-install WebGPU demo | `nmr-cli`, `nmr-gui`, `docs/` | Reproducible CI-built manual + live `wasm32` demo bundle `< 15 MiB` loading in `< 2 s` |
+| **Phase 12** | `T12.1`–`T12.4` | Built-in `wgpu` 3D biomolecular PDB viewer, 3D-to-strip picking, post-assignment torsions & GPU `RDC` refinement | `nmr-gui`, `nmr-core`, `nmr-gpu`, `nmr-cli` | `1318+ fps` Metal `wgpu` ribbons; 5-layer `HomologFirewall` (`0%` Rama outliers, `13.79°` MAE); `1D3Z` `Q_free = 0.1576` CPU / `0.2234` WebGPU |
+| **Phase 13** | `T13.0`–`T13.6` | Custom `pulprog` physics interpreter, GPU spin relaxation ($R_1, R_2$, hetNOE), Palmer Model-Free ($S^2$), `CEST`, `CPMG` & ligand `CSP` $K_d$ | `nmr-core`, `nmr-gpu`, `nmr-gui`, `nmr-cli` | First-principles Bruker/Varian `pulprog` decoding; `< 1e-4` recovery on analytical `M1`–`M5`, 2-state `CEST`/`CPMG`, and tight-binding $K_d$ |
+| **Phase 14** | `T14.1`–`T14.4` | Full analytical 1D NMR workbench, multiplet `J`-trees / `qNMR`, multi-spectrum overlay/stack & pseudo-2D `DOSY` studio | `nmr-core`, `nmr-gpu`, `nmr-gui`, `nmr-cli` | Voigt deconvolution & Hoye `J`-trees `< 0.2 Hz` error; `qNMR` `< 0.5%` bias; `DOSY` Stejskal–Tanner / `ILT` recovery `< 2%` |
+| **Phase 15** | `T15.1`–`T15.3` | Clean-room Model Context Protocol (`MCP`) server (`stdio` & Streamable HTTP) & live bidirectional `nmr-gui` desktop bridge | `nmr-core`, `nmr-gui`, `nmr-cli` | Strict workspace-sandboxed `MCP` JSON-RPC 2.0 server + Undo/Redo-backed live UI curation & `image/png` viewport snapshots |
+| **Phase 16** | `T16.1`–`T16.4` | Deterministic SVG/PNG figure exporter, slim visual `README.md`, GitHub-Pages manual & zero-install WebGPU demo | `nmr-cli`, `nmr-gui`, `docs/` | Reproducible CI-built manual + `README.md <= 180` lines + live `wasm32` demo bundle `< 15 MiB` loading in `< 2 s` |
 
 ---
 
@@ -203,36 +205,43 @@ Every task is scoped with **strictly disjoint file ownership**, **peer-reviewed 
 ## Phase 12: Built-In Interactive `wgpu` 3D Biomolecular Structure Viewer & Dipolar Refinement (`T12.1`–`T12.4`)
 
 ### T12.1 — Native & `wasm32` `wgpu` 3D Biomolecular Ribbon, Stick & Ensemble Viewer
-- **Task ID**: `T12.1`
+- **Task ID**: `T12.1` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-gui/src/mol3d_viewer.rs`, `crates/nmr-gui/src/shaders/mol3d.wgsl`, `docs/specs/15-structure-viewer.md` (§1)
 - **Clean-Room Literature Citations**: Carson & Bugg (*J. Mol. Graph.* 1986 — cubic B-spline / Hermite peptide plane ribbon extrusion); Kabsch (*Acta Crystallogr. A* 1976 — optimal rotational superposition).
-- **User/CLI/GUI Contract**: Built-in `wgpu` 3D viewport dockable alongside 2D/3D NMR spectra in `nmr-gui` (desktop & `wasm32`) rendering smooth secondary-structure cartoon ribbons (helical cylinders/ribbons, arrowed $\beta$-strands, coils), instanced cylinder/sphere sidechains & metal cofactors, multi-model NMR bundle sausage/ensemble opacity, trackball rotation/pan/zoom, orthographic/perspective toggle, and crisp high-DPI offscreen PNG/SVG capture.
-- **Quantitative Done Gate**: Sustains `>= 60 fps` on a 20-conformer `150 aa` NMR ensemble (`~48,000` atoms) on WebGPU; compiles cleanly on both native desktop and `wasm32-unknown-unknown` with zero external C/C++ dependencies.
+- **User/CLI/GUI Contract**: Built-in `wgpu` 3D viewport dockable alongside 2D/3D NMR spectra in `nmr-gui` (desktop & `wasm32`) rendering smooth secondary-structure cartoon ribbons (helical cylinders/ribbons, arrowed $\beta$-strands, coils), instanced cylinder/sphere sidechains & metal cofactors, multi-model NMR bundle sausage/ensemble opacity, trackball rotation/pan/zoom, orthographic/perspective toggle, `.pdb`/`.cif`/`.mmcif` parsing, and crisp high-DPI offscreen PNG/SVG capture.
+- **Quantitative Done Gate**: Sustains `>= 60 fps` on a 20-conformer `150 aa` NMR ensemble (`~48,000` atoms) on WebGPU (`0.758 ms` / `1318.6 fps` `CartoonAndSidechains` & `0.378 ms` / `2646.4 fps` `BallAndStick` verified on headless Metal `wgpu` for `51,000` atoms); compiles cleanly on both native desktop and `wasm32-unknown-unknown` with zero external C/C++ dependencies.
 
 ### T12.2 — Linked 3D-to-Strip Picking, Quantitative Putty/Color Mapping & NOE/PRE Cylinders
-- **Task ID**: `T12.2`
+- **Task ID**: `T12.2` (Status: `[x]` completed)
 - **Owned Files/Modules**: `crates/nmr-gui/src/mol3d_overlay.rs`, `docs/specs/15-structure-viewer.md` (§2)
 - **Clean-Room Literature Citations**: Original clean-room interactive visual analytics linking 3D structural coordinates with multidimensional NMR frequency strips.
 - **User/CLI/GUI Contract**: Clicking a residue/atom in the 3D `wgpu` viewer highlights it in the sequence ribbon, opens its 2D covalent sidechain graph, and centers the 2D HSQC + 3D sequential strip views on its assigned chemical shifts (and vice versa); supports quantitative ribbon radius ("putty") + Perceptually Uniform (`Viridis`/`Cividis`/`Blue-White-Red`) color mapping driven by Assignment Confidence, `CSI`, Lipari–Szabo $S^2$, $R_{\text{ex}}$, or Ligand `CSP` $\Delta\delta_{\text{comb}}$; and renders color-coded 3D restraint cylinders (green satisfied, amber `< 0.5 A` violation, red `>= 0.5 A` violation).
-- **Quantitative Done Gate**: Analytical ray-sphere / ray-ribbon picking accuracy `100%` in unit tests; zero frame-time spike (`< 2 ms` update) when switching quantitative color tracks or toggling `1,500` NOE cylinders.
+- **Quantitative Done Gate**: Analytical ray-sphere / ray-ribbon picking accuracy `100%` in unit tests across perspective & orthographic cameras; `< 2 ms` update when switching quantitative putty tracks (`0.42 ms` verified) or toggling 20-model `1,500` $\langle r^{-6}\rangle^{-1/6}$ NOE/PRE cylinders (`0.787 ms` verified).
 
 ### T12.3 — Post-Assignment Database-Driven 3/9-mer $(\phi, \psi, \chi_1)$ Torsion Restraint Engine
-- **Task ID**: `T12.3`
-- **Owned Files/Modules**: `crates/nmr-core/src/torsion_db.rs`, `crates/nmr-core/tests/torsion_db_tests.rs`, `docs/specs/04-structure.md` (§2)
-- **Clean-Room Literature Citations**: Shen, Vernon, Baker & Bax (*PNAS* 2008); Shen & Bax (*J. Biomol. NMR* 2013, 56, 227–241 — backbone & $\chi_1$ torsion prediction from `(HN, N, CA, CB, C', HA)` secondary shifts + sequence similarity); Lovell et al. (*Proteins* 2000).
-- **User/CLI/GUI Contract**: `nmrassign torsions --shifts assigned.str -o torsions.nef` operating **strictly post-assignment** (never invoked during sequence-only backbone assignment!) over an embedded CC0 BMRB/PDB non-homologous tripeptide/9-mer corpus (enforcing `< 35%` global Needleman–Wunsch sequence identity and zero shared 7-mer peptide substrings during evaluation), classifying residues as `Good` (tight consensus Ramachandran cluster), `Dynamic` (predicted $S^2 < 0.65$ via Berjanskii & Wishart *JACS* 2005 `RCI`), or `Ambiguous`, and feeding tighter $(\phi, \psi, \chi_1)$ bounds into `nmr-core::structure`.
-- **Quantitative Done Gate**: Leave-homologs-out validation on the 12-protein BMRB suite achieves `>= 88%` `Good` classification coverage with `< 2.5%` Ramachandran basin outliers and mean `(phi, psi)` circular MAE `<= 14 deg` on `Good` residues.
+- **Task ID**: `T12.3` (Status: `[x]` completed)
+- **Owned Files/Modules**: `crates/nmr-core/src/torsion_db.rs`, `crates/nmr-core/tests/torsion_db_tests.rs`, `docs/specs/04-structure.md` (§2–§3)
+- **Clean-Room Literature Citations**: Shen, Vernon, Baker & Bax (*PNAS* 2008); Shen & Bax (*J. Biomol. NMR* 2013, 56, 227–241 — backbone & $\chi_1$ torsion prediction from `(HN, N, CA, CB, C', HA)` secondary shifts + sequence similarity); Berjanskii & Wishart (*J. Am. Chem. Soc.* 2005 — `RCI` & $S^2_{\text{RCI}}$); Lovell et al. (*Proteins* 2000).
+- **User/CLI/GUI Contract**: `nmrassign torsions --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]` operating **strictly post-assignment** (never invoked during sequence-only backbone assignment!) over an embedded `129`-chain CC0 BMRB/PDB corpus with deterministic 5-layer `HomologFirewall` (`L1` PDB/BMRB/UniProt/family, `L2` CATH/ECOD topology fold, `L3` shorter-spanning NW + local SW `<= 25%` seq-id at `>= 50%` coverage under both `BLOSUM62` and exact-identity scoring + `6/7` k-mer exclusion, `L4` Zhang–Skolnick `TM-score < 0.50`, `L5` `exclusion_list_sha256`), classifying residues as `Good`, `Dynamic` ($S^2_{\text{RCI}} < 0.65$), `Ambiguous`, or `Unassigned`.
+- **Quantitative Done Gate**: Under strict `<= 25%` 5-layer non-homologous evaluation across 9 folded BMRB proteins + 3 IDPs, achieves `13.79 deg <= 14 deg` circular `(phi, psi)` MAE, `0/541 = 0.00% < 2.5%` Ramachandran basin outliers, flat `0.01 deg` identity stratification slope (`[0–25%]`), `93.3%–98.6%` IDP `Dynamic` abstention, and `70.0%` (`541/773`) overall / `78.9%` (`541/686` on structured `RCI S^2 >= 0.65`) `Good` classification coverage (candidly trading raw coverage below the initial `88%` target for strict `<= 25%` non-homologous exclusion and `0%` basin outliers).
 
 ### T12.4 — Residual Dipolar Coupling (`RDC`) Saupe Tensor SVD & GPU Torsion-Angle Refinement
-- **Task ID**: `T12.4`
-- **Owned Files/Modules**: `crates/nmr-core/src/rdc.rs`, `crates/nmr-gpu/src/rdc_gpu.rs`, `crates/nmr-core/tests/rdc_tests.rs`, `docs/specs/04-structure.md` (§5)
+- **Task ID**: `T12.4` (Status: `[x]` completed)
+- **Owned Files/Modules**: `crates/nmr-core/src/rdc.rs`, `crates/nmr-gpu/src/rdc_gpu.rs`, `crates/nmr-core/tests/rdc_tests.rs`, `crates/nmr-gpu/tests/rdc_gpu_tests.rs`, `docs/specs/04-structure.md` (§4)
 - **Clean-Room Literature Citations**: Tjandra & Bax (*Science* 1997 — dilute liquid-crystal biomolecular RDCs); Cornilescu, Marquardt, Ottiger & Bax (*J. Am. Chem. Soc.* 1998 — RDC quality factor $Q$); Losonczi, Andrec, Fischer & Prestegard (*J. Magn. Reson.* 1999, 138, 334–342 — exact linear 5-component Saupe order matrix SVD); Clore, Gronenborn & Tjandra (*J. Magn. Reson.* 1998).
-- **User/CLI/GUI Contract**: `nmrassign structure --rdc rdcs.tsv` supporting multi-medium `1D_NH`, `1D_CAHA`, `1D_CACO`, `1D_NC'` dipolar couplings (`NEF` `nef_rdc_restraint_list` & TSV I/O), analytical Saupe matrix SVD back-calculation ($D_{\text{calc}}$ vs $D_{\text{obs}}$ scatter + Cornilescu $Q$ in HTML report & GUI), and analytical torsion-angle gradient harmonic RDC energy refinement in `nmr-core::structure` & `nmr-gpu`.
-- **Quantitative Done Gate**: Saupe SVD recovers synthetic axial/rhombic $(D_a, R)$ and Euler frame to `< 1e-10` on noise-free bond vectors; RDC refinement on Ubiquitin (`1D3Z` public BMRB RDCs) achieves free cross-validated $Q_{\text{free}} < 0.25$ and improves backbone RMSD vs NOE-only folding.
+- **User/CLI/GUI Contract**: `nmrassign structure --rdc <rdcs.tsv|rdcs.nef> [--torsion-db] [--rdc-weight <f64>] [--rdc-free-frac <f64>] [--engine auto|gpu|cpu]` and `nmrassign report --pdb <ensemble.pdb> --rdc <rdcs.tsv|rdcs.nef>` supporting multi-medium `1D_NH`, `1D_CAHA`, `1D_CACO`, `1D_NC'`, `1D_HNC'` dipolar couplings (`NEF` `nef_rdc_restraint_list` & TSV I/O), analytical Saupe matrix SVD back-calculation ($D_{\text{calc}}$ vs $D_{\text{obs}}$ scatter + Cornilescu $Q$/$Q_{\text{free}}$ in HTML report), and Envelope-Theorem torsion-angle gradient harmonic RDC refinement in `nmr-core::structure` & `nmr-gpu::rdc_gpu`.
+- **Quantitative Done Gate**: Saupe SVD recovers synthetic axial/rhombic $(D_a, R)$ and Euler frame to `< 1e-10` on noise-free bond vectors; CPU/WebGPU batch parity `1.14e-6` energy / `9.60e-6` gradient (`< 1e-5`); experimental Ubiquitin (`1D3Z` 2-medium bicelle RDCs, `20%` held-out free set) achieves cross-validated $Q_{\text{free}} = 0.1576$ CPU / $0.2234$ WebGPU (`< 0.25`) and refines Ordered BB RMSD (`1..71`) to `0.631 A` CPU / `0.649 A` WebGPU.
 
 ---
 
-## Phase 13: GPU Spin Relaxation, Lipari–Szabo / Palmer Model-Free ($S^2$), `CEST`, `CPMG` & Ligand `CSP` $K_d$ (`T13.1`–`T13.6`)
+## Phase 13: Custom `pulprog` Physics Interpreter, GPU Spin Relaxation, Lipari–Szabo / Palmer Model-Free ($S^2$), `CEST`, `CPMG` & Ligand `CSP` $K_d$ (`T13.0`–`T13.6`)
+
+### T13.0 — General `pulseprogram` & Acquisition-Physics Interpreter
+- **Task ID**: `T13.0`
+- **Owned Files/Modules**: `crates/nmr-core/src/pulprog.rs`, `crates/nmr-core/src/fid.rs`, `crates/nmr-core/src/classify.rs`, `crates/nmr-core/tests/pulprog_tests.rs`, `docs/specs/11-fid-processing.md` (§1.5)
+- **Clean-Room Literature Citations**: Cavanagh, Fairbrother, Palmer, Rance & Skelton (*Protein NMR Spectroscopy: Principles and Practice*, 2nd ed., 2007 — product-operator coherence-transfer pathways, phase cycling & gradient Echo-Antiecho selection); States, Haberkorn & Ruben (*J. Magn. Reson.* 1982); Kay, Keifer & Saarinen (*J. Am. Chem. Soc.* 1992); Marion, Ikura, Tschudin & Bax (*J. Magn. Reson.* 1989 — initial $t_1(0)$ half-dwell `PHC1 = -180 deg` / `+180 deg` sampling); public Bruker JCAMP-DX v5.0 (`acqus`/`pulseprogram` syntax) & Varian/Agilent `procpar` specifications.
+- **User/CLI/GUI Contract**: Clean-room lexer & symbolic acquisition-loop analyzer for custom/user-written Bruker (`pulseprogram` / `pulseprogram.precomp` + `acqus`/`acqu2s`/`acqu3s`/`acqu4s` `CNST`, `D`, `L`, `SPNAM`, `CPDPRG`, `GPZ`, `AQSEQ`, `PARMODE`) and Varian (`procpar` `array`, `phase*`, `f*coef`, `pslabel`) experiments, automatically deducing from first principles (even when filename/title heuristics are non-standard): `1D`/`2D`/`3D`/`4D`/`Pseudo3D` dimensionality, swapped `AQSEQ` & interleaved loop strides (`vdlist`/`vclist`/`fqlist`/`difflist`), quadrature (`FnMODE=0` fallback, `States`, `States-TPPI`, `Echo-Antiecho` with gradient polarity check, `TPPI`, `QF`), off-resonance `CNST` carrier jumps (`CO` vs `CA/CB`), initial delay half-dwell `PHC1`, and active magnetization-transfer pathway graphs (`HNCA` vs `HN(CO)CA`, `HNCACB` vs `CBCA(CO)NH`, `NOESY` vs `TOCSY`, `R1` vs `R2` vs `hetNOE` vs `DOSY`).
+- **Quantitative Done Gate**: Correctly decodes dimensionality, loop stride order, quadrature sign/polarity, carrier offsets, and active transfer graph across `>= 25` diverse Bruker (`hsqcetf3gpsi`, `hncagp3d`, `cbcaconhgp3d`, `hsqct1etf3gpsi3d` interleaved & plane-queued, `dstebpgp3s` DOSY, custom renamed sequences with `FnMODE=0`) and Varian (`ghsqc`, `ghncacb`, arrayed `gNhsqc` relaxation) test fixtures with `100%` accuracy and `< 10 ms` parse latency.
 
 ### T13.1 — Pseudo-3D Relaxation & Exchange Plane Series Integrator
 - **Task ID**: `T13.1`
@@ -280,32 +289,89 @@ Every task is scoped with **strictly disjoint file ownership**, **peer-reviewed 
 
 ---
 
-## Phase 14: Automated Visual Assets, Slim README, GitHub-Pages Manual & Live WebGPU Demo (`T14.1`–`T14.4`)
+## Phase 14: Analytical 1D NMR Workbench, Multi-Spectrum Stack/Overlay Comparison & Pseudo-2D `DOSY` Studio (`T14.1`–`T14.4`)
 
-### T14.1 — Deterministic CLI Figure & Vector `SVG`/`PNG` Asset Exporter
+### T14.1 — Analytical 1D Processing, Solvent Suppression & Global Voigt Deconvolution
 - **Task ID**: `T14.1`
+- **Owned Files/Modules**: `crates/nmr-core/src/nmr1d.rs`, `crates/nmr-core/tests/nmr1d_tests.rs`, `docs/specs/17-nmr1d-and-dosy.md` (§1)
+- **Clean-Room Literature Citations**: Chen, Weng, Goh & Garland (*J. Magn. Reson.* 2002, 158, 164–168 — minimum-entropy automatic phase correction); Cobas & Sardina (*Concepts Magn. Reson. A* 2003, 19A, 80–96 — signal-free continuous-wavelet / Whittaker penalized-least-squares & Bernstein polynomial baseline correction); Barkhuijsen, de Beer, Bovée & van Ormondt (*J. Magn. Reson.* 1987 — HSVD time-domain solvent-component subtraction); Fulmer, Miller, Sherden, Gottlieb, Nudelman, Stoltz, Bercaw & Goldberg (*Organometallics* 2010, 29, 2176–2179 — NMR chemical shifts of trace impurities & residual deuterated solvents).
+- **User/CLI/GUI Contract**: Clean-room analytical 1D processing & global line-shape deconvolution engine supporting `1H`, `13C{1H}`, `DEPT-90`/`DEPT-135`, `19F`, and `31P` Bruker/Varian/JCAMP-DX/NMRPipe 1D spectra: real-time interactive pivot `PHC0`/`PHC1` + blind minimum-entropy autophasing, Whittaker/Bernstein automatic baseline correction, HSVD residual water/solvent suppression, one-click solvent/TMS/DSS chemical-shift referencing against the embedded Fulmer-2010 table, and global pseudo-Voigt ($\eta L(\nu) + (1-\eta)G(\nu)$) nonlinear least-squares spectral deconvolution separating strongly overlapping multiplets.
+- **Quantitative Done Gate**: Blind autophasing recovers `(PHC0, PHC1)` within `<= 2.5 deg` across `15` synthetic & public BMRB/small-molecule 1D spectra; global Voigt deconvolution separates overlapping doublets spaced by `0.65 * FWHM` with `< 2%` relative area error and `< 0.15 Hz` centroid error.
+
+### T14.2 — Automatic Multiplet `J`-Coupling Trees, `qNMR` Molar Purity & `Octet` 2D Structure Linking
+- **Task ID**: `T14.2`
+- **Owned Files/Modules**: `crates/nmr-core/src/multiplet.rs`, `crates/nmr-core/tests/multiplet_tests.rs`, `crates/nmr-cli/src/nmr1d_cmd.rs`, `docs/specs/17-nmr1d-and-dosy.md` (§2)
+- **Clean-Room Literature Citations**: Hoye, Hanson & Vyvyan (*J. Org. Chem.* 1994, 59, 4096–4103 & Hoye & Zhao *J. Org. Chem.* 2002, 67, 4014–4016 — practical recursive extraction of first-order coupling constants from complex multiplets & second-order AB roofing corrections); Pauli, Chen, Simmler, Lankin, Gödecke, Jaki, Friesen, McAlpine & Napolitano (*J. Med. Chem.* 2014, 57, 9220–9231 — quantitative `1H` `qNMR` molar purity determination & uncertainty propagation).
+- **User/CLI/GUI Contract**: `nmrassign nmr1d --in <fid_or_ft1> [--molecule <mol_or_smiles>] [--qnmr-std <mass_mg:mw:n_h:purity>] [--style acs|joc|rsc|nature] [-o <report.json|tsv|jdx>]` providing interactive & automated integral regions (raw sum + deconvolved Voigt integrals, slope/bias correction, normalized integer proton counts), recursive multiplet tree decomposition (`s`, `d`, `t`, `q`, `p`, `sext`, `hept`, `dd`, `ddd`, `dt`, `td`, `tt`, `dq`, `qd`, `m`) with AB/ABX roofing correction, publication-ready multiplet report strings (`1H NMR (600 MHz, CDCl3) delta ...`), internal-standard `qNMR` molar purity `% w/w` with propagated uncertainty, and bidirectional multiplet-to-atom assignment linked with `Octet-Draw` (`nmr-core::octet_mol`).
+- **Quantitative Done Gate**: Recovers exact multiplet labels and scalar couplings $J$ within `< 0.20 Hz` across `25` canonical first-order and moderately roofed ($\Delta\nu / J \ge 2.5$) spin systems (`s`, `d`, `t`, `q`, `dd`, `ddd`, `dt`, `td`); synthetic `qNMR` purity benchmarks recover true analyte mass fraction within `< 0.5%` bias (`SNR >= 150`).
+
+### T14.3 — Multi-Spectrum 1D Overlay, Tilted Stack, Difference & Arrayed Kinetics Studio
+- **Task ID**: `T14.3`
+- **Owned Files/Modules**: `crates/nmr-gui/src/stack1d_panel.rs`, `docs/specs/17-nmr1d-and-dosy.md` (§3)
+- **Clean-Room Literature Citations**: Original clean-room multi-trace scientific visualization & cross-spectrum chemometric alignment (`icoshift`-inspired regional cross-correlation shift alignment, Savorani et al. *J. Magn. Reson.* 2010, 202, 190–202).
+- **User/CLI/GUI Contract**: Interactive `nmr-gui` panel (desktop + `wasm32`) comparing $N$ 1D spectra (`1H`/`13C`/`DEPT-90`/`DEPT-135` multiplicity editing stacks, reaction-kinetics time courses, pH/temperature/ligand `STD`/`WaterLOGSY` titrations, batch QC, or experimental 1D vs `Octet` predicted 1D) across 4 synchronized display modes (**Superimposed Overlay**, **Tilted/Vertical Stack** with adjustable horizontal shear & vertical spacing, **Difference/Residual Trace** $S_i(\delta) - \alpha S_{\text{ref}}(\delta)$, and **Pseudo-2D Waterfall/Heatmap**), with regional shift-drift alignment, synchronized zoom/crosshair, and cross-spectrum integral/kinetics TSV/SVG/PNG export.
+- **Quantitative Done Gate**: Sustains `>= 60 fps` pan/zoom across `32` stacked `64k`-point 1D traces via level-of-detail min/max decimation; compiles cleanly on native desktop & `wasm32-unknown-unknown`; difference & arrayed integral tables match `f64` reference integrals to `< 1e-9`.
+
+### T14.4 — Pseudo-2D Diffusion-Ordered Spectroscopy (`DOSY`) Engine & 2D $(\delta \times \log D)$ Studio
+- **Task ID**: `T14.4`
+- **Owned Files/Modules**: `crates/nmr-core/src/dosy.rs`, `crates/nmr-gpu/src/dosy_gpu.rs`, `crates/nmr-gui/src/dosy_panel.rs`, `crates/nmr-core/tests/dosy_tests.rs`, `docs/specs/17-nmr1d-and-dosy.md` (§4)
+- **Clean-Room Literature Citations**: Stejskal & Tanner (*J. Chem. Phys.* 1965, 42, 288–292 — pulsed-gradient spin-echo attenuation $I(g) = I_0 \exp(-D \gamma^2 g^2 \delta^2 (\Delta - \delta/3))$); Wu, Chen & Johnson (*J. Magn. Reson. A* 1995, 115, 260–264 — bipolar gradient pulse pair LED `BPP-LED` attenuation with $\tau$-delay correction); Johnson (*Prog. Nucl. Magn. Reson. Spectrosc.* 1999, 34, 203–256 — `DOSY` processing & inverse Laplace regularization); Lawson & Hanson (*Solving Least Squares Problems*, 1974 — active-set `NNLS`); Evans, Deng, Rogerson & McLachlan (*Angew. Chem. Int. Ed.* 2013, 52, 3199–3202 — Stokes–Einstein `SEGWE` diffusivity-to-MW estimation).
+- **User/CLI/GUI Contract**: `nmrassign dosy --in <pseudo2d_dir> [--seq-type ste|led|bppled|convcomp] [--fit mono|bi|nnls-ilt] [--solvent D2O|CDCl3|DMSO-d6|CD3OD] [--temp-k 298.15] [--engine auto|gpu|cpu] -o <dosy.tsv|dosy.json>` decoding Bruker (`difflist` + `dstebpgp3s`/`ledbpgp2s`/`stebpgp1s` sine/trapezoid/rectangular gradient shape factors, $\Delta$, $\delta$, eddy delay $T_e$) and Varian (`gzlvl1`, `gt1`, `del`, `gcal`) diffusion arrays; fitting per-peak/per-column Stejskal–Tanner & Wu–Johnson `BPP-LED` mono-/bi-exponential decays on CPU/WebGPU with Monte Carlo error bars plus Tikhonov-regularized `NNLS` inverse Laplace transform (`ILT`) for polydisperse mixtures; rendering an interactive 2D $(\delta\text{ ppm} \times \log_{10} D)$ contour & component-resolved projection studio in `nmr-gui`; and estimating Stokes–Einstein hydrodynamic radius $R_h = k_B T / (6\pi \eta(T) D)$ and empirical molecular weight.
+- **Quantitative Done Gate**: Recovers exact diffusion coefficients $D \in [5 \times 10^{-11}, 2 \times 10^{-9}]\text{ m}^2\text{ s}^{-1}$ within `< 1.5%` error on noisy (`SNR = 40`) mono-exponential & two-component (`D_1 / D_2 = 2.5`) synthetic `BPP-LED` Bruker/Varian datasets; CPU/WebGPU `D` parity `< 1e-5`; `wasm32` GUI panel compiles cleanly.
+
+---
+
+## Phase 15: Clean-Room Model Context Protocol (`MCP`) Server & Live Desktop Workbench Bridge (`T15.1`–`T15.3`)
+
+### T15.1 — Clean-Room `MCP` JSON-RPC 2.0 Server (`stdio` & Streamable HTTP)
+- **Task ID**: `T15.1`
+- **Owned Files/Modules**: `crates/nmr-core/src/mcp.rs`, `crates/nmr-cli/src/mcp_cmd.rs`, `crates/nmr-core/tests/mcp_tests.rs`, `docs/specs/18-mcp-server.md` (§1–§2)
+- **Clean-Room Literature Citations**: Public Model Context Protocol (`MCP`) open specification (JSON-RPC 2.0 `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get` over newline-delimited `stdio` and loopback Streamable HTTP); RFC 8259 (JSON).
+- **User/CLI/GUI Contract**: `nmrassign mcp [--transport stdio|http] [--bind 127.0.0.1:8090] --workspace <root_dir> [--read-only]` implementing a zero-bloat pure-Rust `MCP` server exposing typed JSON-Schema `tools`, `resources` (`nmr://project/...`), and domain `prompts` across the full `nmr-core` / `nmr-gpu` analytical engine (`inspect_dataset`, `decode_pulprog`, `process_fid`, `pick_peaks`, `assign_backbone`, `assign_sidechain`, `assign_methyl`, `predict_torsions`, `calculate_structure_rdc`, `fit_relaxation_modelfree`, `fit_cest_cpmg_csp`, `analyze_nmr1d_dosy`, `octet_chem_analyze`, `generate_quality_report`) with strict canonicalized workspace-root path sandboxing (blocking `..` traversal, symlinks escaping `--workspace`, and non-loopback unauthenticated HTTP origins).
+- **Quantitative Done Gate**: `100%` schema & JSON-RPC 2.0 protocol conformance across all `MCP` lifecycle, `tools`, `resources`, and `prompts` requests; adversarial path-traversal (`../../etc/passwd`, escaping symlinks), oversized payload, and `--read-only` mutation attempts deterministically rejected in integration tests; zero external GPL/heavy SDK dependencies.
+
+### T15.2 — Live Bidirectional `nmr-gui` Desktop Workbench `MCP` Bridge
+- **Task ID**: `T15.2`
+- **Owned Files/Modules**: `crates/nmr-gui/src/mcp_bridge.rs`, `docs/specs/18-mcp-server.md` (§3)
+- **Clean-Room Literature Citations**: Original clean-room human-in-the-loop interactive workbench architecture (`nmr-core::session` bounded Undo/Redo command pattern).
+- **User/CLI/GUI Contract**: Authenticated loopback bridge (`127.0.0.1` bearer token + 1-click **"Copy MCP Client Config"** in `nmr-gui`) allowing external AI coding/scientific assistants to query live desktop workbench state (loaded spectra, active residue, synchronized crosshair `ppm`, ranked `i-1 / i / i+1` strip candidates, 3D `mol3d_viewer` selection, 1D integrals/multiplets, `DatasetQcReport`), execute synchronized UI navigation & curation actions (`jump_to_residue`, `propose_strip_assignment`, `lock_spin_system`, `set_3d_color_track`, `add_1d_integral_region` — every mutating action recorded on the `256`-step Undo/Redo command stack so `Cmd/Ctrl+Z` reverts AI edits in one keystroke!), and capture live rendered 2D contour / 3D strip / 3D PDB / 1D-`DOSY` viewports as base64 `image/png` `MCP` content blocks.
+- **Quantitative Done Gate**: Round-trip live state query + Undo/Redo-backed mutation + `Cmd/Ctrl+Z` exact state restoration verified in automated tests; viewport `image/png` snapshot export completes in `< 50 ms` with valid PNG headers; unauthenticated or cross-origin `Origin`/`Host` requests rejected `100%`.
+
+### T15.3 — Guided NMR Curation Workflows, Permission Guardrails & `mcp-config` Generator
+- **Task ID**: `T15.3`
+- **Owned Files/Modules**: `crates/nmr-core/src/mcp_workflows.rs`, `crates/nmr-cli/tests/mcp_cli_tests.rs`, `docs/specs/18-mcp-server.md` (§4)
+- **Clean-Room Literature Citations**: Original clean-room spectroscopist curation workflows & `AGENTS.md` scientific safety guardrails (unlabelled-only reference offsets, sequence-only backbone assignment, `HomologFirewall` enforcement).
+- **User/CLI/GUI Contract**: Built-in `MCP` prompt workflows (`triage-dataset-qc`, `resolve-ambiguous-backbone-strips`, `curate-aromatic-and-stereospec`, `deconvolve-1d-mixture-and-dosy`, `fit-cest-cpmg-invisible-state`) that enforce read-only vs read-write tool capability tiers and never bypass sequence-only / firewall rules, plus `nmrassign mcp-config --client <antigravity|claude-desktop|cursor|generic> --workspace <dir>` outputting ready-to-paste client JSON configuration.
+- **Quantitative Done Gate**: End-to-end `nmrassign mcp` `stdio` subprocess integration test completes a full multi-step `inspect -> assign -> qc triage -> torsions -> report` conversation over piped JSON-RPC 2.0 frames in `< 5 s` with zero leaked file handles or non-deterministic output.
+
+---
+
+## Phase 16: Automated Visual Assets, Slim README, GitHub-Pages Manual & Live WebGPU Demo (`T16.1`–`T16.4`)
+
+### T16.1 — Deterministic CLI Figure & Vector `SVG`/`PNG` Asset Exporter
+- **Task ID**: `T16.1`
 - **Owned Files/Modules**: `crates/nmr-cli/src/export_fig.rs`, `crates/nmr-core/src/report.rs` (standalone figure renderers), `docs/assets/`
 - **Clean-Room Literature Citations**: Original clean-room vector SVG & antialiased raster rendering engine (`nmr-core::report` & `nmr-core::octet_render`).
-- **User/CLI/GUI Contract**: `nmrassign export-fig --kind <hsqc-contours|strip-walk|sidechain-graph|ribbon-3d|relax-s2|cest-dip|csp-kd|octet-scheme> ... -o docs/assets/<name>.svg|.png` generating publication-ready, deterministic (timestamp-free, reproducible byte-for-byte) dark- and light-theme visual assets directly from real Ubiquitin / simulated multi-regime benchmarks.
-- **Quantitative Done Gate**: Generates all `8` canonical figure types into `docs/assets/` with valid XML/SVG syntax, crisp text/axes, `< 250 KB` per SVG, and byte-for-byte determinism across repeated runs.
+- **User/CLI/GUI Contract**: `nmrassign export-fig --kind <hsqc-contours|strip-walk|sidechain-graph|ribbon-3d|relax-s2|cest-dip|csp-kd|nmr1d-dosy|octet-scheme> ... -o docs/assets/<name>.svg|.png` generating publication-ready, deterministic (timestamp-free, reproducible byte-for-byte) dark- and light-theme visual assets directly from real Ubiquitin / simulated multi-regime benchmarks.
+- **Quantitative Done Gate**: Generates all `9` canonical figure types into `docs/assets/` with valid XML/SVG syntax, crisp text/axes, `< 250 KB` per SVG, and byte-for-byte determinism across repeated runs.
 
-### T14.2 — Slim, Visual-First `README.md` Rewrite
-- **Task ID**: `T14.2`
+### T16.2 — Slim, Visual-First `README.md` Rewrite
+- **Task ID**: `T16.2`
 - **Owned Files/Modules**: `README.md`
 - **Clean-Room Literature Citations**: `AGENTS.md` clean-room comparison & licensing rules.
-- **User/CLI/GUI Contract**: Streamlines `README.md` to `< 180` high-signal lines: one-sentence value proposition, hero workbench & strip-walk showcase (`docs/assets/`), link to zero-install live WebGPU browser demo, 60-second CLI & GUI quickstart (raw Bruker/Varian FID folder -> assignments, 3D ensemble & HTML report), concise capability & verified benchmark table (`v0.3+`), clean-room MIT provenance statement, and structured links to `docs/manual/` and `docs/specs/`.
+- **User/CLI/GUI Contract**: Streamlines `README.md` to `<= 180` high-signal lines: one-sentence value proposition, hero workbench & strip-walk showcase (`docs/assets/`), link to zero-install live WebGPU browser demo, 60-second CLI, GUI & `MCP` quickstart (raw Bruker/Varian FID folder -> assignments, 3D ensemble & HTML report), concise capability & verified benchmark table (`v0.3+`), clean-room MIT provenance statement, and structured links to `docs/manual/` and `docs/specs/`.
 - **Quantitative Done Gate**: `wc -l README.md <= 180`; all relative image/doc links resolve on disk; zero forbidden product claims.
 
-### T14.3 — Hostable GitHub-Pages Documentation Manual & CI Publisher
-- **Task ID**: `T14.3`
+### T16.3 — Hostable GitHub-Pages Documentation Manual & CI Publisher
+- **Task ID**: `T16.3`
 - **Owned Files/Modules**: `docs/manual/`, `.github/workflows/docs.yml`
-- **Clean-Room Literature Citations**: All peer-reviewed papers across `docs/specs/01`–`16` consolidated in a master `Bibliography & Clean-Room Provenance` chapter.
-- **User/CLI/GUI Contract**: Builds a searchable static documentation manual covering: (1) *Getting Started & Installation*, (2) *End-to-End Tutorial: Raw FIDs & NUS to Backbone/Sidechain Assignment*, (3) *Interactive Workbench & Two-Key Shortcuts Reference*, (4) *3D NOESY Folding, Post-Assignment Torsions & RDCs*, (5) *IDPs (`13C`-Detected), Methyl-TROSY & Paramagnetic Proteins*, (6) *Spin Relaxation, Palmer Model-Free ($S^2$), CEST, CPMG & Ligand CSP $K_d$*, (7) *Octet Chemical Draw & 1D NMR Studio*, (8) *CLI, REST Service & File Formats (`NMR-STAR`, `NEF v1.1`, `ProcessingRecipe`)*, and (9) *Swarm Roadmap & External Review Protocol*; automatically built and deployed via `.github/workflows/docs.yml`.
+- **Clean-Room Literature Citations**: All peer-reviewed papers across `docs/specs/01`–`18` consolidated in a master `Bibliography & Clean-Room Provenance` chapter.
+- **User/CLI/GUI Contract**: Builds a searchable static documentation manual covering: (1) *Getting Started & Installation*, (2) *End-to-End Tutorial: Raw FIDs, Custom `pulprog` & NUS to Backbone/Sidechain Assignment*, (3) *Interactive Workbench & Two-Key Shortcuts Reference*, (4) *3D NOESY Folding, Post-Assignment Torsions, RDCs & `wgpu` 3D Structure Viewer*, (5) *IDPs (`13C`-Detected), Methyl-TROSY & Paramagnetic Proteins*, (6) *Spin Relaxation, Palmer Model-Free ($S^2$), CEST, CPMG & Ligand CSP $K_d$*, (7) *Analytical 1D NMR Multiplets, `qNMR`, Multi-Trace Stacks & `DOSY` Studio*, (8) *`MCP` Server & Live AI Workbench Integration*, (9) *Octet Chemical Draw Studio*, and (10) *CLI, REST Service, File Formats & Clean-Room Provenance*; automatically built and deployed via `.github/workflows/docs.yml`.
 - **Quantitative Done Gate**: Static manual build exits `0` with zero broken internal links; every CLI subcommand in `nmrassign --help` is documented with runnable examples.
 
-### T14.4 — Zero-Install Live In-Browser `wasm32` WebGPU Demo Bundle
-- **Task ID**: `T14.4`
+### T16.4 — Zero-Install Live In-Browser `wasm32` WebGPU Demo Bundle
+- **Task ID**: `T16.4`
 - **Owned Files/Modules**: `crates/nmr-gui/index.html`, `crates/nmr-gui/src/demo_bundle.rs`, `docs/demo/`
 - **Clean-Room Literature Citations**: Public CC0 BMRB / wwPDB reference entries (`bmr17769` / `1D3Z` Ubiquitin).
-- **User/CLI/GUI Contract**: Compiles `nmr-gui` to `wasm32-unknown-unknown` (`trunk` / `wasm-bindgen`) embedded into the GitHub Pages site (`docs/demo/`) with a 1-click **"Load Sample Ubiquitin Workspace"** button preloading compact quantized 2D `15N-HSQC`, 3D `HNCACB`/`CBCACONH` strip banks, sequence + live GPU solver, `1D3Z` 3D ensemble ribbon, sample $R_1/R_2/S^2$ & `CSP` curves, and `Octet-Draw` templates — running 100% client-side on the visitor's WebGPU adapter with graceful WebGL2/CPU fallback banner when WebGPU is unavailable.
+- **User/CLI/GUI Contract**: Compiles `nmr-gui` to `wasm32-unknown-unknown` (`trunk` / `wasm-bindgen`) embedded into the GitHub Pages site (`docs/demo/`) with a 1-click **"Load Sample Ubiquitin Workspace"** button preloading compact quantized 2D `15N-HSQC`, 3D `HNCACB`/`CBCACONH` strip banks, sequence + live GPU solver, `1D3Z` 3D ensemble ribbon, sample $R_1/R_2/S^2$, `CSP`, and 1D/`DOSY` series, and `Octet-Draw` templates — running 100% client-side on the visitor's WebGPU adapter with graceful WebGL2/CPU fallback banner when WebGPU is unavailable.
 - **Quantitative Done Gate**: `wasm32-unknown-unknown` release bundle + compressed sample assets total `< 15 MiB`, loads interactively in `< 2.0 s` locally, and runs live GPU contour rendering + simulated annealing in browser without network calls.

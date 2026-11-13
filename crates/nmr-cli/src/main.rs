@@ -3,7 +3,7 @@
 //! structure folding, CCPN NEF v1.1 interchange, HTML quality reporting, self-hosted HTTP service,
 //! and Octet-Draw 2D chemical structure / IUPAC / 1D NMR analytics.
 //!
-//! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/13-methyl-trosy.md`
+//! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/15-structure-viewer.md`
 //! and Octet-Draw CLI workflows.
 
 pub mod methyl_cmd;
@@ -80,6 +80,10 @@ use nmr_core::qc::{
     ProteinReliabilityCurve, EVO_GRAPH_CALIBRATED_RUNS, STANDARD_CPU_CALIBRATED_RUNS,
     STANDARD_GPU_CALIBRATED_RUNS,
 };
+use nmr_core::rdc::{
+    evaluate_rdc_validation, partition_rdc_free_set, read_rdc_tsv, RdcMediumSet,
+    RdcValidationSummary,
+};
 use nmr_core::report::{
     predict_csi_dihedrals, write_quality_report_html, ReportInput, StructureReportSummary,
 };
@@ -97,10 +101,16 @@ use nmr_core::spectrum::{
 };
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 use nmr_core::structure::{
-    calculate_structure_iterative, validate_ensemble, write_pdb_ensemble, StructureCalcConfig,
+    calculate_structure_iterative, calculate_structure_with_rdcs, validate_ensemble,
+    write_pdb_ensemble, StructureCalcConfig, StructureEnsembleResult,
 };
 use nmr_core::topology::SidechainPriors;
+use nmr_core::torsion_db::{
+    format_torsions_json, predict_torsions, predict_torsions_with_firewall, write_torsions_tsv,
+    HomologFirewallQuery, TorsionPredictionClass,
+};
 use nmr_gpu::neural_gpu::{GpuNeuralPicker, GpuNeuralPickerConfig, PRETRAINED_WEIGHTS_3D_GPU};
+use nmr_gpu::rdc_gpu::refine_ensemble_with_rdcs_gpu;
 use nmr_gpu::GpuEngine;
 
 pub mod fetch_bmrb;
@@ -173,16 +183,17 @@ fn usage() -> String {
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
        nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
+       nmrassign torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
        nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--aromatic] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
        nmrassign methyl          --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]\n\
-       nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
+       nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
-       nmrassign report          --star|--shifts <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
+       nmrassign report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
        nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
@@ -2012,9 +2023,7 @@ pub(crate) fn execute_paramagnetic_workflow(
         seed,
         ..ParamagneticAssignConfig::default()
     };
-    if let Some(rb) = r_bleach_opt {
-        para_cfg.r_bleach_angstrom = rb;
-    }
+    para_cfg.r_bleach_angstrom = r_bleach_opt;
 
     let (systems, result, para_report, eff_priors, engine_label) = match solver {
         SolverKind::Standard => {
@@ -2259,6 +2268,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     .map_err(|e| format!("{e}"))?;
             }
             "-v" | "--verbose" => verbose = true,
+            "--rdc" | "--torsion-db" | "--rdc-weight" | "--rdc-free-frac" => {
+                return Err(format!(
+                    "{} is a post-assignment structure/report flag (backbone assignment is strictly structure-free; use `nmrassign structure`, `nmrassign torsions`, or `nmrassign report`)",
+                    args[i]
+                ))
+            }
             other => return Err(format!("unknown assign flag {other:?}")),
         }
         i += 1;
@@ -4302,9 +4317,81 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     run_sidechain(args)
 }
 
+fn load_shifts_str_or_nef(path: &Path) -> Result<Reference, String> {
+    let is_nef = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("nef"));
+    if is_nef {
+        read_nef_file(path)?.to_reference()
+    } else {
+        read_star_all_atoms(path, None)
+    }
+}
+
+fn load_rdc_media_auto(path: &Path) -> Result<Vec<RdcMediumSet>, String> {
+    let is_nef = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("nef"));
+    let media = if is_nef {
+        read_nef_file(path)?.rdc_media()?
+    } else {
+        read_rdc_tsv(path)?
+    };
+    if media.is_empty() {
+        return Err(format!(
+            "RDC input '{}' contains zero alignment media / restraints",
+            path.display()
+        ));
+    }
+    Ok(media)
+}
+
+fn run_gpu_rdc_structure_workflow(
+    gpu: &GpuEngine,
+    shifts: &Reference,
+    noesy_peaks: &[Peak],
+    rdc_media: &[RdcMediumSet],
+    use_torsion_db: bool,
+    w_rdc: f64,
+    cfg: &StructureCalcConfig,
+) -> Result<(StructureEnsembleResult, RdcValidationSummary), String> {
+    let mut init_cfg = cfg.clone();
+    init_cfg.n_select = cfg.n_select.max(8).min(cfg.n_replicas.max(1));
+    let (base_ens, _) =
+        calculate_structure_with_rdcs(shifts, noesy_peaks, &[], use_torsion_db, 0.0, &init_cfg)?;
+    let (mut refined, rdc_summary) = refine_ensemble_with_rdcs_gpu(
+        gpu,
+        &base_ens.conformers,
+        &shifts.sequence,
+        &shifts.seq_ids,
+        &base_ens.final_adrs,
+        &base_ens.dihedral_restraints,
+        rdc_media,
+        w_rdc,
+        cfg.lbfgs_iters.max(110),
+    )?;
+    refined.truncate(cfg.n_select.max(1).min(refined.len()));
+    Ok((
+        StructureEnsembleResult {
+            conformers: refined,
+            dihedral_restraints: base_ens.dihedral_restraints,
+            initial_unambiguous_adrs: base_ens.initial_unambiguous_adrs,
+            final_adrs: base_ens.final_adrs,
+        },
+        rdc_summary,
+    ))
+}
+
 fn cmd_structure(args: &[String]) -> Result<(), String> {
     let mut star_path: Option<PathBuf> = None;
     let mut noesy_path: Option<PathBuf> = None;
+    let mut rdc_path: Option<PathBuf> = None;
+    let mut use_torsion_db = false;
+    let mut rdc_weight_opt: Option<f64> = None;
+    let mut rdc_free_frac_opt: Option<f64> = None;
+    let mut engine_req_opt: Option<EngineRequest> = None;
     let mut pdb_ref_path: Option<PathBuf> = None;
     let mut out_pdb_path: Option<PathBuf> = None;
     let mut n_conformers = 10usize;
@@ -4314,13 +4401,62 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--star" => {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: nmrassign structure --star <shifts.str|shifts.nef> [--noesy-peaks <noesy.tsv>] [--rdc <rdcs.tsv|rdcs.nef>] [--torsion-db] [--rdc-weight 0.75] [--rdc-free-frac 0.20] [--engine auto|gpu|cpu] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]"
+                );
+                return Ok(());
+            }
+            "--star" | "--shifts" => {
                 i += 1;
                 star_path = args.get(i).map(PathBuf::from);
             }
             "--noesy-peaks" => {
                 i += 1;
                 noesy_path = args.get(i).map(PathBuf::from);
+            }
+            "--rdc" => {
+                i += 1;
+                rdc_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --rdc <rdcs.tsv|rdcs.nef>")?,
+                ));
+            }
+            "--torsion-db" => {
+                use_torsion_db = true;
+            }
+            "--rdc-weight" => {
+                i += 1;
+                let w: f64 = args
+                    .get(i)
+                    .ok_or("missing --rdc-weight")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+                if !w.is_finite() || !(1e-6..=1000.0).contains(&w) {
+                    return Err(format!(
+                        "invalid --rdc-weight {w}: expected finite positive weight in 1e-6..=1000.0"
+                    ));
+                }
+                rdc_weight_opt = Some(w);
+            }
+            "--rdc-free-frac" => {
+                i += 1;
+                let frac: f64 = args
+                    .get(i)
+                    .ok_or("missing --rdc-free-frac")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+                if !frac.is_finite() || !(0.0..=0.50).contains(&frac) {
+                    return Err(format!(
+                        "invalid --rdc-free-frac {frac}: expected finite fraction in 0.0..=0.50"
+                    ));
+                }
+                rdc_free_frac_opt = Some(frac);
+            }
+            "--engine" => {
+                i += 1;
+                engine_req_opt = Some(parse_engine_request(
+                    args.get(i).ok_or("missing --engine")?,
+                )?);
             }
             "--pdb-ref" => {
                 i += 1;
@@ -4337,6 +4473,11 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --conformers")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                if !(1..=512).contains(&n_conformers) {
+                    return Err(format!(
+                        "invalid --conformers {n_conformers}: out of allowed bounds (1..=512)"
+                    ));
+                }
             }
             "--seed" => {
                 i += 1;
@@ -4352,12 +4493,48 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
+    if rdc_path.is_none() {
+        if rdc_weight_opt.is_some() {
+            return Err(
+                "--rdc-weight requires --rdc <rdcs.tsv|rdcs.nef> in `nmrassign structure`"
+                    .to_string(),
+            );
+        }
+        if rdc_free_frac_opt.is_some() {
+            return Err(
+                "--rdc-free-frac requires --rdc <rdcs.tsv|rdcs.nef> in `nmrassign structure`"
+                    .to_string(),
+            );
+        }
+        if engine_req_opt == Some(EngineRequest::Gpu) {
+            return Err(
+                "--engine gpu in `nmrassign structure` requires --rdc <rdcs.tsv|rdcs.nef> (NOE-only torsion folding is CPU-only; use --engine cpu or --engine auto)"
+                    .to_string(),
+            );
+        }
+    }
+    if dihedrals_only && (rdc_path.is_some() || engine_req_opt.is_some()) {
+        return Err(
+            "--dihedrals-only cannot be combined with --rdc or --engine in `nmrassign structure`"
+                .to_string(),
+        );
+    }
+
     let star_p = star_path.ok_or("structure requires --star <shifts.str>")?;
-    let shifts = read_star_all_atoms(&star_p, None)?;
-    let dih_preds = predict_dihedrals(&shifts);
+    let shifts = load_shifts_str_or_nef(&star_p)?;
+    let dih_preds = if use_torsion_db {
+        predict_torsions(&shifts).to_dihedral_restraints()
+    } else {
+        predict_dihedrals(&shifts)
+    };
     let n_confident = dih_preds.iter().filter(|d| d.confidence >= 0.5).count();
+    let dih_src = if use_torsion_db {
+        "empirical 3/9-mer TorsionDb"
+    } else {
+        "CSI/RCI"
+    };
     println!(
-        "Predicted backbone (phi, psi) dihedrals for {} residues ({} confident):",
+        "Predicted backbone (phi, psi) dihedrals ({dih_src}) for {} residues ({} confident):",
         shifts.sequence.len(),
         n_confident
     );
@@ -4382,7 +4559,11 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
     }
 
     let noesy_peaks: Vec<Peak> = if let Some(np) = &noesy_path {
-        if np.extension().and_then(|s| s.to_str()) == Some("nef") {
+        if np
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("nef"))
+        {
             let doc = read_nef_file(np)?;
             doc.to_peaks()
                 .into_iter()
@@ -4413,7 +4594,95 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
     cfg.seed = seed;
 
     let t0 = Instant::now();
-    let ens = calculate_structure_iterative(&shifts, &noesy_peaks, &cfg);
+    let (ens, rdc_val_opt, engine_label): (
+        StructureEnsembleResult,
+        Option<RdcValidationSummary>,
+        String,
+    ) = if let Some(ref rdc_p) = rdc_path {
+        let mut rdc_media = load_rdc_media_auto(rdc_p)?;
+        if let Some(frac) = rdc_free_frac_opt {
+            partition_rdc_free_set(&mut rdc_media, frac, seed);
+        }
+        let w_rdc = rdc_weight_opt.unwrap_or(0.75);
+        let engine_req = engine_req_opt.unwrap_or(EngineRequest::Auto);
+        match engine_req {
+            EngineRequest::Cpu => {
+                let (e, rv) = calculate_structure_with_rdcs(
+                    &shifts,
+                    &noesy_peaks,
+                    &rdc_media,
+                    use_torsion_db,
+                    w_rdc,
+                    &cfg,
+                )?;
+                (e, rv, "CPU (f64)".to_string())
+            }
+            EngineRequest::Gpu => {
+                let gpu = GpuEngine::new_headless()?;
+                let lbl = format!("WebGPU ({}, {})", gpu.adapter_name, gpu.backend_name);
+                let (e, rv) = run_gpu_rdc_structure_workflow(
+                    &gpu,
+                    &shifts,
+                    &noesy_peaks,
+                    &rdc_media,
+                    use_torsion_db,
+                    w_rdc,
+                    &cfg,
+                )?;
+                (e, Some(rv), lbl)
+            }
+            EngineRequest::Auto => match GpuEngine::new_headless() {
+                Ok(gpu) => {
+                    let lbl = format!("WebGPU ({}, {})", gpu.adapter_name, gpu.backend_name);
+                    match run_gpu_rdc_structure_workflow(
+                        &gpu,
+                        &shifts,
+                        &noesy_peaks,
+                        &rdc_media,
+                        use_torsion_db,
+                        w_rdc,
+                        &cfg,
+                    ) {
+                        Ok((e, rv)) => (e, Some(rv), lbl),
+                        Err(err) => {
+                            eprintln!(
+                                "Warning: WebGPU RDC structure refinement failed ({err}); falling back to CPU (f64) RDC refinement."
+                            );
+                            let (e, rv) = calculate_structure_with_rdcs(
+                                &shifts,
+                                &noesy_peaks,
+                                &rdc_media,
+                                use_torsion_db,
+                                w_rdc,
+                                &cfg,
+                            )?;
+                            (e, rv, "CPU (f64, auto-fallback)".to_string())
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Warning: WebGPU unavailable for RDC structure refinement ({err}); falling back to CPU (f64) RDC refinement."
+                    );
+                    let (e, rv) = calculate_structure_with_rdcs(
+                        &shifts,
+                        &noesy_peaks,
+                        &rdc_media,
+                        use_torsion_db,
+                        w_rdc,
+                        &cfg,
+                    )?;
+                    (e, rv, "CPU (f64, auto-fallback)".to_string())
+                }
+            },
+        }
+    } else if use_torsion_db {
+        let (e, _) = calculate_structure_with_rdcs(&shifts, &noesy_peaks, &[], true, 0.0, &cfg)?;
+        (e, None, "CPU (f64)".to_string())
+    } else {
+        let e = calculate_structure_iterative(&shifts, &noesy_peaks, &cfg);
+        (e, None, "CPU (f64)".to_string())
+    };
     let dt = t0.elapsed().as_secs_f64();
     let adr_sum = summarize_adrs(&ens.final_adrs);
     let val = validate_ensemble(
@@ -4424,7 +4693,8 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
     );
 
     println!(
-        "Folded {}-conformer torsion-angle ensemble in {:.2}s ({} NOESY peaks -> {} ADRs, {} unambiguous, {} long-range):",
+        "[{}] Folded {}-conformer torsion-angle ensemble in {:.2}s ({} NOESY peaks -> {} ADRs, {} unambiguous, {} long-range):",
+        engine_label,
         ens.conformers.len(),
         dt,
         noesy_peaks.len(),
@@ -4443,6 +4713,20 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
         "  Mean violations: {:.2} NOE > 0.5 A, {:.2} dihedral > 5 deg",
         val.mean_distance_violations_gt_0_5a, val.mean_dihedral_violations_gt_5deg
     );
+    if let Some(ref rv) = rdc_val_opt {
+        let q_free_str = if rv.overall_q_free.is_finite() {
+            format!("{:.4}", rv.overall_q_free)
+        } else {
+            "n/a (0 free RDCs)".to_string()
+        };
+        println!(
+            "  RDC validation ({} media, {} couplings): Cornilescu Q_work={:.4}, Q_free={}",
+            rv.media.len(),
+            rv.points.len(),
+            rv.overall_q_work,
+            q_free_str
+        );
+    }
     if let (Some(low_e), Some(best_r), Some(mean_r)) = (
         val.lowest_energy_rmsd_ordered_to_ref,
         val.best_conformer_rmsd_ordered_to_ref,
@@ -4455,6 +4739,11 @@ fn cmd_structure(args: &[String]) -> Result<(), String> {
     }
 
     if let Some(out_p) = out_pdb_path {
+        if let Some(parent) = out_p.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+            }
+        }
         write_pdb_ensemble(&out_p, &ens.conformers, "NMRASSIGN TORSION ENSEMBLE")?;
         println!(
             "Wrote {}-model PDB ensemble to {}",
@@ -4683,10 +4972,168 @@ fn cmd_propensity(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_comma_ids_non_empty(raw: &str, flag: &str) -> Result<Vec<String>, String> {
+    let vals: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if vals.is_empty() {
+        return Err(format!("invalid empty {flag} list"));
+    }
+    Ok(vals)
+}
+
+fn cmd_torsions(args: &[String]) -> Result<(), String> {
+    let mut shifts_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut exclude_pdb: Vec<String> = Vec::new();
+    let mut exclude_bmrb: Vec<String> = Vec::new();
+    let mut exclude_topology: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: nmrassign torsions --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]"
+                );
+                return Ok(());
+            }
+            "--shifts" | "--star" => {
+                i += 1;
+                shifts_path = Some(PathBuf::from(
+                    args.get(i)
+                        .ok_or("missing --shifts <assigned.str|assigned.nef>")?,
+                ));
+            }
+            "-o" | "--out" => {
+                i += 1;
+                out_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing -o <out.tsv|out.nef|out.json>")?,
+                ));
+            }
+            "--exclude-pdb" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --exclude-pdb <ids>")?;
+                exclude_pdb.extend(parse_comma_ids_non_empty(raw, "--exclude-pdb")?);
+            }
+            "--exclude-bmrb" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --exclude-bmrb <ids>")?;
+                for tok in parse_comma_ids_non_empty(raw, "--exclude-bmrb")? {
+                    let norm = tok
+                        .to_ascii_lowercase()
+                        .trim_start_matches("bmr")
+                        .to_string();
+                    if norm.is_empty() {
+                        return Err(format!("invalid --exclude-bmrb token {tok:?}"));
+                    }
+                    exclude_bmrb.push(norm);
+                }
+            }
+            "--exclude-topology" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or("missing --exclude-topology <id>")?
+                    .trim()
+                    .to_string();
+                if raw.is_empty() {
+                    return Err("invalid empty --exclude-topology value".to_string());
+                }
+                exclude_topology = Some(raw);
+            }
+            other => return Err(format!("unknown torsions flag {other:?}")),
+        }
+        i += 1;
+    }
+
+    let shifts_p = shifts_path.ok_or("torsions requires --shifts <assigned.str|assigned.nef>")?;
+    let out_p = out_path.ok_or("torsions requires -o <out.tsv|out.nef|out.json>")?;
+    let ext = out_p
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "tsv" | "nef" | "json") {
+        return Err(format!(
+            "unsupported torsions output extension {:?} on '{}' (expected .tsv, .nef, or .json)",
+            ext,
+            out_p.display()
+        ));
+    }
+
+    let shifts = load_shifts_str_or_nef(&shifts_p)?;
+    let has_firewall_overrides =
+        !exclude_pdb.is_empty() || !exclude_bmrb.is_empty() || exclude_topology.is_some();
+    let report = if has_firewall_overrides {
+        let fw = HomologFirewallQuery {
+            query_pdb_ids: exclude_pdb,
+            query_bmrb_ids: exclude_bmrb,
+            query_topology_id: exclude_topology,
+            ..HomologFirewallQuery::default()
+        };
+        predict_torsions_with_firewall(&shifts, &fw)
+    } else {
+        predict_torsions(&shifts)
+    };
+
+    if let Some(parent) = out_p.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+        }
+    }
+
+    match ext.as_str() {
+        "tsv" => write_torsions_tsv(&out_p, &report)?,
+        "nef" => {
+            let entry_name = shifts_p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("torsion_db_project");
+            let mut doc = NefDocument::from_reference_and_peaks(entry_name, &shifts, None, &[]);
+            doc.dihedral_restraint_lists
+                .push(report.to_nef_dihedral_restraint_list("A", "torsion_db_restraints"));
+            write_nef_file(&out_p, &doc)?;
+        }
+        "json" => {
+            let json = format_torsions_json(&report)?;
+            fs::write(&out_p, format!("{json}\n"))
+                .map_err(|e| format!("failed to write {}: {e}", out_p.display()))?;
+        }
+        _ => unreachable!(),
+    }
+
+    let mut n_good = 0usize;
+    let mut n_dynamic = 0usize;
+    let mut n_ambiguous = 0usize;
+    let mut n_unassigned = 0usize;
+    for r in &report.residues {
+        match r.class {
+            TorsionPredictionClass::Good => n_good += 1,
+            TorsionPredictionClass::Dynamic => n_dynamic += 1,
+            TorsionPredictionClass::Ambiguous => n_ambiguous += 1,
+            TorsionPredictionClass::Unassigned => n_unassigned += 1,
+        }
+    }
+    println!(
+        "Predicted empirical 3/9-mer torsions for {} residues: Good={n_good}, Dynamic={n_dynamic}, Ambiguous={n_ambiguous}, Unassigned={n_unassigned} (excluded_templates={}, max_retained_seq_id={:.1}%, exclusion_list_sha256={}) -> {}",
+        report.residues.len(),
+        report.excluded_template_ids.len(),
+        report.max_retained_seq_identity * 100.0,
+        report.exclusion_list_sha256,
+        out_p.display()
+    );
+    Ok(())
+}
+
 fn cmd_report(args: &[String]) -> Result<(), String> {
     let mut star_path: Option<PathBuf> = None;
     let mut peaks_path: Option<PathBuf> = None;
     let mut pdb_path: Option<PathBuf> = None;
+    let mut rdc_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut title: Option<String> = None;
     let mut report_opts = ReportOptions::default();
@@ -4695,6 +5142,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: nmrassign report --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]"
+                );
+                return Ok(());
+            }
             "--star" | "--shifts" => {
                 i += 1;
                 star_path = args.get(i).map(PathBuf::from);
@@ -4706,6 +5159,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             "--pdb" => {
                 i += 1;
                 pdb_path = args.get(i).map(PathBuf::from);
+            }
+            "--rdc" => {
+                i += 1;
+                rdc_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --rdc <rdcs.tsv|rdcs.nef>")?,
+                ));
             }
             "--out" | "-o" => {
                 i += 1;
@@ -4755,10 +5214,13 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             );
         }
     }
+    if rdc_path.is_some() && pdb_path.is_none() {
+        return Err("--rdc requires --pdb <ensemble.pdb> in `nmrassign report`".to_string());
+    }
 
     let star_p = star_path.ok_or("report requires --star <shifts.str>")?;
     let out_p = out_path.ok_or("report requires --out <report.html>")?;
-    let ref_data = read_star_all_atoms(&star_p, None)?;
+    let ref_data = load_shifts_str_or_nef(&star_p)?;
 
     let mut conf = BTreeMap::new();
     for k in 0..ref_data.sequence.len() {
@@ -4790,6 +5252,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     if let Some(pdb_p) = pdb_path {
         let pdb_txt = fs::read_to_string(&pdb_p)
             .map_err(|e| format!("failed to read {}: {e}", pdb_p.display()))?;
+        if let Some(rdc_p) = rdc_path {
+            let chain = parse_pdb_str_first_model(&pdb_txt)?;
+            let rdc_media = load_rdc_media_auto(&rdc_p)?;
+            let rdc_summary = evaluate_rdc_validation(&chain, &rdc_media)?;
+            input = input.with_rdc_report(rdc_summary);
+        }
         input.pdb_coordinates = Some(pdb_txt);
     } else {
         input.dihedrals = predict_csi_dihedrals(&ref_data);
@@ -4800,6 +5268,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         input = input.with_propensity_report(prop_rep);
     }
 
+    if let Some(parent) = out_p.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+        }
+    }
     write_quality_report_html(&out_p, &input)?;
     println!(
         "Wrote self-contained HTML + SVG quality report -> {}",
@@ -5080,6 +5553,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
             "--fold" => fold = true,
             "-v" | "--verbose" => verbose = true,
+            "--rdc" | "--torsion-db" | "--rdc-weight" | "--rdc-free-frac" => {
+                return Err(format!(
+                    "{} is not supported in `nmrassign pipeline` (use post-assignment `nmrassign structure --rdc ...` or `nmrassign report --pdb ... --rdc ...`)",
+                    args[i]
+                ))
+            }
             other => return Err(format!("unknown pipeline flag {other:?}")),
         }
         i += 1;
@@ -6715,6 +7194,7 @@ fn main() {
         "simulate" => cmd_simulate(&args[1..]),
         "assign" => cmd_assign(&args[1..]),
         "propensity" => cmd_propensity(&args[1..]),
+        "torsions" => cmd_torsions(&args[1..]),
         "score" => cmd_score(&args[1..]),
         "pick" => cmd_pick(&args[1..]),
         "priors" => cmd_priors(&args[1..]),
