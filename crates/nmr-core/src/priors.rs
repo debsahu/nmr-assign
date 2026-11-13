@@ -602,6 +602,29 @@ impl NucleusOffsetFit {
         self.format_compact_with_min(label, 5)
     }
 
+    /// Estimated standard error (`sigma`, in ppm) of `applied_ppm` when `status == Fitted`
+    /// (combining prior sample-mean standard error `sd_prior / sqrt(n_values)` and Wilks
+    /// profile-likelihood curvature `|applied_ppm| / sqrt(2 * ΔLL)`), or `f64::INFINITY`
+    /// when `NotSignificant` / `TooFewValues`.
+    pub fn estimated_sigma_ppm(&self, atom: &str) -> f64 {
+        if self.status != OffsetFitStatus::Fitted || self.n_values == 0 {
+            return f64::INFINITY;
+        }
+        let (sd_prior, floor_ppm) = match atom {
+            "H" => (0.60, 0.015),
+            "N" => (3.80, 0.060),
+            "C" => (1.90, 0.060),
+            _ => (2.10, 0.060),
+        };
+        let se_sample = sd_prior / (self.n_values as f64).sqrt();
+        let se_wilks = if self.log_likelihood_gain > 0.25 && self.applied_ppm.abs() > 0.05 {
+            self.applied_ppm.abs() / (2.0 * self.log_likelihood_gain).sqrt()
+        } else {
+            0.0
+        };
+        se_sample.max(se_wilks).max(floor_ppm)
+    }
+
     /// Format a compact diagnostic token with an explicit minimum sample threshold `min_values`.
     pub fn format_compact_with_min(&self, label: &str, min_values: usize) -> String {
         match self.status {
@@ -652,16 +675,53 @@ impl DetailedReferenceOffsets {
         }
     }
 
-    /// Extract the backwards-compatible applied `ShiftOffsets` (`0.0` for `NotSignificant` / `TooFewValues`).
+    /// Extract the applied `ShiftOffsets` for scoring `Priors` (`0.0` for `NotSignificant` /
+    /// `TooFewValues`, except when one aliphatic channel is `Fitted` on a uniform `13C`-shifted
+    /// dataset and the other has `< 8` observations, in which case the sparse channel inherits
+    /// the fitted aliphatic `13C` carrier shift).
     #[inline]
     pub fn to_shift_offsets(&self) -> ShiftOffsets {
+        let ca_eff = if self.ca.status != OffsetFitStatus::Fitted
+            && self.ca.n_values < 8
+            && self.cb.status == OffsetFitStatus::Fitted
+        {
+            self.cb.applied_ppm
+        } else {
+            self.ca.applied_ppm
+        };
+        let cb_eff = if self.cb.status != OffsetFitStatus::Fitted
+            && self.cb.n_values < 8
+            && self.ca.status == OffsetFitStatus::Fitted
+        {
+            self.ca.applied_ppm
+        } else {
+            self.cb.applied_ppm
+        };
         ShiftOffsets {
             h: self.h.applied_ppm,
             n: self.n.applied_ppm,
-            ca: self.ca.applied_ppm,
-            cb: self.cb.applied_ppm,
+            ca: ca_eff,
+            cb: cb_eff,
             c: self.c.applied_ppm,
         }
+    }
+
+    /// Joint standard error (`hypot(sigma_CA, sigma_CB)`, in ppm) of `(dCA - dCB)` when both
+    /// `CA` and `CB` are `Fitted` (`f64::INFINITY` otherwise).
+    #[inline]
+    pub fn aliphatic_joint_sigma_ppm(&self) -> f64 {
+        self.ca
+            .estimated_sigma_ppm("CA")
+            .hypot(self.cb.estimated_sigma_ppm("CB"))
+    }
+
+    /// Joint standard error (`hypot(sigma_CA, sigma_C)`, in ppm) of `(dCA - dC)` when both
+    /// `CA` and `C` are `Fitted` (`f64::INFINITY` otherwise).
+    #[inline]
+    pub fn ca_co_joint_sigma_ppm(&self) -> f64 {
+        self.ca
+            .estimated_sigma_ppm("CA")
+            .hypot(self.c.estimated_sigma_ppm("C"))
     }
 
     /// Format all five nuclei in compact one-line diagnostic form.
@@ -838,285 +898,80 @@ fn refine_grid_peak(scores: &[f64], best_idx: usize, min_d: f64, step: f64) -> f
     }
 }
 
+/// Synchronize `DetailedReferenceOffsets` with the final `ShiftOffsets` actually applied by a
+/// solver (e.g., after `evo-graph` Pass-2 anchor refinement), preserving `TooFewValues`, sample
+/// counts `n_values`, and `log_likelihood_gain` while ensuring the `DatasetQcReport` and CLI/JSON
+/// outputs evaluate the exact same joint `(CA, CB, C')` offsets applied during scoring (`P1-4`).
+pub fn sync_detailed_reference_offsets(
+    applied: &ShiftOffsets,
+    base: &DetailedReferenceOffsets,
+) -> DetailedReferenceOffsets {
+    let sync_one = |d_app: f64, fit: NucleusOffsetFit| -> NucleusOffsetFit {
+        if fit.status == OffsetFitStatus::TooFewValues || fit.n_values < 5 {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::TooFewValues,
+                applied_ppm: 0.0,
+                candidate_ppm: 0.0,
+                log_likelihood_gain: 0.0,
+                n_values: fit.n_values,
+            }
+        } else if fit.n_values < 8 && fit.status == OffsetFitStatus::NotSignificant {
+            // Sparse (< 8 observations) channel may inherit shared 13C shift in `ShiftOffsets` for scoring,
+            // while remaining `NotSignificant` in `DetailedReferenceOffsets` (`P1-4`).
+            fit
+        } else if d_app.abs() > 1e-9 {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::Fitted,
+                applied_ppm: d_app,
+                candidate_ppm: if fit.candidate_ppm.abs() > 1e-9 {
+                    fit.candidate_ppm
+                } else {
+                    d_app
+                },
+                log_likelihood_gain: fit.log_likelihood_gain.max(1.0),
+                n_values: fit.n_values,
+            }
+        } else {
+            NucleusOffsetFit {
+                status: OffsetFitStatus::NotSignificant,
+                applied_ppm: 0.0,
+                candidate_ppm: fit.candidate_ppm,
+                log_likelihood_gain: fit.log_likelihood_gain,
+                n_values: fit.n_values,
+            }
+        }
+    };
+    DetailedReferenceOffsets {
+        h: sync_one(applied.h, base.h),
+        n: sync_one(applied.n, base.n),
+        ca: sync_one(applied.ca, base.ca),
+        cb: sync_one(applied.cb, base.cb),
+        c: sync_one(applied.c, base.c),
+    }
+}
+
 /// Estimate global chemical-shift reference offsets `(dH, dN, dCA, dCB, dC)` maximizing the
 /// outlier-robust marginal mixture log-likelihood of observed spin-system shifts against
-/// sequence-weighted `Priors` (with joint aliphatic `dCA ≈ dCB` regularization and a deadband/BIC
-/// gate so DSS-referenced spectra remain at exact `0.0 ppm`).
+/// sequence-weighted `Priors` (delegating directly to [`estimate_reference_offsets_detailed`]
+/// so the solver and `DatasetQcReport` share one canonical joint `(CA, CB, C')` estimator).
 pub fn estimate_reference_offsets(
     systems: &[SpinSystem],
     sequence: &[String],
     priors: &Priors,
 ) -> ShiftOffsets {
-    if systems.is_empty() {
-        return ShiftOffsets::default();
-    }
-
-    let slot_and_support = |ss: &SpinSystem| -> (usize, usize) {
-        let mut slots = 0usize;
-        let mut sup_sum = 0usize;
-        for cands in ss.cands.values() {
-            if let Some(&(_, sup)) = cands.iter().find(|&&(_, sup)| sup > 0) {
-                slots += 1;
-                sup_sum += sup;
-            }
-        }
-        (sup_sum, slots)
-    };
-    let assignable = sequence
-        .iter()
-        .enumerate()
-        .filter(|&(k, r)| k > 0 && r != "PRO")
-        .count()
-        .max(sequence.len());
-    let max_selected = ((assignable * 4) / 3).max(24);
-    let mut multi_slot: Vec<&SpinSystem> = systems
-        .iter()
-        .filter(|ss| slot_and_support(ss).1 >= 2)
-        .collect();
-    if multi_slot.len() > max_selected {
-        multi_slot.sort_by_key(|b| std::cmp::Reverse(slot_and_support(b)));
-        multi_slot.truncate(max_selected);
-    }
-    let mut selected: Vec<&SpinSystem> = if multi_slot.len() >= 8 {
-        multi_slot
-    } else {
-        systems
-            .iter()
-            .filter(|ss| ss.has_observed_carbons())
-            .collect()
-    };
-    if selected.len() > max_selected {
-        selected.sort_by_key(|b| std::cmp::Reverse(slot_and_support(b)));
-        selected.truncate(max_selected);
-    }
-    if selected.len() < 6 {
-        return ShiftOffsets::default();
-    }
-
-    let collect_carbon = |atom: &str, lo: f64, hi: f64| -> (Vec<(f64, bool)>, f64) {
-        let mut obs = Vec::new();
-        let mut n0 = 0usize;
-        let mut nm1 = 0usize;
-        for ss in &selected {
-            for (off, is_im1) in [(0, false), (-1, true)] {
-                if let Some(list) = ss.cands.get(&(atom.to_string(), off)) {
-                    if let Some(&(v, _)) = list.iter().find(|&&(_, sup)| sup > 0) {
-                        if (lo..=hi).contains(&v) {
-                            obs.push((v, is_im1));
-                            if is_im1 {
-                                nm1 += 1;
-                            } else {
-                                n0 += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let scale = if obs.is_empty() {
-            1.0
-        } else {
-            (n0.max(nm1).max(1) as f64) / (obs.len() as f64)
-        };
-        (obs, scale)
-    };
-
-    let (obs_ca, scale_ca) = collect_carbon("CA", 34.0, 76.0);
-    let (obs_cb, scale_cb) = collect_carbon("CB", 8.0, 78.0);
-    let (obs_c, scale_c) = collect_carbon("C", 162.0, 188.0);
-
-    let obs_h: Vec<(f64, bool)> = selected
-        .iter()
-        .filter(|ss| (5.0..=12.5).contains(&ss.h))
-        .map(|ss| (ss.h, false))
-        .collect();
-    let obs_n: Vec<(f64, bool)> = selected
-        .iter()
-        .filter(|ss| (95.0..=145.0).contains(&ss.n))
-        .map(|ss| (ss.n, false))
-        .collect();
-
-    // 13C grid: [-6.0, +6.0] ppm in 0.05 ppm steps (index 120 == 0.0 ppm)
-    const N_GRID_C: usize = 241;
-    const ZERO_C: usize = 120;
-    const MIN_C: f64 = -6.0;
-    const STEP_C: f64 = 0.05;
-
-    let eval_c_curve = |atom: &str, obs: &[(f64, bool)], scale: f64, range_ppm: f64| -> Vec<f64> {
-        let mix0 = build_sequence_mixture(sequence, priors, atom, false);
-        let mixm1 = build_sequence_mixture(sequence, priors, atom, true);
-        (0..N_GRID_C)
-            .map(|i| {
-                let d = MIN_C + (i as f64) * STEP_C;
-                scale * outlier_robust_mixture_ll(obs, &mix0, &mixm1, range_ppm, d)
-                    - 0.5 * (d / 4.5).powi(2)
-            })
-            .collect()
-    };
-
-    let round3 = |x: f64| (x * 1000.0).round() / 1000.0;
-
-    // 1. Joint aliphatic (dCA, dCB) estimation with carrier-tether regularization dCA ≈ dCB.
-    // Because alpha-helix vs beta-sheet secondary structure shifts CA and CB in OPPOSITE directions
-    // whereas chemical-shift referencing shifts CA and CB in the SAME direction, coupling dCA ≈ dCB
-    // cancels secondary-structure bias on DSS-referenced proteins while capturing TMS/carrier offsets.
-    let (ca_off, cb_off) = if obs_ca.len() >= 8 && obs_cb.len() >= 8 {
-        let l_ca = eval_c_curve("CA", &obs_ca, scale_ca, 45.0);
-        let l_cb = eval_c_curve("CB", &obs_cb, scale_cb, 65.0);
-        let null_score = l_ca[ZERO_C] + l_cb[ZERO_C];
-        let mut best_score = f64::NEG_INFINITY;
-        let mut best_i = ZERO_C;
-        let mut best_j = ZERO_C;
-        for (i, &sca) in l_ca.iter().enumerate() {
-            let di = MIN_C + (i as f64) * STEP_C;
-            for (j, &scb) in l_cb.iter().enumerate() {
-                let dj = MIN_C + (j as f64) * STEP_C;
-                let tether = -0.5 * ((di - dj) / 0.25).powi(2);
-                let sc = sca + scb + tether;
-                if sc > best_score {
-                    best_score = sc;
-                    best_i = i;
-                    best_j = j;
-                }
-            }
-        }
-        // Refine 1D slices along best_j / best_i
-        let slice_ca: Vec<f64> = (0..N_GRID_C)
-            .map(|i| {
-                let di = MIN_C + (i as f64) * STEP_C;
-                let dj = MIN_C + (best_j as f64) * STEP_C;
-                l_ca[i] + l_cb[best_j] - 0.5 * ((di - dj) / 0.25).powi(2)
-            })
-            .collect();
-        let slice_cb: Vec<f64> = (0..N_GRID_C)
-            .map(|j| {
-                let di = MIN_C + (best_i as f64) * STEP_C;
-                let dj = MIN_C + (j as f64) * STEP_C;
-                l_ca[best_i] + l_cb[j] - 0.5 * ((di - dj) / 0.25).powi(2)
-            })
-            .collect();
-        let d_ca = refine_grid_peak(&slice_ca, best_i, MIN_C, STEP_C);
-        let d_cb = refine_grid_peak(&slice_cb, best_j, MIN_C, STEP_C);
-        if d_ca.abs().max(d_cb.abs()) >= 0.85 && (best_score - null_score) >= 12.0 {
-            (round3(d_ca), round3(d_cb))
-        } else {
-            (0.0, 0.0)
-        }
-    } else if obs_ca.len() >= 8 {
-        let l_ca = eval_c_curve("CA", &obs_ca, scale_ca, 45.0);
-        let (best_i, &best_sc) = l_ca
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((ZERO_C, &0.0));
-        let d_ca = refine_grid_peak(&l_ca, best_i, MIN_C, STEP_C);
-        // Without CB to cancel secondary-structure shift propensities, require a clear offset
-        if d_ca.abs() >= 1.15 && (best_sc - l_ca[ZERO_C]) >= 12.0 {
-            let r = round3(d_ca);
-            (r, r)
-        } else {
-            (0.0, 0.0)
-        }
-    } else if obs_cb.len() >= 8 {
-        let l_cb = eval_c_curve("CB", &obs_cb, scale_cb, 65.0);
-        let (best_j, &best_sc) = l_cb
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((ZERO_C, &0.0));
-        let d_cb = refine_grid_peak(&l_cb, best_j, MIN_C, STEP_C);
-        if d_cb.abs() >= 0.85 && (best_sc - l_cb[ZERO_C]) >= 12.0 {
-            let r = round3(d_cb);
-            (r, r)
-        } else {
-            (0.0, 0.0)
-        }
-    } else {
-        (0.0, 0.0)
-    };
-
-    // 2. Carbonyl dC estimation
-    let c_off = if obs_c.len() >= 8 {
-        let l_c = eval_c_curve("C", &obs_c, scale_c, 25.0);
-        let (best_i, &best_sc) = l_c
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((ZERO_C, &0.0));
-        let d_c = refine_grid_peak(&l_c, best_i, MIN_C, STEP_C);
-        if d_c.abs() >= 0.45 && (best_sc - l_c[ZERO_C]) >= 5.0 {
-            round3(d_c)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-
-    // 3. Amide dH and dN estimation (conservative deadband so fold-dependent dispersion stays 0.0)
-    let h_off = if obs_h.len() >= 12 {
-        const N_GRID_H: usize = 301;
-        const ZERO_H: usize = 150;
-        const MIN_H: f64 = -1.5;
-        const STEP_H: f64 = 0.01;
-        let mix_h = build_sequence_mixture(sequence, priors, "H", false);
-        let l_h: Vec<f64> = (0..N_GRID_H)
-            .map(|i| {
-                let d = MIN_H + (i as f64) * STEP_H;
-                outlier_robust_mixture_ll(&obs_h, &mix_h, &mix_h, 6.0, d) - 0.5 * (d / 0.8).powi(2)
-            })
-            .collect();
-        let (best_i, &best_sc) = l_h
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((ZERO_H, &0.0));
-        let d_h = refine_grid_peak(&l_h, best_i, MIN_H, STEP_H);
-        if d_h.abs() >= 0.22 && (best_sc - l_h[ZERO_H]) >= 6.0 {
-            round3(d_h)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-
-    let n_off = if obs_n.len() >= 12 {
-        let mix_n = build_sequence_mixture(sequence, priors, "N", false);
-        let l_n: Vec<f64> = (0..N_GRID_C)
-            .map(|i| {
-                let d = MIN_C + (i as f64) * STEP_C;
-                outlier_robust_mixture_ll(&obs_n, &mix_n, &mix_n, 40.0, d) - 0.5 * (d / 4.0).powi(2)
-            })
-            .collect();
-        let (best_i, &best_sc) = l_n
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((ZERO_C, &0.0));
-        let d_n = refine_grid_peak(&l_n, best_i, MIN_C, STEP_C);
-        if d_n.abs() >= 1.25 && (best_sc - l_n[ZERO_C]) >= 6.0 {
-            round3(d_n)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-
-    ShiftOffsets {
-        h: h_off,
-        n: n_off,
-        ca: ca_off,
-        cb: cb_off,
-        c: c_off,
-    }
+    estimate_reference_offsets_detailed(systems, sequence, priors).to_shift_offsets()
 }
 
-/// Blind untethered per-nucleus reference offset diagnostics against sequence-weighted `Priors`
-/// (without ground truth), recording `OffsetFitStatus`, candidate shift, `ΔLL` gain, and `n_values`
-/// independently for `(H, N, CA, CB, C)` so `qc::check_offset_consistency` can detect single-channel
-/// carrier/folding anomalies when no ground-truth `Reference` is available.
+/// Unified joint `(CA, CB, C')` + `(H, N)` unlabelled reference offset estimator against
+/// sequence-weighted `Priors`, recording `OffsetFitStatus`, `applied_ppm`, `candidate_ppm`,
+/// `log_likelihood_gain`, and `n_values` (`P1-4`).
+///
+/// Alpha-helix vs beta-sheet secondary structure shifts `CA` and `CB` in opposite directions
+/// (`|ΔCA_sec - ΔCB_sec| <= 3.0 ppm` relative to `Priors::bmrb()`), whereas spectrometer
+/// chemical-shift referencing (e.g., `-2.7 ppm` TMS vs DSS) shifts `CA`, `CB`, and `C'` in the
+/// same direction. A Huber/Lorentzian-bounded carrier tether couples `dCA ≈ dCB` across the full
+/// physical secondary-structure basin while allowing genuine single-channel carrier/folding
+/// errors (`> barrier`) to decouple and be caught by `qc::check_offset_consistency`.
 pub fn estimate_reference_offsets_detailed(
     systems: &[SpinSystem],
     sequence: &[String],
@@ -1213,72 +1068,250 @@ pub fn estimate_reference_offsets_detailed(
     const STEP_C: f64 = 0.05;
     let round3 = |x: f64| (x * 1000.0).round() / 1000.0;
 
-    let fit_blind_c = |atom: &str,
-                       obs: &[(f64, bool)],
-                       scale: f64,
-                       range_ppm: f64,
-                       min_amp: f64,
-                       min_gain: f64|
-     -> NucleusOffsetFit {
-        let n_values = obs.len();
-        if n_values < 5 || selected.len() < 6 {
-            return NucleusOffsetFit {
-                status: OffsetFitStatus::TooFewValues,
-                applied_ppm: 0.0,
-                candidate_ppm: 0.0,
-                log_likelihood_gain: 0.0,
-                n_values,
-            };
-        }
+    let eval_c_curve = |atom: &str, obs: &[(f64, bool)], scale: f64, range_ppm: f64| -> Vec<f64> {
         let mix0 = build_sequence_mixture(sequence, priors, atom, false);
         let mixm1 = build_sequence_mixture(sequence, priors, atom, true);
-        let l_c: Vec<f64> = (0..N_GRID_C)
+        (0..N_GRID_C)
             .map(|i| {
                 let d = MIN_C + (i as f64) * STEP_C;
                 scale * outlier_robust_mixture_ll(obs, &mix0, &mixm1, range_ppm, d)
                     - 0.5 * (d / 4.5).powi(2)
             })
+            .collect()
+    };
+
+    let mk_tfv = |n_values: usize| NucleusOffsetFit {
+        status: OffsetFitStatus::TooFewValues,
+        applied_ppm: 0.0,
+        candidate_ppm: 0.0,
+        log_likelihood_gain: 0.0,
+        n_values,
+    };
+
+    let l_c_opt: Option<Vec<f64>> = if selected.len() >= 6 && obs_c.len() >= 5 {
+        Some(eval_c_curve("C", &obs_c, scale_c, 25.0))
+    } else {
+        None
+    };
+
+    // 1. Joint aliphatic (dCA, dCB) estimation with Huber/Lorentzian-bounded carrier tether
+    let (ca, cb) = if selected.len() < 6 {
+        (
+            if obs_ca.len() < 5 {
+                mk_tfv(obs_ca.len())
+            } else {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: 0.0,
+                    log_likelihood_gain: 0.0,
+                    n_values: obs_ca.len(),
+                }
+            },
+            if obs_cb.len() < 5 {
+                mk_tfv(obs_cb.len())
+            } else {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: 0.0,
+                    log_likelihood_gain: 0.0,
+                    n_values: obs_cb.len(),
+                }
+            },
+        )
+    } else if obs_ca.len() >= 8 && obs_cb.len() >= 8 {
+        let l_ca = eval_c_curve("CA", &obs_ca, scale_ca, 45.0);
+        let l_cb = eval_c_curve("CB", &obs_cb, scale_cb, 65.0);
+        let n_eff_ab = scale_ca * (obs_ca.len() as f64) + scale_cb * (obs_cb.len() as f64);
+        let barrier_ab = (0.35 * n_eff_ab).max(16.0);
+        let tether_ab = |diff: f64| -> f64 {
+            -(0.5 * (diff / 0.25).powi(2)).min(barrier_ab + 0.5 * (diff / 3.5).powi(2))
+        };
+        let null_score = l_ca[ZERO_C] + l_cb[ZERO_C];
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_i = ZERO_C;
+        let mut best_j = ZERO_C;
+        for (i, &sca) in l_ca.iter().enumerate() {
+            let di = MIN_C + (i as f64) * STEP_C;
+            for (j, &scb) in l_cb.iter().enumerate() {
+                let dj = MIN_C + (j as f64) * STEP_C;
+                let sc = sca + scb + tether_ab(di - dj);
+                if sc > best_score {
+                    best_score = sc;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+        let slice_ca: Vec<f64> = (0..N_GRID_C)
+            .map(|i| {
+                let di = MIN_C + (i as f64) * STEP_C;
+                let dj = MIN_C + (best_j as f64) * STEP_C;
+                l_ca[i] + l_cb[best_j] + tether_ab(di - dj)
+            })
             .collect();
-        let (best_i, &best_sc) = l_c
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .unwrap_or((ZERO_C, &0.0));
-        let d_cand = round3(refine_grid_peak(&l_c, best_i, MIN_C, STEP_C));
-        let gain = (best_sc - l_c[ZERO_C]).max(0.0);
-        if n_values >= 8 && d_cand.abs() >= min_amp && gain >= min_gain {
-            NucleusOffsetFit {
-                status: OffsetFitStatus::Fitted,
-                applied_ppm: d_cand,
-                candidate_ppm: d_cand,
-                log_likelihood_gain: gain,
-                n_values,
+        let slice_cb: Vec<f64> = (0..N_GRID_C)
+            .map(|j| {
+                let di = MIN_C + (best_i as f64) * STEP_C;
+                let dj = MIN_C + (j as f64) * STEP_C;
+                l_ca[best_i] + l_cb[j] + tether_ab(di - dj)
+            })
+            .collect();
+        let d_ca = round3(refine_grid_peak(&slice_ca, best_i, MIN_C, STEP_C));
+        let d_cb = round3(refine_grid_peak(&slice_cb, best_j, MIN_C, STEP_C));
+        let joint_gain = (best_score - null_score).max(0.0);
+        let gain_ca_1d = (l_ca[best_i] - l_ca[ZERO_C]).max(0.0);
+        let gain_cb_1d = (l_cb[best_j] - l_cb[ZERO_C]).max(0.0);
+
+        if (d_ca - d_cb).abs() <= 0.85 {
+            // Coupled joint carrier basin: secondary-structure skew cancels across CA + CB (+ C')
+            let gain_ca = gain_ca_1d.max(0.5 * joint_gain);
+            let gain_cb = gain_cb_1d.max(0.5 * joint_gain);
+            if d_ca.abs().max(d_cb.abs()) >= 0.85 && joint_gain >= 12.0 {
+                (
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::Fitted,
+                        applied_ppm: d_ca,
+                        candidate_ppm: d_ca,
+                        log_likelihood_gain: gain_ca,
+                        n_values: obs_ca.len(),
+                    },
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::Fitted,
+                        applied_ppm: d_cb,
+                        candidate_ppm: d_cb,
+                        log_likelihood_gain: gain_cb,
+                        n_values: obs_cb.len(),
+                    },
+                )
+            } else {
+                (
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: d_ca,
+                        log_likelihood_gain: gain_ca,
+                        n_values: obs_ca.len(),
+                    },
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: d_cb,
+                        log_likelihood_gain: gain_cb,
+                        n_values: obs_cb.len(),
+                    },
+                )
             }
         } else {
-            NucleusOffsetFit {
-                status: OffsetFitStatus::NotSignificant,
-                applied_ppm: 0.0,
-                candidate_ppm: d_cand,
-                log_likelihood_gain: gain,
-                n_values,
+            // Tether barrier broken by strongly divergent channels: evaluate each channel's significance
+            let ca_fit = if d_ca.abs() >= 1.15 && gain_ca_1d >= 10.0 {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::Fitted,
+                    applied_ppm: d_ca,
+                    candidate_ppm: d_ca,
+                    log_likelihood_gain: gain_ca_1d,
+                    n_values: obs_ca.len(),
+                }
+            } else {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: d_ca,
+                    log_likelihood_gain: gain_ca_1d,
+                    n_values: obs_ca.len(),
+                }
+            };
+            let cb_fit = if d_cb.abs() >= 1.15 && gain_cb_1d >= 10.0 {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::Fitted,
+                    applied_ppm: d_cb,
+                    candidate_ppm: d_cb,
+                    log_likelihood_gain: gain_cb_1d,
+                    n_values: obs_cb.len(),
+                }
+            } else {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: d_cb,
+                    log_likelihood_gain: gain_cb_1d,
+                    n_values: obs_cb.len(),
+                }
+            };
+            (ca_fit, cb_fit)
+        }
+    } else {
+        let fit_single =
+            |atom: &str, obs: &[(f64, bool)], scale: f64, range_ppm: f64, min_amp: f64| {
+                if obs.len() < 5 {
+                    return mk_tfv(obs.len());
+                }
+                let l_x = eval_c_curve(atom, obs, scale, range_ppm);
+                let (best_i, &best_sc) = l_x
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap_or((ZERO_C, &0.0));
+                let d_cand = round3(refine_grid_peak(&l_x, best_i, MIN_C, STEP_C));
+                let gain = (best_sc - l_x[ZERO_C]).max(0.0);
+                if obs.len() >= 8 && d_cand.abs() >= min_amp && gain >= 12.0 {
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::Fitted,
+                        applied_ppm: d_cand,
+                        candidate_ppm: d_cand,
+                        log_likelihood_gain: gain,
+                        n_values: obs.len(),
+                    }
+                } else {
+                    NucleusOffsetFit {
+                        status: OffsetFitStatus::NotSignificant,
+                        applied_ppm: 0.0,
+                        candidate_ppm: d_cand,
+                        log_likelihood_gain: gain,
+                        n_values: obs.len(),
+                    }
+                }
+            };
+        (
+            fit_single("CA", &obs_ca, scale_ca, 45.0, 1.15),
+            fit_single("CB", &obs_cb, scale_cb, 65.0, 0.85),
+        )
+    };
+
+    // 2. Carbonyl dC estimation (independent 13C' carrier ~176 ppm, untethered from aliphatic carrier)
+    let c = match l_c_opt {
+        None => mk_tfv(obs_c.len()),
+        Some(l_c) => {
+            let (best_i, &best_sc) = l_c
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap_or((ZERO_C, &0.0));
+            let d_c = round3(refine_grid_peak(&l_c, best_i, MIN_C, STEP_C));
+            let gain_c = (best_sc - l_c[ZERO_C]).max(0.0);
+            if obs_c.len() >= 8 && d_c.abs() >= 0.45 && gain_c >= 5.0 {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::Fitted,
+                    applied_ppm: d_c,
+                    candidate_ppm: d_c,
+                    log_likelihood_gain: gain_c,
+                    n_values: obs_c.len(),
+                }
+            } else {
+                NucleusOffsetFit {
+                    status: OffsetFitStatus::NotSignificant,
+                    applied_ppm: 0.0,
+                    candidate_ppm: d_c,
+                    log_likelihood_gain: gain_c,
+                    n_values: obs_c.len(),
+                }
             }
         }
     };
 
-    // Untethered blind carbon fits: conservative amplitude gates protect strongly alpha-helical
-    // DSS proteins (mean helical ΔCA <= ~1.8 ppm) while catching TMS (-2.7 ppm) and mis-referenced channels.
-    let ca = fit_blind_c("CA", &obs_ca, scale_ca, 45.0, 2.15, 12.0);
-    let cb = fit_blind_c("CB", &obs_cb, scale_cb, 65.0, 1.50, 10.0);
-    let c = fit_blind_c("C", &obs_c, scale_c, 25.0, 1.45, 7.0);
-
     let h = if obs_h.len() < 5 || selected.len() < 6 {
-        NucleusOffsetFit {
-            status: OffsetFitStatus::TooFewValues,
-            applied_ppm: 0.0,
-            candidate_ppm: 0.0,
-            log_likelihood_gain: 0.0,
-            n_values: obs_h.len(),
-        }
+        mk_tfv(obs_h.len())
     } else {
         const N_GRID_H: usize = 301;
         const ZERO_H: usize = 150;
@@ -1318,13 +1351,7 @@ pub fn estimate_reference_offsets_detailed(
     };
 
     let n = if obs_n.len() < 5 || selected.len() < 6 {
-        NucleusOffsetFit {
-            status: OffsetFitStatus::TooFewValues,
-            applied_ppm: 0.0,
-            candidate_ppm: 0.0,
-            log_likelihood_gain: 0.0,
-            n_values: obs_n.len(),
-        }
+        mk_tfv(obs_n.len())
     } else {
         let mix_n = build_sequence_mixture(sequence, priors, "N", false);
         let l_n: Vec<f64> = (0..N_GRID_C)

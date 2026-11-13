@@ -775,7 +775,9 @@ fn test_nef_session_bit_exact_roundtrip_and_standard_saveframes() {
         "save_nef_nmr_spectrum_HSQC",
         "save_nef_nmr_spectrum_HNCACB",
         "save_nmrassign_workbench",
-        "_nmrassign_workbench.sf_category     nmrassign_workbench_session",
+        "_nmrassign_workbench.sf_category     nmrassign_workbench",
+        "_nmrassign_workbench.sf_framecode    nmrassign_workbench",
+        "_nmrassign_workbench.shift_list_crc32",
         "_nmrassign_lock.spin_system_id",
         "_nmrassign_contour_layer.layer_id",
         "_nmrassign_processing_recipe.recipe_json",
@@ -863,4 +865,138 @@ fn test_nef_session_edge_strings_verdicts_and_plain_external_nef_import() {
     assert_eq!(imported.peaks.len(), 2);
     assert!(imported.locked_residues.is_empty());
     imported.validate_invariants().unwrap();
+}
+
+#[test]
+fn test_p2_4_and_p2_5_nef_multiline_quotes_legacy_category_and_shift_drift_adoption() {
+    // 1. P2-4: Standard `fmt_val` + `NefDocument` must round-trip strings containing BOTH `'` and `"`
+    //    AND strings > 80 characters (including leading/trailing whitespace) 100% losslessly via `;...;`
+    //    multi-line STAR text blocks.
+    let ref_data = read_star(ubiquitin_fixture_path(), None).expect("read Ubiquitin fixture");
+    let tricky_both_quotes = "  Peak 'A' & \"B\" (13C' / 1H\" overlap #7)  ";
+    let long_over_80 = "Long acquisition & curation note exceeding eighty ASCII characters without losing 'single' or \"double\" quotes!";
+    assert!(long_over_80.len() > 80);
+
+    let mut doc = NefDocument::from_reference_and_peaks(
+        "p2_4_lossless_test",
+        &ref_data,
+        None,
+        &[
+            Peak::hsqc(8.41, 121.2),
+            Peak::triple("HNCA", 8.41, 121.2, 55.4, 1),
+        ],
+    );
+    doc.meta_data.coordinate_file_name = Some(long_over_80.to_string());
+    doc.peak_lists[0].peaks[0].details = Some(tricky_both_quotes.to_string());
+
+    let nef_txt = write_nef_str(&doc);
+    assert!(
+        nef_txt.contains(&format!("\n;{tricky_both_quotes}\n;\n")),
+        "expected `;...;` STAR block for string with both quote types"
+    );
+    assert!(
+        nef_txt.contains(&format!("\n;{long_over_80}\n;\n")),
+        "expected `;...;` STAR block for >80-char string"
+    );
+    let reparsed_doc = read_nef_str(&nef_txt).expect("reparse NefDocument with `;...;` blocks");
+    assert_eq!(
+        reparsed_doc.meta_data.coordinate_file_name.as_deref(),
+        Some(long_over_80)
+    );
+    assert_eq!(
+        reparsed_doc.peak_lists[0].peaks[0].details.as_deref(),
+        Some(tricky_both_quotes)
+    );
+
+    // 2. P2-4: `ProcessingRecipe` JSON in `save_nmrassign_workbench` is written as `;...;` block,
+    //    `sf_category == sf_framecode == nmrassign_workbench`, and legacy `nmrassign_workbench_session`
+    //    category still loads cleanly.
+    let mut sess = WorkbenchSessionState::from_fasta_sequence("MiniUbq", ">u\nMQIFVK");
+    sess.processing_recipes.insert(
+        "HNCO_3D".to_string(),
+        sample_processing_recipe("1H", "13C'", true),
+    );
+    let mut sh0 = BTreeMap::new();
+    sh0.insert("H".to_string(), 8.412_345_678_9);
+    sh0.insert("N".to_string(), 121.234_567_89);
+    sh0.insert("CA".to_string(), 55.123_456_789);
+    sh0.insert("CB".to_string(), 29.400_0);
+    sess.assignments
+        .insert(1, ResidueAssignmentState::with_shifts(Some(0), sh0, 0.95));
+    sess.locked_residues.insert(0, 1);
+
+    let sess_nef = write_session_nef_str(&sess);
+    assert!(sess_nef.contains("_nmrassign_workbench.sf_category     nmrassign_workbench\n"));
+    assert!(sess_nef.contains("_nmrassign_workbench.sf_framecode    nmrassign_workbench\n"));
+    assert!(
+        sess_nef.contains("\n;{\"dims\":["),
+        "ProcessingRecipe JSON must be serialized as a `;...;` STAR text block"
+    );
+    let clean_reload = read_session_nef_str(&sess_nef).expect("clean session reload");
+    assert!(clean_reload.load_warnings.is_empty());
+    assert!(clean_reload.bitwise_eq(&sess));
+
+    // Legacy `nmrassign_workbench_session` backward-compatibility read check
+    let legacy_nef = sess_nef.replace(
+        "_nmrassign_workbench.sf_category     nmrassign_workbench\n",
+        "_nmrassign_workbench.sf_category     nmrassign_workbench_session\n",
+    );
+    let legacy_reload = read_session_nef_str(&legacy_nef).expect("legacy sf_category reload");
+    assert!(legacy_reload.bitwise_eq(&sess));
+
+    // 3. P2-5: Simulate external tool editing `save_nef_chemical_shift_list_default`:
+    //    - Modify GLN-2 `CA` from `55.1235` -> `56.7500`
+    //    - Delete GLN-2 `CB` (`29.4000`)
+    //    - Add ILE-3 `CA` = `60.8500`
+    let mut edited_doc = read_nef_str(&sess_nef).expect("parse session as NefDocument");
+    let shifts_vec = &mut edited_doc.shift_lists[0].shifts;
+    for s in shifts_vec.iter_mut() {
+        if s.sequence_code == Some(2) && s.atom_name == "CA" {
+            s.value = 56.75;
+        }
+    }
+    shifts_vec.retain(|s| !(s.sequence_code == Some(2) && s.atom_name == "CB"));
+    shifts_vec.push(nmr_core::nef::AssignedShift {
+        chain_code: "A".to_string(),
+        sequence_code: Some(3),
+        residue_name: "ILE".to_string(),
+        atom_name: "CA".to_string(),
+        element: Some("C".to_string()),
+        isotope_number: Some(13),
+        value: 60.85,
+        value_uncertainty: Some(0.10),
+    });
+    // Serialize `edited_doc` WITHOUT regenerating `workbench_session.shift_list_crc32` or `assignment_shifts`!
+    let externally_edited_nef = write_nef_str(&edited_doc);
+    let adopted =
+        read_session_nef_str(&externally_edited_nef).expect("reload externally edited NEF");
+
+    assert_eq!(
+        adopted.load_warnings.len(),
+        1,
+        "expected 1 CRC32 drift warning, got {:?}",
+        adopted.load_warnings
+    );
+    assert!(adopted.load_warnings[0].contains("CRC32"));
+    // GLN-2 (res_idx = 1): `CA` adopted `56.75`, `CB` deleted, untouched `H` kept full IEEE-754 precision, lock preserved!
+    let r1 = adopted.assignments.get(&1).expect("GLN-2 assignment kept");
+    assert_eq!(r1.spin_system, Some(0));
+    assert!(adopted.is_residue_locked(1));
+    assert_eq!(r1.shifts.get("CA").copied(), Some(56.75));
+    assert!(
+        !r1.shifts.contains_key("CB"),
+        "deleted CB shift must be pruned"
+    );
+    assert_eq!(
+        r1.shifts.get("H").unwrap().to_bits(),
+        8.412_345_678_9f64.to_bits(),
+        "unedited atom H must retain bit-exact precision"
+    );
+    // ILE-3 (res_idx = 2): newly added `CA = 60.85` adopted!
+    let r2 = adopted
+        .assignments
+        .get(&2)
+        .expect("ILE-3 newly added shift adopted");
+    assert_eq!(r2.shifts.get("CA").copied(), Some(60.85));
+    adopted.validate_invariants().unwrap();
 }

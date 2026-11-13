@@ -484,13 +484,17 @@ fn minor_conformer_gln2_competition_synthetic_and_real_ubiquitin() {
             );
             if target_k == 1 {
                 assert!(
-                    real_sys[s_assigned].rel_root_height.unwrap_or(1.0) >= 0.45,
+                    real_sys[s_assigned]
+                        .rel_root_intensity
+                        .or(real_sys[s_assigned].rel_root_height)
+                        .unwrap_or(1.0)
+                        >= 0.45,
                     "{label}: Gln2 winner must be the major-state conformer"
                 );
             }
         }
         for (s, ss) in real_sys.iter().enumerate() {
-            if ss.rel_root_height.unwrap_or(1.0) < 0.15 {
+            if ss.rel_root_intensity.or(ss.rel_root_height).unwrap_or(1.0) < 0.15 {
                 assert_ne!(
                     real_res.position[s], 1,
                     "{label}: sub-stoichiometric root s={s} must not occupy Gln2 (k=1)"
@@ -709,5 +713,100 @@ fn evo_graph_confidence_calibration_ece_gate() {
         curve.hc_precision.unwrap_or(0.0) >= 0.96,
         "Pooled HC precision must remain >= 96%, got {}",
         curve.hc_status
+    );
+}
+
+#[test]
+fn p1_5_volume_preferred_minor_conformer_over_broadened_height() {
+    let priors = Priors::bmrb();
+    let seq: Vec<String> = ["MET", "GLN", "ILE", "PHE", "VAL", "LYS"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let shifts: [(f64, f64, f64, Option<f64>, f64); 6] = [
+        (8.30, 120.0, 55.4, Some(32.8), 175.8), // Met1
+        (8.45, 121.2, 55.9, Some(29.2), 175.9), // Gln2
+        (8.18, 119.5, 61.2, Some(38.9), 175.2), // Ile3
+        (8.62, 122.4, 57.6, Some(40.1), 174.9), // Phe4
+        (8.05, 118.2, 62.1, Some(33.0), 175.1), // Val5
+        (8.39, 121.8, 56.8, Some(33.1), 176.2), // Lys6
+    ];
+
+    let mut peaks = Vec::new();
+    for k in 1..seq.len() {
+        let (h, n, ca0, cb0, c0) = shifts[k];
+        let (_, _, cam1, cbm1, cm1) = shifts[k - 1];
+        // Exchange-broadened major Gln2 (k=1) has lower peak height (140) than sharp minor (190),
+        // but full stoichiometric integrated volume (5000 vs 400 -> r = 0.08 < 0.15).
+        let (ht, vol) = if k == 1 {
+            (140.0, 5000.0)
+        } else {
+            (1000.0, 5000.0)
+        };
+        let mut root = hsqc_with_height(h, n, ht);
+        root.volume = Some(vol);
+        peaks.push(root);
+        for (exp, c_val, sign) in [
+            ("HNCACB", ca0, 1),
+            ("HNCACB", cam1, 1),
+            ("CBCACONH", cam1, 1),
+            ("HNCO", cm1, 1),
+            ("HNCACO", c0, 1),
+            ("HNCACO", cm1, 1),
+        ] {
+            peaks.push(triple_with_height(exp, h, n, c_val, sign, 400.0));
+        }
+        if let Some(cb) = cb0 {
+            peaks.push(triple_with_height("HNCACB", h, n, cb, -1, -350.0));
+        }
+        if let Some(cb_prev) = cbm1 {
+            peaks.push(triple_with_height("HNCACB", h, n, cb_prev, -1, -300.0));
+            peaks.push(triple_with_height("CBCACONH", h, n, cb_prev, 1, 350.0));
+        }
+    }
+    // Add overlap candidates on major Gln2 (s=0) so multiplicity penalty favors minor unless damped
+    for (exp, extra_c, sign) in [
+        ("HNCACB", 61.9, 1),
+        ("CBCACONH", 61.9, 1),
+        ("HNCO", 173.4, 1),
+    ] {
+        peaks.push(triple_with_height(exp, 8.45, 121.2, extra_c, sign, 300.0));
+    }
+    // Sharp minor slow-exchange Gln2 root (s=5): height 190 > major 140, but volume 400 = 0.08 * median!
+    let (h_min, n_min) = (8.33, 120.5);
+    let mut minor_root = hsqc_with_height(h_min, n_min, 190.0);
+    minor_root.volume = Some(400.0);
+    peaks.push(minor_root);
+    for (exp, c_val, sign) in [
+        ("HNCACB", 55.92, 1),
+        ("HNCACB", 29.18, -1),
+        ("CBCACONH", 55.38, 1),
+        ("CBCACONH", 32.82, 1),
+        ("HNCO", 175.81, 1),
+        ("HNCACO", 175.88, 1),
+    ] {
+        peaks.push(triple_with_height(
+            exp,
+            h_min,
+            n_min,
+            c_val,
+            sign,
+            (sign as f64) * 80.0,
+        ));
+    }
+
+    let built = build_spin_systems(&peaks, &Tolerances::default(), 4, false).expect("systems");
+    assert!((built[0].rel_root_intensity.unwrap() - 1.0).abs() < 1e-6);
+    assert!((built[5].rel_root_intensity.unwrap() - 0.08).abs() < 1e-6);
+
+    let evo_cfg = EvoGraphConfig {
+        seed: 0,
+        ..EvoGraphConfig::default()
+    };
+    let (_, res, rep) = assign_evo_graph_from_peaks(&peaks, &seq, &priors, &evo_cfg);
+    let s_major = rep.kept_hsqc_indices.iter().position(|&i| i == 0).unwrap();
+    assert_eq!(
+        res.position[s_major], 1,
+        "Broadened full-volume major Gln2 root must win residue k=1"
     );
 }

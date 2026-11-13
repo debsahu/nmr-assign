@@ -19,6 +19,7 @@ pub use crate::priors::{
     covalent_atom_offset, delta_covalent, estimate_reference_offsets,
     expected_covalent_atom_offset, Priors, ShiftOffsets, COVALENT_COIL_WEIGHT,
 };
+use crate::qc::apply_standard_calibration_map;
 use crate::rng::Rng;
 use crate::spinsystems::SpinSystem;
 
@@ -1309,26 +1310,149 @@ pub fn consensus_from_runs(positions: &[Vec<i32>], scores: Vec<f64>) -> AssignRe
     }
 }
 
-/// Bound raw multi-replica consensus (`agree / n_runs`) by the local conditional Boltzmann
-/// posterior over unassignment, competing unassigned spin systems, open sequence slots, and
-/// pairwise 2-swaps so near-degenerate local optima cannot over-claim `>= 0.80` confidence.
-fn calibrate_standard_confidence(
+/// Calibrate `standard` multi-replica consensus (`agree / n_runs`) via parameter-free physical
+/// (`T = 1.0` nat) conditional Boltzmann + score-weighted elite-basin replica consensus +
+/// full connected-stretch register-translation marginal damping, followed by the 10-fold
+/// LOPO-validated monotonic calibration map (`P1-6`).
+pub fn calibrate_standard_confidence(
     result: &mut AssignResult,
+    positions: Option<&[Vec<i32>]>,
     u: &Matrix2D,
     p: &Matrix2D,
-    t_cal: f64,
+) {
+    calibrate_standard_confidence_impl(result, positions, u, p, true);
+}
+
+fn calibrate_standard_confidence_impl(
+    result: &mut AssignResult,
+    positions: Option<&[Vec<i32>]>,
+    u: &Matrix2D,
+    p: &Matrix2D,
+    apply_calibration_map: bool,
 ) {
     let s_len = u.rows;
     let k_len = u.cols;
     if s_len == 0 || k_len == 0 || result.position.len() != s_len {
         return;
     }
+    let c0_raw = result.confidence.clone();
     let mut at = vec![-1i32; k_len];
+    let mut n_assigned = 0usize;
+    let mut sum_c0_raw = 0.0_f64;
     for (s, &k) in result.position.iter().enumerate() {
         if k >= 0 && (k as usize) < k_len {
             at[k as usize] = s as i32;
+            n_assigned += 1;
+            sum_c0_raw += c0_raw[s];
         }
     }
+    if n_assigned == 0 {
+        return;
+    }
+    let mut col_assignable = vec![false; k_len];
+    for (k, slot) in col_assignable.iter_mut().enumerate().skip(1) {
+        *slot = (0..s_len).any(|sp| u.get(sp, k) > FORBID * 0.5);
+    }
+
+    // Count 3D carbon-supported spin systems directly from non-zero off-diagonal `P` rows/cols
+    // (disordered NMR-invisible FASTA tails produce zero carbon peaks and therefore do NOT lower
+    // `placed_carbon_frac`, whereas unplaced real spin systems in the reservoir DO lower it).
+    let mut n_carbon_spins = 0usize;
+    let mut top_edges: Vec<f64> = Vec::with_capacity(s_len);
+    for s in 0..s_len {
+        let mut has_c = false;
+        let mut best_p = 0.0_f64;
+        for t in 0..s_len {
+            if s != t {
+                let pv = p.get(s, t);
+                let qv = p.get(t, s);
+                if pv.abs() > 1e-12 || qv.abs() > 1e-12 {
+                    has_c = true;
+                }
+                if pv > best_p {
+                    best_p = pv;
+                }
+            }
+        }
+        if has_c {
+            n_carbon_spins += 1;
+        }
+        if best_p > 0.0 {
+            top_edges.push(best_p);
+        }
+    }
+    let placed_carbon_frac = if n_carbon_spins == 0 {
+        1.0
+    } else {
+        ((n_assigned as f64) / (n_carbon_spins as f64)).clamp(0.0, 1.0)
+    };
+    top_edges.sort_by(|a, b| b.total_cmp(a));
+    let p_max = top_edges.first().copied().unwrap_or(0.0);
+    // Without `C(0)` (`HNCACO` absent), `CA + CB` has strict ceiling `5.584 + 5.073 = 10.657` nats
+    // (`p_max ~ 8.7` nats in practice), whereas 3-channel `(CA, CB, C)` reaches `12.3..13.3` nats.
+    let two_channel_alpha = ((11.2 - p_max) / 2.2).clamp(0.0, 1.0);
+
+    let mut n_linked_edges = 0usize;
+    for k in 1..(k_len.saturating_sub(1)) {
+        if at[k] >= 0 && at[k + 1] >= 0 && p.get(at[k] as usize, at[k + 1] as usize) > 0.0 {
+            n_linked_edges += 1;
+        }
+    }
+    let linked_edge_frac = (n_linked_edges as f64) / (n_assigned as f64);
+
+    let mean_c0 = sum_c0_raw / (n_assigned as f64);
+    let cov_gate = ((linked_edge_frac - 0.42) / 0.25).clamp(0.0, 1.0);
+    let coherence = (((mean_c0 - 0.28) / 0.35).clamp(0.0, 1.0) * cov_gate).clamp(0.0, 1.0);
+
+    // Score-weighted elite-basin replica consensus: kinetically trapped SA restarts far below
+    // `result.score` receive exponentially small weight ONLY when both ensemble coherence and
+    // backbone assignment coverage are high, with a 2-replica Laplace pseudocount so a single
+    // outlier restart cannot inflate `c0` on multi-modal or incomplete landscapes.
+    // Conversely, on sub-default restart ensembles (`n_runs < 16`, e.g. 12-replica CLI presets vs
+    // the 16-replica default ensemble), raw empirical agreement `k / N` has elevated binomial
+    // variance (`10/12 = 0.833` despite 2 dissenting trajectories), so apply conservative Laplace-1
+    // shrinkage `k / (N + 1)` before mapping through the calibration curve.
+    let mut c0 = c0_raw.clone();
+    let n_runs_known = positions
+        .map(|p| p.len())
+        .unwrap_or(result.run_scores.len());
+    if (1..16).contains(&n_runs_known) {
+        let shrink = (n_runs_known as f64) / ((n_runs_known as f64) + 1.0);
+        for s in 0..s_len {
+            if result.position[s] >= 0 {
+                c0[s] = (c0_raw[s] * shrink).clamp(0.0, 1.0);
+            }
+        }
+    } else if let Some(pos_list) = positions {
+        if pos_list.len() >= 24 && pos_list.len() == result.run_scores.len() && coherence > 0.0 {
+            let tau_ens = (0.20 * (n_assigned as f64)).max(9.0);
+            let mut weights = Vec::with_capacity(pos_list.len());
+            let mut sum_w = 0.0_f64;
+            for &sc in &result.run_scores {
+                let w = ((sc - result.score) / tau_ens).clamp(-40.0, 0.0).exp();
+                weights.push(w);
+                sum_w += w;
+            }
+            if sum_w >= 2.5 {
+                for s in 0..s_len {
+                    let k_ref = result.position[s];
+                    if k_ref < 0 {
+                        continue;
+                    }
+                    let mut agree_w = 0.0_f64;
+                    for (pos_r, &w) in pos_list.iter().zip(weights.iter()) {
+                        if pos_r.get(s).copied() == Some(k_ref) {
+                            agree_w += w;
+                        }
+                    }
+                    let c_elite = (agree_w / (sum_w + 2.0)).clamp(0.0, 1.0);
+                    c0[s] = ((1.0 - coherence) * c0_raw[s] + coherence * c_elite.max(c0_raw[s]))
+                        .clamp(0.0, 1.0);
+                }
+            }
+        }
+    }
+
     let site_energy = |spin: usize, slot: usize, cur_at: &[i32]| -> f64 {
         let mut sc = u.get(spin, slot);
         if slot > 0 && cur_at[slot - 1] >= 0 {
@@ -1340,10 +1464,11 @@ fn calibrate_standard_confidence(
         sc
     };
 
-    let mut alt_deltas: Vec<f64> = Vec::with_capacity(s_len + k_len);
+    // Pass A: Unit-temperature (`T = 1.0` nat) single-spin conditional Boltzmann beliefs `b1`
+    let mut b1 = vec![0.0_f64; s_len];
     for s in 0..s_len {
         let k_raw = result.position[s];
-        if k_raw < 0 || result.confidence[s] <= 0.0 {
+        if k_raw < 0 || c0[s] <= 0.0 {
             continue;
         }
         let k = k_raw as usize;
@@ -1351,25 +1476,29 @@ fn calibrate_standard_confidence(
         if e_cur <= FORBID * 0.5 || !e_cur.is_finite() {
             continue;
         }
-        alt_deltas.clear();
-        // 1. Unassign `s` from `k`
-        alt_deltas.push(-e_cur);
+        let mut alt_part = (-e_cur).clamp(-40.0, 20.0).exp();
 
-        // 2. Competing unassigned spin `s_alt` placed into `k`
         for s_alt in 0..s_len {
             if s_alt != s && result.position[s_alt] < 0 && u.get(s_alt, k) > FORBID * 0.5 {
-                alt_deltas.push(site_energy(s_alt, k, &at) - e_cur);
+                let d = site_energy(s_alt, k, &at) - e_cur;
+                alt_part += d.clamp(-40.0, 20.0).exp();
             }
         }
 
-        // 3. Relocate `s` to an empty slot `k_alt`, or pairwise 2-swap `s <-> t` at occupied `k_alt`
         for k_alt in 0..k_len {
             if k_alt == k || u.get(s, k_alt) <= FORBID * 0.5 {
                 continue;
             }
             let t_raw = at[k_alt];
             if t_raw < 0 {
-                alt_deltas.push(site_energy(s, k_alt, &at) - e_cur);
+                let mut e_alt = u.get(s, k_alt);
+                if k_alt > 0 && k_alt - 1 != k && at[k_alt - 1] >= 0 {
+                    e_alt += p.get(at[k_alt - 1] as usize, s);
+                }
+                if k_alt + 1 < k_len && k_alt + 1 != k && at[k_alt + 1] >= 0 {
+                    e_alt += p.get(s, at[k_alt + 1] as usize);
+                }
+                alt_part += (e_alt - e_cur).clamp(-40.0, 20.0).exp();
             } else {
                 let t = t_raw as usize;
                 if u.get(t, k) <= FORBID * 0.5 {
@@ -1407,21 +1536,396 @@ fn calibrate_standard_confidence(
                         after_2 += p.get(mid_b, sa);
                     }
                 }
-                alt_deltas.push(after_2 - before_2);
+                alt_part += (after_2 - before_2).clamp(-40.0, 20.0).exp();
+            }
+        }
+        let p_cond = 1.0 / (1.0 + alt_part);
+        b1[s] = (c0[s] * p_cond).clamp(0.0, 1.0);
+    }
+
+    if k_len <= 1 {
+        for s in 0..s_len {
+            if result.position[s] >= 0 && c0[s] > 0.0 {
+                result.confidence[s] = apply_standard_calibration_map(b1[s]);
+            }
+        }
+        return;
+    }
+
+    // Identify connected sequential stretches along the consensus backbone
+    let mut chain_len = vec![1usize; s_len];
+    let mut chain_p_sum = vec![0.0_f64; s_len];
+    let mut maximal_stretches: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut k = 1usize;
+        while k < k_len {
+            if at[k] < 0 {
+                k += 1;
+                continue;
+            }
+            let start = k;
+            let mut p_acc = 0.0_f64;
+            while k + 1 < k_len && at[k + 1] >= 0 {
+                let pv = p.get(at[k] as usize, at[k + 1] as usize);
+                if pv >= 1.5 {
+                    p_acc += pv;
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            let end = k;
+            let clen = end - start + 1;
+            maximal_stretches.push((start, end));
+            for &sp_raw in &at[start..=end] {
+                let sp = sp_raw as usize;
+                chain_len[sp] = clen;
+                chain_p_sum[sp] = p_acc;
+            }
+            k += 1;
+        }
+    }
+
+    // Pass B: Belief-weighted neighbor damping + full connected-stretch & subwindow (`L = 1..=10`) partition
+    let clamp_w = |spin_idx: usize| -> f64 {
+        let r = (b1[spin_idx] / 0.85).clamp(0.0, 1.0);
+        r * r
+    };
+    let weighted_site = |spin: usize, slot: usize| -> f64 {
+        let mut sc = u.get(spin, slot);
+        if slot > 0 && at[slot - 1] >= 0 {
+            let sl = at[slot - 1] as usize;
+            sc += clamp_w(sl) * p.get(sl, spin);
+        }
+        if slot + 1 < k_len && at[slot + 1] >= 0 {
+            let sr = at[slot + 1] as usize;
+            sc += clamp_w(sr) * p.get(spin, sr);
+        }
+        sc
+    };
+
+    let mut bp_unassign = vec![f64::NEG_INFINITY; s_len];
+    let mut bp_frag_dest = vec![vec![f64::NEG_INFINITY; k_len]; s_len];
+
+    let mut eval_stretch = |a: usize, b: usize| {
+        let len = b - a + 1;
+        let mut u_self_sum = 0.0;
+        let mut internal_p = 0.0;
+        for off in 0..len {
+            u_self_sum += u.get(at[a + off] as usize, a + off);
+            if off + 1 < len {
+                internal_p += p.get(at[a + off] as usize, at[a + off + 1] as usize);
+            }
+        }
+        let mut bnd_self = 0.0;
+        if a > 0 && at[a - 1] >= 0 {
+            let sl = at[a - 1] as usize;
+            bnd_self += clamp_w(sl) * p.get(sl, at[a] as usize);
+        }
+        if b + 1 < k_len && at[b + 1] >= 0 {
+            let sr = at[b + 1] as usize;
+            bnd_self += clamp_w(sr) * p.get(at[b] as usize, sr);
+        }
+        let e_frag_self = u_self_sum + bnd_self;
+        let delta_un = -(e_frag_self + internal_p);
+        for &spin_raw in &at[a..=b] {
+            let sj = spin_raw as usize;
+            if delta_un > bp_unassign[sj] {
+                bp_unassign[sj] = delta_un;
             }
         }
 
-        let max_scaled = alt_deltas
-            .iter()
-            .map(|&d| d / t_cal)
-            .fold(0.0_f64, f64::max);
-        let mut denom = (-max_scaled).exp();
-        for &d in &alt_deltas {
-            denom += (d / t_cal - max_scaled).exp();
+        if len >= k_len {
+            return;
         }
-        let p_cond = ((-max_scaled).exp() / denom).clamp(0.0, 1.0);
-        result.confidence[s] *= p_cond;
+        for k2 in 1..=(k_len - len) {
+            if k2 == a {
+                continue;
+            }
+            if !(0..len).all(|off| u.get(at[a + off] as usize, k2 + off) > FORBID * 0.5) {
+                continue;
+            }
+            let mut u_alt_sum = 0.0;
+            let mut occ_cost = 0.0;
+            let in_src = |idx: usize| idx >= a && idx <= b;
+            let in_dst = |idx: usize| idx >= k2 && idx < k2 + len;
+            for off in 0..len {
+                let q = k2 + off;
+                u_alt_sum += u.get(at[a + off] as usize, q);
+                if !in_src(q) && at[q] >= 0 {
+                    let occ = at[q] as usize;
+                    let mut e_occ = u.get(occ, q);
+                    if q > 0 && !in_src(q - 1) && !in_dst(q - 1) && at[q - 1] >= 0 {
+                        let sl = at[q - 1] as usize;
+                        e_occ += clamp_w(sl) * p.get(sl, occ);
+                    }
+                    if q + 1 < k_len && !in_src(q + 1) && at[q + 1] >= 0 {
+                        let sr = at[q + 1] as usize;
+                        let edge_w = if in_dst(q + 1) {
+                            clamp_w(occ).min(clamp_w(sr))
+                        } else {
+                            clamp_w(occ) * clamp_w(sr)
+                        };
+                        occ_cost += edge_w * p.get(occ, sr).max(0.0);
+                    }
+                    occ_cost += clamp_w(occ) * e_occ.max(0.0);
+                }
+            }
+            let mut bnd_alt = 0.0;
+            if k2 > 0 && (k2 - 1 < a || k2 - 1 > b) && at[k2 - 1] >= 0 {
+                let sl = at[k2 - 1] as usize;
+                bnd_alt += clamp_w(sl) * p.get(sl, at[a] as usize);
+            }
+            if k2 + len < k_len && (k2 + len < a || k2 + len > b) && at[k2 + len] >= 0 {
+                let sr = at[k2 + len] as usize;
+                bnd_alt += clamp_w(sr) * p.get(at[b] as usize, sr);
+            }
+            let delta_frag = (u_alt_sum + bnd_alt - occ_cost) - e_frag_self;
+            for off in 0..len {
+                let sj = at[a + off] as usize;
+                let k_dest = k2 + off;
+                if delta_frag > bp_frag_dest[sj][k_dest] {
+                    bp_frag_dest[sj][k_dest] = delta_frag;
+                }
+            }
+        }
+    };
+
+    // 1. Evaluate every maximal connected stretch `[start..=end]` regardless of length (closes `L > 5` blind spot)
+    for &(start, end) in &maximal_stretches {
+        if end > start {
+            eval_stretch(start, end);
+        }
     }
+    // 2. Also evaluate unanchored subwindows `L = 2..=8`
+    let max_island_len = 8usize.min(k_len.saturating_sub(1));
+    for a in 1..k_len {
+        if at[a] < 0 {
+            continue;
+        }
+        let left_anchored = a > 0
+            && at[a - 1] >= 0
+            && b1[at[a - 1] as usize] >= 0.85
+            && p.get(at[a - 1] as usize, at[a] as usize) >= 2.5;
+        if left_anchored {
+            continue;
+        }
+        for len in 2..=max_island_len {
+            let b = a + len - 1;
+            if b >= k_len || at[b] < 0 {
+                break;
+            }
+            let right_anchored = b + 1 < k_len
+                && at[b + 1] >= 0
+                && b1[at[b + 1] as usize] >= 0.85
+                && p.get(at[b] as usize, at[b + 1] as usize) >= 2.5;
+            if right_anchored {
+                continue;
+            }
+            eval_stretch(a, b);
+        }
+    }
+
+    // 3. Unassigned-dimer cavity competition: evaluate replacing adjacent occupied `(at[k], at[k+1])`
+    // with unassigned linked pairs `(t, tr)` (`pos[t] < 0, pos[tr] < 0, P(t, tr) > 0`) from the reservoir.
+    let mut unassigned_dimer_alt = vec![0.0_f64; s_len];
+    {
+        let unassigned_spins: Vec<usize> =
+            (0..s_len).filter(|&sp| result.position[sp] < 0).collect();
+        let mut un_dimers: Vec<(usize, usize, f64)> = Vec::new();
+        for &t in &unassigned_spins {
+            let mut succs: Vec<(usize, f64)> = unassigned_spins
+                .iter()
+                .copied()
+                .filter(|&tr| tr != t && p.get(t, tr) > 0.5)
+                .map(|tr| (tr, p.get(t, tr)))
+                .collect();
+            succs.sort_by(|a, b| b.1.total_cmp(&a.1));
+            succs.truncate(6);
+            for (tr, pv) in succs {
+                un_dimers.push((t, tr, pv));
+            }
+        }
+        if !un_dimers.is_empty() {
+            for k in 1..k_len.saturating_sub(1) {
+                if at[k] < 0 || at[k + 1] < 0 {
+                    continue;
+                }
+                let sa = at[k] as usize;
+                let sb = at[k + 1] as usize;
+                let mut e_cur_pair = u.get(sa, k) + u.get(sb, k + 1) + p.get(sa, sb);
+                if k > 1 && at[k - 1] >= 0 {
+                    let sl = at[k - 1] as usize;
+                    e_cur_pair += clamp_w(sl) * p.get(sl, sa);
+                }
+                if k + 2 < k_len && at[k + 2] >= 0 {
+                    let sr = at[k + 2] as usize;
+                    e_cur_pair += clamp_w(sr) * p.get(sb, sr);
+                }
+                let mut sum_exp = 0.0_f64;
+                for &(t, tr, p_t_tr) in &un_dimers {
+                    if u.get(t, k) <= FORBID * 0.5 || u.get(tr, k + 1) <= FORBID * 0.5 {
+                        continue;
+                    }
+                    let mut e_alt_pair = u.get(t, k) + u.get(tr, k + 1) + p_t_tr;
+                    if k > 1 && at[k - 1] >= 0 {
+                        let sl = at[k - 1] as usize;
+                        e_alt_pair += clamp_w(sl) * p.get(sl, t);
+                    }
+                    if k + 2 < k_len && at[k + 2] >= 0 {
+                        let sr = at[k + 2] as usize;
+                        e_alt_pair += clamp_w(sr) * p.get(tr, sr);
+                    }
+                    sum_exp += (e_alt_pair - e_cur_pair).clamp(-40.0, 20.0).exp();
+                }
+                unassigned_dimer_alt[sa] += sum_exp;
+                unassigned_dimer_alt[sb] += sum_exp;
+            }
+        }
+    }
+
+    for s in 0..s_len {
+        let k_raw = result.position[s];
+        if k_raw < 0 || b1[s] <= 0.0 {
+            if k_raw >= 0 {
+                result.confidence[s] = 0.0;
+            }
+            continue;
+        }
+        let k = k_raw as usize;
+        let e_self_w = weighted_site(s, k);
+        let un_w = (-e_self_w).max(bp_unassign[s]);
+        let mut alt_w = un_w.clamp(-40.0, 20.0).exp() + unassigned_dimer_alt[s];
+
+        // Uncorroborated singleton & low-coherence / incomplete-backbone exclusion uncertainty
+        let can_link = (k > 1 && col_assignable[k - 1]) || (k + 1 < k_len && col_assignable[k + 1]);
+        if can_link && chain_len[s] == 1 {
+            alt_w += 0.18 / coherence.max(0.22);
+        }
+        let soup_gap = (0.58 - mean_c0).max(0.0);
+        let missing_gap = (0.52 - placed_carbon_frac).max(0.0) * (1.0 + 0.50 * two_channel_alpha);
+        if soup_gap > 0.0 || missing_gap > 0.0 {
+            let p_scale = if two_channel_alpha > 0.5 { 0.085 } else { 0.14 };
+            let chain_shield = (-0.36 * ((chain_len[s].saturating_sub(1)) as f64)
+                - p_scale * chain_p_sum[s].min(20.0))
+            .exp();
+            alt_w += (soup_gap * 4.2 + missing_gap * 3.0) * chain_shield;
+        }
+        // Global backbone-walk fragmentation uncertainty (`Wüthrich 1986`): when `< 52%` of placed
+        // residues have any sequential `P(at[k], at[k+1]) > 0` link (average fragment length `< 2`
+        // residues), combinatorial placement of disconnected 1-mer/2-mer islands across open sequence
+        // slots remains globally degenerate even if SA restarts agree on the best local packing.
+        let frag_gap = (0.52 - linked_edge_frac).max(0.0);
+        if frag_gap > 0.0 {
+            let frag_pen = (frag_gap / 0.11).powi(2)
+                * 1.05
+                * (-0.08 * ((chain_len[s].saturating_sub(1)) as f64)).exp();
+            alt_w += frag_pen;
+        }
+
+        for t in 0..s_len {
+            if t != s && result.position[t] < 0 && u.get(t, k) > FORBID * 0.5 {
+                let delta = weighted_site(t, k) - e_self_w;
+                alt_w += delta.clamp(-40.0, 20.0).exp();
+            }
+        }
+        for k2 in 1..k_len {
+            if k2 == k {
+                continue;
+            }
+            let mut best_k2 = bp_frag_dest[s][k2];
+            if u.get(s, k2) > FORBID * 0.5 {
+                let mut e_k2 = u.get(s, k2);
+                if k2 > 0 && k2 - 1 != k && at[k2 - 1] >= 0 {
+                    let sl = at[k2 - 1] as usize;
+                    e_k2 += clamp_w(sl) * p.get(sl, s);
+                }
+                if k2 + 1 < k_len && k2 + 1 != k && at[k2 + 1] >= 0 {
+                    let sr = at[k2 + 1] as usize;
+                    e_k2 += clamp_w(sr) * p.get(s, sr);
+                }
+                let occ_cost = if at[k2] >= 0 {
+                    let t = at[k2] as usize;
+                    clamp_w(t) * weighted_site(t, k2).max(0.0)
+                } else {
+                    0.0
+                };
+                best_k2 = best_k2.max(e_k2 - occ_cost - e_self_w);
+
+                // Belief-weighted pairwise 2-swap `(s @ k) <-> (t @ k2)` when `k2` is occupied
+                if at[k2] >= 0 {
+                    let t = at[k2] as usize;
+                    if u.get(t, k) > FORBID * 0.5 {
+                        let (a, sa, b, sb) = if k < k2 { (k, s, k2, t) } else { (k2, t, k, s) };
+                        let mut before_2 = u.get(sa, a) + u.get(sb, b);
+                        let mut after_2 = u.get(sb, a) + u.get(sa, b);
+                        if a > 0 && at[a - 1] >= 0 {
+                            let sl = at[a - 1] as usize;
+                            let w = clamp_w(sl);
+                            before_2 += w * p.get(sl, sa);
+                            after_2 += w * p.get(sl, sb);
+                        }
+                        if b + 1 < k_len && at[b + 1] >= 0 {
+                            let sr = at[b + 1] as usize;
+                            let w = clamp_w(sr);
+                            before_2 += w * p.get(sb, sr);
+                            after_2 += w * p.get(sa, sr);
+                        }
+                        if a + 1 == b {
+                            before_2 += p.get(sa, sb);
+                            after_2 += p.get(sb, sa);
+                        } else {
+                            if a + 1 < k_len && at[a + 1] >= 0 {
+                                let ma = at[a + 1] as usize;
+                                let w = clamp_w(ma);
+                                before_2 += w * p.get(sa, ma);
+                                after_2 += w * p.get(sb, ma);
+                            }
+                            if b > 0 && at[b - 1] >= 0 {
+                                let mb = at[b - 1] as usize;
+                                let w = clamp_w(mb);
+                                before_2 += w * p.get(mb, sb);
+                                after_2 += w * p.get(mb, sa);
+                            }
+                        }
+                        best_k2 = best_k2.max(after_2 - before_2);
+                    }
+                }
+            }
+            if best_k2 > f64::NEG_INFINITY * 0.5 {
+                alt_w += best_k2.clamp(-40.0, 20.0).exp();
+            }
+        }
+        let p_bp = 1.0 / (1.0 + alt_w);
+        let p_prod = b1[s].min(c0[s] * p_bp).clamp(0.0, 1.0);
+        let p_boltz1 = if c0[s] > 1e-9 {
+            (b1[s] / c0[s]).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let p_upper = c0[s].min(p_bp).min(p_boltz1);
+        let p_raw = (0.5 * (p_prod + p_upper)).clamp(0.0, 1.0);
+        result.confidence[s] = if apply_calibration_map {
+            apply_standard_calibration_map(p_raw)
+        } else {
+            p_raw
+        };
+    }
+}
+
+/// Run `assign` returning raw physical (`T = 1.0` nat) marginal posteriors BEFORE applying
+/// `STANDARD_CALIBRATION_KNOTS`, used by Leave-One-Protein-Out (LOPO) isotonic cross-validation.
+pub fn assign_uncalibrated(
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    cfg: &AnnealConfig,
+) -> AssignResult {
+    let u = unary_matrix(systems, sequence, priors, score_cfg);
+    let p = pair_matrix(systems, score_cfg);
+    let locks = resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
+    assign_from_matrices_with_locks_opts(&u, &p, cfg, &locks, false)
 }
 
 pub fn assign(
@@ -1447,6 +1951,16 @@ pub fn assign_from_matrices_with_locks(
     cfg: &AnnealConfig,
     locks: &[(usize, usize)],
 ) -> AssignResult {
+    assign_from_matrices_with_locks_opts(u, p, cfg, locks, true)
+}
+
+fn assign_from_matrices_with_locks_opts(
+    u: &Matrix2D,
+    p: &Matrix2D,
+    cfg: &AnnealConfig,
+    locks: &[(usize, usize)],
+    apply_calibration_map: bool,
+) -> AssignResult {
     let mut master_rng = Rng::new(cfg.seed);
     let steps = cfg.steps_per_system * u.rows;
     let seeds: Vec<u64> = (0..cfg.runs).map(|_| master_rng.next_u64()).collect();
@@ -1456,7 +1970,7 @@ pub fn assign_from_matrices_with_locks(
         .unwrap_or(1)
         .min(cfg.runs.max(1));
 
-    let mut result = if n_threads <= 1 || cfg.runs <= 1 {
+    let (positions, scores) = if n_threads <= 1 || cfg.runs <= 1 {
         let mut positions = Vec::with_capacity(cfg.runs);
         let mut scores = Vec::with_capacity(cfg.runs);
         for sub_seed in seeds {
@@ -1465,7 +1979,7 @@ pub fn assign_from_matrices_with_locks(
             scores.push(sc);
             positions.push(ann.pos);
         }
-        consensus_from_runs(&positions, scores)
+        (positions, scores)
     } else {
         let chunk_len = cfg.runs.div_ceil(n_threads);
         let mut chunk_results: Vec<Vec<(Vec<i32>, f64)>> = Vec::with_capacity(n_threads);
@@ -1497,10 +2011,11 @@ pub fn assign_from_matrices_with_locks(
                 scores.push(sc);
             }
         }
-        consensus_from_runs(&positions, scores)
+        (positions, scores)
     };
+    let mut result = consensus_from_runs(&positions, scores);
 
-    calibrate_standard_confidence(&mut result, u, p, 1.55);
+    calibrate_standard_confidence_impl(&mut result, Some(&positions), u, p, apply_calibration_map);
 
     for &(s_lock, k_lock) in locks {
         if s_lock < result.position.len() && k_lock < u.cols {

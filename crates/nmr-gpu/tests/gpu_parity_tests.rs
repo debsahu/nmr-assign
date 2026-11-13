@@ -17,7 +17,8 @@ use nmr_core::priors::Priors;
 use nmr_core::rng::Rng;
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::solver::{
-    assign_from_matrices, pair_matrix, unary_matrix, AnnealConfig, Matrix2D, ScoreConfig, FORBID,
+    assign_from_matrices, calibrate_standard_confidence, consensus_from_runs, pair_matrix,
+    resolve_locked_assignments, unary_matrix, AnnealConfig, Matrix2D, ScoreConfig, FORBID,
 };
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d, AxisPpm, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
@@ -791,4 +792,185 @@ fn test_gpu_covalent_pre_proline_unary_parity() {
         }
     }
     println!("Covalent pre-Proline U-matrix max_abs_diff = {max_diff:.3e}");
+}
+
+#[test]
+fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
+    let gpu = match GpuEngine::new_headless() {
+        Ok(g) => g,
+        Err(err) => {
+            eprintln!("Skipping WebGPU calibration test (no GPU adapter available): {err}");
+            return;
+        }
+    };
+
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let ref_data = read_star(star_path, None).unwrap();
+    let (peaks, _truth) = simulate(
+        &ref_data,
+        &SimConfig {
+            seed: 0,
+            ..SimConfig::default()
+        },
+    );
+    let systems = build_spin_systems(&peaks, &Tolerances::default(), 3, false).unwrap();
+    let priors = Priors::provisional();
+    let scfg = ScoreConfig::default();
+    let (u, p) = gpu
+        .score_matrices_gpu(&systems, &ref_data.sequence, &priors, &scfg)
+        .expect("GPU scoring matrices");
+
+    // 1. Single-replica (`runs == 1`) exact parity: `positions` is uniquely `[res_gpu.position]`,
+    //    so `anneal_from_matrices_gpu` must match `consensus_from_runs` + `calibrate_standard_confidence` bit-for-bit.
+    let res_single = gpu
+        .anneal_from_matrices_gpu(
+            &u,
+            &p,
+            &AnnealConfig {
+                runs: 1,
+                steps_per_system: 1500,
+                seed: 11,
+                ..AnnealConfig::default()
+            },
+        )
+        .expect("single-replica GPU anneal");
+    let single_positions = vec![res_single.position.clone()];
+    let mut expected_single = consensus_from_runs(&single_positions, res_single.run_scores.clone());
+    calibrate_standard_confidence(&mut expected_single, Some(&single_positions), &u, &p);
+    assert_eq!(
+        res_single.confidence.len(),
+        expected_single.confidence.len()
+    );
+    for (s, (&got, &exp)) in res_single
+        .confidence
+        .iter()
+        .zip(expected_single.confidence.iter())
+        .enumerate()
+    {
+        assert!(
+            (got - exp).abs() < 1e-12,
+            "single-replica calibrated confidence mismatch at spin {s}: gpu={got} vs expected={exp}"
+        );
+    }
+
+    // 2. Multi-replica (`runs == 16`) exact bit-for-bit parity on a well-separated heptapeptide
+    //    where all 16 GPU replicas converge to the identical global optimum (`run_scores` uniform),
+    //    plus 32-replica ubiquitin ensemble parity against CPU `assign_from_matrices`.
+    let pep_seq: Vec<String> = ["MET", "GLN", "ILE", "PHE", "PRO", "ALA", "GLY"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let bmrb = Priors::bmrb();
+    let mut pep_sys = Vec::new();
+    for &(h, n, ca0, cb0, cam1) in &[
+        (8.42, 120.5, 56.2, Some(29.1), 55.8),
+        (8.25, 121.8, 60.9, Some(38.4), 56.2),
+        (8.51, 119.3, 57.6, Some(39.5), 60.9),
+        (8.05, 123.1, 52.4, Some(19.1), 62.8),
+        (8.33, 109.4, 45.1, None, 52.4),
+    ] {
+        let mut ss = SpinSystem::new(h, n);
+        ss.cands.insert(("CA".to_string(), 0), vec![(ca0, 2)]);
+        ss.cands.insert(("CA".to_string(), -1), vec![(cam1, 2)]);
+        if let Some(cb) = cb0 {
+            ss.cands.insert(("CB".to_string(), 0), vec![(cb, 2)]);
+        }
+        pep_sys.push(ss);
+    }
+    let (u_pep, p_pep) = gpu
+        .score_matrices_gpu(&pep_sys, &pep_seq, &bmrb, &scfg)
+        .expect("heptapeptide GPU matrices");
+    let pep_cfg = AnnealConfig {
+        runs: 16,
+        steps_per_system: 1500,
+        seed: 7,
+        ..AnnealConfig::default()
+    };
+    let res_pep_gpu = gpu
+        .anneal_from_matrices_gpu(&u_pep, &p_pep, &pep_cfg)
+        .expect("heptapeptide 16-replica GPU anneal");
+    let pep_positions = vec![res_pep_gpu.position.clone(); 16];
+    let mut expected_pep = consensus_from_runs(&pep_positions, res_pep_gpu.run_scores.clone());
+    calibrate_standard_confidence(&mut expected_pep, Some(&pep_positions), &u_pep, &p_pep);
+    for (s, (&got, &exp)) in res_pep_gpu
+        .confidence
+        .iter()
+        .zip(expected_pep.confidence.iter())
+        .enumerate()
+    {
+        assert!(
+            (got - exp).abs() < 1e-12,
+            "16-replica converged confidence mismatch at spin {s}: gpu={got} vs expected={exp}"
+        );
+        assert!(got < 0.95, "unlocked calibrated confidence must be < 0.95");
+    }
+
+    let multi_cfg = AnnealConfig {
+        runs: 32,
+        steps_per_system: 2500,
+        seed: 0,
+        ..AnnealConfig::default()
+    };
+    let res_multi_gpu = gpu
+        .anneal_from_matrices_gpu(&u, &p, &multi_cfg)
+        .expect("multi-replica GPU anneal");
+    let res_multi_cpu = assign_from_matrices(&u, &p, &multi_cfg);
+    let mut n_assigned_unlocked = 0usize;
+    for (s, &k) in res_multi_gpu.position.iter().enumerate() {
+        if k >= 0 {
+            n_assigned_unlocked += 1;
+            let c = res_multi_gpu.confidence[s];
+            assert!(
+                (0.0..=0.9462 + 1e-9).contains(&c),
+                "unlocked GPU confidence at spin {s} escaped STANDARD_CALIBRATION_KNOTS ceiling: {c}"
+            );
+        } else {
+            assert_eq!(res_multi_gpu.confidence[s], 0.0);
+        }
+    }
+    assert!(n_assigned_unlocked >= 60);
+    assert_eq!(res_multi_gpu.position, res_multi_cpu.position);
+    let mean_abs_conf_diff = res_multi_gpu
+        .confidence
+        .iter()
+        .zip(res_multi_cpu.confidence.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f64>()
+        / (systems.len() as f64);
+    assert!(
+        mean_abs_conf_diff < 0.025,
+        "GPU vs CPU 32-replica mean calibrated confidence diff too large: {mean_abs_conf_diff:.4}"
+    );
+
+    // 3. Locked spins still pin strictly to `1.0` after calibration while unlocked spins stay calibrated.
+    let raw_locks = vec![(0usize, 1usize), (3usize, 4usize)];
+    let locks = resolve_locked_assignments(systems.len(), &ref_data.sequence, &raw_locks);
+    assert_eq!(locks.len(), 2);
+    let scfg_locked = ScoreConfig {
+        locked_assignments: raw_locks,
+        ..ScoreConfig::default()
+    };
+    let (u_locked, _) = gpu
+        .score_matrices_gpu(&systems, &ref_data.sequence, &priors, &scfg_locked)
+        .expect("locked GPU scoring matrices");
+    let res_locked = gpu
+        .anneal_from_matrices_with_locks_gpu(&u_locked, &p, &multi_cfg, &locks)
+        .expect("locked GPU anneal");
+    for &(s_lock, k_lock) in &locks {
+        assert_eq!(res_locked.position[s_lock], k_lock as i32);
+        assert_eq!(
+            res_locked.confidence[s_lock], 1.0,
+            "locked spin {s_lock} must pin to 1.0 after calibration"
+        );
+    }
+    let locked_spins: HashSet<usize> = locks.iter().map(|&(s, _)| s).collect();
+    for (s, &k) in res_locked.position.iter().enumerate() {
+        if k >= 0 && !locked_spins.contains(&s) {
+            assert!(
+                res_locked.confidence[s] <= 0.9462 + 1e-9,
+                "unlocked spin {s} in locked GPU run must remain calibrated (got {})",
+                res_locked.confidence[s]
+            );
+        }
+    }
 }

@@ -16,8 +16,9 @@ use bytemuck::{Pod, Zeroable};
 use nmr_core::priors::{delta_covalent, Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
 use nmr_core::solver::{
-    apply_locked_assignments_to_unary, consensus_from_runs, prepare_scoring_priors,
-    resolve_locked_assignments, AnnealConfig, AssignResult, Matrix2D, ScoreConfig, FORBID,
+    apply_locked_assignments_to_unary, calibrate_standard_confidence, consensus_from_runs,
+    prepare_scoring_priors, resolve_locked_assignments, AnnealConfig, AssignResult, Matrix2D,
+    ScoreConfig, FORBID,
 };
 use nmr_core::spinsystems::SpinSystem;
 use wgpu::util::DeviceExt;
@@ -972,6 +973,7 @@ impl GpuEngine {
         }
 
         let mut result = consensus_from_runs(&positions, exact_scores);
+        calibrate_standard_confidence(&mut result, Some(&positions), u, p);
         for &(s_lock, k_lock) in locks {
             if s_lock < result.position.len() && k_lock < k_len {
                 result.position[s_lock] = k_lock as i32;

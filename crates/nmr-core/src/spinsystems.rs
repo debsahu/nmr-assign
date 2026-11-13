@@ -54,10 +54,13 @@ pub struct SpinSystem {
     pub h: f64,
     pub n: f64,
     pub cands: BTreeMap<(String, i32), Vec<(f64, usize)>>,
-    /// Absolute root intensity (`|HSQC height|`, or max attached 3D `|height|` when HSQC lacks heights).
+    /// Absolute root intensity (`HSQC volume` when positive, else `|HSQC height|`, or max attached 3D intensity).
     pub root_height: Option<f64>,
-    /// Root intensity normalized by the median root intensity across carbon-bearing spin systems.
+    /// Volume-preferred relative root intensity (`rel_root_intensity`), retained as an alias for API compatibility.
     pub rel_root_height: Option<f64>,
+    /// Root intensity normalized by the median root intensity across carbon-bearing spin systems,
+    /// computed from integrated `Peak.volume` when positive (falling back to `|Peak.height|` only when volume is absent).
+    pub rel_root_intensity: Option<f64>,
 }
 
 impl SpinSystem {
@@ -68,6 +71,7 @@ impl SpinSystem {
             cands: BTreeMap::new(),
             root_height: None,
             rel_root_height: None,
+            rel_root_intensity: None,
         }
     }
 
@@ -435,9 +439,10 @@ pub fn build_spin_systems(
     Ok(systems)
 }
 
-/// Populate `root_height` and `rel_root_height` (`root_height / median_root_height`) on assembled
-/// `SpinSystem`s from HSQC peak heights (or max attached 3D peak height when HSQC lacks heights)
-/// without modifying candidate attachment, clustering, or ranking.
+/// Populate `root_height`, `rel_root_height` (`height / median_height`), and `rel_root_intensity`
+/// (`volume / median_volume` when positive integrated `Peak.volume` is present on HSQC roots,
+/// falling back to `rel_root_height` when volume is absent) on assembled `SpinSystem`s without
+/// modifying candidate attachment, clustering, or ranking.
 pub(crate) fn populate_root_heights(
     systems: &mut [SpinSystem],
     roots: &[&Peak],
@@ -446,12 +451,26 @@ pub(crate) fn populate_root_heights(
     if systems.len() != roots.len() || systems.len() != attached.len() {
         return;
     }
-    let has_hsqc_heights = roots
+    let n_hsqc_vol = roots
         .iter()
-        .any(|r| r.height.is_some_and(|h| h.is_finite() && h.abs() > 0.0));
+        .filter(|r| r.volume.is_some_and(|v| v.is_finite() && v > 0.0))
+        .count();
+    let n_hsqc_ht = roots
+        .iter()
+        .filter(|r| r.height.is_some_and(|h| h.is_finite() && h.abs() > 0.0))
+        .count();
+    let use_hsqc_ht = n_hsqc_ht > 0;
+    let use_hsqc_vol = n_hsqc_vol > 0 && (n_hsqc_ht == 0 || n_hsqc_vol * 2 >= n_hsqc_ht);
+    let use_3d_vol = !use_hsqc_vol
+        && !use_hsqc_ht
+        && attached
+            .iter()
+            .flat_map(|pl| pl.iter())
+            .any(|p| p.volume.is_some_and(|v| v.is_finite() && v > 0.0));
 
+    let mut raw_intensities: Vec<Option<f64>> = Vec::with_capacity(systems.len());
     for (j, ss) in systems.iter_mut().enumerate() {
-        ss.root_height = if has_hsqc_heights {
+        ss.root_height = if use_hsqc_ht {
             roots[j]
                 .height
                 .map(f64::abs)
@@ -464,6 +483,23 @@ pub(crate) fn populate_root_heights(
                     Some(acc.map_or(h, |a| a.max(h)))
                 })
         };
+        let vol_or_ht = if use_hsqc_vol {
+            roots[j]
+                .volume
+                .filter(|&v| v.is_finite() && v > 0.0)
+                .or(ss.root_height)
+        } else if use_3d_vol {
+            attached[j]
+                .iter()
+                .filter_map(|p| p.volume.filter(|&v| v.is_finite() && v > 0.0))
+                .fold(None, |acc: Option<f64>, v| {
+                    Some(acc.map_or(v, |a| a.max(v)))
+                })
+                .or(ss.root_height)
+        } else {
+            ss.root_height
+        };
+        raw_intensities.push(vol_or_ht);
     }
 
     let mut ref_heights: Vec<f64> = systems
@@ -474,9 +510,28 @@ pub(crate) fn populate_root_heights(
     if ref_heights.is_empty() {
         ref_heights = systems.iter().filter_map(|ss| ss.root_height).collect();
     }
-    if let Some(med) = median_f64(ref_heights).filter(|&m| m > 0.0) {
+    if let Some(med_h) = median_f64(ref_heights).filter(|&m| m > 0.0) {
         for ss in systems.iter_mut() {
-            ss.rel_root_height = ss.root_height.map(|h| h / med);
+            ss.rel_root_height = ss.root_height.map(|h| h / med_h);
+        }
+    }
+
+    let mut ref_intensities: Vec<f64> = systems
+        .iter()
+        .zip(raw_intensities.iter())
+        .filter(|(ss, _)| ss.has_observed_carbons())
+        .filter_map(|(_, &v)| v)
+        .collect();
+    if ref_intensities.is_empty() {
+        ref_intensities = raw_intensities.iter().copied().flatten().collect();
+    }
+    if let Some(med_v) = median_f64(ref_intensities).filter(|&m| m > 0.0) {
+        for (ss, &vi) in systems.iter_mut().zip(raw_intensities.iter()) {
+            ss.rel_root_intensity = vi.map(|v| v / med_v);
+        }
+    } else {
+        for ss in systems.iter_mut() {
+            ss.rel_root_intensity = ss.rel_root_height;
         }
     }
 }

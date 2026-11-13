@@ -667,6 +667,8 @@ pub struct NefWorkbenchSaveframe {
     pub reference_offsets: [f64; 5],
     pub qc_verdict: Option<String>,
     pub view_bounds_ppm: Option<[f64; 4]>,
+    #[serde(default)]
+    pub shift_list_crc32: Option<String>,
     pub residues: Vec<NefWorkbenchResidueRow>,
     pub peaks: Vec<NefWorkbenchPeakRow>,
     pub assignments: Vec<NefWorkbenchAssignmentRow>,
@@ -1112,7 +1114,7 @@ fn tokenize_star(text: &str) -> Vec<String> {
                 buf.push(lines[i]);
                 i += 1;
             }
-            out.push(buf.join("\n").trim().to_string());
+            out.push(buf.join("\n"));
             i += 1;
             continue;
         }
@@ -1727,7 +1729,8 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                 potential_type: pot,
                 restraints,
             });
-        } else if cat == "nmrassign_workbench_session"
+        } else if cat == "nmrassign_workbench"
+            || cat == "nmrassign_workbench_session"
             || sf.name.eq_ignore_ascii_case("nmrassign_workbench")
             || sf
                 .name
@@ -1786,6 +1789,10 @@ fn parse_workbench_saveframe(sf: &Saveframe) -> Result<NefWorkbenchSaveframe, St
         parse_exact_f64_tag(&sf.tags, "_nmrassign_workbench.ref_offset_c", 0.0)?,
     ];
     let qc_verdict = match sf.tags.get("_nmrassign_workbench.qc_verdict") {
+        Some(v) if v != "." && v != "?" && !v.is_empty() => Some(decode_lossless_star_token(v)?),
+        _ => None,
+    };
+    let shift_list_crc32 = match sf.tags.get("_nmrassign_workbench.shift_list_crc32") {
         Some(v) if v != "." && v != "?" && !v.is_empty() => Some(decode_lossless_star_token(v)?),
         _ => None,
     };
@@ -2059,6 +2066,7 @@ fn parse_workbench_saveframe(sf: &Saveframe) -> Result<NefWorkbenchSaveframe, St
         reference_offsets,
         qc_verdict,
         view_bounds_ppm,
+        shift_list_crc32,
         residues,
         peaks,
         assignments,
@@ -2068,6 +2076,45 @@ fn parse_workbench_saveframe(sf: &Saveframe) -> Result<NefWorkbenchSaveframe, St
         contour_layers,
         processing_recipes,
     })
+}
+
+/// Compute an 8-character lowercase hex IEEE 802.3 CRC-32 digest over the canonicalized rows
+/// of `nef_chemical_shift_list` saveframes so external edits to standard NEF shift tables can
+/// be detected and adopted when reloading a `save_nmrassign_workbench` session.
+pub fn compute_nef_shift_lists_crc32(shift_lists: &[NefShiftList]) -> String {
+    let mut crc = 0xFFFF_FFFFu32;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                if (crc & 1) != 0 {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+    };
+
+    for slist in shift_lists {
+        let sname = sanitize_identifier(&slist.name);
+        feed(b"list:");
+        feed(sname.as_bytes());
+        feed(b"\n");
+        for sh in &slist.shifts {
+            let norm_val = if sh.value == 0.0 { 0.0 } else { sh.value };
+            let seq_s = sh
+                .sequence_code
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| ".".to_string());
+            let row = format!(
+                "{}\t{}\t{}\t{}\t{norm_val:.4}\n",
+                sh.chain_code, seq_s, sh.residue_name, sh.atom_name
+            );
+            feed(row.as_bytes());
+        }
+    }
+    format!("{:08x}", !crc)
 }
 
 // ============================================================================
@@ -2093,9 +2140,28 @@ fn sanitize_identifier(raw: &str) -> String {
     }
 }
 
+fn can_use_multiline_star_block(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("\n;")
+        && !s.contains('\r')
+        && !s.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+}
+
+fn fmt_multiline_star(s: &str) -> String {
+    if s.starts_with('\n') {
+        format!("\n;\n{s}\n;\n")
+    } else {
+        format!("\n;{s}\n;\n")
+    }
+}
+
 fn fmt_val(s: &str) -> String {
     if s.is_empty() {
         return ".".to_string();
+    }
+    let needs_multiline = (s.contains('\'') && s.contains('"')) || s.contains('\n') || s.len() > 80;
+    if needs_multiline && can_use_multiline_star_block(s) {
+        return fmt_multiline_star(s);
     }
     let needs_quotes = s.chars().any(char::is_whitespace)
         || s.contains('#')
@@ -2111,8 +2177,11 @@ fn fmt_val(s: &str) -> String {
     if needs_quotes {
         if !s.contains('\'') {
             format!("'{s}'")
+        } else if !s.contains('"') {
+            format!("\"{s}\"")
         } else {
-            format!("\"{}\"", s.replace('"', "'"))
+            let sanitized = s.replace("\n;", "\n ;").replace('\r', "");
+            fmt_multiline_star(&sanitized)
         }
     } else {
         s.to_string()
@@ -2612,20 +2681,23 @@ pub(crate) fn encode_lossless_star_token(s: &str) -> String {
         || low == "loop_"
         || low.starts_with("save_")
         || low.starts_with("data_");
-    let needs_hex = s.is_empty()
+    let force_hex = s.is_empty()
         || s == "."
         || s == "?"
         || is_star_keyword
         || s.starts_with("~hex:")
-        || s.chars()
-            .any(|c| c == '\'' || c == '"' || c == '\n' || c == '\r' || c.is_control());
-    if needs_hex {
+        || s.contains("\n;")
+        || s.contains('\r')
+        || s.chars().any(|c| c.is_control() && c != '\n' && c != '\t');
+    if force_hex {
         let mut out = String::with_capacity(5 + s.len() * 2);
         out.push_str("~hex:");
         for b in s.as_bytes() {
             out.push_str(&format!("{b:02x}"));
         }
         out
+    } else if (s.contains('\'') && s.contains('"')) || s.contains('\n') || s.len() > 80 {
+        fmt_multiline_star(s)
     } else {
         fmt_val(s)
     }
@@ -2650,21 +2722,16 @@ pub(crate) fn decode_lossless_star_token(raw: &str) -> Result<String, String> {
 }
 
 pub(crate) fn encode_json_star_token(json: &str) -> String {
-    let safe = json.replace('\'', "\\u0027");
-    if safe.is_empty()
-        || safe.contains('\n')
-        || safe.contains('\r')
-        || safe.chars().any(char::is_control)
-    {
+    if !can_use_multiline_star_block(json) || json.starts_with("~hex:") {
         encode_lossless_star_token(json)
     } else {
-        format!("'{safe}'")
+        fmt_multiline_star(json)
     }
 }
 
 fn write_workbench_saveframe(out: &mut String, wb: &NefWorkbenchSaveframe) {
     out.push_str("save_nmrassign_workbench\n");
-    out.push_str("   _nmrassign_workbench.sf_category     nmrassign_workbench_session\n");
+    out.push_str("   _nmrassign_workbench.sf_category     nmrassign_workbench\n");
     out.push_str("   _nmrassign_workbench.sf_framecode    nmrassign_workbench\n");
     out.push_str(&format!(
         "   _nmrassign_workbench.schema_version  {}\n",
@@ -2705,6 +2772,12 @@ fn write_workbench_saveframe(out: &mut String, wb: &NefWorkbenchSaveframe) {
     out.push_str(&format!(
         "   _nmrassign_workbench.qc_verdict      {qc_tok}\n"
     ));
+    if let Some(ref crc) = wb.shift_list_crc32 {
+        out.push_str(&format!(
+            "   _nmrassign_workbench.shift_list_crc32 {}\n",
+            encode_lossless_star_token(crc)
+        ));
+    }
     if let Some([hl, hr, nt, nb]) = wb.view_bounds_ppm {
         out.push_str(&format!(
             "   _nmrassign_workbench.view_h_left     {}\n",

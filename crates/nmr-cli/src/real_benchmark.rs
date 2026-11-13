@@ -89,6 +89,7 @@ pub struct RealManifestEntry {
     pub vendor: String,
     pub experiments: Vec<String>,
     pub split: String,
+    pub cohort: String,
 }
 
 pub fn parse_real_manifest_str(text: &str) -> Result<Vec<RealManifestEntry>, String> {
@@ -107,7 +108,7 @@ pub fn parse_real_manifest_str(text: &str) -> Result<Vec<RealManifestEntry>, Str
         }
         if cols.len() < 7 {
             return Err(format!(
-                "real_manifest.tsv line {} has {} columns (expected 7: bmrb_id, protein, residues, field_mhz, vendor, experiments, split)",
+                "real_manifest.tsv line {} has {} columns (expected 7 or 8: bmrb_id, protein, residues, field_mhz, vendor, experiments, split[, cohort])",
                 line_idx + 1,
                 cols.len()
             ));
@@ -136,6 +137,11 @@ pub fn parse_real_manifest_str(text: &str) -> Result<Vec<RealManifestEntry>, Str
             .filter(|s| !s.is_empty() && s != "*" && s != "AUTO")
             .collect();
         let split = cols[6].trim().to_ascii_lowercase();
+        let cohort = cols
+            .get(7)
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| split.clone());
         out.push(RealManifestEntry {
             bmrb_id,
             protein,
@@ -144,6 +150,7 @@ pub fn parse_real_manifest_str(text: &str) -> Result<Vec<RealManifestEntry>, Str
             vendor,
             experiments,
             split,
+            cohort,
         });
     }
     Ok(out)
@@ -229,8 +236,8 @@ pub fn resolve_local_entry_paths(
 ) -> Result<ResolvedEntryLocations, String> {
     let id_trim = bmrb_id.trim();
     let mut base_roots: Vec<PathBuf> = Vec::new();
-    // When `--data-root` has shape `<repo>/data/private/bmrb`, include `<repo>/data` so sibling
-    // `<repo>/data/ubiquitin` and `<repo>/data/private/bmrb51439_cisd3` resolve cleanly too.
+    // When `--data-root` has shape `<repo>/data/private/bmrb` or `<repo>/data/real_bmrb`, include
+    // `<repo>/data` so sibling `<repo>/data/ubiquitin` and `<repo>/data/private/bmrb51439_cisd3` resolve cleanly too.
     if data_root
         .file_name()
         .and_then(|s| s.to_str())
@@ -246,6 +253,14 @@ pub fn resolve_local_entry_paths(
                     base_roots.push(data_anc.to_path_buf());
                 }
             }
+        }
+    } else if data_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("real_bmrb"))
+    {
+        if let Some(data_anc) = data_root.parent() {
+            base_roots.push(data_anc.to_path_buf());
         }
     }
     if allow_repo_fallbacks {
@@ -311,6 +326,11 @@ pub fn resolve_local_entry_paths(
                         }
                     }
                 }
+                if let Some(real_bmrb) = find_child_ci(droot, "real_bmrb") {
+                    if let Some(c) = find_child_ci(&real_bmrb, "51439") {
+                        dir_candidates.push(c);
+                    }
+                }
             }
         } else {
             for droot in &base_roots {
@@ -322,6 +342,14 @@ pub fn resolve_local_entry_paths(
                         if let Some(c2) = find_child_ci(&bmrb_sub, &format!("bmr{id_digits}")) {
                             dir_candidates.push(c2);
                         }
+                    }
+                }
+                if let Some(real_bmrb) = find_child_ci(droot, "real_bmrb") {
+                    if let Some(c1) = find_child_ci(&real_bmrb, id_digits) {
+                        dir_candidates.push(c1);
+                    }
+                    if let Some(c2) = find_child_ci(&real_bmrb, &format!("bmr{id_digits}")) {
+                        dir_candidates.push(c2);
                     }
                 }
             }
@@ -594,7 +622,9 @@ fn candidate_selection_score(
     }
     let t_low = c.title.to_ascii_lowercase();
     let p_low = c.pulse_program.to_ascii_lowercase();
-    // Deprioritize aligned media / RDC / paramagnetic / BIRD variants when an isotropic spectrum exists
+    let rel_low = c.rel_path.to_ascii_lowercase();
+    // Deprioritize aligned media / RDC / paramagnetic / BIRD / D2O H-D exchange / NH2-only variants
+    // when an isotropic H2O backbone spectrum exists
     if t_low.contains("align")
         || t_low.contains("allign")
         || t_low.contains("acrylamid")
@@ -602,6 +632,11 @@ fn candidate_selection_score(
         || t_low.contains("bicelle")
         || t_low.contains("phage")
         || t_low.contains("paramag")
+        || t_low.contains("d2o")
+        || t_low.contains("hdex")
+        || rel_low.contains("d2o")
+        || rel_low.contains("hdex")
+        || rel_low.contains("nh2only")
         || p_low.contains("bird")
     {
         score -= 3_000;
@@ -2293,6 +2328,54 @@ pub fn format_real_benchmark_report(summary: &RealBenchmarkSummary) -> String {
             summary.micro_assignable,
         );
 
+        let mut cohort_order: Vec<String> = Vec::new();
+        for rec in &summary.records {
+            if !cohort_order.contains(&rec.manifest_entry.cohort) {
+                cohort_order.push(rec.manifest_entry.cohort.clone());
+            }
+        }
+        if cohort_order.len() > 1 {
+            let _ = writeln!(out, "\nCohort Breakdown (seen_p8_p9 vs cold_p10):");
+            for coh in &cohort_order {
+                let sub_recs: Vec<EntryBenchmarkRecord> = summary
+                    .records
+                    .iter()
+                    .filter(|r| &r.manifest_entry.cohort == coh)
+                    .cloned()
+                    .collect();
+                let sub = summarize_real_benchmark_records(
+                    coh,
+                    summary.solver_label.clone(),
+                    summary.seeds,
+                    summary.hc_threshold,
+                    sub_recs,
+                );
+                let sub_ok = sub
+                    .records
+                    .iter()
+                    .filter(|r| matches!(r.outcome, EntryBenchmarkOutcome::Succeeded(_)))
+                    .count();
+                let sub_hc = if sub.n_hc_active_proteins == 0 {
+                    "ABSTAIN".to_string()
+                } else {
+                    format!("{:.1}%", sub.macro_hc_precision * 100.0)
+                };
+                let _ = writeln!(
+                    out,
+                    "  - cohort={:<12} ({}/{} evaluated): Macro Acc={:.1}%, Recall={:.1}%, HC-Prec={}, HC-Recall={:.1}%, Mean ECE={:.3}, Pooled ECE={:.3}",
+                    coh,
+                    sub_ok,
+                    sub.records.len(),
+                    sub.macro_accuracy * 100.0,
+                    sub.macro_recall * 100.0,
+                    sub_hc,
+                    sub.macro_hc_recall * 100.0,
+                    sub.mean_protein_ece,
+                    sub.pooled_reliability.ece,
+                );
+            }
+        }
+
         let _ = writeln!(
             out,
             "\nPer-Protein Confidence Calibration & Reliability Curves (threshold >= {:.2}):",
@@ -2635,6 +2718,58 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
         summary.mean_protein_ece,
         render_reliability_curve_json(&summary.pooled_reliability, 4),
     ));
+    let mut cohort_order: Vec<String> = Vec::new();
+    for rec in &summary.records {
+        if !cohort_order.contains(&rec.manifest_entry.cohort) {
+            cohort_order.push(rec.manifest_entry.cohort.clone());
+        }
+    }
+    let cohort_json_items: Vec<String> = cohort_order
+        .iter()
+        .map(|coh| {
+            let sub_recs: Vec<EntryBenchmarkRecord> = summary
+                .records
+                .iter()
+                .filter(|r| &r.manifest_entry.cohort == coh)
+                .cloned()
+                .collect();
+            let sub = summarize_real_benchmark_records(
+                coh,
+                summary.solver_label.clone(),
+                summary.seeds,
+                summary.hc_threshold,
+                sub_recs,
+            );
+            let sub_ok = sub
+                .records
+                .iter()
+                .filter(|r| matches!(r.outcome, EntryBenchmarkOutcome::Succeeded(_)))
+                .count();
+            let sub_hcp = if sub.n_hc_active_proteins > 0 {
+                format!("{:.6}", sub.macro_hc_precision)
+            } else {
+                "null".to_string()
+            };
+            format!(
+                "    {{ \"cohort\": \"{}\", \"total\": {}, \"evaluated\": {}, \"macro_accuracy\": {:.6}, \"macro_recall\": {:.6}, \"macro_hc_precision\": {}, \"macro_hc_recall\": {:.6}, \"hc_active_proteins\": {}, \"hc_abstained_proteins\": {}, \"mean_protein_ece\": {:.6}, \"pooled_ece\": {:.6} }}",
+                json_escape(coh),
+                sub.records.len(),
+                sub_ok,
+                sub.macro_accuracy,
+                sub.macro_recall,
+                sub_hcp,
+                sub.macro_hc_recall,
+                sub.n_hc_active_proteins,
+                sub.n_hc_abstained_proteins,
+                sub.mean_protein_ece,
+                sub.pooled_reliability.ece,
+            )
+        })
+        .collect();
+    j.push_str(&format!(
+        "  \"cohort_summaries\": [\n{}\n  ],\n",
+        cohort_json_items.join(",\n")
+    ));
     j.push_str("  \"entries\": [\n");
     for (idx, rec) in summary.records.iter().enumerate() {
         let comma = if idx + 1 < summary.records.len() {
@@ -2645,13 +2780,14 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
         let e = &rec.manifest_entry;
         j.push_str("    {\n");
         j.push_str(&format!(
-            "      \"bmrb_id\": \"{}\",\n      \"protein\": \"{}\",\n      \"residues\": {},\n      \"field_mhz\": {:.2},\n      \"vendor\": \"{}\",\n      \"split\": \"{}\",\n",
+            "      \"bmrb_id\": \"{}\",\n      \"protein\": \"{}\",\n      \"residues\": {},\n      \"field_mhz\": {:.2},\n      \"vendor\": \"{}\",\n      \"split\": \"{}\",\n      \"cohort\": \"{}\",\n",
             json_escape(&e.bmrb_id),
             json_escape(&e.protein),
             e.residues,
             e.field_mhz,
             json_escape(&e.vendor),
             json_escape(&e.split),
+            json_escape(&e.cohort),
         ));
         match &rec.outcome {
             EntryBenchmarkOutcome::SkippedMissingData { expected_path } => {
@@ -3160,26 +3296,89 @@ mod tests {
             .join("../../data/benchmark/real_manifest.tsv");
         let raw = fs::read_to_string(&manifest_path).unwrap();
         let entries = parse_real_manifest_str(&raw).unwrap();
-        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.len(), 19);
         let n_dev = entries.iter().filter(|e| e.split == "dev").count();
         let n_held = entries.iter().filter(|e| e.split == "heldout").count();
-        assert_eq!(n_dev, 7);
+        assert_eq!(n_dev, 10);
         assert_eq!(n_held, 9);
 
-        // Verify Q4 governance transitions: 5329 and 6318 promoted to dev; 16099 and 18489 added to heldout.
-        for promoted_id in ["5329", "6318"] {
+        // Verify unique BMRB IDs across all 19 entries
+        let unique_ids: BTreeSet<&str> = entries.iter().map(|e| e.bmrb_id.as_str()).collect();
+        assert_eq!(unique_ids.len(), 19);
+
+        // Verify Q4 governance transitions:
+        // - 5329, 6318, 15476, 16385, 53280 promoted to `dev` (`cohort=dev`),
+        // - 5845, 17030, 18145, 51351, 16099, 18489 tagged `seen_p8_p9` (`heldout`),
+        // - 16072, 16782, 17092 added as fresh cold `cold_p10` (`heldout`).
+        for promoted_id in ["5329", "6318", "15476", "16385", "53280"] {
             let e = entries
                 .iter()
                 .find(|e| e.bmrb_id == promoted_id)
                 .unwrap_or_else(|| panic!("missing promoted entry {promoted_id}"));
             assert_eq!(e.split, "dev", "expected {promoted_id} in dev split");
+            assert_eq!(e.cohort, "dev", "expected {promoted_id} in dev cohort");
         }
-        for fresh_id in ["16099", "18489"] {
+        let n_seen = entries
+            .iter()
+            .filter(|e| e.split == "heldout" && e.cohort == "seen_p8_p9")
+            .count();
+        let n_cold = entries
+            .iter()
+            .filter(|e| e.split == "heldout" && e.cohort == "cold_p10")
+            .count();
+        assert_eq!(n_seen, 6);
+        assert_eq!(n_cold, 3);
+        for seen_id in ["5845", "17030", "18145", "51351", "16099", "18489"] {
             let e = entries
                 .iter()
-                .find(|e| e.bmrb_id == fresh_id)
-                .unwrap_or_else(|| panic!("missing fresh heldout entry {fresh_id}"));
-            assert_eq!(e.split, "heldout", "expected {fresh_id} in heldout split");
+                .find(|e| e.bmrb_id == seen_id)
+                .unwrap_or_else(|| panic!("missing seen heldout entry {seen_id}"));
+            assert_eq!(e.split, "heldout");
+            assert_eq!(e.cohort, "seen_p8_p9");
+        }
+        for cold_id in ["16072", "16782", "17092"] {
+            let e = entries
+                .iter()
+                .find(|e| e.bmrb_id == cold_id)
+                .unwrap_or_else(|| panic!("missing cold_p10 heldout entry {cold_id}"));
+            assert_eq!(e.split, "heldout", "expected {cold_id} in heldout split");
+            assert_eq!(
+                e.cohort, "cold_p10",
+                "expected {cold_id} in cold_p10 cohort"
+            );
+            assert!((60..=160).contains(&e.residues));
+            // Header-only verification (strictly zero FID FFT, peak picking, or solver runs!)
+            if let Ok(loc) =
+                resolve_local_entry_paths(cold_id, Path::new("data/private/bmrb"), true)
+            {
+                assert!(
+                    loc.truth_path.as_ref().is_some_and(|p| p.is_file()),
+                    "cold_p10 entry {cold_id} must have NMR-STAR file present"
+                );
+                assert!(
+                    loc.entry_dir.join("PROVENANCE.md").is_file(),
+                    "cold_p10 entry {cold_id} must have PROVENANCE.md"
+                );
+                let ws = nmr_core::classify::classify_nmr_workspace(&loc.entry_dir).unwrap();
+                assert!(
+                    ws.problem_regime == nmr_core::classify::ProblemRegime::GlobularBackbone
+                        || ws
+                            .secondary_regimes
+                            .contains(&nmr_core::classify::ProblemRegime::GlobularBackbone),
+                    "cold_p10 entry {cold_id} must support GlobularBackbone (got primary {:?}, secondary {:?})",
+                    ws.problem_regime,
+                    ws.secondary_regimes
+                );
+                let (disc, _) =
+                    discover_entry_experiments(&loc.entry_dir, Some(e.field_mhz)).unwrap();
+                let disc_exps: BTreeSet<&str> = disc.iter().map(|d| d.exp_type.as_str()).collect();
+                for req_exp in &e.experiments {
+                    assert!(
+                        disc_exps.contains(req_exp.as_str()),
+                        "cold_p10 entry {cold_id} missing manifest experiment {req_exp}; discovered {disc_exps:?}"
+                    );
+                }
+            }
         }
 
         // Verify zero overlap with Phase-1 `data/benchmark/manifest.tsv`
@@ -3241,6 +3440,7 @@ mod tests {
             vendor: "Bruker".to_string(),
             experiments: vec!["HSQC".into(), "HNCO".into(), "HNCACB".into()],
             split: "dev".to_string(),
+            cohort: "dev".to_string(),
         };
 
         let det_mixed = DetailedReferenceOffsets {
@@ -3446,5 +3646,767 @@ mod tests {
         assert!(json.contains("\"status\": \"not_significant\""));
         assert!(json.contains("\"status\": \"too_few_values\""));
         assert!(json.contains("\"calibration_summary\":"));
+    }
+
+    #[test]
+    #[ignore]
+    fn dev_split_lopo_calibration_and_minor_conformer_audit() {
+        use nmr_core::evo_graph::{assign_evo_graph_from_peaks_with_minor_damping, EvoGraphConfig};
+        use nmr_core::priors::sync_detailed_reference_offsets;
+        use nmr_core::qc::{
+            eval_monotone_calibration_map, fit_isotonic_monotone_knots, DatasetQcVerdict,
+            ProteinReliabilityCurve,
+        };
+        use nmr_core::solver::{assign_uncalibrated, prepare_scoring_priors, AnnealConfig};
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        env::set_current_dir(&repo_root).expect("chdir repo_root");
+        let manifest_path = PathBuf::from("data/benchmark/real_manifest.tsv");
+        let manifest_txt = fs::read_to_string(&manifest_path).expect("read real_manifest.tsv");
+        let entries: Vec<RealManifestEntry> = parse_real_manifest_str(&manifest_txt)
+            .expect("parse real_manifest.tsv")
+            .into_iter()
+            .filter(|e| e.split == "dev")
+            .collect();
+        assert_eq!(entries.len(), 10, "expected exact 10 dev entries");
+        for e in &entries {
+            assert_eq!(e.split, "dev", "STRICT HELDOUT FIREWALL");
+        }
+
+        let priors = load_priors(None).expect("load priors");
+        let score_cfg = ScoreConfig::default();
+        let picker_cfg = PickerConfig::default();
+        let data_root = PathBuf::from("data/private/bmrb");
+
+        #[derive(Clone)]
+        struct RawPredSample {
+            seed: u64,
+            p_raw: f64,
+            hard_abstain: bool,
+            hsqc_mult: f64,
+            warn_scale: f64,
+            is_ok: bool,
+        }
+
+        let apply_qc_with_knots = |samps: &[RawPredSample],
+                                   knots: Option<&[(f64, f64)]>|
+         -> Vec<(f64, bool)> {
+            let mut out = Vec::with_capacity(samps.len());
+            for seed in 0..5u64 {
+                let seed_samps: Vec<&RawPredSample> =
+                    samps.iter().filter(|s| s.seed == seed).collect();
+                if seed_samps.is_empty() {
+                    continue;
+                }
+                let cals: Vec<f64> = seed_samps
+                    .iter()
+                    .map(|s| match knots {
+                        Some(k) => eval_monotone_calibration_map(s.p_raw, k),
+                        None => s.p_raw.clamp(0.0, 1.0),
+                    })
+                    .collect();
+                let n_ass = cals.len();
+                let strong = cals.iter().filter(|&&c| c >= 0.65).count();
+                let margin = (strong as f64) / (n_ass as f64);
+                let s0 = seed_samps[0];
+                let is_abstain = s0.hard_abstain
+                    || (n_ass >= 12 && (margin < 0.07 || (s0.hsqc_mult > 1.60 && margin < 0.16)));
+                for (&p_cal, s) in cals.iter().zip(seed_samps.iter()) {
+                    let p_final = if is_abstain {
+                        p_cal.clamp(0.0, 0.45)
+                    } else {
+                        (p_cal * s.warn_scale).clamp(0.0, 1.0)
+                    };
+                    out.push((p_final, s.is_ok));
+                }
+            }
+            out
+        };
+
+        let mut evo_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
+            Vec::new();
+        let mut std_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
+            Vec::new();
+
+        // P1-5 minor-conformer audit accumulators across all 10 dev proteins
+        let mut tot_true_roots_1seed = 0usize;
+        let mut tot_weak_true_roots_1seed = 0usize;
+        let mut tot_weak_ht_true_roots_1seed = 0usize;
+        let mut weak_with_assigned = 0usize;
+        let mut weak_with_correct = 0usize;
+        let mut weak_without_assigned = 0usize;
+        let mut weak_without_correct = 0usize;
+        let mut weak_total_5seed = 0usize;
+        let mut all_with_assigned = 0usize;
+        let mut all_with_correct = 0usize;
+        let mut all_without_assigned = 0usize;
+        let mut all_without_correct = 0usize;
+        let mut per_prot_audit_lines: Vec<String> = Vec::new();
+
+        let only_filter = env::var("ONLY_ENTRY").ok();
+        for entry in &entries {
+            if let Some(ref f) = only_filter {
+                if !f.split(',').any(|tok| tok.trim() == entry.bmrb_id) {
+                    continue;
+                }
+            }
+            let loc = resolve_local_entry_paths(&entry.bmrb_id, &data_root, true)
+                .unwrap_or_else(|p| panic!("missing dev entry {}: {p:?}", entry.bmrb_id));
+            let truth_path = loc.truth_path.expect("truth STAR path");
+            let (truth_ref, _, _) = parse_truth_auto(&truth_path).expect("parse truth STAR");
+            let (discovered, _) = discover_entry_experiments(&loc.entry_dir, Some(entry.field_mhz))
+                .expect("discover");
+            let hsqc_exp = discovered
+                .iter()
+                .find(|d| d.exp_type == "HSQC")
+                .expect("HSQC");
+            let triple_exps: Vec<&DiscoveredFidExperiment> =
+                discovered.iter().filter(|d| d.exp_type != "HSQC").collect();
+
+            let (hsqc_spec, _) =
+                process_fid_dir_2d(&hsqc_exp.dir, false, false).expect("load 2D HSQC");
+            let roots = pick_hsqc_2d(&hsqc_spec, &picker_cfg);
+            let mut all_peaks: Vec<Peak> = roots.clone();
+            let mut used_exps = vec![("HSQC".to_string(), hsqc_exp.rel_path.clone())];
+            let mut strip_bank = StripBank3D::new();
+            for texp in &triple_exps {
+                if let Ok((mut spec3d, _)) =
+                    process_fid_dir_3d(&texp.dir, &texp.exp_type, false, false)
+                {
+                    let _ = register_3d_hn_to_hsqc_2d(&mut spec3d, &hsqc_spec, 0.08, 0.60);
+                    let pks = strip_bank.pick_and_record_3d(&spec3d, &roots, &picker_cfg);
+                    all_peaks.extend(pks);
+                    used_exps.push((texp.exp_type.clone(), texp.rel_path.clone()));
+                }
+            }
+            if used_exps.len() >= 3 && !roots.is_empty() {
+                all_peaks.extend(corroborated_re_pick_3d(
+                    &strip_bank,
+                    &roots,
+                    &all_peaks,
+                    &picker_cfg,
+                    &CorroboratedRepickConfig::default(),
+                ));
+            }
+            let all_systems_for_eval =
+                build_spin_systems(&all_peaks, &Tolerances::default(), 3, false)
+                    .expect("build_spin_systems");
+
+            let mut evo_samples = Vec::new();
+            let mut std_samples = Vec::new();
+            let mut evo_verdict = DatasetQcVerdict::Pass;
+            let mut std_verdict = DatasetQcVerdict::Pass;
+            let mut evo_qc_reasons = String::new();
+            let mut std_qc_reasons = String::new();
+
+            let mut p_weak_1seed = 0usize;
+            let mut p_weak_ht_1seed = 0usize;
+            let mut p_true_1seed = 0usize;
+            let mut p_weak_w_ass = 0usize;
+            let mut p_weak_w_cor = 0usize;
+            let mut p_weak_wo_ass = 0usize;
+            let mut p_weak_wo_cor = 0usize;
+
+            // Precompute standard spin systems & offsets once per protein
+            let std_base_det = nmr_core::priors::estimate_reference_offsets_detailed(
+                &all_systems_for_eval,
+                &truth_ref.sequence,
+                &priors,
+            );
+            let (std_eff_priors, std_offs) = prepare_scoring_priors(
+                &all_systems_for_eval,
+                &truth_ref.sequence,
+                &priors,
+                &score_cfg,
+            );
+            let std_synced_det = sync_detailed_reference_offsets(&std_offs, &std_base_det);
+
+            let fast_std_only = env::var("FAST_STD_ONLY").is_ok();
+            for seed in 0..5u64 {
+                if !fast_std_only {
+                    // 1. Evo-graph WITH minor-conformer damping (`apply_qc_calibration = false` to get raw p_raw!)
+                    let evo_cfg_raw = EvoGraphConfig {
+                        score_cfg: score_cfg.clone(),
+                        auto_reference: true,
+                        apply_qc_calibration: false,
+                        seed,
+                        ..EvoGraphConfig::default()
+                    };
+                    let (evo_sys, evo_res_raw, evo_rep) =
+                        assign_evo_graph_from_peaks_with_minor_damping(
+                            &all_peaks,
+                            &truth_ref.sequence,
+                            &priors,
+                            &evo_cfg_raw,
+                            true,
+                        );
+                    let qc_evo = &evo_rep.qc_report;
+                    if seed == 0 {
+                        evo_verdict = qc_evo.verdict;
+                        evo_qc_reasons = qc_evo.reasons.join("; ");
+                    }
+                    let eff_evo_priors = evo_rep.shifted_priors(&priors);
+                    let (pred_evo, conf_k_evo) = to_reference(
+                        &evo_res_raw,
+                        &evo_sys,
+                        &truth_ref.sequence,
+                        &truth_ref.seq_ids,
+                        0.0,
+                        Some(&eff_evo_priors),
+                    );
+                    let mut conf_seq_evo = BTreeMap::new();
+                    for (k, c) in conf_k_evo {
+                        conf_seq_evo.insert(truth_ref.seq_ids[k], c);
+                    }
+                    let eval_evo = evaluate_prediction_against_truth(
+                        &pred_evo,
+                        &truth_ref,
+                        &conf_seq_evo,
+                        Some(&all_systems_for_eval),
+                        0.80,
+                        true,
+                    );
+                    let evo_hard_abstain = qc_evo.verdict == DatasetQcVerdict::Abstain
+                        && qc_evo
+                            .reasons
+                            .iter()
+                            .any(|r| !r.contains("solution margin"));
+                    let evo_warn_scale = if qc_evo.verdict == DatasetQcVerdict::Warn {
+                        qc_evo.confidence_scale
+                    } else {
+                        1.0
+                    };
+                    for &(p_raw, is_ok) in &eval_evo.placed_predictions {
+                        evo_samples.push(RawPredSample {
+                            seed,
+                            p_raw,
+                            hard_abstain: evo_hard_abstain,
+                            hsqc_mult: qc_evo.hsqc_multiplicity_ratio,
+                            warn_scale: evo_warn_scale,
+                            is_ok,
+                        });
+                    }
+                    all_with_assigned += eval_evo.assigned;
+                    all_with_correct += eval_evo.correct;
+
+                    // Map `evo_sys` 1-to-1 to `eval_evo.truth_for_cmp` (`tol_h = 0.05, tol_n = 0.50`)
+                    let mut true_roots = Vec::new();
+                    for k in 1..eval_evo.truth_for_cmp.sequence.len() {
+                        if eval_evo.truth_for_cmp.sequence[k] == "PRO" {
+                            continue;
+                        }
+                        if let (Some(&th), Some(&tn)) = (
+                            eval_evo.truth_for_cmp.shifts.get(&(k, "H".to_string())),
+                            eval_evo.truth_for_cmp.shifts.get(&(k, "N".to_string())),
+                        ) {
+                            true_roots.push((k, th, tn));
+                        }
+                    }
+                    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+                    for (si, ss) in evo_sys.iter().enumerate() {
+                        for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
+                            let dh = (ss.h - th).abs();
+                            let dn = (ss.n - tn).abs();
+                            if dh <= 0.05 && dn <= 0.50 {
+                                pairs.push(((dh / 0.05).powi(2) + (dn / 0.50).powi(2), si, ti));
+                            }
+                        }
+                    }
+                    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let mut used_s = vec![false; evo_sys.len()];
+                    let mut used_t = vec![false; true_roots.len()];
+                    let mut evo_ss_truth = vec![-1i32; evo_sys.len()];
+                    for &(_, si, ti) in &pairs {
+                        if !used_s[si] && !used_t[ti] {
+                            used_s[si] = true;
+                            used_t[ti] = true;
+                            evo_ss_truth[si] = true_roots[ti].0 as i32;
+                        }
+                    }
+
+                    // 2. Evo-graph WITHOUT minor-conformer damping (`enable_minor_damping = false`)
+                    let (_evo_sys_no, evo_res_no, evo_rep_no) =
+                        assign_evo_graph_from_peaks_with_minor_damping(
+                            &all_peaks,
+                            &truth_ref.sequence,
+                            &priors,
+                            &evo_cfg_raw,
+                            false,
+                        );
+                    let eff_no_priors = evo_rep_no.shifted_priors(&priors);
+                    let (pred_no, conf_k_no) = to_reference(
+                        &evo_res_no,
+                        &evo_sys,
+                        &truth_ref.sequence,
+                        &truth_ref.seq_ids,
+                        0.0,
+                        Some(&eff_no_priors),
+                    );
+                    let mut conf_seq_no = BTreeMap::new();
+                    for (k, c) in conf_k_no {
+                        conf_seq_no.insert(truth_ref.seq_ids[k], c);
+                    }
+                    let eval_no = evaluate_prediction_against_truth(
+                        &pred_no,
+                        &truth_ref,
+                        &conf_seq_no,
+                        Some(&all_systems_for_eval),
+                        0.80,
+                        true,
+                    );
+                    all_without_assigned += eval_no.assigned;
+                    all_without_correct += eval_no.correct;
+
+                    for (si, ss) in evo_sys.iter().enumerate() {
+                        let tk = evo_ss_truth[si];
+                        if tk < 0 {
+                            continue;
+                        }
+                        if seed == 0 {
+                            p_true_1seed += 1;
+                            if ss.rel_root_height.is_some_and(|rh| rh < 0.15) {
+                                p_weak_ht_1seed += 1;
+                            }
+                        }
+                        if ss
+                            .rel_root_intensity
+                            .or(ss.rel_root_height)
+                            .is_some_and(|r| r < 0.15)
+                        {
+                            if seed == 0 {
+                                p_weak_1seed += 1;
+                            }
+                            weak_total_5seed += 1;
+                            if evo_res_raw.position[si] >= 0 {
+                                p_weak_w_ass += 1;
+                                if evo_res_raw.position[si] == tk {
+                                    p_weak_w_cor += 1;
+                                }
+                            }
+                            if evo_res_no.position[si] >= 0 {
+                                p_weak_wo_ass += 1;
+                                if evo_res_no.position[si] == tk {
+                                    p_weak_wo_cor += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Standard CPU (`runs = 16`) raw pre-QC confidences
+                let anneal_cfg = AnnealConfig {
+                    runs: 16,
+                    steps_per_system: 1500,
+                    seed,
+                    ..AnnealConfig::default()
+                };
+                let std_res_raw = assign_uncalibrated(
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                    &anneal_cfg,
+                );
+                let qc_std = nmr_core::qc::evaluate_dataset_qc(
+                    Some(&all_peaks),
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                    &std_res_raw,
+                    Some(&std_synced_det),
+                );
+                if seed == 0 {
+                    std_verdict = qc_std.verdict;
+                    std_qc_reasons = qc_std.reasons.join("; ");
+                }
+                let (pred_std, conf_k_std) = to_reference(
+                    &std_res_raw,
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &truth_ref.seq_ids,
+                    0.0,
+                    Some(&std_eff_priors),
+                );
+                let mut conf_seq_std = BTreeMap::new();
+                for (k, c) in conf_k_std {
+                    conf_seq_std.insert(truth_ref.seq_ids[k], c);
+                }
+                let eval_std = evaluate_prediction_against_truth(
+                    &pred_std,
+                    &truth_ref,
+                    &conf_seq_std,
+                    Some(&all_systems_for_eval),
+                    0.80,
+                    true,
+                );
+                // Compute dataset-level Warn scale even if raw margin temporarily triggered Abstain
+                let mut probe_res = std_res_raw.clone();
+                for c in &mut probe_res.confidence {
+                    if *c > 0.0 {
+                        *c = 0.90;
+                    }
+                }
+                let qc_std_non_margin = nmr_core::qc::evaluate_dataset_qc(
+                    Some(&all_peaks),
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                    &probe_res,
+                    Some(&std_synced_det),
+                );
+                let std_hard_abstain = qc_std_non_margin.verdict == DatasetQcVerdict::Abstain;
+                let std_warn_scale = if qc_std_non_margin.verdict == DatasetQcVerdict::Warn {
+                    qc_std_non_margin.confidence_scale
+                } else {
+                    1.0
+                };
+                for &(p_raw, is_ok) in &eval_std.placed_predictions {
+                    std_samples.push(RawPredSample {
+                        seed,
+                        p_raw,
+                        hard_abstain: std_hard_abstain,
+                        hsqc_mult: qc_std.hsqc_multiplicity_ratio,
+                        warn_scale: std_warn_scale,
+                        is_ok,
+                    });
+                }
+                if only_filter.is_some() && seed == 0 {
+                    let n_hi_ok = eval_std
+                        .placed_predictions
+                        .iter()
+                        .filter(|&&(p, ok)| p >= 0.90 && ok)
+                        .count();
+                    let n_hi_bad = eval_std
+                        .placed_predictions
+                        .iter()
+                        .filter(|&&(p, ok)| p >= 0.90 && !ok)
+                        .count();
+                    println!(
+                        "    [SEED0 {}] acc={}/{} ({:.1}%), eval_offs={}, qc={}, conn={:.3}, margin={:.3}, p>=0.90 ok={} bad={}",
+                        entry.bmrb_id,
+                        eval_std.correct,
+                        eval_std.assigned,
+                        100.0 * (eval_std.correct as f64) / (eval_std.assigned.max(1) as f64),
+                        eval_std.global_offsets,
+                        qc_std.verdict.as_str(),
+                        qc_std.connectivity_frac,
+                        qc_std.solution_margin,
+                        n_hi_ok,
+                        n_hi_bad,
+                    );
+                }
+            }
+
+            tot_true_roots_1seed += p_true_1seed;
+            tot_weak_true_roots_1seed += p_weak_1seed;
+            tot_weak_ht_true_roots_1seed += p_weak_ht_1seed;
+            weak_with_assigned += p_weak_w_ass;
+            weak_with_correct += p_weak_w_cor;
+            weak_without_assigned += p_weak_wo_ass;
+            weak_without_correct += p_weak_wo_cor;
+
+            per_prot_audit_lines.push(format!(
+                "  {:16} {:14} | QC(evo={}, std={}) | true_roots={} | r_vol<0.15={} (r_ht<0.15={}) | 5-seed weak correct: WITH={}/{} (ass={}), WITHOUT={}/{} (ass={}) | evo_notes=[{}] std_notes=[{}]",
+                entry.bmrb_id,
+                entry.protein,
+                evo_verdict.as_str(),
+                std_verdict.as_str(),
+                p_true_1seed,
+                p_weak_1seed,
+                p_weak_ht_1seed,
+                p_weak_w_cor,
+                p_weak_1seed * 5,
+                p_weak_w_ass,
+                p_weak_wo_cor,
+                p_weak_1seed * 5,
+                p_weak_wo_ass,
+                evo_qc_reasons,
+                std_qc_reasons,
+            ));
+
+            evo_by_prot.push((
+                entry.bmrb_id.clone(),
+                entry.protein.clone(),
+                evo_verdict,
+                evo_samples,
+            ));
+            std_by_prot.push((
+                entry.bmrb_id.clone(),
+                entry.protein.clone(),
+                std_verdict,
+                std_samples,
+            ));
+        }
+
+        println!("\n================ P1-5 MINOR-CONFORMER (< 0.15) 10-PROTEIN DEV AUDIT ================");
+        for line in &per_prot_audit_lines {
+            println!("{line}");
+        }
+        println!(
+            "  TOTAL (10 dev proteins): true_roots={} | r_vol<0.15={} ({:.2}%) [vs r_height<0.15={} ({:.2}%)]",
+            tot_true_roots_1seed,
+            tot_weak_true_roots_1seed,
+            100.0 * (tot_weak_true_roots_1seed as f64) / (tot_true_roots_1seed.max(1) as f64),
+            tot_weak_ht_true_roots_1seed,
+            100.0 * (tot_weak_ht_true_roots_1seed as f64) / (tot_true_roots_1seed.max(1) as f64),
+        );
+        println!(
+            "  r_vol<0.15 5-seed pool (N={}): WITH damping acc={:.2}% ({}/{}), recall={:.2}% ({}/{}) | WITHOUT damping acc={:.2}% ({}/{}), recall={:.2}% ({}/{})",
+            weak_total_5seed,
+            100.0 * (weak_with_correct as f64) / (weak_with_assigned.max(1) as f64),
+            weak_with_correct,
+            weak_with_assigned,
+            100.0 * (weak_with_correct as f64) / (weak_total_5seed.max(1) as f64),
+            weak_with_correct,
+            weak_total_5seed,
+            100.0 * (weak_without_correct as f64) / (weak_without_assigned.max(1) as f64),
+            weak_without_correct,
+            weak_without_assigned,
+            100.0 * (weak_without_correct as f64) / (weak_total_5seed.max(1) as f64),
+            weak_without_correct,
+            weak_total_5seed,
+        );
+        println!(
+            "  Overall 10-dev micro accuracy: WITH damping={:.2}% ({}/{}) | WITHOUT damping={:.2}% ({}/{})",
+            100.0 * (all_with_correct as f64) / (all_with_assigned.max(1) as f64),
+            all_with_correct,
+            all_with_assigned,
+            100.0 * (all_without_correct as f64) / (all_without_assigned.max(1) as f64),
+            all_without_correct,
+            all_without_assigned,
+        );
+
+        // Helper to evaluate strict zero-search 10-fold Leave-One-Protein-Out (LOPO) cross-validation
+        // using a single canonical a priori isotonic PAV specification (`CANONICAL_GRID_12`, Jeffreys
+        // `CANONICAL_LAPLACE = 0.5`) shared identically across BOTH `evo-graph` and `standard`
+        // (zero outer-loop or inner-loop hyperparameter search).
+        let run_lopo_calibration = |solver_name: &str,
+                                    by_prot: &[(
+            String,
+            String,
+            DatasetQcVerdict,
+            Vec<RawPredSample>,
+        )]| {
+            const CANONICAL_GRID_NAME: &str = "g12";
+            const CANONICAL_GRID: &[f64] = &[
+                0.0, 0.15, 0.30, 0.45, 0.58, 0.68, 0.76, 0.83, 0.89, 0.94, 0.975, 0.992, 1.0,
+            ];
+            const CANONICAL_LAPLACE: f64 = 0.5;
+
+            let is_unconverged_prot = |samps: &[RawPredSample]| -> bool {
+                samps.first().is_some_and(|s0| {
+                    s0.hard_abstain
+                        || (samps.len() >= 12 && {
+                            let m = (samps.iter().filter(|x| x.p_raw >= 0.65).count() as f64)
+                                / (samps.len() as f64);
+                            m < 0.07 || (s0.hsqc_mult > 1.60 && m < 0.16)
+                        })
+                })
+            };
+
+            let collect_train_pairs =
+                |subset: &[&(String, String, DatasetQcVerdict, Vec<RawPredSample>)],
+                 skip_idx: Option<usize>|
+                 -> Vec<(f64, bool)> {
+                    let mut pairs = Vec::new();
+                    for (idx, (_, _, _, samps)) in subset.iter().enumerate() {
+                        if skip_idx == Some(idx) {
+                            continue;
+                        }
+                        if !is_unconverged_prot(samps) {
+                            for s in samps {
+                                pairs.push((s.p_raw, s.is_ok));
+                            }
+                        }
+                    }
+                    pairs
+                };
+
+            println!("\n================ CANONICAL 10-FOLD LOPO CALIBRATION: {solver_name} ================");
+            // 1. Report UNCALIBRATED (identity map) baseline
+            {
+                let mut prot_eces = Vec::new();
+                let mut prot_hcps = Vec::new();
+                let mut pooled = Vec::new();
+                for (_, _, _, samps) in by_prot {
+                    let preds = apply_qc_with_knots(samps, None);
+                    let rel = ProteinReliabilityCurve::from_predictions(&preds, 0.80);
+                    prot_eces.push(rel.ece);
+                    if let Some(hcp) = rel.hc_precision {
+                        prot_hcps.push(hcp);
+                    }
+                    pooled.extend(preds);
+                }
+                let pool_rel = ProteinReliabilityCurve::from_predictions(&pooled, 0.80);
+                let mean_ece = prot_eces.iter().sum::<f64>() / (prot_eces.len() as f64);
+                let macro_hcp = prot_hcps.iter().sum::<f64>() / (prot_hcps.len().max(1) as f64);
+                println!(
+                    "  [Identity T=1.0 baseline] mean_ECE={mean_ece:.4}, pooled_ECE={:.4}, macro_HCP={:.2}% (n_hc_prot={}), micro_HCP={:.2}% ({}/{}), bin[0.8,0.9)={:.1}% (conf={:.3}, n={})",
+                    pool_rel.ece,
+                    macro_hcp * 100.0,
+                    prot_hcps.len(),
+                    pool_rel.hc_precision.unwrap_or(0.0) * 100.0,
+                    pool_rel.hc_correct,
+                    pool_rel.hc_assigned,
+                    pool_rel.bins[2].empirical_acc * 100.0,
+                    pool_rel.bins[2].mean_conf,
+                    pool_rel.bins[2].count,
+                );
+            }
+
+            // 2. Strict zero-search 10-fold LOPO: for each held-out protein `hold_idx`, fit the
+            // canonical (`CANONICAL_GRID`, `CANONICAL_LAPLACE = 0.5`) isotonic PAV map exclusively
+            // on the 9 training proteins `j != hold_idx`, and evaluate once on `by_prot[hold_idx]`.
+            let all_refs: Vec<&(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
+                by_prot.iter().collect();
+            let mut oof_eces = Vec::with_capacity(by_prot.len());
+            let mut oof_hcps = Vec::with_capacity(by_prot.len());
+            let mut oof_pooled = Vec::new();
+
+            for (hold_idx, (_, _, _, held_samps)) in by_prot.iter().enumerate() {
+                let train_pairs = collect_train_pairs(&all_refs, Some(hold_idx));
+                let fold_knots =
+                    fit_isotonic_monotone_knots(&train_pairs, CANONICAL_GRID, CANONICAL_LAPLACE);
+                let held_preds = apply_qc_with_knots(held_samps, Some(&fold_knots));
+                let rel = ProteinReliabilityCurve::from_predictions(&held_preds, 0.80);
+                oof_eces.push(rel.ece);
+                if let Some(hcp) = rel.hc_precision {
+                    oof_hcps.push(hcp);
+                }
+                oof_pooled.extend(held_preds);
+            }
+            let oof_pool = ProteinReliabilityCurve::from_predictions(&oof_pooled, 0.80);
+            let oof_mean_ece = oof_eces.iter().sum::<f64>() / (oof_eces.len().max(1) as f64);
+            let oof_macro_hcp = oof_hcps.iter().sum::<f64>() / (oof_hcps.len().max(1) as f64);
+
+            // 3. Fit the identical canonical estimator on all 10 dev proteins for deployment.
+            let all_train = collect_train_pairs(&all_refs, None);
+            let full_knots =
+                fit_isotonic_monotone_knots(&all_train, CANONICAL_GRID, CANONICAL_LAPLACE);
+
+            {
+                // Evaluate full_knots in-sample on the 10 dev proteins
+                let mut ins_eces = Vec::new();
+                let mut ins_hcps = Vec::new();
+                let mut ins_pooled = Vec::new();
+                for (_, _, _, samps) in by_prot {
+                    let preds = apply_qc_with_knots(samps, Some(&full_knots));
+                    let rel = ProteinReliabilityCurve::from_predictions(&preds, 0.80);
+                    ins_eces.push(rel.ece);
+                    if let Some(hcp) = rel.hc_precision {
+                        ins_hcps.push(hcp);
+                    }
+                    ins_pooled.extend(preds);
+                }
+                let ins_pool = ProteinReliabilityCurve::from_predictions(&ins_pooled, 0.80);
+                let ins_mean_ece = ins_eces.iter().sum::<f64>() / (ins_eces.len() as f64);
+                let ins_macro_hcp = ins_hcps.iter().sum::<f64>() / (ins_hcps.len().max(1) as f64);
+
+                println!(
+                    "\n  >>> CANONICAL ZERO-SEARCH LOPO {solver_name} (grid={CANONICAL_GRID_NAME}, laplace={CANONICAL_LAPLACE:.1})"
+                );
+                println!(
+                    "  OOF LOPO: mean_ECE={oof_mean_ece:.4}, pooled_ECE={:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
+                    oof_pool.ece,
+                    oof_macro_hcp * 100.0,
+                    oof_pool.hc_precision.unwrap_or(0.0) * 100.0,
+                    oof_pool.hc_correct,
+                    oof_pool.hc_assigned,
+                );
+                for b in &oof_pool.bins {
+                    println!(
+                        "    OOF bin [{:.1}, {:.1}): n={:4}, mean_conf={:.4}, emp_acc={:.4} (gap={:+.4})",
+                        b.lower,
+                        b.upper,
+                        b.count,
+                        b.mean_conf,
+                        b.empirical_acc,
+                        b.mean_conf - b.empirical_acc
+                    );
+                }
+                for ((id, name, verd, samps), &pece) in by_prot.iter().zip(oof_eces.iter()) {
+                    let n_ok = samps.iter().filter(|s| s.is_ok).count();
+                    let acc = 100.0 * (n_ok as f64) / (samps.len().max(1) as f64);
+                    let preds_p = apply_qc_with_knots(samps, Some(&full_knots));
+                    let rel_p = ProteinReliabilityCurve::from_predictions(&preds_p, 0.80);
+                    println!(
+                        "    per-protein {id:16} ({name:12}, QC={:4}): acc={acc:5.1}%, OOF_ECE={pece:.4}, INS_HC={} (HCP={})",
+                        verd.as_str(),
+                        rel_p.hc_status,
+                        rel_p
+                            .hc_precision
+                            .map(|v| format!("{:.1}%", v * 100.0))
+                            .unwrap_or_else(|| "ABSTAIN".to_string()),
+                    );
+                }
+                println!(
+                    "  IN-SAMPLE: mean_ECE={ins_mean_ece:.4}, pooled_ECE={:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
+                    ins_pool.ece,
+                    ins_macro_hcp * 100.0,
+                    ins_pool.hc_precision.unwrap_or(0.0) * 100.0,
+                    ins_pool.hc_correct,
+                    ins_pool.hc_assigned,
+                );
+                for b in &ins_pool.bins {
+                    println!(
+                        "    INS bin [{:.1}, {:.1}): n={:4}, mean_conf={:.4}, emp_acc={:.4} (gap={:+.4})",
+                        b.lower,
+                        b.upper,
+                        b.count,
+                        b.mean_conf,
+                        b.empirical_acc,
+                        b.mean_conf - b.empirical_acc
+                    );
+                }
+                print!("  RUST KNOTS {solver_name}: &[");
+                for (i, &(x, y)) in full_knots.iter().enumerate() {
+                    if i > 0 {
+                        print!(", ");
+                    }
+                    print!("({x:.4}, {y:.4})");
+                }
+                println!("];");
+
+                if only_filter.is_none() {
+                    assert!(
+                        oof_mean_ece <= 0.060,
+                        "{solver_name} OOF mean_ECE {oof_mean_ece:.4} exceeded 0.060 gate"
+                    );
+                    assert!(
+                        oof_pool.ece <= 0.050,
+                        "{solver_name} OOF pooled_ECE {:.4} exceeded 0.050 gate",
+                        oof_pool.ece
+                    );
+                    assert!(
+                        oof_macro_hcp >= 0.90,
+                        "{solver_name} OOF macro_HCP {:.2}% fell below 90.0% gate",
+                        oof_macro_hcp * 100.0
+                    );
+                    let committed = if solver_name == "EVO_GRAPH" {
+                        nmr_core::qc::EVO_GRAPH_CALIBRATION_KNOTS
+                    } else {
+                        nmr_core::qc::STANDARD_CALIBRATION_KNOTS
+                    };
+                    assert_eq!(
+                        committed.len(),
+                        full_knots.len(),
+                        "{solver_name} committed knot count mismatch"
+                    );
+                    for ((cx, cy), (fx, fy)) in committed.iter().zip(full_knots.iter()) {
+                        assert!(
+                            (cx - fx).abs() <= 2e-4 && (cy - fy).abs() <= 2e-4,
+                            "{solver_name} committed knot ({cx:.4}, {cy:.4}) drifted from fitted ({fx:.4}, {fy:.4})"
+                        );
+                    }
+                }
+            }
+        };
+
+        if env::var("FAST_STD_ONLY").is_err() {
+            run_lopo_calibration("EVO_GRAPH", &evo_by_prot);
+        }
+        run_lopo_calibration("STANDARD_CPU", &std_by_prot);
     }
 }

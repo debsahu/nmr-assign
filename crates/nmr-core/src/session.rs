@@ -16,10 +16,10 @@ use std::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::nef::{
-    read_nef_str, write_nef_str, NefDocument, NefMolecularSystem, NefShiftList,
-    NefWorkbenchAssignmentRow, NefWorkbenchContourLayerRow, NefWorkbenchLinkRow,
-    NefWorkbenchLockRow, NefWorkbenchPeakRow, NefWorkbenchRecipeRow, NefWorkbenchResidueRow,
-    NefWorkbenchSaveframe, NefWorkbenchShiftRow,
+    compute_nef_shift_lists_crc32, normalize_nef_atom_name, read_nef_str, write_nef_str,
+    NefDocument, NefMolecularSystem, NefShiftList, NefWorkbenchAssignmentRow,
+    NefWorkbenchContourLayerRow, NefWorkbenchLinkRow, NefWorkbenchLockRow, NefWorkbenchPeakRow,
+    NefWorkbenchRecipeRow, NefWorkbenchResidueRow, NefWorkbenchSaveframe, NefWorkbenchShiftRow,
 };
 use crate::nmrstar::Reference;
 use crate::peaks::Peak;
@@ -255,6 +255,9 @@ pub struct WorkbenchSessionState {
     pub processing_recipes: BTreeMap<String, ProcessingRecipe>,
     /// Optional unlabelled per-dataset quality-control verdict (`Pass`, `Warn`, `Abstain`).
     pub qc_verdict: Option<DatasetQcVerdict>,
+    /// Non-fatal load warnings (e.g. when external edits to `nef_chemical_shift_list` are detected and adopted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_warnings: Vec<String>,
 }
 
 impl Default for WorkbenchSessionState {
@@ -273,6 +276,7 @@ impl Default for WorkbenchSessionState {
             reference_offsets: [0.0; 5],
             processing_recipes: BTreeMap::new(),
             qc_verdict: None,
+            load_warnings: Vec::new(),
         }
     }
 }
@@ -1353,6 +1357,8 @@ pub fn write_session_nef_str(state: &WorkbenchSessionState) -> String {
         });
     }
 
+    let shift_list_crc32 = Some(compute_nef_shift_lists_crc32(&doc.shift_lists));
+
     doc.workbench_session = Some(NefWorkbenchSaveframe {
         schema_version: "1.1".to_string(),
         protein_name: state.protein_name.clone(),
@@ -1360,6 +1366,7 @@ pub fn write_session_nef_str(state: &WorkbenchSessionState) -> String {
         reference_offsets: state.reference_offsets,
         qc_verdict: state.qc_verdict.map(|v| v.as_str().to_string()),
         view_bounds_ppm: state.view_bounds_ppm,
+        shift_list_crc32,
         residues,
         peaks,
         assignments,
@@ -1484,6 +1491,23 @@ pub fn read_session_nef_str(text: &str) -> Result<WorkbenchSessionState, String>
             None => None,
         };
 
+        let mut load_warnings = Vec::new();
+        if let Some(ref expected_crc) = wb.shift_list_crc32 {
+            let actual_crc = compute_nef_shift_lists_crc32(&doc.shift_lists);
+            if !actual_crc.eq_ignore_ascii_case(expected_crc) {
+                reconcile_external_nef_shift_edits(
+                    &mut assignments,
+                    &sequence,
+                    &seq_ids,
+                    &wb.chain_code,
+                    &doc.shift_lists,
+                );
+                load_warnings.push(format!(
+                    "Detected external edits to nef_chemical_shift_list (CRC32 expected {expected_crc}, found {actual_crc}); adopted updated chemical shifts from standard NEF shift list."
+                ));
+            }
+        }
+
         let state = WorkbenchSessionState {
             protein_name: wb.protein_name,
             chain_code: wb.chain_code,
@@ -1498,6 +1522,7 @@ pub fn read_session_nef_str(text: &str) -> Result<WorkbenchSessionState, String>
             reference_offsets: wb.reference_offsets,
             processing_recipes,
             qc_verdict,
+            load_warnings,
         };
         state.validate_invariants()?;
         Ok(state)
@@ -1553,4 +1578,107 @@ pub fn read_session_nef_file(path: impl AsRef<Path>) -> Result<WorkbenchSessionS
         )
     })?;
     read_session_nef_str(&text)
+}
+
+fn reconcile_external_nef_shift_edits(
+    assignments: &mut BTreeMap<usize, ResidueAssignmentState>,
+    sequence: &[String],
+    seq_ids: &[i32],
+    chain_code: &str,
+    shift_lists: &[NefShiftList],
+) {
+    let primary_chain = if chain_code.trim().is_empty() {
+        "A"
+    } else {
+        chain_code.trim()
+    };
+    let mut seq_map: BTreeMap<i32, usize> = BTreeMap::new();
+    for (idx, &sid) in seq_ids.iter().enumerate() {
+        seq_map.insert(sid, idx);
+    }
+    if seq_map.is_empty() {
+        for idx in 0..sequence.len() {
+            seq_map.insert((idx + 1) as i32, idx);
+        }
+    }
+
+    let mut external_by_res: BTreeMap<usize, BTreeMap<String, f64>> = BTreeMap::new();
+    for slist in shift_lists {
+        for sh in &slist.shifts {
+            if sh.chain_code != primary_chain && sh.chain_code != "." {
+                continue;
+            }
+            let Some(sid) = sh.sequence_code else {
+                continue;
+            };
+            let Some(&res_idx) = seq_map.get(&sid) else {
+                continue;
+            };
+            let atom = match sh.atom_name.as_str() {
+                "HN" => "H".to_string(),
+                "CO" => "C".to_string(),
+                other => other.to_string(),
+            };
+            external_by_res
+                .entry(res_idx)
+                .or_default()
+                .insert(atom, sh.value);
+        }
+    }
+
+    let fmt_4dp = |v: f64| -> String {
+        let nv = if v == 0.0 { 0.0 } else { v };
+        format!("{nv:.4}")
+    };
+
+    // Update or prune existing residue shift maps against the externally edited standard shifts
+    let existing_keys: Vec<usize> = assignments.keys().copied().collect();
+    for res_idx in existing_keys {
+        let res_name = sequence.get(res_idx).map(String::as_str).unwrap_or("GLY");
+        let ext_map = external_by_res.remove(&res_idx).unwrap_or_default();
+        if let Some(entry) = assignments.get_mut(&res_idx) {
+            let mut next_shifts: BTreeMap<String, f64> = BTreeMap::new();
+            // Carry over unchanged atoms at full IEEE-754 precision; update changed atoms; drop deleted atoms
+            for (raw_atom, &old_val) in &entry.shifts {
+                let nef_atom = normalize_nef_atom_name(res_name, raw_atom);
+                if let Some(&ext_val) = ext_map.get(raw_atom).or_else(|| ext_map.get(&nef_atom)) {
+                    if fmt_4dp(old_val) == fmt_4dp(ext_val) {
+                        next_shifts.insert(raw_atom.clone(), old_val);
+                    } else {
+                        next_shifts.insert(raw_atom.clone(), ext_val);
+                    }
+                }
+            }
+            // Insert newly added external atoms
+            for (ext_atom, &ext_val) in &ext_map {
+                let already_mapped = next_shifts.keys().any(|raw_atom| {
+                    raw_atom == ext_atom || normalize_nef_atom_name(res_name, raw_atom) == *ext_atom
+                });
+                if !already_mapped {
+                    next_shifts.insert(ext_atom.clone(), ext_val);
+                }
+            }
+            entry.shifts = next_shifts;
+        }
+        if assignments
+            .get(&res_idx)
+            .is_some_and(|e| e.shifts.is_empty() && e.spin_system.is_none())
+        {
+            assignments.remove(&res_idx);
+        }
+    }
+
+    // Insert brand-new residue assignments added externally to `nef_chemical_shift_list`
+    for (res_idx, ext_map) in external_by_res {
+        if !ext_map.is_empty() {
+            assignments.insert(
+                res_idx,
+                ResidueAssignmentState {
+                    spin_system: None,
+                    shifts: ext_map,
+                    confidence: 1.0,
+                },
+            );
+        }
+    }
 }

@@ -33,10 +33,14 @@ use crate::dihedrals::{align_by_res_names, periodic_angle_diff_deg, random_coil_
 use crate::noesy::{compute_chain_torsions, parse_pdb_first_model, PdbChain};
 use crate::peaks::Peak;
 use crate::priors::{
-    covalent_atom_offset, delta_covalent, expected_covalent_atom_offset, logpdf, one_to_three,
-    Priors, STANDARD_RESIDUES,
+    covalent_atom_offset, delta_covalent, estimate_reference_offsets_detailed,
+    expected_covalent_atom_offset, logpdf, one_to_three, sync_detailed_reference_offsets,
+    DetailedReferenceOffsets, OffsetFitStatus, Priors, ShiftOffsets, STANDARD_RESIDUES,
 };
-use crate::qc::{apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport};
+use crate::qc::{
+    apply_dataset_qc_to_assignments, apply_evo_graph_calibration_map, evaluate_dataset_qc,
+    DatasetQcReport,
+};
 use crate::rng::Rng;
 use crate::solver::{
     candidate_llr_shifted, consensus_from_runs, pair_matrix, resolve_locked_assignments,
@@ -1700,7 +1704,25 @@ pub fn estimate_mixture_reference_offsets(
     let comp_h = sequence_atom_weights(&norm_seq, priors, "H");
     let comp_n = sequence_atom_weights(&norm_seq, priors, "N");
 
-    // Step A: Fit shared 13C reference offset across CA + CB + C (cancelling secondary-structure bias)
+    // Step A: Check whether the unified joint prior estimator detected a genuine two-channel
+    // divergent carrier/folding break (both CA and CB Fitted and differing beyond the Huber barrier).
+    let base_joint = estimate_reference_offsets_detailed(systems, &norm_seq, priors);
+    let divergent_aliph = base_joint.ca.status == OffsetFitStatus::Fitted
+        && base_joint.cb.status == OffsetFitStatus::Fitted
+        && (base_joint.ca.applied_ppm - base_joint.cb.applied_ppm).abs()
+            > (3.0 * base_joint.aliphatic_joint_sigma_ppm()).max(0.85);
+
+    if divergent_aliph {
+        return ReferenceOffsets {
+            d_ca: base_joint.ca.applied_ppm,
+            d_cb: base_joint.cb.applied_ppm,
+            d_c: base_joint.c.applied_ppm,
+            d_h: base_joint.h.applied_ppm,
+            d_n: base_joint.n.applied_ppm,
+        };
+    }
+
+    // Fit shared 13C reference offset across CA + CB + C (cancelling secondary-structure bias)
     let (d_13c_raw, gain_13c) = if obs_ca.len() >= 8 || obs_cb.len() >= 8 || obs_c.len() >= 8 {
         maximize_1d_grid_with_gain(-5.5, 5.5, 0.10, |d| {
             atom_mixture_loglik(&obs_ca, &comp_ca, d)
@@ -1993,14 +2015,20 @@ fn refine_anchor_reference_offsets_with_torsions(
     let med_cb = median_f64(res_cb);
     let (d_ca, d_cb) = match (med_ca, med_cb) {
         (Some(mca), Some(mcb)) => {
-            let shared = 0.5 * (mca + mcb);
-            if init_offsets.d_ca.abs() < 0.50 && shared.abs() < 0.55 {
-                (0.0, 0.0)
+            if (init_offsets.d_ca - init_offsets.d_cb).abs() > 1.75 {
+                // Preserve genuinely decoupled single-channel carrier/folding offsets
+                (mca, mcb)
             } else {
-                // Unbiased Pass-2 anchor refinement: 75% shared aliphatic + 25% per-nucleus median
-                let ca_adj = shared + (0.25 * (mca - shared)).clamp(-0.25, 0.25);
-                let cb_adj = shared + (0.25 * (mcb - shared)).clamp(-0.25, 0.25);
-                (ca_adj, cb_adj)
+                let shared = 0.5 * (mca + mcb);
+                if init_offsets.d_ca.abs() < 0.50 && shared.abs() < 0.55 {
+                    (0.0, 0.0)
+                } else {
+                    // Unbiased Pass-2 anchor refinement: shared aliphatic carrier + tightly clamped
+                    // per-nucleus residual (`<= 0.40 ppm` total CA-CB differential across pure helix/sheet)
+                    let ca_adj = shared + (0.25 * (mca - shared)).clamp(-0.20, 0.20);
+                    let cb_adj = shared + (0.25 * (mcb - shared)).clamp(-0.20, 0.20);
+                    (ca_adj, cb_adj)
+                }
             }
         }
         (Some(mca), None) => {
@@ -2199,28 +2227,34 @@ fn conditioned_candidate_llr(
     (best - (cands.len() as f64).ln(), best_i)
 }
 
-/// Sub-stoichiometric minor-conformer threshold (`rel_root_height < 0.15`) and major-conformer
-/// reference threshold (`rel_root_height >= 0.45`).
+/// Sub-stoichiometric minor-conformer threshold (`rel_root_intensity < 0.15`) and major-conformer
+/// reference threshold (`rel_root_intensity >= 0.45`).
 const MINOR_CONFORMER_REL_HEIGHT: f64 = 0.15;
 const MAJOR_CONFORMER_REL_HEIGHT: f64 = 0.45;
 
 /// Compute smooth sub-stoichiometric minor-conformer unary penalties (in nats) for roots with
-/// `rel_root_height < 0.15` while leaving all roots with `rel_root_height >= 0.15` (including
+/// `rel_root_intensity < 0.15` while leaving all roots with `rel_root_intensity >= 0.15` (including
 /// moderate exchange-broadened amides) or `None` at exact `0.0`.
 ///
-/// Sub-stoichiometric roots (`< 15%` median root height) that lack intra-residue `CA(0)` or whose
-/// observed `i`/`i-1` `13C` shifts duplicate a major-state root (`rel_root_height >= 0.45`, e.g.,
-/// slow-exchange minor second-form peaks such as Ubiquitin `Gln2` at `~9–12%` amplitude) receive
-/// a smooth population-weighted conformer log-prior penalty, whereas unique multi-slot C-terminal
-/// or flexible Glycine roots without a major-state carbon duplicate receive only a mild `< 0.8`-nat
-/// sub-stoichiometric prior.
-fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
+/// Sub-stoichiometric roots (`< 15%` median integrated root volume, or height when volume is absent)
+/// whose observed `i`/`i-1` `13C` shifts duplicate a major-state root (`rel_root_intensity >= 0.45`,
+/// e.g., slow-exchange minor second-form peaks such as Ubiquitin `Gln2` at `~9–12%` population) across
+/// `>= 2` matched carbon slots within tight tolerances (`0.22 ppm` CA/CB, `0.15 ppm` CO) inside a
+/// local slow-exchange `(0.25 ppm 1H, 1.8 ppm 15N)` window receive a smooth population-weighted
+/// conformer log-prior penalty, whereas unique multi-slot C-terminal or exchange-broadened roots
+/// without a local major-state carbon duplicate receive only a mild `< 0.75`-nat sub-stoichiometric
+/// prior (with zero correlated missing-`CA(i)` extra penalty).
+fn compute_minor_conformer_penalties(
+    systems: &[SpinSystem],
+    raw_peaks: Option<&[Peak]>,
+    tol: &Tolerances,
+) -> Vec<f64> {
     let mut penalties = vec![0.0_f64; systems.len()];
     let major_roots: Vec<(usize, f64)> = systems
         .iter()
         .enumerate()
         .filter_map(|(m, ss)| {
-            let r = ss.rel_root_height?;
+            let r = ss.rel_root_intensity.or(ss.rel_root_height)?;
             if r >= MAJOR_CONFORMER_REL_HEIGHT && ss.has_observed_carbons() {
                 Some((m, r))
             } else {
@@ -2233,7 +2267,7 @@ fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
     }
 
     for (s, ss) in systems.iter().enumerate() {
-        let Some(r) = ss.rel_root_height else {
+        let Some(r) = ss.rel_root_intensity.or(ss.rel_root_height) else {
             continue;
         };
         let has_ca_i = ss
@@ -2241,21 +2275,87 @@ fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
             .get(&("CA".to_string(), 0))
             .is_some_and(|l| l.iter().any(|c| c.1 > 0));
 
-        let obs_slots: Vec<(&str, i32, Vec<f64>)> = ss
-            .cands
-            .iter()
-            .filter_map(|((atom, off), raw)| {
-                let vals: Vec<f64> = raw
-                    .iter()
-                    .filter(|&&(_, sup)| sup > 0)
-                    .map(|&(v, _)| v)
-                    .collect();
-                if vals.is_empty() {
-                    None
-                } else {
-                    Some((atom.as_str(), *off, vals))
+        let mut slot_map: BTreeMap<(&'static str, i32), Vec<f64>> = BTreeMap::new();
+        for ((atom, off), raw) in &ss.cands {
+            let atom_key: &'static str = match atom.as_str() {
+                "CA" => "CA",
+                "CB" => "CB",
+                "C" => "C",
+                _ => continue,
+            };
+            let vals: Vec<f64> = raw
+                .iter()
+                .filter(|&&(_, sup)| sup > 0)
+                .map(|&(v, _)| v)
+                .collect();
+            if !vals.is_empty() {
+                slot_map.insert((atom_key, *off), vals);
+            }
+        }
+
+        // For sub-stoichiometric roots (`r < 0.15`), global stoichiometric channel truncation in
+        // `filter_peaks_with_report` can drop genuine ~10%-intensity minor-conformer 3D peaks
+        // (e.g., HNCO or intra-CB on Ubiquitin Gln2 minor state). Augment `slot_map` with up to
+        // the top-2 raw 3D peaks per `(exp, sign)` attached to `s`'s strip so shadow matching
+        // tests all carbon slots actually observed on `s` within the tight (0.22 / 0.15 ppm) gates.
+        if r < MINOR_CONFORMER_REL_HEIGHT {
+            if let Some(peaks) = raw_peaks {
+                let mut by_chan: BTreeMap<(&str, i32), Vec<(f64, f64)>> = BTreeMap::new();
+                for pk in peaks {
+                    if pk.exp == "HSQC" {
+                        continue;
+                    }
+                    let Some(c_val) = pk.c.filter(|v| v.is_finite()) else {
+                        continue;
+                    };
+                    let d =
+                        ((ss.h - pk.h) / tol.h.max(1e-6)).hypot((ss.n - pk.n) / tol.n.max(1e-6));
+                    if d <= 1.0 {
+                        let sgn = if pk.sign < 0 { -1 } else { 1 };
+                        let ht = pk.height.map(f64::abs).unwrap_or(1.0);
+                        by_chan
+                            .entry((pk.exp.as_str(), sgn))
+                            .or_default()
+                            .push((ht, c_val));
+                    }
                 }
-            })
+                for ((exp_name, sgn), mut list) in by_chan {
+                    list.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    list.truncate(2);
+                    for (_, c_val) in list {
+                        match (exp_name, sgn) {
+                            ("HNCO", _) => {
+                                slot_map.entry(("C", -1)).or_default().push(c_val);
+                            }
+                            ("HNCACO", _) => {
+                                slot_map.entry(("C", 0)).or_default().push(c_val);
+                                slot_map.entry(("C", -1)).or_default().push(c_val);
+                            }
+                            ("HNCOCA", _) => {
+                                slot_map.entry(("CA", -1)).or_default().push(c_val);
+                            }
+                            ("HNCA", _) | ("HNCACB", 1) => {
+                                slot_map.entry(("CA", 0)).or_default().push(c_val);
+                                slot_map.entry(("CA", -1)).or_default().push(c_val);
+                            }
+                            ("HNCACB", -1) => {
+                                slot_map.entry(("CB", 0)).or_default().push(c_val);
+                                slot_map.entry(("CB", -1)).or_default().push(c_val);
+                            }
+                            ("CBCACONH", _) => {
+                                slot_map.entry(("CA", -1)).or_default().push(c_val);
+                                slot_map.entry(("CB", -1)).or_default().push(c_val);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let obs_slots: Vec<(&str, i32, Vec<f64>)> = slot_map
+            .into_iter()
+            .map(|((atom, off), vals)| (atom, off, vals))
             .collect();
         let n_slots = obs_slots.len();
 
@@ -2264,20 +2364,19 @@ fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
                 .clamp(0.0, 1.0);
             let mut best_shadow_r_maj: Option<f64> = None;
             let mut best_local_conf_r_maj: Option<f64> = None;
-            if n_slots > 0 {
-                let req_slots = if n_slots <= 2 {
-                    n_slots
-                } else {
-                    (n_slots * 2).div_ceil(3)
-                };
+            if n_slots >= 2 {
                 for &(m, r_maj) in &major_roots {
                     if m == s {
                         continue;
                     }
                     let sm = &systems[m];
+                    let near_hn = (ss.h - sm.h).abs() <= 0.25 && (ss.n - sm.n).abs() <= 1.80;
+                    if !near_hn {
+                        continue;
+                    }
                     let mut matched_slots = 0usize;
                     for (atom, off, s_vals) in &obs_slots {
-                        let tol_c = if *atom == "C" { 0.40 } else { 0.55 };
+                        let tol_c = if *atom == "C" { 0.15 } else { 0.22 };
                         if let Some(m_raw) = sm.cands.get(&(atom.to_string(), *off)) {
                             let hit = s_vals.iter().any(|&vs| {
                                 m_raw
@@ -2289,27 +2388,18 @@ fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
                             }
                         }
                     }
-                    let near_hn = (ss.h - sm.h).abs() <= 0.35 && (ss.n - sm.n).abs() <= 2.50;
-                    let hn_neighbor = near_hn && matched_slots >= 1;
-                    if matched_slots >= req_slots || hn_neighbor {
+                    if matched_slots >= 2 {
                         best_shadow_r_maj =
                             Some(best_shadow_r_maj.map_or(r_maj, |prev| prev.max(r_maj)));
-                    }
-                    if near_hn
-                        && n_slots >= 2
-                        && matched_slots >= req_slots
-                        && r_maj >= 6.0 * r.max(0.015)
-                    {
-                        best_local_conf_r_maj =
-                            Some(best_local_conf_r_maj.map_or(r_maj, |prev| prev.max(r_maj)));
+                        if r_maj >= 6.0 * r.max(0.015) {
+                            best_local_conf_r_maj =
+                                Some(best_local_conf_r_maj.map_or(r_maj, |prev| prev.max(r_maj)));
+                        }
                     }
                 }
             }
 
             let mut pen = 0.75 * u_sub;
-            if !has_ca_i {
-                pen += 2.6 * (1.0 - (-6.0 * u_sub).exp());
-            }
             if let Some(r_maj) = best_local_conf_r_maj {
                 let log_pop = (r_maj / r.max(0.015)).ln().max(0.0);
                 pen += 5.0 * log_pop * (1.0 - (-8.0 * u_sub).exp());
@@ -2355,6 +2445,7 @@ fn compute_minor_conformer_penalties(systems: &[SpinSystem]) -> Vec<f64> {
     penalties
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_evo_unary_matrix(
     systems: &[SpinSystem],
     seq: &[String],
@@ -2362,11 +2453,17 @@ fn build_evo_unary_matrix(
     cfg: &EvoGraphConfig<'_>,
     effective_assign_cost: f64,
     locks: &[(usize, usize)],
+    raw_peaks: Option<&[Peak]>,
+    enable_minor_damping: bool,
 ) -> Matrix2D {
     let s_len = systems.len();
     let k_len = seq.len();
     let mut u = Matrix2D::filled(s_len, k_len, FORBID);
-    let minor_penalties = compute_minor_conformer_penalties(systems);
+    let minor_penalties = if enable_minor_damping {
+        compute_minor_conformer_penalties(systems, raw_peaks, &cfg.tolerances)
+    } else {
+        vec![0.0_f64; s_len]
+    };
 
     let has_global_aliphatic = systems.iter().any(|ss| {
         ss.cands
@@ -2531,11 +2628,19 @@ fn build_evo_unary_matrix(
     u
 }
 
-/// Calibrate raw multi-island consensus confidence with the local conditional Boltzmann margin
-/// `1 / (1 + sum_m exp((E_alt_m - E*) / T_cal))` over unassignment, competing free spin systems,
-/// empty sequence slots, and 2-cycle swaps so near-degenerate local alternatives never receive
-/// overconfident `>= 0.80` probability solely from evolutionary clone convergence.
+/// Calibrate raw multi-island consensus confidence with the parameter-free unit-temperature
+/// (`T = 1.0` nat) local conditional Boltzmann margin `1 / (1 + sum_m exp(E_alt_m - E*))` over
+/// unassignment, competing free spin systems, empty sequence slots, and 2-cycle swaps.
 fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matrix2D) {
+    calibrate_boltzmann_confidence_with_null_scale(res, u, p, 1.0);
+}
+
+fn calibrate_boltzmann_confidence_with_null_scale(
+    res: &mut AssignResult,
+    u: &Matrix2D,
+    p: &Matrix2D,
+    null_scale: f64,
+) {
     let s_len = u.rows;
     let k_len = u.cols;
     if s_len == 0 || k_len == 0 {
@@ -2559,7 +2664,6 @@ fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matr
         sc
     };
 
-    let t_cal = 1.65_f64;
     for s in 0..s_len {
         let k_raw = res.position[s];
         if k_raw < 0 || res.confidence[s] <= 0.0 {
@@ -2567,13 +2671,13 @@ fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matr
         }
         let k = k_raw as usize;
         let e_self = site_energy(s, k, &at);
-        let mut alt_partition = (-e_self / t_cal).clamp(-40.0, 20.0).exp();
+        let mut alt_partition = null_scale * (-e_self).clamp(-40.0, 20.0).exp();
 
         // Competing unassigned spin systems `t` taking slot `k`
         for t in 0..s_len {
             if t != s && res.position[t] < 0 && u.get(t, k) > FORBID * 0.5 {
                 let delta = site_energy(t, k, &at) - e_self;
-                alt_partition += (delta / t_cal).clamp(-40.0, 20.0).exp();
+                alt_partition += delta.clamp(-40.0, 20.0).exp();
             }
         }
 
@@ -2592,7 +2696,7 @@ fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matr
                     e_s_k2 += p.get(s, at[k2 + 1] as usize);
                 }
                 let delta = e_s_k2 - e_self;
-                alt_partition += (delta / t_cal).clamp(-40.0, 20.0).exp();
+                alt_partition += delta.clamp(-40.0, 20.0).exp();
             } else {
                 let t = t_raw as usize;
                 if u.get(t, k) <= FORBID * 0.5 {
@@ -2642,7 +2746,7 @@ fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matr
                     }
                 }
                 let delta = after - before;
-                alt_partition += (delta / t_cal).clamp(-40.0, 20.0).exp();
+                alt_partition += delta.clamp(-40.0, 20.0).exp();
             }
         }
 
@@ -2652,15 +2756,17 @@ fn calibrate_boltzmann_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matr
 }
 
 /// Final reported marginal confidence calibration (Pass 2):
-/// combines Pass-1/2 consensus `c0` with single-spin Boltzmann beliefs `b1` and second-order
-/// belief-weighted sequential damping (`clamp_w = (b1 / 0.85)^2`), including rigid register
-/// translation `[a..=b] -> [k2 .. k2 + L]` (`L = 2..=5`) for short stretches lacking a high-belief
-/// (`>= 0.80`) sequential anchor at either boundary so unanchored short islands cannot inflate
-/// interior residues above `0.80` via mutual clamping.
-fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: &Matrix2D) {
-    let c0 = res.confidence.clone();
-    calibrate_boltzmann_confidence(res, u, p);
-
+/// combines Pass-1/2 consensus `c0` with unit-temperature (`T = 1.0` nat) single-spin Boltzmann
+/// beliefs `b1` and parameter-free fourth-power neighbor-belief damping (`clamp_w = b1^4`),
+/// including rigid register translation `[a..=b] -> [k2 .. k2 + L]` (`L = 2..=5`) for short
+/// stretches lacking a high-belief (`>= 0.91`) sequential anchor at either boundary so unanchored
+/// short islands cannot inflate interior residues above `0.80` via mutual clamping.
+fn calibrate_final_marginal_confidence(
+    res: &mut AssignResult,
+    u: &Matrix2D,
+    p: &Matrix2D,
+    apply_calibration_map: bool,
+) {
     let k_len = u.cols;
     let s_len = u.rows;
     if k_len <= 1 || s_len == 0 {
@@ -2668,17 +2774,29 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
     }
 
     let mut at = vec![-1i32; k_len];
+    let mut n_assigned = 0usize;
     for (s, &k) in res.position.iter().enumerate() {
         if k >= 0 && (k as usize) < k_len {
             at[k as usize] = s as i32;
+            n_assigned += 1;
         }
     }
 
+    let mut col_assignable = vec![false; k_len];
+    for (k, slot) in col_assignable.iter_mut().enumerate().skip(1) {
+        *slot = (0..s_len).any(|sp| u.get(sp, k) > FORBID * 0.5);
+    }
+    let n_col_assignable = col_assignable.iter().skip(1).filter(|&&v| v).count().max(1);
+    let seq_occupancy = ((n_assigned as f64) / (n_col_assignable as f64)).clamp(0.0, 1.0);
+    let spin_assigned_frac = ((n_assigned as f64) / (s_len as f64)).clamp(0.0, 1.0);
+    let high_completeness = ((seq_occupancy.min(spin_assigned_frac) - 0.82) / 0.06).clamp(0.0, 1.0);
+    let null_scale = 1.0 - 0.80 * high_completeness;
+
+    let c0 = res.confidence.clone();
+    calibrate_boltzmann_confidence_with_null_scale(res, u, p, null_scale);
+
     let b1 = res.confidence.clone();
-    let clamp_w = |spin_idx: usize| -> f64 {
-        let r = (b1[spin_idx] / 0.85).clamp(0.0, 1.0);
-        r * r
-    };
+    let clamp_w = |spin_idx: usize| -> f64 { b1[spin_idx].clamp(0.0, 1.0).powi(4) };
     let weighted_site = |spin: usize, slot: usize| -> f64 {
         let mut sc = u.get(spin, slot);
         if slot > 0 && at[slot - 1] >= 0 {
@@ -2702,7 +2820,7 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
         }
         let left_anchored = a > 0
             && at[a - 1] >= 0
-            && b1[at[a - 1] as usize] >= 0.80
+            && b1[at[a - 1] as usize] >= 0.91
             && p.get(at[a - 1] as usize, at[a] as usize) >= 1.5;
         if left_anchored {
             continue;
@@ -2714,7 +2832,7 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
             }
             let right_anchored = b + 1 < k_len
                 && at[b + 1] >= 0
-                && b1[at[b + 1] as usize] >= 0.80
+                && b1[at[b + 1] as usize] >= 0.91
                 && p.get(at[b] as usize, at[b + 1] as usize) >= 1.5;
             if right_anchored {
                 continue;
@@ -2803,7 +2921,34 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
         }
     }
 
-    let t_cal = 1.68_f64;
+    let mut chain_p_sum = vec![0.0_f64; s_len];
+    {
+        let mut k = 1usize;
+        while k < k_len {
+            if at[k] < 0 {
+                k += 1;
+                continue;
+            }
+            let start = k;
+            let mut p_acc = 0.0_f64;
+            while k + 1 < k_len && at[k + 1] >= 0 {
+                let pv = p.get(at[k] as usize, at[k + 1] as usize);
+                if pv >= 1.5 {
+                    p_acc += pv;
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            let end = k;
+            for &sp_raw in &at[start..=end] {
+                let sp = sp_raw as usize;
+                chain_p_sum[sp] = p_acc;
+            }
+            k += 1;
+        }
+    }
+
     for s in 0..s_len {
         let k_raw = res.position[s];
         if k_raw < 0 || b1[s] <= 0.0 {
@@ -2811,13 +2956,26 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
         }
         let k = k_raw as usize;
         let e_self_w = weighted_site(s, k);
-        let un_w = (-e_self_w).max(bp_unassign[s]);
-        let mut alt_w = (un_w / t_cal).clamp(-40.0, 20.0).exp();
+        let single_un_w = null_scale * (-e_self_w).clamp(-40.0, 20.0).exp();
+        let frag_un_w = if bp_unassign[s] > f64::NEG_INFINITY * 0.5 {
+            bp_unassign[s].clamp(-40.0, 20.0).exp()
+        } else {
+            0.0
+        };
+        let mut alt_w = single_un_w.max(frag_un_w);
+
+        // Open-sequence exclusion-loss guard: when paramagnetic/exchange broadening leaves >50% of
+        // assignable FASTA positions unoccupied (`seq_occupancy < 0.50`), short islands with
+        // cumulative sequential log-Bayes support `< 20` nats lack steric exclusion (`occ_cost = 0`)
+        // at missing-residue slots.
+        if seq_occupancy < 0.50 && chain_p_sum[s] < 18.0 {
+            alt_w += 0.085;
+        }
 
         for t in 0..s_len {
             if t != s && res.position[t] < 0 && u.get(t, k) > FORBID * 0.5 {
                 let delta = weighted_site(t, k) - e_self_w;
-                alt_w += (delta / t_cal).clamp(-40.0, 20.0).exp();
+                alt_w += delta.clamp(-40.0, 20.0).exp();
             }
         }
         for k2 in 1..k_len {
@@ -2844,7 +3002,7 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
                 best_k2 = best_k2.max(e_k2 - occ_cost - e_self_w);
             }
             if best_k2 > f64::NEG_INFINITY * 0.5 {
-                alt_w += (best_k2 / t_cal).clamp(-40.0, 20.0).exp();
+                alt_w += best_k2.clamp(-40.0, 20.0).exp();
             }
         }
         let p_bp = 1.0 / (1.0 + alt_w);
@@ -2855,10 +3013,12 @@ fn calibrate_final_marginal_confidence(res: &mut AssignResult, u: &Matrix2D, p: 
             0.0
         };
         let p_upper = c0[s].min(p_bp).min(p_boltz1);
-        // Fréchet copula blend below the 0.80 HC boundary: corrects quadratic c0*p_bp
-        // under-confidence for low/medium posteriors without ever promoting <0.80 above 0.80.
-        let sub_hc_taper = (1.0 - p_prod / 0.80).max(0.0);
-        res.confidence[s] = (p_prod + 0.56 * (p_upper - p_prod) * sub_hc_taper).clamp(0.0, 1.0);
+        let p_raw = (0.5 * (p_prod + p_upper)).clamp(0.0, 1.0);
+        res.confidence[s] = if apply_calibration_map {
+            apply_evo_graph_calibration_map(p_raw)
+        } else {
+            p_raw
+        };
     }
 }
 
@@ -3801,6 +3961,28 @@ pub fn assign_evo_graph(
     assign_evo_graph_with_report(systems, sequence, priors, cfg).0
 }
 
+fn compute_evo_detailed_offsets(
+    systems: &[SpinSystem],
+    norm_seq: &[String],
+    priors: &Priors,
+    applied: &ReferenceOffsets,
+    auto_reference: bool,
+) -> DetailedReferenceOffsets {
+    let base = estimate_reference_offsets_detailed(systems, norm_seq, priors);
+    let shifts = if auto_reference {
+        ShiftOffsets {
+            h: applied.d_h,
+            n: applied.d_n,
+            ca: applied.d_ca,
+            cb: applied.d_cb,
+            c: applied.d_c,
+        }
+    } else {
+        ShiftOffsets::default()
+    };
+    sync_detailed_reference_offsets(&shifts, &base)
+}
+
 /// Run `assign_evo_graph` and return both `AssignResult` and diagnostic `EvoGraphReport`.
 pub fn assign_evo_graph_with_report(
     systems: &[SpinSystem],
@@ -3817,8 +3999,23 @@ pub fn assign_evo_graph_with_report(
     let norm_seq = normalize_sequence(sequence);
     let raw_locks = merged_config_locks(cfg);
     let valid_locks = resolve_locked_assignments(systems.len(), &norm_seq, &raw_locks);
-    let mut result =
-        assign_evo_graph_core(systems, sequence, priors, cfg, &valid_locks, &mut report);
+    let mut result = assign_evo_graph_core(
+        systems,
+        sequence,
+        priors,
+        cfg,
+        &valid_locks,
+        None,
+        true,
+        &mut report,
+    );
+    let evo_det = compute_evo_detailed_offsets(
+        systems,
+        &norm_seq,
+        priors,
+        &report.final_offsets,
+        cfg.auto_reference,
+    );
     let mut qc = evaluate_dataset_qc(
         None,
         systems,
@@ -3826,7 +4023,7 @@ pub fn assign_evo_graph_with_report(
         priors,
         &cfg.score_cfg,
         &result,
-        None,
+        Some(&evo_det),
     );
     if cfg.apply_qc_calibration {
         apply_dataset_qc_to_assignments(&mut result, &qc);
@@ -3837,12 +4034,15 @@ pub fn assign_evo_graph_with_report(
     (result, report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assign_evo_graph_core(
     systems: &[SpinSystem],
     sequence: &[String],
     priors: &Priors,
     cfg: &EvoGraphConfig<'_>,
     locks: &[(usize, usize)],
+    raw_peaks: Option<&[Peak]>,
+    enable_minor_damping: bool,
     report: &mut EvoGraphReport,
 ) -> AssignResult {
     let norm_seq = normalize_sequence(sequence);
@@ -3880,6 +4080,8 @@ fn assign_evo_graph_core(
         cfg,
         effective_assign_cost,
         locks,
+        raw_peaks,
+        enable_minor_damping,
     );
     let p = pair_matrix(systems, &cfg.score_cfg);
 
@@ -3887,6 +4089,28 @@ fn assign_evo_graph_core(
     let (pos1, scores1) = run_parallel_islands(&u1, &p, &u1, cfg, locks, None, &mut master_rng);
     let mut res1 = consensus_from_runs(&pos1, scores1);
     calibrate_boltzmann_confidence(&mut res1, &u1, &p);
+    // Map undamped Pass-1 single-spin `T = 1.0` Boltzmann margins through a fixed monotone
+    // single-spin reliability curve (decoupled from the Pass-2 output calibration table so
+    // re-fitting Pass-2 knots never perturbs Pass-1 -> Pass-2 anchor or GNN pruning behavior).
+    const PASS1_SINGLE_SPIN_KNOTS: &[(f64, f64)] = &[
+        (0.0000, 0.0000),
+        (0.0750, 0.1690),
+        (0.2250, 0.3275),
+        (0.3750, 0.4004),
+        (0.5150, 0.6579),
+        (0.6300, 0.6579),
+        (0.7200, 0.6579),
+        (0.7950, 0.7282),
+        (0.8600, 0.7291),
+        (0.9150, 0.7815),
+        (0.9575, 0.7815),
+        (0.9835, 0.8121),
+        (0.9960, 0.9740),
+        (1.0000, 0.9740),
+    ];
+    for c in &mut res1.confidence {
+        *c = crate::qc::eval_monotone_calibration_map(*c, PASS1_SINGLE_SPIN_KNOTS);
+    }
     apply_locked_result_overrides(&mut res1, norm_seq.len(), locks);
     report.pass1_best_score = res1.score;
 
@@ -3915,6 +4139,8 @@ fn assign_evo_graph_core(
         cfg,
         effective_assign_cost,
         locks,
+        raw_peaks,
+        enable_minor_damping,
     );
     let mut u2_guided = u2_phys.clone();
 
@@ -3956,7 +4182,7 @@ fn assign_evo_graph_core(
         &mut master_rng,
     );
     let mut res2 = consensus_from_runs(&pos2, scores2);
-    calibrate_final_marginal_confidence(&mut res2, &u2_phys, &p);
+    calibrate_final_marginal_confidence(&mut res2, &u2_phys, &p, cfg.apply_qc_calibration);
     apply_locked_result_overrides(&mut res2, norm_seq.len(), locks);
     report.final_best_score = res2.score;
     res2
@@ -3970,6 +4196,18 @@ pub fn assign_evo_graph_from_peaks(
     sequence: &[String],
     priors: &Priors,
     cfg: &EvoGraphConfig<'_>,
+) -> (Vec<SpinSystem>, AssignResult, EvoGraphReport) {
+    assign_evo_graph_from_peaks_with_minor_damping(peaks, sequence, priors, cfg, true)
+}
+
+/// Variant of [`assign_evo_graph_from_peaks`] allowing explicit toggling of slow-exchange
+/// minor-conformer damping (`enable_minor_damping`) for paired `dev` ablation audits.
+pub fn assign_evo_graph_from_peaks_with_minor_damping(
+    peaks: &[Peak],
+    sequence: &[String],
+    priors: &Priors,
+    cfg: &EvoGraphConfig<'_>,
+    enable_minor_damping: bool,
 ) -> (Vec<SpinSystem>, AssignResult, EvoGraphReport) {
     let mut report = EvoGraphReport::default();
     let filtered = filter_peaks_with_report(peaks, sequence, cfg, &mut report);
@@ -3998,7 +4236,16 @@ pub fn assign_evo_graph_from_peaks(
         priors,
         cfg,
         &remapped_locks,
+        Some(peaks),
+        enable_minor_damping,
         &mut report,
+    );
+    let evo_det = compute_evo_detailed_offsets(
+        &systems,
+        &norm_seq,
+        priors,
+        &report.final_offsets,
+        cfg.auto_reference,
     );
     let mut qc = evaluate_dataset_qc(
         Some(peaks),
@@ -4007,7 +4254,7 @@ pub fn assign_evo_graph_from_peaks(
         priors,
         &cfg.score_cfg,
         &result,
-        None,
+        Some(&evo_det),
     );
     if cfg.apply_qc_calibration {
         apply_dataset_qc_to_assignments(&mut result, &qc);

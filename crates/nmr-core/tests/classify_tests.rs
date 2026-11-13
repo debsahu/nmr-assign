@@ -24,9 +24,9 @@ use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nmr_core::classify::{
-    classify_nmr_entries, classify_nmr_workspace, extract_archive_virtual_entries, DataState,
-    ExperimentDimensionality, ExperimentVendor, ProblemRegime, PulseSequenceClass, QuadratureKind,
-    VirtualEntry, WorkspaceInventory,
+    classify_nmr_entries, classify_nmr_workspace, extract_archive_virtual_entries,
+    extract_archive_virtual_entries_bounded, DataState, ExperimentDimensionality, ExperimentVendor,
+    ProblemRegime, PulseSequenceClass, QuadratureKind, VirtualEntry, WorkspaceInventory,
 };
 use nmr_core::service::{
     spawn_background_server, spawn_background_server_with_options, ServiceOptions,
@@ -1223,7 +1223,11 @@ fn test_archive_hardening_gnu_tar_crc32_checksum_and_bomb_limits() {
     ];
     assert!(extract_archive_virtual_entries("bad_dist.tgz", &bad_deflate_gz).is_err());
 
-    // 5. > 128 MiB gzip bomb on `extract_archive_virtual_entries` must abort cleanly
+    // 5. > 130 MiB `ser` `.tar.gz`:
+    //    (a) `extract_archive_virtual_entries` (browser drag-and-drop) MUST SUCCEED by streaming/discarding
+    //        `ser` into its 8 KiB scratch buffer without retaining payload memory;
+    //    (b) `extract_archive_virtual_entries_bounded(..., 128 MiB, 32 MiB)` AND untrusted HTTP
+    //        `POST /api/v1/inspect` MUST REJECT it!
     let mut bomb_tar = Vec::new();
     let bomb_hdr_only = {
         let mut hdr = [0u8; 512];
@@ -1232,7 +1236,7 @@ fn test_archive_hardening_gnu_tar_crc32_checksum_and_bomb_limits() {
         hdr[100..107].copy_from_slice(b"0000644");
         hdr[108..115].copy_from_slice(b"0001000");
         hdr[116..123].copy_from_slice(b"0001000");
-        let sz = 130usize * 1024 * 1024; // 130 MiB > 128 MiB cap
+        let sz = 130usize * 1024 * 1024; // 130 MiB > 128 MiB HTTP cap
         hdr[124..135].copy_from_slice(format!("{sz:011o}").as_bytes());
         hdr[136..147].copy_from_slice(b"14600000000");
         hdr[148..156].fill(b' ');
@@ -1248,15 +1252,55 @@ fn test_archive_hardening_gnu_tar_crc32_checksum_and_bomb_limits() {
     let bomb_tgz = gzip_fixed_huffman_rle_zeros(&bomb_tar);
     assert!(
         bomb_tgz.len() < 1_000_000,
-        "RLE-compressed 130 MiB bomb should be < 1 MB, got {}",
+        "RLE-compressed 130 MiB archive should be < 1 MB, got {}",
         bomb_tgz.len()
     );
-    let bomb_err = extract_archive_virtual_entries("bomb.tgz", &bomb_tgz)
-        .expect_err("130 MiB gzip bomb must be rejected in-memory");
+    let ok_entries = extract_archive_virtual_entries("large_bmrb.tgz", &bomb_tgz)
+        .expect("130 MiB ser archive must succeed for browser drag-and-drop");
+    assert_eq!(ok_entries.len(), 1);
+    assert!(
+        ok_entries[0].header_bytes.is_empty(),
+        "discarded ser payload must retain 0 bytes in header_bytes"
+    );
+    assert_eq!(ok_entries[0].total_bytes, 130 * 1024 * 1024);
+
+    let bomb_err = extract_archive_virtual_entries_bounded(
+        "bomb.tgz",
+        &bomb_tgz,
+        128 * 1024 * 1024,
+        32 * 1024 * 1024,
+    )
+    .expect_err("130 MiB gzip bomb must be rejected under 128 MiB bound");
     assert!(
         bomb_err.contains("maximum uncompressed byte limit"),
         "unexpected error: {bomb_err}"
     );
+
+    let retained_err =
+        extract_archive_virtual_entries_bounded("gnu.tar", &gnu_tar, 16 * 1024 * 1024, 32)
+            .expect_err("exceeding max_retained_header_bytes must be rejected");
+    assert!(
+        retained_err.contains("maximum retained header byte limit"),
+        "unexpected retained error: {retained_err}"
+    );
+
+    let root = make_temp_dir("bomb_http_inspect");
+    let mut srv = spawn_background_server("127.0.0.1:0", root.join("srv"))
+        .expect("spawn background server for bomb test");
+    let (st_bomb, resp_bomb) = send_http_post(
+        srv.local_addr(),
+        "/api/v1/inspect",
+        "application/gzip",
+        &bomb_tgz,
+    );
+    assert_eq!(
+        st_bomb,
+        400,
+        "POST /api/v1/inspect must reject > 128 MiB gzip bomb: {}",
+        String::from_utf8_lossy(&resp_bomb)
+    );
+    srv.shutdown();
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn find_real_data_dir() -> Option<PathBuf> {
@@ -1572,4 +1616,134 @@ fn test_conditional_real_dev_datasets_accuracy_and_speed() {
             inv.experiments
         );
     }
+}
+
+fn bruker_indirect_acqus_with_carrier(
+    nuc1: &str,
+    bf1: f64,
+    carrier_ppm: f64,
+    sw_ppm: f64,
+    td: usize,
+    fn_mode: usize,
+) -> String {
+    let sfo1 = bf1 * (1.0 + carrier_ppm * 1.0e-6);
+    format!(
+        "##TITLE= Indirect parameter file\n\
+         ##$NUC1= <{nuc1}>\n\
+         ##$SFO1= {sfo1:.8}\n\
+         ##$BF1= {bf1:.8}\n\
+         ##$SW= {sw_ppm:.4}\n\
+         ##$SW_h= {:.3}\n\
+         ##$TD= {td}\n\
+         ##$FnMODE= {fn_mode}\n\
+         ##END=\n",
+        sw_ppm * sfo1
+    )
+}
+
+#[test]
+fn test_q1b_methyl_carrier_sw_and_interleaved_acqu2s_qf_cest() {
+    // 1. Methyl CT-HSQC (`PULPROG = hsqcetgpsisp2.2`, 13C carrier = 19 ppm, SW = 24 ppm) -> `C13Hmqc` (`MethylTrosy`)
+    let ct_me_dir = make_temp_dir("q1b_methyl_ct_hsqc");
+    write_text(
+        &ct_me_dir,
+        "10_methyl_cthsqc/acqus",
+        &bruker_acqus("hsqcetgpsisp2.2", "1H", 800.13, 12.0, 2048, 0),
+    );
+    write_text(
+        &ct_me_dir,
+        "10_methyl_cthsqc/acqu2s",
+        &bruker_indirect_acqus_with_carrier("13C", 201.19, 19.0, 24.0, 256, 5),
+    );
+    write_bytes(&ct_me_dir, "10_methyl_cthsqc/ser", &[0u8; 64]);
+    let ct_inv = classify_nmr_workspace(&ct_me_dir).expect("classify methyl CT-HSQC");
+    assert_eq!(
+        ct_inv.experiments[0].pulse_class,
+        PulseSequenceClass::C13Hmqc,
+        "Methyl CT-HSQC (carrier=19 ppm, SW=24 ppm) must classify as C13Hmqc"
+    );
+    assert_eq!(ct_inv.problem_regime, ProblemRegime::MethylTrosy);
+    let _ = fs::remove_dir_all(&ct_me_dir);
+
+    // 2. Full-aliphatic `13C-HMQC` (`PULPROG = hmqcetgp`, carrier = 42 ppm, SW = 65 ppm) -> `C13Hsqc`
+    //    AND aromatic `13C-HMQC` (`PULPROG = hmqcetgp`, carrier = 125 ppm, SW = 30 ppm) -> `C13Hsqc`
+    let non_me_dir = make_temp_dir("q1b_non_methyl_hmqc");
+    write_text(
+        &non_me_dir,
+        "10_aliph_hmqc/acqus",
+        &bruker_acqus("hmqcetgp", "1H", 800.13, 12.0, 2048, 0),
+    );
+    write_text(
+        &non_me_dir,
+        "10_aliph_hmqc/acqu2s",
+        &bruker_indirect_acqus_with_carrier("13C", 201.19, 42.0, 65.0, 512, 5),
+    );
+    write_bytes(&non_me_dir, "10_aliph_hmqc/ser", &[0u8; 64]);
+
+    write_text(
+        &non_me_dir,
+        "20_arom_hmqc/acqus",
+        &bruker_acqus("hmqcetgp", "1H", 800.13, 12.0, 2048, 0),
+    );
+    write_text(
+        &non_me_dir,
+        "20_arom_hmqc/acqu2s",
+        &bruker_indirect_acqus_with_carrier("13C", 201.19, 125.0, 30.0, 256, 5),
+    );
+    write_bytes(&non_me_dir, "20_arom_hmqc/ser", &[0u8; 64]);
+
+    let non_me_inv = classify_nmr_workspace(&non_me_dir).expect("classify non-methyl 13C-HMQC");
+    assert_eq!(non_me_inv.experiments.len(), 2);
+    assert_eq!(
+        non_me_inv.experiments[0].pulse_class,
+        PulseSequenceClass::C13Hsqc,
+        "Full-aliphatic SW=65 ppm 13C-HMQC must classify as C13Hsqc, not C13Hmqc"
+    );
+    assert_eq!(
+        non_me_inv.experiments[1].pulse_class,
+        PulseSequenceClass::C13Hsqc,
+        "Aromatic carrier=125 ppm 13C-HMQC must classify as C13Hsqc, not C13Hmqc"
+    );
+    assert_ne!(non_me_inv.problem_regime, ProblemRegime::MethylTrosy);
+    let _ = fs::remove_dir_all(&non_me_dir);
+
+    // 3. Interleaved `acqu2s`-stepped 3D `CEST` (`fq1list`, `acqu2s` FnMODE=1 QF with TD=10,
+    //    `acqu3s` 15N Echo-Antiecho with TD=128, generic HSQC PULPROG without "cest" substring) -> `Pseudo3D` (`Cest`)
+    let cest_dir = make_temp_dir("q1b_interleaved_acqu2s_cest");
+    write_text(
+        &cest_dir,
+        "30_interleaved_cest/acqus",
+        &bruker_acqus("hsqcetf3gpsi3d_sat", "1H", 700.13, 14.0, 2048, 0),
+    );
+    write_text(
+        &cest_dir,
+        "30_interleaved_cest/acqu2s",
+        &bruker_indirect_acqus("off", 700.13, 1.0, 10, 1), // QF (FnMODE == 1), TD == fq1list length (10)
+    );
+    write_text(
+        &cest_dir,
+        "30_interleaved_cest/acqu3s",
+        &bruker_indirect_acqus("15N", 70.95, 32.0, 128, 6), // Echo-Antiecho (FnMODE == 6)
+    );
+    write_text(
+        &cest_dir,
+        "30_interleaved_cest/fq1list",
+        "10000.0\n7100.0\n7250.0\n7400.0\n7550.0\n7700.0\n7850.0\n8000.0\n8150.0\n8300.0\n",
+    );
+    write_bytes(&cest_dir, "30_interleaved_cest/ser", &[0u8; 256]);
+
+    let cest_inv = classify_nmr_workspace(&cest_dir).expect("classify interleaved acqu2s CEST");
+    assert_eq!(cest_inv.experiments.len(), 1);
+    assert_eq!(
+        cest_inv.experiments[0].dimensionality,
+        ExperimentDimensionality::Pseudo3D,
+        "Interleaved acqu2s-QF 3D CEST must be classified as Pseudo3D"
+    );
+    assert_eq!(
+        cest_inv.experiments[0].pulse_class,
+        PulseSequenceClass::Cest,
+        "Interleaved acqu2s-QF 3D fq1list must be classified as Cest"
+    );
+    assert_eq!(cest_inv.problem_regime, ProblemRegime::RelaxationDynamics);
+    let _ = fs::remove_dir_all(&cest_dir);
 }

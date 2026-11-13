@@ -52,8 +52,8 @@ use nmr_core::picker::{
     PickerConfig, StripBank3D,
 };
 use nmr_core::priors::{
-    compute_priors, fit_unlabelled_global_offsets_detailed, one_to_three, DetailedReferenceOffsets,
-    NucleusOffsetFit, OffsetFitStatus, Priors, ShiftOffsets,
+    compute_priors, estimate_reference_offsets_detailed, fit_unlabelled_global_offsets_detailed,
+    one_to_three, sync_detailed_reference_offsets, DetailedReferenceOffsets, Priors, ShiftOffsets,
 };
 use nmr_core::process::{
     process_fid_2d_mut, process_fid_3d_mut, register_3d_hn_to_hsqc_2d, ProcessingRecipe,
@@ -207,44 +207,6 @@ pub(crate) struct SolverWorkflowOutput {
     pub(crate) steps_per_system: usize,
 }
 
-fn sync_detailed_prior_offsets(
-    applied: &ShiftOffsets,
-    blind: &DetailedReferenceOffsets,
-) -> DetailedReferenceOffsets {
-    let sync_one = |d_app: f64, fit: NucleusOffsetFit| -> NucleusOffsetFit {
-        if fit.status == OffsetFitStatus::TooFewValues {
-            fit
-        } else if d_app.abs() > 1e-9 {
-            NucleusOffsetFit {
-                status: OffsetFitStatus::Fitted,
-                applied_ppm: d_app,
-                candidate_ppm: if fit.candidate_ppm.abs() > 1e-9 {
-                    fit.candidate_ppm
-                } else {
-                    d_app
-                },
-                log_likelihood_gain: fit.log_likelihood_gain,
-                n_values: fit.n_values,
-            }
-        } else {
-            NucleusOffsetFit {
-                status: OffsetFitStatus::NotSignificant,
-                applied_ppm: 0.0,
-                candidate_ppm: fit.candidate_ppm,
-                log_likelihood_gain: fit.log_likelihood_gain,
-                n_values: fit.n_values,
-            }
-        }
-    };
-    DetailedReferenceOffsets {
-        h: sync_one(applied.h, blind.h),
-        n: sync_one(applied.n, blind.n),
-        ca: sync_one(applied.ca, blind.ca),
-        cb: sync_one(applied.cb, blind.cb),
-        c: sync_one(applied.c, blind.c),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_assignment_workflow(
     solver: SolverKind,
@@ -263,8 +225,10 @@ pub(crate) fn execute_assignment_workflow(
     match solver {
         SolverKind::Standard => {
             let systems = build_spin_systems(peaks, &Tolerances::default(), 3, false)?;
+            let base_detailed = estimate_reference_offsets_detailed(&systems, sequence, priors);
             let (effective_priors, offsets) =
                 prepare_scoring_priors(&systems, sequence, priors, score_cfg);
+            let detailed_offsets = sync_detailed_reference_offsets(&offsets, &base_detailed);
             let default_runs = if engine == EngineKind::Gpu {
                 64
             } else {
@@ -285,12 +249,10 @@ pub(crate) fn execute_assignment_workflow(
                 priors,
                 score_cfg,
                 &result,
-                None,
+                Some(&detailed_offsets),
             );
             apply_dataset_qc_to_assignments(&mut result, &qc_report);
             qc_report.already_applied = true;
-            let detailed_offsets =
-                sync_detailed_prior_offsets(&offsets, &qc_report.detailed_offsets);
             Ok(SolverWorkflowOutput {
                 systems,
                 kept_hsqc_indices: None,
@@ -321,6 +283,7 @@ pub(crate) fn execute_assignment_workflow(
             }
             let (systems, result, rep) =
                 assign_evo_graph_from_peaks(peaks, sequence, priors, &evo_cfg);
+            let detailed_offsets = rep.qc_report.detailed_offsets;
             let offsets = ShiftOffsets {
                 h: rep.final_offsets.d_h,
                 n: rep.final_offsets.d_n,
@@ -328,8 +291,6 @@ pub(crate) fn execute_assignment_workflow(
                 cb: rep.final_offsets.d_cb,
                 c: rep.final_offsets.d_c,
             };
-            let detailed_offsets =
-                sync_detailed_prior_offsets(&offsets, &rep.qc_report.detailed_offsets);
             let effective_priors = rep.shifted_priors(priors);
             let engine_label = "CPU (f64, evo-graph)".to_string();
             Ok(SolverWorkflowOutput {
@@ -5072,6 +5033,7 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         // 4. Verify `DetailedReferenceOffsets` (`P1-3`) distinguishes `Fitted`, `NotSignificant`,
         //    and `TooFewValues` (`n < 5`), and `evaluate_prediction_against_truth` (`P1-1`)
         //    distinguishes `Abstained (0 HC calls)` from `0.0%` wrong HC calls.
+        use nmr_core::priors::OffsetFitStatus;
         let mut pred_partial = truth.clone();
         pred_partial.shifts.retain(|(_, atom), _| atom != "CB");
         for ((_, atom), val) in &mut pred_partial.shifts {

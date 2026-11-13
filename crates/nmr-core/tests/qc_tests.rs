@@ -15,8 +15,10 @@ use nmr_core::priors::{
     DetailedReferenceOffsets, NucleusOffsetFit, OffsetFitStatus, Priors,
 };
 use nmr_core::qc::{
-    apply_dataset_qc_to_assignments, check_offset_consistency, evaluate_dataset_qc,
-    DatasetQcVerdict, ProteinReliabilityCurve,
+    apply_dataset_qc_to_assignments, apply_evo_graph_calibration_map,
+    apply_standard_calibration_map, check_offset_consistency, eval_monotone_calibration_map,
+    evaluate_dataset_qc, fit_isotonic_monotone_knots, DatasetQcVerdict, ProteinReliabilityCurve,
+    EVO_GRAPH_CALIBRATION_KNOTS, STANDARD_CALIBRATION_KNOTS,
 };
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::solver::{AssignResult, ScoreConfig};
@@ -141,24 +143,48 @@ fn check_offset_consistency_flags_divergent_aliphatic_offsets_and_allows_missing
         "missing CB (`TooFewValues`) must not trigger aliphatic mismatch: {issues_cisd3:?}"
     );
 
-    // Suspect case A: dCA Fitted at -2.70 ppm while dCB has 45 observations yet is NotSignificant near 0.0
-    let ca_only_anom = DetailedReferenceOffsets {
+    // P1-4 rule: `NotSignificant` means unknown / below deadband, NEVER evidence of `0.0 ppm`!
+    // One channel Fitted and the other NotSignificant must NOT trigger an aliphatic mismatch.
+    let ca_fitted_cb_ns = DetailedReferenceOffsets {
         cb: mk_fit(OffsetFitStatus::NotSignificant, 0.0, -0.10, 0.5, 45),
         ..cisd3_like
     };
-    let (ok_a, issues_a) = check_offset_consistency(&ca_only_anom);
-    assert!(!ok_a && !issues_a.is_empty());
+    let (ok_a, issues_a) = check_offset_consistency(&ca_fitted_cb_ns);
+    assert!(
+        ok_a && issues_a.is_empty(),
+        "Fitted vs NotSignificant must not trigger aliphatic mismatch under P1-4: {issues_a:?}"
+    );
 
-    // Suspect case B (e.g., BMRB 53280-like): dCB Fitted at +2.93 ppm while dCA is NotSignificant near 0.0
-    let cb_only_anom = DetailedReferenceOffsets {
+    let cb_fitted_ca_ns = DetailedReferenceOffsets {
         h: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.0, 0.1, 60),
         n: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.0, 0.1, 60),
         ca: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.12, 0.7, 60),
-        cb: mk_fit(OffsetFitStatus::Fitted, 2.93, 2.93, 24.0, 55),
+        cb: mk_fit(OffsetFitStatus::Fitted, -2.72, -2.72, 24.0, 55),
         c: mk_fit(OffsetFitStatus::NotSignificant, 0.0, -0.05, 0.3, 60),
     };
-    let (ok_b, issues_b) = check_offset_consistency(&cb_only_anom);
-    assert!(!ok_b && !issues_b.is_empty());
+    let (ok_b, issues_b) = check_offset_consistency(&cb_fitted_ca_ns);
+    assert!(
+        ok_b && issues_b.is_empty(),
+        "NotSignificant vs Fitted must not trigger aliphatic mismatch under P1-4: {issues_b:?}"
+    );
+
+    // Coherent both-Fitted TMS offsets (-2.78 vs -2.74 ppm) -> OK
+    let tms_both_ok = DetailedReferenceOffsets {
+        cb: mk_fit(OffsetFitStatus::Fitted, -2.74, -2.74, 38.0, 52),
+        ca: mk_fit(OffsetFitStatus::Fitted, -2.78, -2.78, 41.0, 55),
+        ..cisd3_like
+    };
+    let (ok_tms, issues_tms) = check_offset_consistency(&tms_both_ok);
+    assert!(ok_tms, "coherent TMS offsets must pass: {issues_tms:?}");
+
+    // Genuine both-Fitted divergent aliphatic offsets (> max(3 * sigma_joint, 0.85) ppm) -> flagged!
+    let both_divergent = DetailedReferenceOffsets {
+        ca: mk_fit(OffsetFitStatus::Fitted, -2.80, -2.80, 40.0, 60),
+        cb: mk_fit(OffsetFitStatus::Fitted, 2.20, 2.20, 35.0, 60),
+        ..cisd3_like
+    };
+    let (ok_div, issues_div) = check_offset_consistency(&both_divergent);
+    assert!(!ok_div && !issues_div.is_empty());
 
     // Suspect case C: extreme |dH| > 0.35 ppm or |dN| > 2.5 ppm
     let extreme_hn = DetailedReferenceOffsets {
@@ -385,4 +411,174 @@ fn protein_reliability_curve_bins_ece_and_abstention_status() {
     assert!(!wrong_hc.is_abstained());
     assert_eq!(wrong_hc.hc_precision, Some(0.0));
     assert_eq!(wrong_hc.hc_status, "0.0% (0/2)");
+}
+
+#[test]
+fn tms_shifted_all_helix_and_all_sheet_proteins_pass_joint_offset_qc() {
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let base_truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+
+    // Build synthetic 100% alpha-helix and 100% beta-sheet chemical-shift references around BMRB
+    // prior means (Wishart & Sykes 1994 secondary shifts relative to BMRB globular means:
+    // alpha-helix: CA +1.65, CB -0.95, C +1.25 ppm; beta-sheet: CA -1.45, CB +1.35, C -1.10 ppm),
+    // PLUS a uniform -2.70 ppm TMS 13C reference shift on all carbon nuclei!
+    for (label, sec_ca, sec_cb, sec_c) in [
+        ("all_helix_tms", 1.65_f64, -0.95_f64, 1.25_f64),
+        ("all_sheet_tms", -1.45_f64, 1.35_f64, -1.10_f64),
+    ] {
+        let mut synth = base_truth.clone();
+        for k in 0..synth.sequence.len() {
+            let rname = &synth.sequence[k];
+            let jitter = ((k as f64) * 1.6180339).sin() * 0.35;
+            if let Some((mu_ca, _)) = priors.get(rname, "CA") {
+                synth
+                    .shifts
+                    .insert((k, "CA".to_string()), mu_ca + sec_ca + jitter - 2.70);
+            }
+            if rname != "GLY" {
+                if let Some((mu_cb, _)) = priors.get(rname, "CB") {
+                    synth
+                        .shifts
+                        .insert((k, "CB".to_string()), mu_cb + sec_cb - 0.5 * jitter - 2.70);
+                }
+            }
+            if let Some((mu_c, _)) = priors.get(rname, "C") {
+                synth
+                    .shifts
+                    .insert((k, "C".to_string()), mu_c + sec_c + 0.4 * jitter - 2.70);
+            }
+        }
+
+        let (peaks, _) = simulate(
+            &synth,
+            &SimConfig {
+                seed: 7,
+                ..SimConfig::default()
+            },
+        );
+        let (_systems, _res, rep) = assign_evo_graph_from_peaks(
+            &peaks,
+            &synth.sequence,
+            &priors,
+            &EvoGraphConfig::default(),
+        );
+        assert_eq!(
+            rep.qc_report.verdict,
+            DatasetQcVerdict::Pass,
+            "{label} (-2.70 ppm TMS) must earn QC=PASS under unified joint (CA, CB, C') offset estimator, got {:?}",
+            rep.qc_report
+        );
+        assert!(
+            rep.qc_report.offset_consistency_ok,
+            "{label} must have offset_consistency_ok=true: {:?}",
+            rep.qc_report.detailed_offsets
+        );
+        assert_eq!(
+            rep.qc_report.detailed_offsets.ca.status,
+            OffsetFitStatus::Fitted
+        );
+        assert_eq!(
+            rep.qc_report.detailed_offsets.cb.status,
+            OffsetFitStatus::Fitted
+        );
+        assert!(
+            (rep.qc_report.detailed_offsets.ca.applied_ppm - (-2.70)).abs() <= 0.75,
+            "{label} expected dCA near -2.70 ppm, got {}",
+            rep.qc_report.detailed_offsets.ca.applied_ppm
+        );
+        assert!(
+            (rep.qc_report.detailed_offsets.cb.applied_ppm - (-2.70)).abs() <= 0.75,
+            "{label} expected dCB near -2.70 ppm, got {}",
+            rep.qc_report.detailed_offsets.cb.applied_ppm
+        );
+    }
+}
+
+#[test]
+fn monotone_calibration_maps_isotonic_pav_and_unconverged_margin_abstention() {
+    // 1. Both committed LOPO knot tables must be strictly non-decreasing in both x and y,
+    // anchored at (0.0, 0.0) and ending at x = 1.0 with y >= 0.90.
+    for (name, knots) in [
+        ("evo_graph", EVO_GRAPH_CALIBRATION_KNOTS),
+        ("standard", STANDARD_CALIBRATION_KNOTS),
+    ] {
+        assert_eq!(
+            knots.first().copied(),
+            Some((0.0, 0.0)),
+            "{name} start knot"
+        );
+        let (x_end, y_end) = knots.last().copied().expect("non-empty knots");
+        assert!((x_end - 1.0).abs() < 1e-12, "{name} end x");
+        assert!((0.90..=1.0).contains(&y_end), "{name} end y={y_end}");
+        for w in knots.windows(2) {
+            assert!(w[1].0 > w[0].0, "{name} x must strictly increase: {w:?}");
+            assert!(
+                w[1].1 + 1e-12 >= w[0].1,
+                "{name} y must be monotone non-decreasing: {w:?}"
+            );
+        }
+    }
+
+    // 2. Piecewise-linear evaluation & isotonic PAV regression preserve monotonicity
+    let mut prev_evo = 0.0;
+    let mut prev_std = 0.0;
+    for step in 0..=200 {
+        let p = (step as f64) / 200.0;
+        let ce = apply_evo_graph_calibration_map(p);
+        let cs = apply_standard_calibration_map(p);
+        assert!(ce + 1e-12 >= prev_evo && (0.0..=1.0).contains(&ce));
+        assert!(cs + 1e-12 >= prev_std && (0.0..=1.0).contains(&cs));
+        prev_evo = ce;
+        prev_std = cs;
+    }
+
+    let synth_samples = vec![
+        (0.10, false),
+        (0.15, false),
+        (0.35, true),
+        (0.45, false), // non-monotone inversion that PAV must pool
+        (0.75, true),
+        (0.85, true),
+        (0.95, true),
+    ];
+    let grid = [0.0, 0.25, 0.50, 0.80, 1.0];
+    let fitted = fit_isotonic_monotone_knots(&synth_samples, &grid, 1.0);
+    for w in fitted.windows(2) {
+        assert!(w[1].1 + 1e-12 >= w[0].1, "PAV violation: {w:?}");
+    }
+    assert_eq!(eval_monotone_calibration_map(0.0, &fitted), 0.0);
+
+    // 3. Unconverged ensemble (`solution_margin < 0.07` with `>= 12` placed residues) must ABSTAIN
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+    let score_cfg = ScoreConfig::default();
+    let (clean_peaks, _) = simulate(&truth, &SimConfig::default());
+    let (systems_clean, mut res_unconv, _) = assign_evo_graph_from_peaks(
+        &clean_peaks,
+        &truth.sequence,
+        &priors,
+        &EvoGraphConfig::default(),
+    );
+    for c in &mut res_unconv.confidence {
+        if *c > 0.0 {
+            *c = 0.42; // 0% of placed residues >= 0.65 -> solution_margin = 0.0 < 0.07
+        }
+    }
+    let qc_unconv = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &res_unconv,
+        None,
+    );
+    assert_eq!(
+        qc_unconv.verdict,
+        DatasetQcVerdict::Abstain,
+        "collapsed solution_margin must trigger Abstain: {qc_unconv:?}"
+    );
+    assert!(qc_unconv.solution_margin < 0.07);
 }

@@ -602,8 +602,8 @@ enum DeflatePhase {
     Done,
 }
 
-const MAX_IN_MEMORY_INFLATE_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB anti-bomb bound for HTTP/WASM byte buffers
-const MAX_DISK_INFLATE_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB bound for local filesystem archives
+const MAX_DISK_INFLATE_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB bound for streamed/discarded archive payloads
+const MAX_RETAINED_HEADER_BYTES: usize = 64 * 1024 * 1024; // 64 MiB bound on retained VirtualEntry.header_bytes memory
 
 const fn build_crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];
@@ -1155,6 +1155,11 @@ fn classify_file_read_action(rel_path: &str) -> FileReadAction {
             | "fq1list"
             | "fq2list"
             | "fq3list"
+            | "fq4list"
+            | "fq5list"
+            | "fq6list"
+            | "fq7list"
+            | "fq8list"
             | "procpar"
             | "text"
             | "sampling.sch"
@@ -1308,10 +1313,12 @@ fn validate_tar_header_checksum(hdr: &[u8; 512]) -> bool {
 }
 
 /// Walk a POSIX.1-1988 `ustar` stream using `skip_fn` to advance over unread payload tails
-/// (`Seek::seek` on `.tar` files/cursors in `O(1)`, or bounded scratch discard on `.tar.gz`).
+/// (`Seek::seek` on `.tar` files/cursors in `O(1)`, or bounded scratch discard on `.tar.gz`),
+/// while enforcing `max_retained_header_bytes` across all retained `VirtualEntry.header_bytes`.
 fn scan_tar_with_skipper<R, S>(
     reader: &mut R,
     mut skip_fn: S,
+    max_retained_header_bytes: usize,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String>
 where
@@ -1323,6 +1330,7 @@ where
     let mut gnu_long_name: Option<String> = None;
     let mut pax_path: Option<String> = None;
     let mut pax_size: Option<u64> = None;
+    let mut retained_header_bytes: usize = out.iter().map(|e| e.header_bytes.len()).sum();
 
     loop {
         let has_block =
@@ -1440,6 +1448,12 @@ where
             }
             FileReadAction::BoundedBinary(limit) | FileReadAction::BoundedText(limit) => {
                 let to_read = (raw_size.min(limit as u64)) as usize;
+                let next_retained = retained_header_bytes.saturating_add(to_read);
+                if next_retained > max_retained_header_bytes {
+                    return Err(format!(
+                        "archive exceeded maximum retained header byte limit ({max_retained_header_bytes} bytes)"
+                    ));
+                }
                 let mut prefix_bytes = vec![0u8; to_read];
                 if to_read > 0 {
                     read_exact_or_eof(reader, &mut prefix_bytes)
@@ -1449,6 +1463,7 @@ where
                 if rem > 0 {
                     skip_fn(reader, rem).map_err(|e| format!("tar skip error: {e}"))?;
                 }
+                retained_header_bytes = next_retained;
                 out.push(VirtualEntry::header_only(rel, prefix_bytes, raw_size));
             }
         }
@@ -1456,8 +1471,9 @@ where
     Ok(())
 }
 
-fn scan_tar_seekable<R: Read + Seek>(
+fn scan_tar_seekable_bounded<R: Read + Seek>(
     reader: &mut R,
+    max_retained_header_bytes: usize,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String> {
     scan_tar_with_skipper(
@@ -1467,17 +1483,26 @@ fn scan_tar_seekable<R: Read + Seek>(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tar entry > i64::MAX"))?;
             r.seek(SeekFrom::Current(step)).map(|_| ())
         },
+        max_retained_header_bytes,
         out,
     )
 }
 
-fn scan_targz_reader<R: Read>(
+fn scan_tar_seekable<R: Read + Seek>(
+    reader: &mut R,
+    out: &mut Vec<VirtualEntry>,
+) -> Result<(), String> {
+    scan_tar_seekable_bounded(reader, MAX_RETAINED_HEADER_BYTES, out)
+}
+
+fn scan_targz_reader_bounded<R: Read>(
     reader: R,
     max_inflate_bytes: u64,
+    max_retained_header_bytes: usize,
     out: &mut Vec<VirtualEntry>,
 ) -> Result<(), String> {
     let mut gz = GzipStreamDecoder::new(reader, max_inflate_bytes);
-    scan_tar_with_skipper(&mut gz, discard_bytes_read, out)?;
+    scan_tar_with_skipper(&mut gz, discard_bytes_read, max_retained_header_bytes, out)?;
     let mut scratch = [0u8; 4096];
     while gz
         .read(&mut scratch)
@@ -1487,27 +1512,59 @@ fn scan_targz_reader<R: Read>(
     Ok(())
 }
 
+fn scan_targz_reader<R: Read>(
+    reader: R,
+    max_inflate_bytes: u64,
+    out: &mut Vec<VirtualEntry>,
+) -> Result<(), String> {
+    scan_targz_reader_bounded(reader, max_inflate_bytes, MAX_RETAINED_HEADER_BYTES, out)
+}
+
 /// Inspect an in-memory `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
-/// without retaining bulk binary signal payloads (bounded to `128 MiB` decompressed bytes).
-pub fn extract_archive_virtual_entries(
+/// with explicit upper bounds on total decompressed stream bytes (`max_inflate_bytes`) and
+/// total retained header memory (`max_retained_header_bytes`).
+pub fn extract_archive_virtual_entries_bounded(
     archive_name: &str,
     archive_bytes: &[u8],
+    max_inflate_bytes: u64,
+    max_retained_header_bytes: usize,
 ) -> Result<Vec<VirtualEntry>, String> {
     let lower = archive_name.to_ascii_lowercase();
     let is_gz = is_targz_path_lower(&lower)
         || (archive_bytes.len() >= 2 && archive_bytes[0] == 0x1f && archive_bytes[1] == 0x8b);
     let mut entries = Vec::new();
     if is_gz {
-        scan_targz_reader(
+        scan_targz_reader_bounded(
             Cursor::new(archive_bytes),
-            MAX_IN_MEMORY_INFLATE_BYTES,
+            max_inflate_bytes,
+            max_retained_header_bytes,
             &mut entries,
         )?;
     } else {
+        if (archive_bytes.len() as u64) > max_inflate_bytes {
+            return Err(format!(
+                "archive exceeded maximum uncompressed byte limit ({max_inflate_bytes} bytes)"
+            ));
+        }
         let mut cur = Cursor::new(archive_bytes);
-        scan_tar_seekable(&mut cur, &mut entries)?;
+        scan_tar_seekable_bounded(&mut cur, max_retained_header_bytes, &mut entries)?;
     }
     Ok(entries)
+}
+
+/// Inspect an in-memory `.tar` or `.tar.gz` / `.tgz` byte buffer into `VirtualEntry` headers
+/// without retaining bulk binary signal payloads (`ser`/`fid` payloads are streamed and discarded
+/// up to `16 GiB` while retained `VirtualEntry.header_bytes` memory is bounded to `64 MiB`).
+pub fn extract_archive_virtual_entries(
+    archive_name: &str,
+    archive_bytes: &[u8],
+) -> Result<Vec<VirtualEntry>, String> {
+    extract_archive_virtual_entries_bounded(
+        archive_name,
+        archive_bytes,
+        MAX_DISK_INFLATE_BYTES,
+        MAX_RETAINED_HEADER_BYTES,
+    )
 }
 
 fn read_prefix_from_disk(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
@@ -2426,6 +2483,8 @@ fn classify_pulse_token(
     }
 
     // 6. 2D Heteronuclear Correlation (`15N-HSQC`, `13C-HSQC`, `13C-HMQC` Methyl-TROSY)
+    // Decide methyl (`C13Hmqc`) primarily from `13C` carrier (`8.0..=28.0 ppm`) and `SW <= 36.0 ppm`,
+    // treating `hmqc`/`hsqc` in `PULPROG`/`seqfil` only as a fallback hint when carrier/SW are missing.
     if matches!(
         dim,
         ExperimentDimensionality::Dim2D | ExperimentDimensionality::Pseudo3D
@@ -2434,7 +2493,7 @@ fn classify_pulse_token(
             if has_15n && !has_13c && !compact.contains("c13") && !compact.contains("13c") {
                 return Some(PulseSequenceClass::N15Hsqc);
             }
-            return Some(PulseSequenceClass::C13Hmqc);
+            return Some(classify_2d_13c_heteronuclear(axes, Some(true)));
         }
         if compact.contains("hsqc")
             || compact.contains("trosy")
@@ -2442,14 +2501,21 @@ fn classify_pulse_token(
             || compact.contains("hsgp")
             || compact.contains("inviet")
         {
+            let explicit_methyl_tok = compact.contains("methyl");
             if has_13c && !has_15n {
-                return Some(PulseSequenceClass::C13Hsqc);
+                return Some(classify_2d_13c_heteronuclear(
+                    axes,
+                    Some(explicit_methyl_tok),
+                ));
             }
             if has_15n && !has_13c {
                 return Some(PulseSequenceClass::N15Hsqc);
             }
             if compact.contains("c13") || compact.contains("13c") || compact.contains("chsqc") {
-                return Some(PulseSequenceClass::C13Hsqc);
+                return Some(classify_2d_13c_heteronuclear(
+                    axes,
+                    Some(explicit_methyl_tok),
+                ));
             }
             if compact.contains("n15") || compact.contains("15n") || compact.contains("nhsqc") {
                 return Some(PulseSequenceClass::N15Hsqc);
@@ -2460,6 +2526,34 @@ fn classify_pulse_token(
     }
 
     None
+}
+
+/// Classify a 2D `1H`-`13C` heteronuclear correlation spectrum into methyl (`C13Hmqc`) vs
+/// general aliphatic/aromatic (`C13Hsqc`), using `13C` indirect carrier (`8.0..=28.0 ppm`)
+/// and sweep width (`SW <= 36.0 ppm`) as primary physical evidence and falling back to
+/// `token_prefers_methyl` (`hmqc`/`methyltrosy` vs `hsqc`) only when carrier/SW are missing.
+fn classify_2d_13c_heteronuclear(
+    axes: &[ClassifiedAxis],
+    token_prefers_methyl: Option<bool>,
+) -> PulseSequenceClass {
+    let c_ax = axes.iter().skip(1).find(|a| a.nucleus == "13C");
+    let car = c_ax.and_then(|a| a.carrier_ppm);
+    let sw = c_ax.and_then(|a| a.sw_ppm);
+
+    if let (Some(c), Some(s)) = (car, sw) {
+        return if (8.0..=28.0).contains(&c) && s <= 36.0 {
+            PulseSequenceClass::C13Hmqc
+        } else {
+            PulseSequenceClass::C13Hsqc
+        };
+    }
+    if car.is_some_and(|c| !(8.0..=28.0).contains(&c)) || sw.is_some_and(|s| s > 36.0) {
+        return PulseSequenceClass::C13Hsqc;
+    }
+    match token_prefers_methyl {
+        Some(true) => PulseSequenceClass::C13Hmqc,
+        _ => PulseSequenceClass::C13Hsqc,
+    }
 }
 
 #[allow(non_snake_case)]
@@ -2498,15 +2592,7 @@ fn infer_pulse_class_from_axis_physics(
             return PulseSequenceClass::N15Hsqc;
         }
         if direct == "1H" && ind == "13C" {
-            let is_methyl_window = axes[1]
-                .carrier_ppm
-                .is_some_and(|c| (8.0..=28.0).contains(&c))
-                && axes[1].sw_ppm.is_some_and(|sw| sw <= 32.0);
-            return if is_methyl_window {
-                PulseSequenceClass::C13Hmqc
-            } else {
-                PulseSequenceClass::C13Hsqc
-            };
+            return classify_2d_13c_heteronuclear(axes, None);
         }
         if direct == "13C" && ind == "15N" {
             return PulseSequenceClass::Con2D;
@@ -2627,6 +2713,11 @@ fn find_bruker_root_for_path(rel_path: &str) -> Option<(String, &str)> {
             | "fq1list"
             | "fq2list"
             | "fq3list"
+            | "fq4list"
+            | "fq5list"
+            | "fq6list"
+            | "fq7list"
+            | "fq8list"
             | "ser"
     ) {
         let root = if parts.len() > 1 {
@@ -2930,7 +3021,9 @@ fn build_bruker_experiment(
 
     // Detect `Pseudo3D`:
     // 1. `vdlist` or `vclist` present (relaxation T1/T2 or CPMG counter stepped across planes), OR
-    // 2. `ndim_raw == 3` where the slowest axis (`acqu3s`) uses `FnMODE == 1 (QF)` (unmodulated delay/plane counter), OR
+    // 2. Any indirect axis (`acqu2s` or `acqu3s`) uses `FnMODE == 1 (QF)` whose `TD` matches
+    //    `vdlist`/`vclist`/`fqlist` length (e.g. interleaved `acqu2s`-stepped 3D `CEST` `fq1list`),
+    //    or `ndim_raw == 3` where the slowest axis (`acqu3s`) uses `FnMODE == 1 (QF)`, OR
     // 3. `ndim_raw == 2` with a multi-offset `fqlist` (`>= 4` offsets, e.g. CEST saturation sweep — NOT a 2-entry `CA`/`CO` pulse switch in hypercomplex 3D `hncaco`!).
     let vd_len = grp
         .vdlist
@@ -2952,34 +3045,42 @@ fn build_bruker_experiment(
         && axes
             .get(2)
             .is_some_and(|a| a.quadrature == QuadratureKind::Qf);
+    let any_indirect_qf_matches = |sched_len: usize| -> bool {
+        sched_len > 0
+            && axes
+                .iter()
+                .skip(1)
+                .any(|a| a.quadrature == QuadratureKind::Qf && a.points == sched_len)
+    };
     let mut notes = Vec::new();
     let mut pseudo_kind: Option<&'static str> = None;
-    let dimensionality = if vd_len > 1 || (d3_is_qf && vd_len > 0) {
-        pseudo_kind = Some("vdlist");
-        notes.push(format!("pseudo-3D variable delay list ({vd_len} planes)"));
-        ExperimentDimensionality::Pseudo3D
-    } else if vc_len > 1 || (d3_is_qf && vc_len > 0) {
-        pseudo_kind = Some("vclist");
-        notes.push(format!("pseudo-3D variable counter list ({vc_len} planes)"));
-        ExperimentDimensionality::Pseudo3D
-    } else if fq_len >= 4 && (ndim_raw == 2 || d3_is_qf) {
-        pseudo_kind = Some("fqlist");
-        notes.push(format!(
-            "pseudo-3D frequency offset list ({fq_len} offsets)"
-        ));
-        ExperimentDimensionality::Pseudo3D
-    } else if d3_is_qf {
-        pseudo_kind = Some("qf_planes");
-        notes.push("pseudo-3D QF plane stack".to_string());
-        ExperimentDimensionality::Pseudo3D
-    } else {
-        match ndim_raw {
-            1 => ExperimentDimensionality::Dim1D,
-            2 => ExperimentDimensionality::Dim2D,
-            3 => ExperimentDimensionality::Dim3D,
-            _ => ExperimentDimensionality::Dim4D,
-        }
-    };
+    let dimensionality =
+        if vd_len > 1 || (vd_len > 0 && (d3_is_qf || any_indirect_qf_matches(vd_len))) {
+            pseudo_kind = Some("vdlist");
+            notes.push(format!("pseudo-3D variable delay list ({vd_len} planes)"));
+            ExperimentDimensionality::Pseudo3D
+        } else if vc_len > 1 || (vc_len > 0 && (d3_is_qf || any_indirect_qf_matches(vc_len))) {
+            pseudo_kind = Some("vclist");
+            notes.push(format!("pseudo-3D variable counter list ({vc_len} planes)"));
+            ExperimentDimensionality::Pseudo3D
+        } else if fq_len >= 4 && (ndim_raw == 2 || d3_is_qf || any_indirect_qf_matches(fq_len)) {
+            pseudo_kind = Some("fqlist");
+            notes.push(format!(
+                "pseudo-3D frequency offset list ({fq_len} offsets)"
+            ));
+            ExperimentDimensionality::Pseudo3D
+        } else if d3_is_qf {
+            pseudo_kind = Some("qf_planes");
+            notes.push("pseudo-3D QF plane stack".to_string());
+            ExperimentDimensionality::Pseudo3D
+        } else {
+            match ndim_raw {
+                1 => ExperimentDimensionality::Dim1D,
+                2 => ExperimentDimensionality::Dim2D,
+                3 => ExperimentDimensionality::Dim3D,
+                _ => ExperimentDimensionality::Dim4D,
+            }
+        };
 
     // NUS detection: strictly `FnTYPE == 2` or `nuslist` present (avoids TopSpin `FnTYPE=0` template false positives!)
     let fn_type = jcamp_usize(&a1, "FnTYPE").unwrap_or(0);
@@ -3282,6 +3383,21 @@ fn build_varian_experiment(
         quadrature: QuadratureKind::Dqd,
     });
 
+    let varian_carrier =
+        |rfl_key: &str, rfp_key: &str, sw_hz: Option<f64>, obs_mhz: Option<f64>| -> Option<f64> {
+            match (
+                procpar_f64(&map, rfl_key),
+                procpar_f64(&map, rfp_key),
+                sw_hz,
+                obs_mhz,
+            ) {
+                (Some(rfl), Some(rfp), Some(sw), Some(sf)) if sf > 1e-3 => {
+                    Some(((sw - rfl + rfp) - 0.5 * sw) / sf)
+                }
+                _ => None,
+            }
+        };
+
     if ni > 1 {
         let (nuc1, obs1) = resolve_varian_channel("refsource1", sw1, 1);
         axes.push(ClassifiedAxis {
@@ -3292,7 +3408,7 @@ fn build_varian_experiment(
                 (Some(sw), Some(sf)) if sf > 1e-3 => Some(sw / sf),
                 _ => None,
             },
-            carrier_ppm: None,
+            carrier_ppm: varian_carrier("rfl1", "rfp1", sw1, obs1),
             obs_mhz: obs1,
             quadrature: varian_indirect_quadrature(&map, "phase", "f1coef"),
         });
@@ -3307,7 +3423,7 @@ fn build_varian_experiment(
                 (Some(sw), Some(sf)) if sf > 1e-3 => Some(sw / sf),
                 _ => None,
             },
-            carrier_ppm: None,
+            carrier_ppm: varian_carrier("rfl2", "rfp2", sw2, obs2),
             obs_mhz: obs2,
             quadrature: varian_indirect_quadrature(&map, "phase2", "f2coef"),
         });
@@ -3322,7 +3438,7 @@ fn build_varian_experiment(
                 (Some(sw), Some(sf)) if sf > 1e-3 => Some(sw / sf),
                 _ => None,
             },
-            carrier_ppm: None,
+            carrier_ppm: varian_carrier("rfl3", "rfp3", sw3, obs3),
             obs_mhz: obs3,
             quadrature: varian_indirect_quadrature(&map, "phase3", "f3coef"),
         });
@@ -3720,8 +3836,17 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     "vclist" | "valist" | "vplist" if grp.vclist.is_none() => {
                         grp.vclist = Some(e.header_bytes.clone())
                     }
-                    "fqlist" | "fq1list" | "fq2list" | "fq3list" if grp.fqlist.is_none() => {
-                        grp.fqlist = Some(e.header_bytes.clone())
+                    "fqlist" | "fq1list" | "fq2list" | "fq3list" | "fq4list" | "fq5list"
+                    | "fq6list" | "fq7list" | "fq8list" => {
+                        let new_len = count_nonempty_schedule_lines(&e.header_bytes);
+                        let cur_len = grp
+                            .fqlist
+                            .as_deref()
+                            .map(count_nonempty_schedule_lines)
+                            .unwrap_or(0);
+                        if grp.fqlist.is_none() || new_len > cur_len {
+                            grp.fqlist = Some(e.header_bytes.clone());
+                        }
                     }
                     "ser" => grp.raw_bytes += e.effective_bytes(),
                     "1r" | "1i" | "2rr" | "2ri" | "2ir" | "2ii" | "3rrr" | "3rri" | "4rrrr" => {

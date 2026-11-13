@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::classify::{
-    classify_nmr_entries, classify_nmr_workspace, extract_archive_virtual_entries, VirtualEntry,
-    WorkspaceInventory,
+    classify_nmr_entries, classify_nmr_workspace, extract_archive_virtual_entries_bounded,
+    VirtualEntry, WorkspaceInventory,
 };
 use crate::evaluate::to_reference;
 use crate::nef::{
@@ -748,7 +748,12 @@ fn handle_inspect(
     }
 
     if is_archive_content_type(content_type) {
-        match extract_archive_virtual_entries("archive_upload", body) {
+        match extract_archive_virtual_entries_bounded(
+            "archive_upload",
+            body,
+            128 * 1024 * 1024,
+            32 * 1024 * 1024,
+        ) {
             Ok(entries) => {
                 let mut inv: WorkspaceInventory = classify_nmr_entries(&entries);
                 inv.root_name = "archive_upload".to_string();

@@ -15,6 +15,11 @@
 //!    referencing consistency across `(1H, 15N, 13CA, 13CB, 13C')`.
 //! 5. Schmidt, E. & Güntert, P. (2012). *J. Am. Chem. Soc.* 134(30), 12817–12829 — sequence-derived
 //!    amide peak stoichiometry and sequential `(i, i-1)` connectivity self-consistency.
+//! 6. Ayer, M., Brunk, H. D., Ewing, G. M., Reid, W. T. & Silverman, E. (1955). "An empirical
+//!    distribution function for sampling with incomplete information." *Ann. Math. Statist.*
+//!    26(4), 641–647; Zadrozny, B. & Elkan, C. (2002). "Transforming classifier scores into
+//!    accurate multiclass probability estimates." *Proc. 8th ACM SIGKDD*, 694–699 — Pool-Adjacent-
+//!    Violators (PAV) isotonic calibration.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -150,89 +155,50 @@ fn median_f64(mut vals: Vec<f64>) -> Option<f64> {
     }
 }
 
-/// Check physical consistency of `DetailedReferenceOffsets` across `(H, N, CA, CB, C)` (`P1-1` / `P1-3`):
-/// - Flags when `dCA` is `Fitted` at `|dCA| > 1.5 ppm` while `dCB` has sufficient observations (`!= TooFewValues`)
-///   yet is `NotSignificant` near `0` or differs from `dCA` by `> 1.5 ppm` (and symmetrically for `dCB` vs `dCA`).
-/// - Allows `CISD3`-like experiment sets where `dCA` is `Fitted` and `dCB` is `TooFewValues` (`n < 5`).
-/// - Flags `|dCA - dC| > 2.0 ppm` when both `CA` and `C` are `Fitted`.
-/// - Flags extreme amide shifts `|dH| > 0.35 ppm` or `|dN| > 2.5 ppm`.
+/// Check physical consistency of `DetailedReferenceOffsets` across `(H, N, CA, CB, C)` (`P1-4`):
+/// - Never treats `OffsetFitStatus::NotSignificant` or `OffsetFitStatus::TooFewValues` as evidence
+///   of a `0.0 ppm` offset (`NotSignificant` means unknown / below deadband, not zero).
+/// - Flags `aliphatic offset mismatch` strictly when **both** `dCA` and `dCB` are `Fitted` AND
+///   differ by `> max(3.0 * sigma_joint, 0.85)` ppm.
+/// - Flags `CA/CO offset mismatch` strictly when **both** `dCA` and `dC` are `Fitted` AND differ
+///   by `> max(3.5 * sigma_ca_co, 2.0)` ppm.
+/// - Flags extreme amide shifts `|dH| > 0.45 ppm` or `|dN| > 2.5 ppm` when `Fitted`.
 pub fn check_offset_consistency(offsets: &DetailedReferenceOffsets) -> (bool, Vec<String>) {
     let mut issues = Vec::new();
 
-    if offsets.ca.status == OffsetFitStatus::Fitted
-        && offsets.ca.applied_ppm.abs() > 1.5
-        && offsets.cb.status != OffsetFitStatus::TooFewValues
+    if offsets.ca.status == OffsetFitStatus::Fitted && offsets.cb.status == OffsetFitStatus::Fitted
     {
-        match offsets.cb.status {
-            OffsetFitStatus::NotSignificant => {
-                if offsets.cb.candidate_ppm.abs() < 0.75
-                    || (offsets.cb.candidate_ppm - offsets.ca.applied_ppm).abs() > 1.5
-                {
-                    issues.push(format!(
-                        "aliphatic offset mismatch: {} vs {} (cand {:+.2} ppm)",
-                        offsets.ca.format_compact("dCA"),
-                        offsets.cb.format_compact("dCB"),
-                        offsets.cb.candidate_ppm
-                    ));
-                }
-            }
-            OffsetFitStatus::Fitted => {
-                if (offsets.cb.applied_ppm - offsets.ca.applied_ppm).abs() > 1.5 {
-                    issues.push(format!(
-                        "aliphatic offset mismatch: {} vs {}",
-                        offsets.ca.format_compact("dCA"),
-                        offsets.cb.format_compact("dCB")
-                    ));
-                }
-            }
-            OffsetFitStatus::TooFewValues => {}
+        let sigma_joint = offsets.aliphatic_joint_sigma_ppm();
+        let thresh = (3.0 * sigma_joint).max(0.85);
+        let diff = (offsets.ca.applied_ppm - offsets.cb.applied_ppm).abs();
+        if diff > thresh {
+            issues.push(format!(
+                "aliphatic offset mismatch: {} vs {} (|Δ|={:.2} > {:.2} ppm, σ_joint={:.2})",
+                offsets.ca.format_compact("dCA"),
+                offsets.cb.format_compact("dCB"),
+                diff,
+                thresh,
+                sigma_joint
+            ));
         }
     }
 
-    if offsets.cb.status == OffsetFitStatus::Fitted
-        && offsets.cb.applied_ppm.abs() > 1.5
-        && offsets.ca.status != OffsetFitStatus::TooFewValues
-    {
-        match offsets.ca.status {
-            OffsetFitStatus::NotSignificant => {
-                if offsets.ca.candidate_ppm.abs() < 0.75
-                    || (offsets.ca.candidate_ppm - offsets.cb.applied_ppm).abs() > 1.5
-                {
-                    issues.push(format!(
-                        "aliphatic offset mismatch: {} vs {} (cand {:+.2} ppm)",
-                        offsets.cb.format_compact("dCB"),
-                        offsets.ca.format_compact("dCA"),
-                        offsets.ca.candidate_ppm
-                    ));
-                }
-            }
-            OffsetFitStatus::Fitted => {
-                if (offsets.ca.applied_ppm - offsets.cb.applied_ppm).abs() > 1.5
-                    && issues.is_empty()
-                {
-                    issues.push(format!(
-                        "aliphatic offset mismatch: {} vs {}",
-                        offsets.ca.format_compact("dCA"),
-                        offsets.cb.format_compact("dCB")
-                    ));
-                }
-            }
-            OffsetFitStatus::TooFewValues => {}
+    if offsets.ca.status == OffsetFitStatus::Fitted && offsets.c.status == OffsetFitStatus::Fitted {
+        let sigma_ca_co = offsets.ca_co_joint_sigma_ppm();
+        let thresh = (3.5 * sigma_ca_co).max(2.0);
+        let diff = (offsets.ca.applied_ppm - offsets.c.applied_ppm).abs();
+        if diff > thresh {
+            issues.push(format!(
+                "CA/CO offset mismatch: {} vs {} (|Δ|={:.2} > {:.2} ppm)",
+                offsets.ca.format_compact("dCA"),
+                offsets.c.format_compact("dC"),
+                diff,
+                thresh
+            ));
         }
     }
 
-    if offsets.ca.status == OffsetFitStatus::Fitted
-        && offsets.c.status == OffsetFitStatus::Fitted
-        && (offsets.ca.applied_ppm - offsets.c.applied_ppm).abs() > 2.0
-    {
-        issues.push(format!(
-            "CA/CO offset mismatch: {} vs {}",
-            offsets.ca.format_compact("dCA"),
-            offsets.c.format_compact("dC")
-        ));
-    }
-
-    if offsets.h.status == OffsetFitStatus::Fitted && offsets.h.applied_ppm.abs() > 0.35 {
+    if offsets.h.status == OffsetFitStatus::Fitted && offsets.h.applied_ppm.abs() > 0.45 {
         issues.push(format!(
             "extreme 1H offset: {}",
             offsets.h.format_compact("dH")
@@ -615,6 +581,15 @@ pub fn evaluate_dataset_qc(
             connectivity_frac * 100.0
         ));
     }
+    if assigned_count >= 12
+        && (solution_margin < 0.07 || (hsqc_multiplicity_ratio > 1.60 && solution_margin < 0.16))
+    {
+        abstain_reasons.push(format!(
+            "solver ensemble failed to converge (solution margin {:.1}%, multiplicity {:.2}x)",
+            solution_margin * 100.0,
+            hsqc_multiplicity_ratio
+        ));
+    }
     if (hsqc_3d_rms_dh_ppm > 0.065 || hsqc_3d_rms_dn_ppm > 0.65) && hsqc_3d_support_frac < 0.45 {
         abstain_reasons.push(format!(
             "severe HSQC-to-3D registration mismatch (rms dH={:.3}, dN={:.2} ppm)",
@@ -881,4 +856,164 @@ impl ProteinReliabilityCurve {
     pub fn is_abstained(&self) -> bool {
         self.hc_assigned == 0
     }
+}
+
+/// Evaluate a monotone piecewise-linear calibration map `f: [0, 1] -> [0, 1]` over sorted
+/// `(x_i, y_i)` knots (`0 = x_0 < x_1 < ... < x_m = 1`, `0 <= y_0 <= ... <= y_m <= 1`).
+pub fn eval_monotone_calibration_map(p_raw: f64, knots: &[(f64, f64)]) -> f64 {
+    let x = p_raw.clamp(0.0, 1.0);
+    if knots.is_empty() {
+        return x;
+    }
+    if x <= knots[0].0 {
+        return knots[0].1.clamp(0.0, 1.0);
+    }
+    let last = knots[knots.len() - 1];
+    if x >= last.0 {
+        return last.1.clamp(0.0, 1.0);
+    }
+    for win in knots.windows(2) {
+        let (x0, y0) = win[0];
+        let (x1, y1) = win[1];
+        if x <= x1 {
+            let span = (x1 - x0).max(1e-12);
+            let t = ((x - x0) / span).clamp(0.0, 1.0);
+            return (y0 + t * (y1 - y0)).clamp(0.0, 1.0);
+        }
+    }
+    last.1.clamp(0.0, 1.0)
+}
+
+/// Fit a monotone piecewise-linear calibration knot table on `grid` (`0.0 = g_0 < ... < g_m = 1.0`)
+/// using Laplace-regularized Pool-Adjacent-Violators (PAV) isotonic regression (Ayer et al. 1955;
+/// Zadrozny & Elkan 2002).
+///
+/// Each interval `[g_b, g_{b+1})` accumulates empirical `(correct, count)` plus a symmetric
+/// neutral Beta(`laplace_prior / 2`, `laplace_prior / 2`) pseudocount (`0.5 * laplace_prior`) so
+/// sparse bins shrink toward `0.5` rather than collapsing to `0.0`/`1.0` or inheriting raw
+/// `T = 1.0` overconfidence.
+pub fn fit_isotonic_monotone_knots(
+    samples: &[(f64, bool)],
+    grid: &[f64],
+    laplace_prior: f64,
+) -> Vec<(f64, f64)> {
+    if grid.len() < 2 {
+        return vec![(0.0, 0.0), (1.0, 1.0)];
+    }
+    let n_bins = grid.len() - 1;
+    let mut weights = vec![0.0_f64; n_bins];
+    let mut pos_sums = vec![0.0_f64; n_bins];
+    let mut x_mids = vec![0.0_f64; n_bins];
+    for b in 0..n_bins {
+        let mid = 0.5 * (grid[b] + grid[b + 1]);
+        x_mids[b] = mid;
+        weights[b] = laplace_prior.max(1e-6);
+        pos_sums[b] = 0.5 * weights[b];
+    }
+
+    for &(raw_p, is_ok) in samples {
+        let p = raw_p.clamp(0.0, 1.0);
+        let mut idx = n_bins - 1;
+        for b in 0..n_bins {
+            if p < grid[b + 1] || b + 1 == n_bins {
+                idx = b;
+                break;
+            }
+        }
+        weights[idx] += 1.0;
+        if is_ok {
+            pos_sums[idx] += 1.0;
+        }
+    }
+
+    // Pool-Adjacent-Violators (PAV) stack of `(start_bin, end_bin, sum_pos, sum_weight)`
+    let mut blocks: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(n_bins);
+    for b in 0..n_bins {
+        blocks.push((b, b, pos_sums[b], weights[b]));
+        while blocks.len() >= 2 {
+            let n = blocks.len();
+            let mean_prev = blocks[n - 2].2 / blocks[n - 2].3;
+            let mean_curr = blocks[n - 1].2 / blocks[n - 1].3;
+            if mean_prev > mean_curr {
+                let last = blocks.pop().unwrap();
+                let prev = blocks.last_mut().unwrap();
+                prev.1 = last.1;
+                prev.2 += last.2;
+                prev.3 += last.3;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut bin_vals = vec![0.0_f64; n_bins];
+    for (lo, hi, sp, sw) in blocks {
+        let v = (sp / sw).clamp(0.0, 1.0);
+        for slot in &mut bin_vals[lo..=hi] {
+            *slot = v;
+        }
+    }
+
+    let mut knots = Vec::with_capacity(n_bins + 2);
+    knots.push((0.0, 0.0));
+    for b in 0..n_bins {
+        knots.push((x_mids[b], bin_vals[b]));
+    }
+    let y_end = bin_vals[n_bins - 1].max(0.0);
+    knots.push((1.0, y_end));
+    knots
+}
+
+/// Monotone calibration knot table for `evo-graph` (`P1-2`), fitted via isotonic PAV on the
+/// canonical 12-bin grid (`g12`) with Jeffreys `laplace = 0.5` smoothing across the 10-entry
+/// `dev` split (zero hyperparameter search; validated via strict 10-fold Leave-One-Protein-Out
+/// cross-validation over physical `T = 1.0` marginal posteriors).
+pub const EVO_GRAPH_CALIBRATION_KNOTS: &[(f64, f64)] = &[
+    (0.0000, 0.0000),
+    (0.0750, 0.1917),
+    (0.2250, 0.2909),
+    (0.3750, 0.4567),
+    (0.5150, 0.6230),
+    (0.6300, 0.6230),
+    (0.7200, 0.6603),
+    (0.7950, 0.6976),
+    (0.8600, 0.6976),
+    (0.9150, 0.8224),
+    (0.9575, 0.8224),
+    (0.9835, 0.8717),
+    (0.9960, 0.9757),
+    (1.0000, 0.9757),
+];
+
+/// Monotone calibration knot table for `standard` (`P1-6`), fitted via isotonic PAV on the
+/// identical canonical 12-bin grid (`g12`) with Jeffreys `laplace = 0.5` smoothing across the
+/// 10-entry `dev` split (zero hyperparameter search; validated via strict 10-fold
+/// Leave-One-Protein-Out cross-validation over physical `T = 1.0` marginal posteriors).
+pub const STANDARD_CALIBRATION_KNOTS: &[(f64, f64)] = &[
+    (0.0000, 0.0000),
+    (0.0750, 0.2411),
+    (0.2250, 0.5080),
+    (0.3750, 0.5080),
+    (0.5150, 0.5745),
+    (0.6300, 0.5925),
+    (0.7200, 0.7721),
+    (0.7950, 0.7721),
+    (0.8600, 0.8966),
+    (0.9150, 0.9348),
+    (0.9575, 0.9444),
+    (0.9835, 0.9462),
+    (0.9960, 0.9462),
+    (1.0000, 0.9462),
+];
+
+/// Map raw physical (`T = 1.0`) `evo-graph` marginal belief into calibrated probability.
+#[inline]
+pub fn apply_evo_graph_calibration_map(p_raw: f64) -> f64 {
+    eval_monotone_calibration_map(p_raw, EVO_GRAPH_CALIBRATION_KNOTS)
+}
+
+/// Map raw physical (`T = 1.0`) `standard` marginal belief into calibrated probability.
+#[inline]
+pub fn apply_standard_calibration_map(p_raw: f64) -> f64 {
+    eval_monotone_calibration_map(p_raw, STANDARD_CALIBRATION_KNOTS)
 }
