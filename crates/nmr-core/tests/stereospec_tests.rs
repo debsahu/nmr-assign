@@ -1116,34 +1116,63 @@ fn test_p1_1_gly_phi_sign_mirror_degeneracy_cap() {
     assert_eq!(res_pdb_multi.winning_hypothesis, SwapHypothesis::Direct);
     assert_eq!(res_pdb_multi.nmr_star_ambiguity_code, 1);
 
-    // Or without PDB, when psi is constrained (e.g. beta-strand psi ~ 135 deg) while phi sign is
-    // uncertain, an asymmetric sequential HA(i)-HN(i+1) NOE breaks the phi -> -phi mirror symmetry:
-    let frame_seq = build_local_peptide_frame("GLY", 100.0, 135.0, false);
-    let (seq_ha2, seq_ha3) = frame_seq.gly_ha2_ha3.unwrap();
-    let h_next = frame_seq.h_next.unwrap();
-    let r6_seq2 = v_dist(h_next, seq_ha2).powi(-6);
-    let r6_seq3 = v_dist(h_next, seq_ha3).powi(-6);
-    let obs_seq_noe = ProchiralObservables {
+    // P1-1R exact probe: Gly's local unit is achiral under the full mirror (phi, psi) -> (-phi, -psi)
+    // with HA2 <-> HA3, so BOTH intraresidue HN(i)-HA and sequential HA(i)-HN(i+1) NOE ratios are
+    // identical for the truth (+80, +170) and the mirror (-80, -170). Without an explicit 3D PDB
+    // (`ExactTorsions`), Gly MUST stay uncommitted (`Ambiguity_code = 2`, `posterior <= 0.85 < 0.90`).
+    let frame_mirror = build_local_peptide_frame("GLY", 80.0, 170.0, false);
+    let h_curr = frame_mirror.h.unwrap();
+    let (m_ha2, m_ha3) = frame_mirror.gly_ha2_ha3.unwrap();
+    let h_next = frame_mirror.h_next.unwrap();
+    let (_, _, th_h_2, th_h_3) = nmr_core::stereospec::iupac_gly_ha_dihedrals_deg(80.0);
+    let j_ha2 = nmr_core::stereospec::karplus_3j_hnha_hz(th_h_2);
+    let j_ha3 = nmr_core::stereospec::karplus_3j_hnha_hz(th_h_3);
+    let obs_full_local = ProchiralObservables {
         proton_shifts_ppm: Some((3.82, 4.18)),
-        j_hh_vicinal_hz: Some((4.1, 9.0)),
-        noe_pairs: vec![NoePairObs::new(
-            AnchorProton::SeqNextAmideH,
-            r6_seq2,
-            r6_seq3,
-        )],
+        j_hh_vicinal_hz: Some((j_ha2, j_ha3)),
+        noe_pairs: vec![
+            NoePairObs::new(
+                AnchorProton::IntraAmideH,
+                v_dist(h_curr, m_ha2).powi(-6),
+                v_dist(h_curr, m_ha3).powi(-6),
+            ),
+            NoePairObs::new(
+                AnchorProton::SeqNextAmideH,
+                v_dist(h_next, m_ha2).powi(-6),
+                v_dist(h_next, m_ha3).powi(-6),
+            ),
+        ],
         ..Default::default()
     };
-    let psi_known_phi_uncertain = BackboneConditioning::DihedralEstimate {
-        phi_deg: 0.0,
-        psi_deg: 135.0,
-        phi_err_deg: 120.0,
-        psi_err_deg: 15.0,
-        ss_class: SecondaryStructure::Sheet,
+    let mirrored_csi = BackboneConditioning::DihedralEstimate {
+        phi_deg: -80.0,
+        psi_deg: -170.0,
+        phi_err_deg: 25.0,
+        psi_err_deg: 25.0,
+        ss_class: SecondaryStructure::Coil,
     };
-    let res_seq =
-        infer_prochiral_pair(0, 1, gly_spec, &psi_known_phi_uncertain, &obs_seq_noe, &cfg);
-    assert!(res_seq.committed);
-    assert_eq!(res_seq.winning_hypothesis, SwapHypothesis::Direct);
+    let res_mirrored_csi =
+        infer_prochiral_pair(0, 1, gly_spec, &mirrored_csi, &obs_full_local, &cfg);
+    assert!(
+        !res_mirrored_csi.committed,
+        "Gly under mirrored CSI (-80, -170) without PDB must NOT commit (got P={:.4})",
+        res_mirrored_csi.winning_posterior
+    );
+    assert_eq!(res_mirrored_csi.nmr_star_ambiguity_code, 2);
+    assert!(res_mirrored_csi.winning_posterior <= 0.85 + 1e-9);
+
+    let phi_flipped_only = BackboneConditioning::DihedralEstimate {
+        phi_deg: -80.0,
+        psi_deg: 170.0,
+        phi_err_deg: 25.0,
+        psi_err_deg: 25.0,
+        ss_class: SecondaryStructure::Coil,
+    };
+    let res_phi_flipped =
+        infer_prochiral_pair(0, 1, gly_spec, &phi_flipped_only, &obs_full_local, &cfg);
+    assert!(!res_phi_flipped.committed);
+    assert_eq!(res_phi_flipped.nmr_star_ambiguity_code, 2);
+    assert!(res_phi_flipped.winning_posterior <= 0.85 + 1e-9);
 }
 
 #[test]
@@ -1745,4 +1774,33 @@ fn test_p1_4_ambiguity_code_seeding_wildcard_dedup_and_atomic_methyl_swaps() {
     assert!((m_with_res.shifts[&(2, "HG12".to_string())] - 1.18).abs() < 1e-9);
     assert!((m_with_res.shifts[&(2, "HG13".to_string())] - 1.46).abs() < 1e-9);
     assert_eq!(a_with_res[&(2, "HG12".to_string())], 2);
+
+    // 7. `MG1`/`MG2` pseudo-atoms swap atomically with `CG1`/`CG2`, while an unknown methyl proton
+    //    alias (`HG9`) keeps the entire VAL group uncommitted at `Ambiguity_code = 2`.
+    let mut mg_base = Reference {
+        sequence: vec!["VAL".to_string()],
+        seq_ids: vec![1],
+        ..Default::default()
+    };
+    mg_base.shifts.insert((0, "CG1".to_string()), 19.2);
+    mg_base.shifts.insert((0, "CG2".to_string()), 21.8);
+    mg_base.shifts.insert((0, "MG1".to_string()), 0.74);
+    mg_base.shifts.insert((0, "MG2".to_string()), 0.89);
+    let val_swap = infer_prochiral_pair(0, 1, val_spec, &val_bb, &val_swapped_obs, &cfg);
+    assert!(val_swap.committed);
+    let (mg_swapped, mg_amb) =
+        apply_stereospec_to_reference(&mg_base, std::slice::from_ref(&val_swap));
+    assert!((mg_swapped.shifts[&(0, "CG1".to_string())] - 21.8).abs() < 1e-9);
+    assert!((mg_swapped.shifts[&(0, "MG1".to_string())] - 0.89).abs() < 1e-9);
+    assert!((mg_swapped.shifts[&(0, "MG2".to_string())] - 0.74).abs() < 1e-9);
+    assert_eq!(mg_amb[&(0, "MG1".to_string())], 1);
+
+    let mut unk_base = mg_base;
+    unk_base.shifts.insert((0, "HG9".to_string()), 0.81);
+    let (unk_out, unk_amb) = apply_stereospec_to_reference(&unk_base, &[val_swap]);
+    assert!((unk_out.shifts[&(0, "CG1".to_string())] - 19.2).abs() < 1e-9);
+    assert!((unk_out.shifts[&(0, "MG1".to_string())] - 0.74).abs() < 1e-9);
+    assert_eq!(unk_amb[&(0, "CG1".to_string())], 2);
+    assert_eq!(unk_amb[&(0, "MG1".to_string())], 2);
+    assert_eq!(unk_amb[&(0, "HG9".to_string())], 2);
 }

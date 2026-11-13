@@ -1860,10 +1860,11 @@ fn test_p1_5_n3_loopback_dns_rebinding_host_header_validation() {
         assert_eq!(send_raw(bare_loopback), 403);
     }
 
-    // 5. Valid loopback `Host: 127.0.0.1:<port>`, `localhost:<port>`, and `[::1]:<port>` -> 200 OK
+    // 5. Valid loopback `Host: 127.0.0.1:<port>`, `localhost:<port>`, `LOCALHOST:<port>`, and `[::1]:<port>` -> 200 OK
     for ok_host in [
         format!("127.0.0.1:{port}"),
         format!("localhost:{port}"),
+        format!("LOCALHOST:{port}"),
         format!("[::1]:{port}"),
     ] {
         let valid_req = format!(

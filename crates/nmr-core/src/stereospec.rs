@@ -2512,19 +2512,11 @@ fn infer_gly_pair(
     let mut p_dir = (lse_dir - lse_tot).exp();
     let dyn_post = (log_sum_exp(&[ll_iso, ll_iso]) - lse_tot).exp();
 
-    // Under phi -> -phi, Gly 3J(HN, HA2/HA3) and intraresidue HN-HA2/HA3 NOEs are exact mirror
-    // images under Direct <-> Swapped! Cap Gly posterior below 0.90 unless phi comes from an
-    // explicit 3D structural model (ExactTorsions) OR an independent sequential HA(i)-HN(i+1)
-    // NOE pair with distinct intensities breaks the mirror degeneracy.
-    let has_pdb_torsions = matches!(backbone, BackboneConditioning::ExactTorsions { .. });
-    let has_seq_noe_asymmetry = !obs.next_is_pro
-        && obs.noe_pairs.iter().any(|np| {
-            np.anchor == AnchorProton::SeqNextAmideH
-                && np.intensity_a > 0.0
-                && np.intensity_b > 0.0
-                && (np.intensity_a / np.intensity_b).ln().abs() > 0.05
-        });
-    if !has_pdb_torsions && !has_seq_noe_asymmetry {
+    // Gly's local peptide unit (HN(i), HA2(i), HA3(i), HN(i+1)) is achiral: under the full
+    // mirror (phi, psi) -> (-phi, -psi) with HA2 <-> HA3, every 3J(HN, HA) and every
+    // HN(i)/HN(i+1)-HA distance is preserved identically. Cap Gly below 0.90 unless (phi, psi)
+    // comes from a supplied 3D structural model (`BackboneConditioning::ExactTorsions`).
+    if !matches!(backbone, BackboneConditioning::ExactTorsions { .. }) {
         p_dir = cap_degenerate_posterior(p_dir);
     }
 
@@ -2962,10 +2954,16 @@ const VAL_PROTON_SUBPAIRS: &[(&str, &str)] = &[
     ("HG1%", "HG2%"),
     ("HG1", "HG2"),
     ("QG1", "QG2"),
+    ("MG1", "MG2"),
 ];
 
-const VAL_WILDCARD_PROTON_SUBPAIRS: &[(&str, &str)] =
-    &[("HGx%", "HGy%"), ("HGx*", "HGy*"), ("HGx", "HGy")];
+const VAL_WILDCARD_PROTON_SUBPAIRS: &[(&str, &str)] = &[
+    ("HGx%", "HGy%"),
+    ("HGx*", "HGy*"),
+    ("HGx", "HGy"),
+    ("QGX", "QGY"),
+    ("MGx", "MGy"),
+];
 
 const LEU_PROTON_SUBPAIRS: &[(&str, &str)] = &[
     ("HD11", "HD21"),
@@ -2975,10 +2973,16 @@ const LEU_PROTON_SUBPAIRS: &[(&str, &str)] = &[
     ("HD1%", "HD2%"),
     ("HD1", "HD2"),
     ("QD1", "QD2"),
+    ("MD1", "MD2"),
 ];
 
-const LEU_WILDCARD_PROTON_SUBPAIRS: &[(&str, &str)] =
-    &[("HDx%", "HDy%"), ("HDx*", "HDy*"), ("HDx", "HDy")];
+const LEU_WILDCARD_PROTON_SUBPAIRS: &[(&str, &str)] = &[
+    ("HDx%", "HDy%"),
+    ("HDx*", "HDy*"),
+    ("HDx", "HDy"),
+    ("QDX", "QDY"),
+    ("MDx", "MDy"),
+];
 
 /// Canonical NMR-STAR v3 `_Atom_chem_shift.Ambiguity_code` default when no stereospecific
 /// commitment has been established:
@@ -3024,17 +3028,11 @@ pub fn default_atom_ambiguity_code(res_name: &str, atom: &str) -> u8 {
     {
         return 2;
     }
-    if r_up == "VAL"
-        && VAL_PROTON_SUBPAIRS
-            .iter()
-            .any(|&(p1, p2)| a_up == p1 || a_up == p2)
+    if r_up == "VAL" && (a_up.starts_with("HG") || a_up.starts_with("QG") || a_up.starts_with("MG"))
     {
         return 2;
     }
-    if r_up == "LEU"
-        && LEU_PROTON_SUBPAIRS
-            .iter()
-            .any(|&(p1, p2)| a_up == p1 || a_up == p2)
+    if r_up == "LEU" && (a_up.starts_with("HD") || a_up.starts_with("QD") || a_up.starts_with("MD"))
     {
         return 2;
     }
@@ -3095,6 +3093,33 @@ fn is_methyl_group_asymmetrically_populated(
     for &(p1, p2) in canon_subs.iter().chain(wild_subs.iter()) {
         if get_shift_ci(shifts, k, p1).is_some() != get_shift_ci(shifts, k, p2).is_some() {
             return true;
+        }
+    }
+    // Also treat any unknown methyl proton pseudo-atom alias (e.g. `HG*`/`QG*`/`MG*` on VAL or
+    // `HD*`/`QD*`/`MD*` on LEU outside the known sub-pair lists) as asymmetric so the whole group
+    // remains safely uncommitted at `Ambiguity_code = 2` instead of swapping carbons without protons.
+    for (rk, atom) in shifts.keys() {
+        if *rk != k {
+            continue;
+        }
+        let a_up = atom.trim().to_ascii_uppercase();
+        let is_methyl_proton_prefix = match spec.kind {
+            ProchiralSiteKind::ValIsopropyl => {
+                a_up.starts_with("HG") || a_up.starts_with("QG") || a_up.starts_with("MG")
+            }
+            ProchiralSiteKind::LeuIsopropyl => {
+                a_up.starts_with("HD") || a_up.starts_with("QD") || a_up.starts_with("MD")
+            }
+            _ => false,
+        };
+        if is_methyl_proton_prefix {
+            let known = canon_subs
+                .iter()
+                .chain(wild_subs.iter())
+                .any(|&(p1, p2)| a_up.eq_ignore_ascii_case(p1) || a_up.eq_ignore_ascii_case(p2));
+            if !known {
+                return true;
+            }
         }
     }
     false

@@ -510,11 +510,12 @@ fn is_archive_content_type(content_type: &str) -> bool {
 /// or `[::1]` with `:port` matching `state.bound_port` (omitting `:port` only when bound to default
 /// HTTP/HTTPS ports `80`/`443`) unless `http(s)://{Host}` explicitly matches `state.allowed_origins`.
 fn is_valid_request_host(req: &HttpRequest, state: &SharedState) -> bool {
-    if req.duplicate_host || req.host.is_empty() {
+    let req_host = req.host.trim().to_ascii_lowercase();
+    if req.duplicate_host || req_host.is_empty() {
         return false;
     }
-    let host_http = format!("http://{}", req.host);
-    let host_https = format!("https://{}", req.host);
+    let host_http = format!("http://{req_host}");
+    let host_https = format!("https://{req_host}");
     if state
         .allowed_origins
         .iter()
@@ -530,7 +531,7 @@ fn is_valid_request_host(req: &HttpRequest, state: &SharedState) -> bool {
         p.parse::<u16>().ok()
     };
 
-    let (is_loopback_host, opt_port) = if let Some(after_open) = req.host.strip_prefix('[') {
+    let (is_loopback_host, opt_port) = if let Some(after_open) = req_host.strip_prefix('[') {
         let Some((ipv6_body, rest)) = after_open.split_once(']') else {
             return false;
         };
@@ -545,7 +546,7 @@ fn is_valid_request_host(req: &HttpRequest, state: &SharedState) -> bool {
             return false;
         };
         (ipv6_body == "::1", port)
-    } else if let Some((h, p_str)) = req.host.split_once(':') {
+    } else if let Some((h, p_str)) = req_host.split_once(':') {
         if p_str.contains(':') {
             return false;
         }
@@ -554,7 +555,7 @@ fn is_valid_request_host(req: &HttpRequest, state: &SharedState) -> bool {
         };
         (matches!(h, "localhost" | "127.0.0.1"), Some(p))
     } else {
-        (matches!(req.host.as_str(), "localhost" | "127.0.0.1"), None)
+        (matches!(req_host.as_str(), "localhost" | "127.0.0.1"), None)
     };
 
     if !is_loopback_host {
