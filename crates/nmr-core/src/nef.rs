@@ -123,11 +123,50 @@ impl Default for NefMetaData {
     }
 }
 
+/// Parse a canonical NEF v1.1 polymer `sequence_code` token into `(seq_id, optional_insertion_code)`
+/// (e.g. `"27" -> (27, None)`, `"27A" -> (27, Some('A'))`, `"-3B" -> (-3, Some('B'))`),
+/// rejecting unassigned markers (`"."`, `"?"`, `"@..."`), multi-letter suffixes (`"27AB"`),
+/// floats (`"1.5"`), and non-numeric strings (`"NaN"`, `"A"`).
+pub fn parse_nef_sequence_code(raw: &str) -> Result<(i32, Option<char>), String> {
+    let s = raw.trim();
+    if s.is_empty() || s == "." || s == "?" || s.starts_with('@') {
+        return Err(format!(
+            "unassigned or missing NEF sequence_code '{raw}'; expected integer with optional insertion code"
+        ));
+    }
+    if let Ok(seq) = s.parse::<i32>() {
+        return Ok((seq, None));
+    }
+    let mut chars = s.chars();
+    let Some(last) = chars.next_back() else {
+        return Err(format!("empty NEF sequence_code '{raw}'"));
+    };
+    let prefix = chars.as_str();
+    if last.is_ascii_alphabetic() && !prefix.is_empty() {
+        if let Ok(seq) = prefix.parse::<i32>() {
+            return Ok((seq, Some(last)));
+        }
+    }
+    Err(format!(
+        "invalid NEF sequence_code '{raw}'; expected integer with optional single-letter insertion code (e.g. '27' or '27A')"
+    ))
+}
+
+#[inline]
+fn fmt_nef_sequence_code(seq_id: i32, insertion_code: Option<char>) -> String {
+    match insertion_code {
+        Some(ic) => format!("{seq_id}{ic}"),
+        None => seq_id.to_string(),
+    }
+}
+
 /// Residue entry in `_nef_sequence` within `save_nef_molecular_system`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NefSequenceResidue {
     pub chain_code: String,
     pub sequence_code: i32,
+    #[serde(default)]
+    pub insertion_code: Option<char>,
     pub residue_name: String,
     pub linking: String,
     pub residue_variant: Option<String>,
@@ -158,6 +197,7 @@ impl NefMolecularSystem {
             residues.push(NefSequenceResidue {
                 chain_code: chain_code.to_string(),
                 sequence_code: seq_code,
+                insertion_code: None,
                 residue_name: res.to_ascii_uppercase(),
                 linking: linking.to_string(),
                 residue_variant: None,
@@ -191,6 +231,10 @@ pub struct NefShiftList {
     pub name: String,
     pub atom_chem_shift_units: String,
     pub shifts: Vec<NefAssignedShift>,
+    /// Optional PDB/NEF single-letter insertion codes keyed by row index in `shifts`
+    /// (empty when all `sequence_code` values are plain integers).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shift_insertion_codes: BTreeMap<usize, char>,
 }
 
 impl Default for NefShiftList {
@@ -199,6 +243,7 @@ impl Default for NefShiftList {
             name: "default".to_string(),
             atom_chem_shift_units: "ppm".to_string(),
             shifts: Vec::new(),
+            shift_insertion_codes: BTreeMap::new(),
         }
     }
 }
@@ -258,6 +303,7 @@ impl NefShiftList {
             name: "default".to_string(),
             atom_chem_shift_units: "ppm".to_string(),
             shifts,
+            shift_insertion_codes: BTreeMap::new(),
         }
     }
 }
@@ -646,10 +692,14 @@ pub struct NefRdcRestraint {
     pub restraint_combination_id: Option<usize>,
     pub chain_code_1: String,
     pub sequence_code_1: i32,
+    #[serde(default)]
+    pub insertion_code_1: Option<char>,
     pub residue_name_1: String,
     pub atom_name_1: String,
     pub chain_code_2: String,
     pub sequence_code_2: i32,
+    #[serde(default)]
+    pub insertion_code_2: Option<char>,
     pub residue_name_2: String,
     pub atom_name_2: String,
     pub weight: f64,
@@ -702,10 +752,12 @@ impl NefRdcRestraintList {
                 restraint_combination_id: None,
                 chain_code_1: chain_code.to_string(),
                 sequence_code_1: r.seq_id_1,
+                insertion_code_1: None,
                 residue_name_1: r.res_name_1.clone(),
                 atom_name_1: r.atom_name_1.clone(),
                 chain_code_2: chain_code.to_string(),
                 sequence_code_2: r.seq_id_2,
+                insertion_code_2: None,
                 residue_name_2: r.res_name_2.clone(),
                 atom_name_2: r.atom_name_2.clone(),
                 weight: 1.0,
@@ -731,6 +783,14 @@ impl NefRdcRestraintList {
 
     /// Convert this `NefRdcRestraintList` into an `nmr_core::rdc::RdcMediumSet`.
     pub fn to_rdc_medium(&self) -> Result<crate::rdc::RdcMediumSet, String> {
+        if self.tensor_magnitude.is_some_and(|v| !v.is_finite())
+            || self.tensor_rhombicity.is_some_and(|v| !v.is_finite())
+        {
+            return Err(format!(
+                "non-finite tensor_magnitude or tensor_rhombicity in nef_rdc_restraint_list_{}",
+                self.name
+            ));
+        }
         let mut out = Vec::with_capacity(self.restraints.len());
         for r in &self.restraints {
             if !r.target_value.is_finite() || !r.weight.is_finite() || r.weight <= 0.0 {
@@ -738,6 +798,53 @@ impl NefRdcRestraintList {
                     "non-finite or non-positive RDC value/weight in nef_rdc_restraint_list_{}",
                     self.name
                 ));
+            }
+            for (lbl, lim_opt) in [
+                ("lower_linear_limit", r.lower_linear_limit),
+                ("lower_limit", r.lower_limit),
+                ("upper_limit", r.upper_limit),
+                ("upper_linear_limit", r.upper_linear_limit),
+            ] {
+                if let Some(v) = lim_opt {
+                    if !v.is_finite() {
+                        return Err(format!(
+                            "non-finite RDC {lbl} ({v}) in nef_rdc_restraint_list_{}",
+                            self.name
+                        ));
+                    }
+                }
+            }
+            if let (Some(ll), Some(ul)) = (r.lower_limit, r.upper_limit) {
+                if ll > ul {
+                    return Err(format!(
+                        "inverted RDC limits (lower_limit {ll} > upper_limit {ul}) in nef_rdc_restraint_list_{}",
+                        self.name
+                    ));
+                }
+            }
+            if let (Some(lll), Some(ll)) = (r.lower_linear_limit, r.lower_limit) {
+                if lll > ll {
+                    return Err(format!(
+                        "inverted RDC linear limit (lower_linear_limit {lll} > lower_limit {ll}) in nef_rdc_restraint_list_{}",
+                        self.name
+                    ));
+                }
+            }
+            if let (Some(ul), Some(ull)) = (r.upper_limit, r.upper_linear_limit) {
+                if ul > ull {
+                    return Err(format!(
+                        "inverted RDC linear limit (upper_limit {ul} > upper_linear_limit {ull}) in nef_rdc_restraint_list_{}",
+                        self.name
+                    ));
+                }
+            }
+            if let Some(bl) = r.rdc_bond_length {
+                if !bl.is_finite() || bl <= 0.0 {
+                    return Err(format!(
+                        "invalid rdc_bond_length ({bl}) in nef_rdc_restraint_list_{}; must be finite and > 0",
+                        self.name
+                    ));
+                }
             }
             let bond_type = crate::rdc::RdcBondType::infer_from_atoms(
                 r.sequence_code_1,
@@ -972,21 +1079,31 @@ impl NefDocument {
             .collect();
         let seq_ids: Vec<i32> = chain_res.iter().map(|r| r.sequence_code).collect();
 
-        let mut seq_map: BTreeMap<i32, usize> = BTreeMap::new();
-        for (idx, &sid) in seq_ids.iter().enumerate() {
-            seq_map.insert(sid, idx);
+        let mut seq_map: BTreeMap<(i32, Option<char>), usize> = BTreeMap::new();
+        for (idx, r) in chain_res.iter().enumerate() {
+            seq_map.insert(
+                (
+                    r.sequence_code,
+                    r.insertion_code.map(|c| c.to_ascii_uppercase()),
+                ),
+                idx,
+            );
         }
 
         let mut out = Reference::new(sequence, seq_ids);
         if let Some(slist) = self.shift_lists.first() {
-            for sh in &slist.shifts {
+            for (row_idx, sh) in slist.shifts.iter().enumerate() {
                 if &sh.chain_code != primary_chain && sh.chain_code != "." {
                     continue;
                 }
                 let Some(sid) = sh.sequence_code else {
                     continue;
                 };
-                let Some(&idx) = seq_map.get(&sid) else {
+                let ic = slist
+                    .shift_insertion_codes
+                    .get(&row_idx)
+                    .map(|c| c.to_ascii_uppercase());
+                let Some(&idx) = seq_map.get(&(sid, ic)) else {
                     continue;
                 };
                 let atom = match sh.atom_name.as_str() {
@@ -1455,7 +1572,25 @@ fn opt_f64(s: &str) -> Option<f64> {
 }
 
 fn opt_i32(s: &str) -> Option<i32> {
-    opt_str(s).and_then(|v| v.parse::<i32>().ok())
+    opt_nef_sequence_code(s).map(|(seq, _)| seq)
+}
+
+fn opt_nef_sequence_code(s: &str) -> Option<(i32, Option<char>)> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "?" || trimmed.starts_with('@') {
+        None
+    } else {
+        parse_nef_sequence_code(trimmed).ok()
+    }
+}
+
+fn parse_opt_strict_finite_f64(raw: &str, label: &str) -> Result<Option<f64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "?" {
+        Ok(None)
+    } else {
+        parse_strict_finite_f64(trimmed, label).map(Some)
+    }
 }
 
 fn opt_usize(s: &str) -> Option<usize> {
@@ -1538,12 +1673,11 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                 let c_cis = col_idx(ltags, "cis_peptide");
 
                 for r in rows {
-                    let seq_code = r[c_seq]
-                        .parse::<i32>()
-                        .map_err(|e| format!("invalid sequence_code '{}': {e}", r[c_seq]))?;
+                    let (seq_code, insertion_code) = parse_nef_sequence_code(&r[c_seq])?;
                     doc.molecular_system.residues.push(NefSequenceResidue {
                         chain_code: r[c_chain].clone(),
                         sequence_code: seq_code,
+                        insertion_code,
                         residue_name: r[c_res].clone(),
                         linking: c_link
                             .and_then(|c| opt_str(&r[c]))
@@ -1570,6 +1704,7 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                 .cloned()
                 .unwrap_or_else(|| "ppm".to_string());
             let mut shifts = Vec::new();
+            let mut shift_insertion_codes = BTreeMap::new();
             for (ltags, rows) in &sf.loops {
                 let Some(c_val) = col_idx(ltags, "value") else {
                     continue;
@@ -1594,11 +1729,26 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                             r[c_val]
                         ));
                     }
+                    let (seq_code, seq_ins) = match c_seq {
+                        Some(c) => {
+                            let tok = r[c].trim();
+                            if tok.is_empty() || tok == "." || tok == "?" || tok.starts_with('@') {
+                                (None, None)
+                            } else {
+                                let (sq, ic) = parse_nef_sequence_code(tok)?;
+                                (Some(sq), ic)
+                            }
+                        }
+                        None => (None, None),
+                    };
+                    if let Some(ic) = seq_ins {
+                        shift_insertion_codes.insert(shifts.len(), ic);
+                    }
                     shifts.push(NefAssignedShift {
                         chain_code: c_chain
                             .map(|c| r[c].clone())
                             .unwrap_or_else(|| "A".to_string()),
-                        sequence_code: c_seq.and_then(|c| opt_i32(&r[c])),
+                        sequence_code: seq_code,
                         residue_name: c_res
                             .map(|c| r[c].clone())
                             .unwrap_or_else(|| ".".to_string()),
@@ -1616,6 +1766,7 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                 name,
                 atom_chem_shift_units: units,
                 shifts,
+                shift_insertion_codes,
             });
         } else if cat == "nef_nmr_spectrum"
             || sf.name.to_ascii_lowercase().starts_with("nef_nmr_spectrum")
@@ -2053,15 +2204,16 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                     let Some(rid) = opt_usize(&r[c_rid]) else {
                         continue;
                     };
-                    let get_atom = |k: usize| -> Result<(String, i32, String, String), String> {
+                    type RdcAtomSpec = (String, i32, Option<char>, String, String);
+                    let get_atom = |k: usize| -> Result<RdcAtomSpec, String> {
                         let ch = col_idx(ltags, &format!("chain_code_{k}"))
                             .map(|c| r[c].clone())
                             .unwrap_or_else(|| "A".to_string());
-                        let sq = match col_idx(ltags, &format!("sequence_code_{k}")) {
-                            Some(c) => r[c].parse::<i32>().map_err(|e| {
+                        let (sq, ic) = match col_idx(ltags, &format!("sequence_code_{k}")) {
+                            Some(c) => parse_nef_sequence_code(&r[c]).map_err(|e| {
                                 format!("invalid RDC sequence_code_{k} '{}': {e}", r[c])
                             })?,
-                            None => 1,
+                            None => (1, None),
                         };
                         let rs = col_idx(ltags, &format!("residue_name_{k}"))
                             .map(|c| r[c].clone())
@@ -2069,10 +2221,10 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                         let at = col_idx(ltags, &format!("atom_name_{k}"))
                             .map(|c| r[c].clone())
                             .unwrap_or_else(|| "N".to_string());
-                        Ok((ch, sq, rs, at))
+                        Ok((ch, sq, ic, rs, at))
                     };
-                    let (ch1, sq1, rs1, at1) = get_atom(1)?;
-                    let (ch2, sq2, rs2, at2) = get_atom(2)?;
+                    let (ch1, sq1, ic1, rs1, at1) = get_atom(1)?;
+                    let (ch2, sq2, ic2, rs2, at2) = get_atom(2)?;
 
                     let target_col = c_tv.ok_or_else(|| {
                         format!("missing target_value in nef_rdc_restraint_list_{name}")
@@ -2121,25 +2273,51 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                         _ => None,
                     };
 
+                    let lower_linear_limit = match c_lll {
+                        Some(c) => parse_opt_strict_finite_f64(&r[c], "RDC lower_linear_limit")?,
+                        None => None,
+                    };
+                    let lower_limit = match c_ll {
+                        Some(c) => parse_opt_strict_finite_f64(&r[c], "RDC lower_limit")?,
+                        None => None,
+                    };
+                    let upper_limit = match c_ul {
+                        Some(c) => parse_opt_strict_finite_f64(&r[c], "RDC upper_limit")?,
+                        None => None,
+                    };
+                    let upper_linear_limit = match c_ull {
+                        Some(c) => parse_opt_strict_finite_f64(&r[c], "RDC upper_linear_limit")?,
+                        None => None,
+                    };
+                    if let (Some(ll), Some(ul)) = (lower_limit, upper_limit) {
+                        if ll > ul {
+                            return Err(format!(
+                                "inverted RDC limits in nef_rdc_restraint_list_{name}: lower_limit ({ll}) > upper_limit ({ul})"
+                            ));
+                        }
+                    }
+
                     restraints.push(NefRdcRestraint {
                         index: c_idx.and_then(|c| opt_usize(&r[c])).unwrap_or(row_i + 1),
                         restraint_id: rid,
                         restraint_combination_id: c_rcid.and_then(|c| opt_usize(&r[c])),
                         chain_code_1: ch1,
                         sequence_code_1: sq1,
+                        insertion_code_1: ic1,
                         residue_name_1: rs1,
                         atom_name_1: at1,
                         chain_code_2: ch2,
                         sequence_code_2: sq2,
+                        insertion_code_2: ic2,
                         residue_name_2: rs2,
                         atom_name_2: at2,
                         weight,
                         target_value,
                         target_value_uncertainty,
-                        lower_linear_limit: c_lll.and_then(|c| opt_f64(&r[c])),
-                        lower_limit: c_ll.and_then(|c| opt_f64(&r[c])),
-                        upper_limit: c_ul.and_then(|c| opt_f64(&r[c])),
-                        upper_linear_limit: c_ull.and_then(|c| opt_f64(&r[c])),
+                        lower_linear_limit,
+                        lower_limit,
+                        upper_limit,
+                        upper_linear_limit,
                         scale,
                         rdc_bond_length,
                     });
@@ -2526,11 +2704,13 @@ pub fn compute_nef_shift_lists_crc32(shift_lists: &[NefShiftList]) -> String {
         feed(b"list:");
         feed(sname.as_bytes());
         feed(b"\n");
-        for sh in &slist.shifts {
+        for (row_idx, sh) in slist.shifts.iter().enumerate() {
             let norm_val = if sh.value == 0.0 { 0.0 } else { sh.value };
             let seq_s = sh
                 .sequence_code
-                .map(|n| n.to_string())
+                .map(|n| {
+                    fmt_nef_sequence_code(n, slist.shift_insertion_codes.get(&row_idx).copied())
+                })
                 .unwrap_or_else(|| ".".to_string());
             let row = format!(
                 "{}\t{}\t{}\t{}\t{norm_val:.4}\n",
@@ -2717,11 +2897,12 @@ pub fn write_nef_str(doc: &NefDocument) -> String {
         }
         out.push('\n');
         for (i, r) in doc.molecular_system.residues.iter().enumerate() {
+            let seq_str = fmt_nef_sequence_code(r.sequence_code, r.insertion_code);
             out.push_str(&format!(
-                "      {:5} {:4} {:5} {:5} {:8} {:6} {}\n",
+                "      {:5} {:4} {:>5} {:5} {:8} {:6} {}\n",
                 i + 1,
                 fmt_val(&r.chain_code),
-                r.sequence_code,
+                fmt_val(&seq_str),
                 fmt_val(&r.residue_name),
                 fmt_val(&r.linking),
                 fmt_opt_str(r.residue_variant.as_deref()),
@@ -2762,15 +2943,24 @@ pub fn write_nef_str(doc: &NefDocument) -> String {
                 out.push_str(&format!("      {tag}\n"));
             }
             out.push('\n');
-            for sh in &slist.shifts {
+            for (row_idx, sh) in slist.shifts.iter().enumerate() {
                 let iso_str = sh
                     .isotope_number
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| ".".to_string());
+                let seq_str = sh
+                    .sequence_code
+                    .map(|sq| {
+                        fmt_val(&fmt_nef_sequence_code(
+                            sq,
+                            slist.shift_insertion_codes.get(&row_idx).copied(),
+                        ))
+                    })
+                    .unwrap_or_else(|| ".".to_string());
                 out.push_str(&format!(
-                    "      {:4} {:5} {:5} {:6} {:3} {:3} {:9.4} {}\n",
+                    "      {:4} {:>5} {:5} {:6} {:3} {:3} {:9.4} {}\n",
                     fmt_val(&sh.chain_code),
-                    fmt_opt_i32(sh.sequence_code),
+                    seq_str,
                     fmt_val(&sh.residue_name),
                     fmt_val(&sh.atom_name),
                     fmt_opt_str(sh.element.as_deref()),
@@ -3117,17 +3307,25 @@ pub fn write_nef_str(doc: &NefDocument) -> String {
             }
             out.push('\n');
             for r in &rlist.restraints {
+                let sq1_str = fmt_val(&fmt_nef_sequence_code(
+                    r.sequence_code_1,
+                    r.insertion_code_1,
+                ));
+                let sq2_str = fmt_val(&fmt_nef_sequence_code(
+                    r.sequence_code_2,
+                    r.insertion_code_2,
+                ));
                 out.push_str(&format!(
-                    "      {:4} {:4} {:3} {:2} {:4} {:4} {:4} {:2} {:4} {:4} {:4} {:5.2} {:9.3} {:7} {:7} {:9} {:9} {:7} {:10} {}\n",
+                    "      {:4} {:4} {:3} {:2} {:>4} {:4} {:4} {:2} {:>4} {:4} {:4} {:5.2} {:9.3} {:7} {:7} {:9} {:9} {:7} {:10} {}\n",
                     r.index,
                     r.restraint_id,
                     fmt_opt_usize(r.restraint_combination_id),
                     fmt_val(&r.chain_code_1),
-                    r.sequence_code_1,
+                    sq1_str,
                     fmt_val(&r.residue_name_1),
                     fmt_val(&r.atom_name_1),
                     fmt_val(&r.chain_code_2),
-                    r.sequence_code_2,
+                    sq2_str,
                     fmt_val(&r.residue_name_2),
                     fmt_val(&r.atom_name_2),
                     r.weight,
@@ -3535,4 +3733,162 @@ fn write_workbench_saveframe(out: &mut String, wb: &NefWorkbenchSaveframe) {
     }
 
     out.push_str("save_\n\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nef_rdc_rejects_nan_inf_and_inverted_limits() {
+        let make_nef_with_limits = |ll: &str, ul: &str, lll: &str, ull: &str| -> String {
+            let mut rows = String::new();
+            for i in 1..=6 {
+                let (r_ll, r_ul, r_lll, r_ull) = if i == 1 {
+                    (ll, ul, lll, ull)
+                } else {
+                    ("-5.5", "-3.5", ".", ".")
+                };
+                rows.push_str(&format!(
+                    "      {i} {i} . A {seq} ALA N A {seq} ALA H 1.0 -4.5 1.0 {r_lll} {r_ll} {r_ul} {r_ull} . .\n",
+                    seq = i + 1
+                ));
+            }
+            format!(
+                "data_nef_rdc_nan\n\
+                 save_nef_nmr_meta_data\n\
+                    _nef_nmr_meta_data.sf_category nef_nmr_meta_data\n\
+                    _nef_nmr_meta_data.sf_framecode nef_nmr_meta_data\n\
+                 save_\n\
+                 save_nef_rdc_restraint_list_bicelle\n\
+                    _nef_rdc_restraint_list.sf_category nef_rdc_restraint_list\n\
+                    _nef_rdc_restraint_list.sf_framecode nef_rdc_restraint_list_bicelle\n\
+                    loop_\n\
+                       _nef_rdc_restraint.index\n\
+                       _nef_rdc_restraint.restraint_id\n\
+                       _nef_rdc_restraint.restraint_combination_id\n\
+                       _nef_rdc_restraint.chain_code_1\n\
+                       _nef_rdc_restraint.sequence_code_1\n\
+                       _nef_rdc_restraint.residue_name_1\n\
+                       _nef_rdc_restraint.atom_name_1\n\
+                       _nef_rdc_restraint.chain_code_2\n\
+                       _nef_rdc_restraint.sequence_code_2\n\
+                       _nef_rdc_restraint.residue_name_2\n\
+                       _nef_rdc_restraint.atom_name_2\n\
+                       _nef_rdc_restraint.weight\n\
+                       _nef_rdc_restraint.target_value\n\
+                       _nef_rdc_restraint.target_value_uncertainty\n\
+                       _nef_rdc_restraint.lower_linear_limit\n\
+                       _nef_rdc_restraint.lower_limit\n\
+                       _nef_rdc_restraint.upper_limit\n\
+                       _nef_rdc_restraint.upper_linear_limit\n\
+                       _nef_rdc_restraint.scale\n\
+                       _nef_rdc_restraint.rdc_bond_length\n\
+                 {rows}\
+                    stop_\n\
+                 save_\n"
+            )
+        };
+
+        assert!(read_nef_str(&make_nef_with_limits("NaN", "-3.5", ".", ".")).is_err());
+        assert!(read_nef_str(&make_nef_with_limits("-5.5", "NaN", ".", ".")).is_err());
+        assert!(read_nef_str(&make_nef_with_limits("-5.5", "-3.5", "inf", ".")).is_err());
+        assert!(read_nef_str(&make_nef_with_limits("-5.5", "-3.5", ".", "-inf")).is_err());
+        assert!(read_nef_str(&make_nef_with_limits("-2.0", "-5.0", ".", ".")).is_err());
+
+        let mut valid_doc =
+            read_nef_str(&make_nef_with_limits("-5.5", "-3.5", "-6.5", "-2.5")).unwrap();
+        assert_eq!(valid_doc.rdc_media().unwrap()[0].restraints.len(), 6);
+
+        valid_doc.rdc_restraint_lists[0].restraints[0].upper_limit = Some(f64::NAN);
+        assert!(valid_doc.rdc_media().is_err());
+    }
+
+    #[test]
+    fn test_nef_sequence_code_insertion_codes_parse_and_roundtrip() {
+        assert_eq!(parse_nef_sequence_code("27").unwrap(), (27, None));
+        assert_eq!(parse_nef_sequence_code("27A").unwrap(), (27, Some('A')));
+        assert_eq!(parse_nef_sequence_code("-3B").unwrap(), (-3, Some('B')));
+        assert!(parse_nef_sequence_code("27AB").is_err());
+        assert!(parse_nef_sequence_code("NaN").is_err());
+        assert!(parse_nef_sequence_code("@12").is_err());
+
+        let nef_ins = "\
+data_nef_ins_test
+save_nef_nmr_meta_data
+   _nef_nmr_meta_data.sf_category nef_nmr_meta_data
+   _nef_nmr_meta_data.sf_framecode nef_nmr_meta_data
+save_
+save_nef_molecular_system
+   _nef_molecular_system.sf_category nef_molecular_system
+   _nef_molecular_system.sf_framecode nef_molecular_system
+   loop_
+      _nef_sequence.index
+      _nef_sequence.chain_code
+      _nef_sequence.sequence_code
+      _nef_sequence.residue_name
+      _nef_sequence.linking
+      1 A 27  GLY start
+      2 A 27A ALA middle
+      3 A 28  SER end
+   stop_
+save_
+save_nef_chemical_shift_list_default
+   _nef_chemical_shift_list.sf_category nef_chemical_shift_list
+   _nef_chemical_shift_list.sf_framecode nef_chemical_shift_list_default
+   loop_
+      _nef_chemical_shift.chain_code
+      _nef_chemical_shift.sequence_code
+      _nef_chemical_shift.residue_name
+      _nef_chemical_shift.atom_name
+      _nef_chemical_shift.value
+      A 27  GLY CA 45.20
+      A 27A ALA CA 52.80
+      A @9  .   CA 54.10
+   stop_
+save_
+save_nef_rdc_restraint_list_m1
+   _nef_rdc_restraint_list.sf_category nef_rdc_restraint_list
+   _nef_rdc_restraint_list.sf_framecode nef_rdc_restraint_list_m1
+   loop_
+      _nef_rdc_restraint.index
+      _nef_rdc_restraint.restraint_id
+      _nef_rdc_restraint.chain_code_1
+      _nef_rdc_restraint.sequence_code_1
+      _nef_rdc_restraint.residue_name_1
+      _nef_rdc_restraint.atom_name_1
+      _nef_rdc_restraint.chain_code_2
+      _nef_rdc_restraint.sequence_code_2
+      _nef_rdc_restraint.residue_name_2
+      _nef_rdc_restraint.atom_name_2
+      _nef_rdc_restraint.target_value
+      1 1 A 27A ALA N A 27A ALA H -6.25
+   stop_
+save_
+";
+        let doc = read_nef_str(nef_ins).expect("insertion-code NEF should parse");
+        assert_eq!(doc.molecular_system.residues[0].insertion_code, None);
+        assert_eq!(doc.molecular_system.residues[1].insertion_code, Some('A'));
+        assert_eq!(
+            doc.rdc_restraint_lists[0].restraints[0].insertion_code_1,
+            Some('A')
+        );
+
+        let r_ref = doc.to_reference().expect("to_reference should succeed");
+        assert_eq!(r_ref.sequence, vec!["GLY", "ALA", "SER"]);
+        assert_eq!(r_ref.shifts.get(&(0, "CA".to_string())), Some(&45.20));
+        assert_eq!(r_ref.shifts.get(&(1, "CA".to_string())), Some(&52.80));
+
+        let roundtripped = read_nef_str(&write_nef_str(&doc)).expect("round-trip parse");
+        let r_ref2 = roundtripped.to_reference().unwrap();
+        assert_eq!(r_ref2.shifts, r_ref.shifts);
+        assert_eq!(
+            roundtripped.molecular_system.residues[1].insertion_code,
+            Some('A')
+        );
+        assert_eq!(
+            roundtripped.rdc_restraint_lists[0].restraints[0].insertion_code_1,
+            Some('A')
+        );
+    }
 }

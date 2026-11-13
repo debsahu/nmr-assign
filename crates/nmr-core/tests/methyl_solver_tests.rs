@@ -11,8 +11,8 @@ use nmr_core::methyl_solver::{
     assign_methyl_cpu, build_initial_replica_states, evaluate_methyl_raw_score,
     max_cardinality_max_weight_matching, sample_methyl_mcmc_terminal_cpu_with_mask,
     MethylAnnealConfig, MethylContactProblem, ObsAdjEntry, ObsNoeEdge, StructShortAdjEntry,
-    StructShortEdge, METHYL_FORBID, METHYL_MOVE_ALL, METHYL_MOVE_BIRTH_DEATH, METHYL_MOVE_CONTACT,
-    METHYL_MOVE_GEMINAL, METHYL_MOVE_SLOT,
+    StructShortEdge, METHYL_FORBID, METHYL_FORBID_HALF, METHYL_INIT_MIN_UNARY, METHYL_MOVE_ALL,
+    METHYL_MOVE_BIRTH_DEATH, METHYL_MOVE_CONTACT, METHYL_MOVE_GEMINAL, METHYL_MOVE_SLOT,
 };
 use nmr_core::methyl_trosy::MethylClassPosterior;
 use nmr_core::rng::Rng;
@@ -427,6 +427,9 @@ fn p1_6_cpu_variable_cardinality_multi_seed_per_move_and_combined_boltzmann_tvd(
             for m in 0..prob.m_len {
                 if !sl.contains(&(m as u32)) {
                     prob.u_mat[s * prob.m_len + m] = METHYL_FORBID;
+                } else if prob.u_mat[s * prob.m_len + m] <= METHYL_FORBID_HALF {
+                    prob.u_mat[s * prob.m_len + m] =
+                        0.45 + 0.31 * ((s * 3 + m * 5) % 7) as f32 - 0.22 * (m as f32);
                 }
             }
         }
@@ -595,4 +598,236 @@ fn p1_6_artifact_root_leaves_via_birth_death_without_displacing_true_sites() {
         "spurious negative-log-odds artifact root must unassign via Move 4 even when a vacant site exists: {:?}",
         res.position
     );
+}
+
+fn ln_gamma_lanczos(z: f64) -> f64 {
+    const COEFFS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let x = z - 1.0;
+    let mut acc = COEFFS[0];
+    for (i, &c) in COEFFS.iter().enumerate().skip(1) {
+        acc += c / (x + i as f64);
+    }
+    let t = x + 7.5;
+    0.5 * std::f64::consts::TAU.ln() + (x + 0.5) * t.ln() - t + acc.ln()
+}
+
+/// Regularized upper incomplete gamma `Q(a, x) = P(Chi2_{2a} >= 2x)` via series / Lentz continued fraction.
+fn chi2_survival_prob(stat: f64, df: usize) -> f64 {
+    if stat <= 0.0 {
+        return 1.0;
+    }
+    let a = 0.5 * (df as f64);
+    let x = 0.5 * stat;
+    let gln = ln_gamma_lanczos(a);
+    if x < a + 1.0 {
+        let mut ap = a;
+        let mut term = 1.0 / a;
+        let mut sum = term;
+        for _ in 0..512 {
+            ap += 1.0;
+            term *= x / ap;
+            sum += term;
+            if term.abs() <= sum.abs() * 1.0e-14 {
+                break;
+            }
+        }
+        let p_lower = (sum * (-x + a * x.ln() - gln).exp()).clamp(0.0, 1.0);
+        (1.0 - p_lower).clamp(0.0, 1.0)
+    } else {
+        let tiny = 1.0e-300_f64;
+        let mut b = x + 1.0 - a;
+        let mut c = 1.0 / tiny;
+        let mut d = 1.0 / b.max(tiny);
+        let mut h = d;
+        for i in 1..=512 {
+            let an = -(i as f64) * ((i as f64) - a);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < tiny {
+                d = tiny;
+            }
+            c = b + an / c;
+            if c.abs() < tiny {
+                c = tiny;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() <= 1.0e-14 {
+                break;
+            }
+        }
+        ((-x + a * x.ln() - gln).exp() * h).clamp(0.0, 1.0)
+    }
+}
+
+/// Compute pooled multinomial log-likelihood ratio `G = 2 * sum O_j ln(O_j / E_j)` and Pearson
+/// `chi2 = sum (O_j - E_j)^2 / E_j` (pooling only rare tail states with `E < min_exp` so Cochran's
+/// `E_j >= 5` multinomial asymptotic validity condition holds strictly).
+fn multinomial_g_and_chi2(
+    exact: &BTreeMap<Vec<i32>, f64>,
+    samples: &[Vec<i32>],
+    min_exp: f64,
+) -> (f64, f64, usize) {
+    let mut counts: BTreeMap<&[i32], usize> = BTreeMap::new();
+    for st in samples {
+        assert!(
+            exact.contains_key(st),
+            "MCMC sampled invalid or out-of-manifold state: {st:?}"
+        );
+        *counts.entry(st.as_slice()).or_insert(0) += 1;
+    }
+
+    let n = samples.len() as f64;
+    let mut ordered: Vec<(usize, f64)> = exact
+        .iter()
+        .map(|(st, &p)| (*counts.get(st.as_slice()).unwrap_or(&0), n * p))
+        .collect();
+    // Sort ascending by expected count so any rare tail cells pool deterministically first
+    ordered.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let mut bins: Vec<(f64, f64)> = Vec::with_capacity(ordered.len());
+    let mut pool_o = 0.0f64;
+    let mut pool_e = 0.0f64;
+    for (o_u, e) in ordered {
+        pool_o += o_u as f64;
+        pool_e += e;
+        if pool_e >= min_exp {
+            bins.push((pool_o, pool_e));
+            pool_o = 0.0;
+            pool_e = 0.0;
+        }
+    }
+    if pool_e > 0.0 {
+        if let Some(last) = bins.last_mut() {
+            last.0 += pool_o;
+            last.1 += pool_e;
+        } else {
+            bins.push((pool_o, pool_e));
+        }
+    }
+    assert!(bins.len() >= 2, "require >= 2 multinomial bins");
+
+    let mut g_stat = 0.0f64;
+    let mut chi2_stat = 0.0f64;
+    for &(o, e) in &bins {
+        if o > 0.0 {
+            g_stat += 2.0 * o * (o / e).ln();
+        }
+        let diff = o - e;
+        chi2_stat += (diff * diff) / e;
+    }
+    (g_stat, chi2_stat, bins.len() - 1)
+}
+
+#[test]
+fn p2_near_forbidden_init_guard_and_s4_m4_209_state_multinomial_g_test() {
+    // 1. Verify `build_initial_replica_states` NEVER forces near-forbidden edges
+    //    (`METHYL_FORBID_HALF < u <= METHYL_INIT_MIN_UNARY`, e.g. `-25.0` or `-5_000.0`)
+    //    onto vacant sites via `max_cardinality_max_weight_matching`.
+    let mut prob_near_forbid = build_variable_cardinality_test_problem(3, 3);
+    prob_near_forbid.u_mat.fill(METHYL_FORBID);
+    for s in 0..2 {
+        prob_near_forbid.slots[s] = vec![0, 1, 2];
+        for m in 0..3 {
+            prob_near_forbid.u_mat[s * 3 + m] = if s == m { 8.0 } else { 0.5 };
+        }
+    }
+    // Root 2 only has near-forbidden outlier edges (`u = -25.0 <= METHYL_INIT_MIN_UNARY`,
+    // still `> METHYL_FORBID_HALF` so present in `slots[2]`).
+    prob_near_forbid.slots[2] = vec![0, 1, 2];
+    for m in 0..3 {
+        prob_near_forbid.u_mat[2 * 3 + m] = METHYL_INIT_MIN_UNARY - 10.0;
+    }
+    let init_reps = build_initial_replica_states(&prob_near_forbid, 32, 2026_1113);
+    for (ri, (_, pos, _)) in init_reps.iter().enumerate() {
+        assert!(
+            pos[0] >= 0 && pos[1] >= 0,
+            "replica {ri} must still match compatible roots 0 & 1: {pos:?}"
+        );
+        assert_eq!(
+            pos[2],
+            -1,
+            "replica {ri} must NOT force near-forbidden edge (u = {:.1}) onto vacant site: {pos:?}",
+            METHYL_INIT_MIN_UNARY - 10.0
+        );
+    }
+
+    // 2. Exact `S = 4, M = 4` (`|Omega| = sum_{k=0}^4 C(4,k)^2 k! = 209` states) Boltzmann
+    //    multinomial G-test & Pearson chi-squared verification across 3 independent seeds.
+    let mut prob_209 = build_variable_cardinality_test_problem(4, 4);
+    for s in 0..4 {
+        prob_209.slots[s] = vec![0, 1, 2, 3];
+        for m in 0..4 {
+            prob_209.u_mat[s * 4 + m] =
+                -0.45 + 0.29 * ((s * 3 + m * 5) % 7) as f32 - 0.21 * (m as f32);
+        }
+    }
+    let temp = 3.2;
+    let exact_209 = enumerate_boltzmann_omega(&prob_209, None, temp);
+    assert_eq!(
+        exact_209.len(),
+        209,
+        "complete S=4, M=4 partial-matching space must have exact cardinality 209"
+    );
+
+    let n_samples = 100_000usize;
+    let steps = 950usize;
+    for &seed in &[314_159u64, 271_828, 161_803] {
+        let samples = sample_methyl_mcmc_terminal_cpu_with_mask(
+            &prob_209,
+            temp,
+            steps,
+            n_samples,
+            seed,
+            METHYL_MOVE_ALL,
+        );
+        let tvd = compute_tvd(&exact_209, &samples);
+        let (g_stat, chi2_stat, df) = multinomial_g_and_chi2(&exact_209, &samples, 8.0);
+        let p_g = chi2_survival_prob(g_stat, df);
+        let p_chi2 = chi2_survival_prob(chi2_stat, df);
+        println!(
+            "[P2 S=4,M=4 209-State Boltzmann seed={seed}] |Omega|={} df={df} G={g_stat:.2} (p={p_g:.4}) chi2={chi2_stat:.2} (p={p_chi2:.4}) TVD={tvd:.4}",
+            exact_209.len()
+        );
+        assert!(
+            df >= 195,
+            "S=4, M=4 Boltzmann test should exercise >= 196 unpooled state bins out of 209, got df={df}"
+        );
+        assert!(
+            p_g > 0.005 && p_chi2 > 0.005,
+            "S=4, M=4 209-state Boltzmann G-test/chi2 failed at seed={seed}: G={g_stat:.2} (p={p_g:.5}), chi2={chi2_stat:.2} (p={p_chi2:.5}), df={df}"
+        );
+        assert!(
+            tvd <= 0.025,
+            "S=4, M=4 209-state Boltzmann TVD {tvd:.4} > 0.025 at seed={seed}"
+        );
+
+        // Negative control: verify G-test rejects a slightly skewed reference distribution (`p < 1e-6`)
+        if seed == 314_159 {
+            let mut skewed = exact_209.clone();
+            let first_key = skewed.keys().next().unwrap().clone();
+            *skewed.get_mut(&first_key).unwrap() += 0.025;
+            let z_skew: f64 = skewed.values().sum();
+            for v in skewed.values_mut() {
+                *v /= z_skew;
+            }
+            let (g_bad, _, df_bad) = multinomial_g_and_chi2(&skewed, &samples, 8.0);
+            let p_bad = chi2_survival_prob(g_bad, df_bad);
+            assert!(
+                p_bad < 1.0e-6,
+                "G-test power check must strongly reject skewed Boltzmann null: G={g_bad:.2}, p={p_bad:.3e}"
+            );
+        }
+    }
 }

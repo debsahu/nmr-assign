@@ -32,6 +32,66 @@ use crate::rng::Rng;
 
 pub const METHYL_FORBID: f32 = -1.0e9;
 pub const METHYL_FORBID_HALF: f32 = -5.0e8;
+/// Minimum unary compatibility (`> METHYL_INIT_MIN_UNARY`) required for an edge `(s, m)` to enter
+/// initial maximum-cardinality replica matching (`build_initial_replica_states`), preventing
+/// near-forbidden outlier/artifact edges (`METHYL_FORBID_HALF < u <= METHYL_INIT_MIN_UNARY`) from
+/// being forced onto vacant sites at `t = 0`.
+pub const METHYL_INIT_MIN_UNARY: f32 = -15.0;
+
+#[inline]
+fn debug_assert_slots_consistent(prob: &MethylContactProblem, require_exact_eq: bool) {
+    #[cfg(debug_assertions)]
+    {
+        debug_assert_eq!(
+            prob.slots.len(),
+            prob.s_len,
+            "MethylContactProblem slots.len() ({}) != s_len ({})",
+            prob.slots.len(),
+            prob.s_len
+        );
+        debug_assert_eq!(
+            prob.u_mat.len(),
+            prob.s_len * prob.m_len,
+            "MethylContactProblem u_mat.len() ({}) != s_len * m_len ({})",
+            prob.u_mat.len(),
+            prob.s_len * prob.m_len
+        );
+        for s in 0..prob.s_len {
+            let mut sorted_slots = prob.slots[s].clone();
+            sorted_slots.sort_unstable();
+            for w in sorted_slots.windows(2) {
+                debug_assert_ne!(w[0], w[1], "duplicate site index {} in slots[{s}]", w[0]);
+            }
+            for &m_u32 in &sorted_slots {
+                debug_assert!(
+                    (m_u32 as usize) < prob.m_len,
+                    "out-of-bounds site index {m_u32} >= m_len ({}) in slots[{s}]",
+                    prob.m_len
+                );
+            }
+            let expected: Vec<u32> = (0..prob.m_len)
+                .filter(|&m| prob.u_mat[s * prob.m_len + m] > METHYL_FORBID_HALF)
+                .map(|m| m as u32)
+                .collect();
+            if require_exact_eq {
+                debug_assert_eq!(
+                    sorted_slots, expected,
+                    "slots[{s}] ({sorted_slots:?}) != {{m : u_mat[s, m] > METHYL_FORBID_HALF}} ({expected:?})"
+                );
+            } else {
+                for &m_req in &expected {
+                    debug_assert!(
+                        sorted_slots.binary_search(&m_req).is_ok(),
+                        "site {m_req} has u_mat[{s}, {m_req}] = {} > METHYL_FORBID_HALF but is missing from slots[{s}] ({sorted_slots:?})",
+                        prob.u_mat[s * prob.m_len + (m_req as usize)]
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (prob, require_exact_eq);
+}
 
 /// Bitmask flags selecting individual reversible MCMC move families on $\Omega = \bigcup_k \Omega_k$.
 pub const METHYL_MOVE_SLOT: u32 = 0x1;
@@ -741,7 +801,7 @@ pub fn build_methyl_contact_problem(
         struct_cut_offsets.push(struct_cut_peers.len() as u32);
     }
 
-    MethylContactProblem {
+    let prob = MethylContactProblem {
         s_len,
         m_len,
         d_cutoff: cfg.d_cutoff_angstrom as f32,
@@ -763,7 +823,9 @@ pub fn build_methyl_contact_problem(
         struct_cut_offsets,
         struct_cut_peers,
         class_posteriors,
-    }
+    };
+    debug_assert_slots_consistent(&prob, true);
+    prob
 }
 
 fn find_closest_root_2d(
@@ -1081,6 +1143,7 @@ pub fn build_initial_replica_states(
     replicas: usize,
     seed: u64,
 ) -> Vec<ReplicaInitState> {
+    debug_assert_slots_consistent(prob, false);
     let s_len = prob.s_len;
     let m_len = prob.m_len;
     let mut master_rng = Rng::new(seed ^ 0x4D45_5448_494E_4954);
@@ -1156,7 +1219,8 @@ pub fn build_initial_replica_states(
                 for &(ma, mb) in &[(m1, m2), (m2, m1)] {
                     let u1 = prob.u_mat[s1 * m_len + ma] as f64;
                     let u2 = prob.u_mat[s2 * m_len + mb] as f64;
-                    if u1 <= (METHYL_FORBID_HALF as f64) || u2 <= (METHYL_FORBID_HALF as f64) {
+                    if u1 <= (METHYL_INIT_MIN_UNARY as f64) || u2 <= (METHYL_INIT_MIN_UNARY as f64)
+                    {
                         continue;
                     }
                     let deg_pen = 0.16
@@ -1186,7 +1250,7 @@ pub fn build_initial_replica_states(
                     continue;
                 }
                 let u = prob.u_mat[s * m_len + m] as f64;
-                if u <= (METHYL_FORBID_HALF as f64) {
+                if u <= (METHYL_INIT_MIN_UNARY as f64) {
                     continue;
                 }
                 let deg_pen = 0.18 * (obs_deg[s] - struct_deg[m]).abs();
@@ -1895,6 +1959,7 @@ pub fn sample_methyl_mcmc_terminal_cpu_with_mask(
     seed: u64,
     move_mask: u32,
 ) -> Vec<Vec<i32>> {
+    debug_assert_slots_consistent(prob, false);
     let reps = replicas.max(1);
     if prob.s_len == 0 || prob.m_len == 0 {
         return vec![vec![-1; prob.s_len]; reps];
@@ -1996,6 +2061,7 @@ pub fn assign_methyl_cpu(
     prob: &MethylContactProblem,
     cfg: &MethylAnnealConfig,
 ) -> MethylAssignResult {
+    debug_assert_slots_consistent(prob, false);
     let replicas = cfg.replicas.max(1);
     if prob.s_len == 0 || prob.m_len == 0 {
         return MethylAssignResult {

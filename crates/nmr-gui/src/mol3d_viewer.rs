@@ -12,7 +12,7 @@
 //!   Ramachandran `(phi, psi)` basin fallback when header `HELIX`/`SHEET` records are absent).
 //! - Shoemake, K. (*ACM SIGGRAPH Comput. Graph.* 1985, 19(3), 245–254 — quaternion arcball rotation).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -218,8 +218,12 @@ pub struct StructureModel3d {
     pub model_number: usize,
     pub chains: Vec<PolymerChain3d>,
     pub het_atoms: Vec<StructureAtom3d>,
-    /// Kabsch `CA` RMSD (`Å`) of this conformer relative to conformer `0` (`0.0` for conformer `0`).
+    /// Kabsch `CA` RMSD (`Å`) of this conformer relative to conformer `0` (`0.0` for conformer `0`,
+    /// `NaN` when `< 3` shared `CA` atoms exist). Prefer [`Self::kabsch_rmsd_to_ref_opt`].
     pub kabsch_rmsd_to_ref: f64,
+    /// Defined Kabsch `CA` RMSD (`Å`) relative to conformer `0`, or `None` when `< 3` shared `CA`
+    /// guide atoms are available for rigid-body `SO(3)` superposition.
+    pub kabsch_rmsd_to_ref_opt: Option<f64>,
 }
 
 impl StructureModel3d {
@@ -242,10 +246,14 @@ pub struct StructureEnsemble3d {
     pub primary_sequence: Vec<String>,
     /// Primary polymer chain author `seq_id`s matching `primary_sequence`.
     pub primary_seq_ids: Vec<i32>,
-    /// Per-residue `CA` spatial RMSD (`Å`) across all conformers for `0..primary_sequence.len()`.
+    /// Per-residue `CA` spatial RMSD (`Å`) across superposed conformers for `0..primary_sequence.len()`.
     pub per_residue_ca_rmsd: Vec<f64>,
-    /// Mean ensemble `CA` RMSD (`Å`) across `per_residue_ca_rmsd`.
+    /// Mean ensemble `CA` RMSD (`Å`) across `per_residue_ca_rmsd` (`0.0` for a single conformer;
+    /// `NaN` when `models.len() > 1` has `< 3` shared `CA` atoms). Prefer [`Self::mean_ensemble_ca_rmsd_opt`].
     pub mean_ensemble_ca_rmsd: f64,
+    /// Defined mean ensemble `CA` RMSD (`Å`), or `None` for single-conformer structures and
+    /// multi-conformer structures with `< 3` shared `CA` atoms.
+    pub mean_ensemble_ca_rmsd_opt: Option<f64>,
     /// Bounding center (`Å`) of conformer `0`.
     pub center: [f64; 3],
     /// Bounding sphere radius (`Å`) around `center`.
@@ -275,13 +283,15 @@ impl StructureEnsemble3d {
         if nmr_seq.is_empty() {
             return;
         }
+        let mut seq_id_to_pos: HashMap<i32, usize> = HashMap::with_capacity(nmr_seq_ids.len());
+        for (pos, &sid) in nmr_seq_ids.iter().enumerate() {
+            if pos < nmr_seq.len() {
+                seq_id_to_pos.entry(sid).or_insert(pos);
+            }
+        }
         let map_res = |seq_id: i32, fallback_idx: usize, res_name: &str| -> Option<usize> {
-            if !nmr_seq_ids.is_empty() {
-                if let Some(pos) = nmr_seq_ids.iter().position(|&sid| sid == seq_id) {
-                    if pos < nmr_seq.len() {
-                        return Some(pos);
-                    }
-                }
+            if let Some(&pos) = seq_id_to_pos.get(&seq_id) {
+                return Some(pos);
             }
             if seq_id >= 1 && ((seq_id - 1) as usize) < nmr_seq.len() {
                 let k = (seq_id - 1) as usize;
@@ -835,8 +845,16 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             }
             let is_atom_site = headers.iter().any(|h| h.starts_with("_atom_site."));
             if !is_atom_site {
+                let loop_start = idx;
                 while idx < tokens.len() && !is_cif_control_token(&tokens[idx]) {
                     idx += 1;
+                }
+                let n_vals = idx - loop_start;
+                if !n_vals.is_multiple_of(ncols) {
+                    return Err(format!(
+                        "Truncated mmCIF loop ({}) row: {} values is not a multiple of {ncols} columns",
+                        headers[0], n_vals
+                    ));
                 }
                 continue;
             }
@@ -870,12 +888,28 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             let c_model = col_of(&["_atom_site.pdbx_pdb_model_num"]);
 
             let mut row_num = 0usize;
-            while idx + ncols <= tokens.len() {
+            while idx < tokens.len() {
                 let first = &tokens[idx];
                 if is_cif_control_token(first) {
                     break;
                 }
                 row_num += 1;
+                if let Some(ctrl_off) = tokens[idx..]
+                    .iter()
+                    .take(ncols)
+                    .position(is_cif_control_token)
+                {
+                    return Err(format!(
+                        "Truncated mmCIF _atom_site row {row_num}: expected {ncols} columns before '{}', got {ctrl_off}",
+                        tokens[idx + ctrl_off].text
+                    ));
+                }
+                if idx + ncols > tokens.len() {
+                    return Err(format!(
+                        "Truncated mmCIF _atom_site row {row_num}: expected {ncols} columns, got {}",
+                        tokens.len() - idx
+                    ));
+                }
                 let row = &tokens[idx..idx + ncols];
                 idx += ncols;
 
@@ -1011,6 +1045,8 @@ fn finalize_structure_ensemble(
         }
 
         let mut chains: Vec<PolymerChain3d> = Vec::new();
+        let mut chain_idx_map: HashMap<char, usize> = HashMap::new();
+        let mut chain_res_idx_maps: Vec<HashMap<(i32, char), usize>> = Vec::new();
         let mut het_atoms: Vec<StructureAtom3d> = Vec::new();
 
         for rec in chosen {
@@ -1032,22 +1068,19 @@ fn finalize_structure_ensemble(
             };
 
             if is_polymer {
-                let chain_pos = chains
-                    .iter()
-                    .position(|c| c.chain_id == rec.chain_id)
-                    .unwrap_or_else(|| {
-                        chains.push(PolymerChain3d {
-                            chain_id: rec.chain_id,
-                            residues: Vec::new(),
-                        });
-                        chains.len() - 1
+                let chain_pos = *chain_idx_map.entry(rec.chain_id).or_insert_with(|| {
+                    chains.push(PolymerChain3d {
+                        chain_id: rec.chain_id,
+                        residues: Vec::new(),
                     });
+                    chain_res_idx_maps.push(HashMap::new());
+                    chains.len() - 1
+                });
                 let chain = &mut chains[chain_pos];
-                let res_pos = chain
-                    .residues
-                    .iter()
-                    .position(|r| r.seq_id == rec.seq_id && r.ins_code == rec.ins_code)
-                    .unwrap_or_else(|| {
+                let res_map = &mut chain_res_idx_maps[chain_pos];
+                let res_pos = *res_map
+                    .entry((rec.seq_id, rec.ins_code))
+                    .or_insert_with(|| {
                         chain.residues.push(PolymerResidue3d {
                             chain_id: rec.chain_id,
                             seq_id: rec.seq_id,
@@ -1088,6 +1121,7 @@ fn finalize_structure_ensemble(
             chains,
             het_atoms,
             kabsch_rmsd_to_ref: 0.0,
+            kabsch_rmsd_to_ref_opt: None,
         });
     }
 
@@ -1095,14 +1129,19 @@ fn finalize_structure_ensemble(
         return Err("No valid structure models decoded".to_string());
     }
 
-    // Bind `sequence_idx` on primary chain (`chain 0`) across all conformers
+    // Bind `sequence_idx` on primary chain (`chain 0`) across all conformers in O(residues)
     let mut primary_sequence = Vec::new();
     let mut primary_seq_ids = Vec::new();
+    let mut primary_seq_ins_map: HashMap<(i32, char), usize> = HashMap::new();
+    let mut primary_seq_id_map: HashMap<i32, usize> = HashMap::new();
     if let Some(c0) = models[0].chains.first() {
         for (k, r) in c0.residues.iter().enumerate() {
             primary_sequence.push(r.res_name.clone());
             primary_seq_ids.push(r.seq_id);
-            let _ = k;
+            primary_seq_ins_map
+                .entry((r.seq_id, r.ins_code))
+                .or_insert(k);
+            primary_seq_id_map.entry(r.seq_id).or_insert(k);
         }
     }
     let primary_chain_id = models[0].chains.first().map(|c| c.chain_id);
@@ -1110,14 +1149,17 @@ fn finalize_structure_ensemble(
         for chain in &mut model.chains {
             if Some(chain.chain_id) == primary_chain_id {
                 for res in &mut chain.residues {
-                    res.sequence_idx = primary_seq_ids.iter().position(|&sid| sid == res.seq_id);
+                    res.sequence_idx = primary_seq_ins_map
+                        .get(&(res.seq_id, res.ins_code))
+                        .or_else(|| primary_seq_id_map.get(&res.seq_id))
+                        .copied();
                 }
             }
         }
     }
 
     // Kabsch-superpose conformers `1..M` onto conformer `0` and compute per-residue `CA` RMSD
-    let (per_residue_ca_rmsd, mean_ensemble_ca_rmsd) =
+    let (per_residue_ca_rmsd, mean_ensemble_ca_rmsd, mean_ensemble_ca_rmsd_opt) =
         superpose_ensemble_kabsch(&mut models, primary_sequence.len());
 
     // Compute bounding center & sphere radius on conformer `0`
@@ -1130,6 +1172,7 @@ fn finalize_structure_ensemble(
         primary_seq_ids,
         per_residue_ca_rmsd,
         mean_ensemble_ca_rmsd,
+        mean_ensemble_ca_rmsd_opt,
         center,
         bounding_radius,
         coord_lookup: AtomCoordLookup::default(),
@@ -1647,13 +1690,27 @@ fn collect_ca_map(model: &StructureModel3d) -> BTreeMap<(char, i32, char), [f64;
 fn superpose_ensemble_kabsch(
     models: &mut [StructureModel3d],
     primary_len: usize,
-) -> (Vec<f64>, f64) {
-    if models.len() <= 1 {
-        return (vec![0.0; primary_len], 0.0);
+) -> (Vec<f64>, f64, Option<f64>) {
+    if models.is_empty() {
+        return (vec![0.0; primary_len], 0.0, None);
+    }
+    let ref_ca = collect_ca_map(&models[0]);
+    if ref_ca.len() >= 3 {
+        models[0].kabsch_rmsd_to_ref = 0.0;
+        models[0].kabsch_rmsd_to_ref_opt = Some(0.0);
+    } else {
+        models[0].kabsch_rmsd_to_ref = if models.len() > 1 { f64::NAN } else { 0.0 };
+        models[0].kabsch_rmsd_to_ref_opt = None;
     }
 
-    let ref_ca = collect_ca_map(&models[0]);
-    for m in models.iter_mut().skip(1) {
+    if models.len() <= 1 {
+        return (vec![0.0; primary_len], 0.0, None);
+    }
+
+    let mut superposed_flags = vec![false; models.len()];
+    superposed_flags[0] = ref_ca.len() >= 3;
+
+    for (offset, m) in models.iter_mut().skip(1).enumerate() {
         let mov_ca = collect_ca_map(m);
         let mut ref_pts = Vec::with_capacity(ref_ca.len());
         let mut mov_pts = Vec::with_capacity(ref_ca.len());
@@ -1664,10 +1721,14 @@ fn superpose_ensemble_kabsch(
             }
         }
         if ref_pts.len() < 3 {
+            m.kabsch_rmsd_to_ref = f64::NAN;
+            m.kabsch_rmsd_to_ref_opt = None;
             continue;
         }
         let (rot, c_ref, c_mov, rmsd) = kabsch_superpose_points(&ref_pts, &mov_pts);
         m.kabsch_rmsd_to_ref = rmsd;
+        m.kabsch_rmsd_to_ref_opt = Some(rmsd);
+        superposed_flags[offset + 1] = true;
 
         let apply_xform = |p: &mut [f32; 3]| {
             let xm = [
@@ -1692,25 +1753,35 @@ fn superpose_ensemble_kabsch(
         }
     }
 
+    let superposed_count = superposed_flags.iter().filter(|&&ok| ok).count();
+    if superposed_count < 2 {
+        return (vec![0.0; primary_len], f64::NAN, None);
+    }
+
+    // Collect CA coordinates per primary-sequence slot in O(models * residues) without nested scans
+    let mut pts_by_k: Vec<Vec<[f64; 3]>> = vec![Vec::with_capacity(superposed_count); primary_len];
+    for (m_idx, m) in models.iter().enumerate() {
+        if !superposed_flags[m_idx] {
+            continue;
+        }
+        if let Some(c0) = m.chains.first() {
+            for r in &c0.residues {
+                if let Some(k) = r.sequence_idx.filter(|&k| k < primary_len) {
+                    if let Some(ca) = r.atom_pos("CA") {
+                        pts_by_k[k].push([ca[0] as f64, ca[1] as f64, ca[2] as f64]);
+                    }
+                }
+            }
+        }
+    }
+
     // Compute per-residue `CA` spatial RMSD across all superposed conformers on primary chain
     let mut per_res_rmsd = vec![0.0f64; primary_len];
     let mut valid_res = 0usize;
     let mut rmsd_sum = 0.0f64;
 
     for (k, rmsd_slot) in per_res_rmsd.iter_mut().enumerate() {
-        let mut pts: Vec<[f64; 3]> = Vec::with_capacity(models.len());
-        for m in models.iter() {
-            if let Some(c0) = m.chains.first() {
-                if let Some(ca) = c0
-                    .residues
-                    .iter()
-                    .find(|r| r.sequence_idx == Some(k))
-                    .and_then(|r| r.atom_pos("CA"))
-                {
-                    pts.push([ca[0] as f64, ca[1] as f64, ca[2] as f64]);
-                }
-            }
-        }
+        let pts = &pts_by_k[k];
         if pts.len() >= 2 {
             let inv = 1.0 / (pts.len() as f64);
             let mean = [
@@ -1735,12 +1806,12 @@ fn superpose_ensemble_kabsch(
         }
     }
 
-    let mean_rmsd = if valid_res > 0 {
-        rmsd_sum / (valid_res as f64)
+    if valid_res > 0 {
+        let mean_rmsd = rmsd_sum / (valid_res as f64);
+        (per_res_rmsd, mean_rmsd, Some(mean_rmsd))
     } else {
-        0.0
-    };
-    (per_res_rmsd, mean_rmsd)
+        (per_res_rmsd, f64::NAN, None)
+    }
 }
 
 // ============================================================================
@@ -3123,6 +3194,85 @@ pub struct Mol3dPipelineResource {
     cyl_template_indices: u32,
     target: Option<OffscreenTarget3d>,
     uploaded: Option<UploadedSceneBuffers>,
+    last_upload_error: Option<String>,
+}
+
+/// Validate a prospective GPU buffer allocation against `wgpu::Limits::max_buffer_size` (and
+/// `max_storage_buffer_binding_size` when `check_storage_binding` is set) before invoking
+/// `device.create_buffer` / `device.create_buffer_init`, preventing validation panics on massive
+/// ensembles.
+pub fn validate_mol3d_buffer_limits(
+    limits: &wgpu::Limits,
+    label: &str,
+    byte_len: u64,
+    check_storage_binding: bool,
+) -> Result<(), String> {
+    if byte_len > limits.max_buffer_size {
+        return Err(format!(
+            "3D GPU buffer '{label}' ({byte_len} B) exceeds adapter max_buffer_size ({} B)",
+            limits.max_buffer_size
+        ));
+    }
+    if check_storage_binding
+        && limits.max_storage_buffer_binding_size > 0
+        && byte_len > limits.max_storage_buffer_binding_size
+    {
+        return Err(format!(
+            "3D GPU buffer '{label}' ({byte_len} B) exceeds adapter max_storage_buffer_binding_size ({} B)",
+            limits.max_storage_buffer_binding_size
+        ));
+    }
+    Ok(())
+}
+
+/// Validate all 3D scene geometry buffer sizes against both `max_buffer_size` and
+/// `max_storage_buffer_binding_size` on `limits`.
+pub fn validate_scene_gpu_buffer_limits(
+    limits: &wgpu::Limits,
+    scene: &Mol3dSceneBuffers,
+) -> Result<(), String> {
+    let specs: [(&str, usize); 9] = [
+        (
+            "mol3d-op-rib-vbo",
+            std::mem::size_of_val(scene.opaque_ribbon_verts.as_slice()),
+        ),
+        (
+            "mol3d-op-rib-ibo",
+            std::mem::size_of_val(scene.opaque_ribbon_indices.as_slice()),
+        ),
+        (
+            "mol3d-bl-rib-vbo",
+            std::mem::size_of_val(scene.blend_ribbon_verts.as_slice()),
+        ),
+        (
+            "mol3d-bl-rib-ibo",
+            std::mem::size_of_val(scene.blend_ribbon_indices.as_slice()),
+        ),
+        (
+            "mol3d-op-sph-vbo",
+            std::mem::size_of_val(scene.opaque_spheres.as_slice()),
+        ),
+        (
+            "mol3d-bl-sph-vbo",
+            std::mem::size_of_val(scene.blend_spheres.as_slice()),
+        ),
+        (
+            "mol3d-op-cyl-vbo",
+            std::mem::size_of_val(scene.opaque_cylinders.as_slice()),
+        ),
+        (
+            "mol3d-bl-cyl-vbo",
+            std::mem::size_of_val(scene.blend_cylinders.as_slice()),
+        ),
+        (
+            "mol3d-rst-cyl-vbo",
+            std::mem::size_of_val(scene.restraint_cylinders.as_slice()),
+        ),
+    ];
+    for (label, byte_len) in specs {
+        validate_mol3d_buffer_limits(limits, label, byte_len.max(64) as u64, true)?;
+    }
+    Ok(())
 }
 
 impl Mol3dPipelineResource {
@@ -3453,6 +3603,7 @@ impl Mol3dPipelineResource {
             cyl_template_indices: cyl_i.len() as u32,
             target: None,
             uploaded: None,
+            last_upload_error: None,
         }
     }
 
@@ -3541,6 +3692,14 @@ impl Mol3dPipelineResource {
         {
             return;
         }
+
+        let limits = device.limits();
+        if let Err(err) = validate_scene_gpu_buffer_limits(&limits, scene) {
+            self.uploaded = None;
+            self.last_upload_error = Some(err);
+            return;
+        }
+        self.last_upload_error = None;
 
         let make_vbo = |label: &str, bytes: &[u8]| -> wgpu::Buffer {
             let fallback = [0u8; 64];
@@ -3746,9 +3905,14 @@ impl Mol3dPipelineResource {
         let w = width.clamp(2, 4096);
         let h = height.clamp(2, 4096);
         let bytes_per_row = (w * 4).div_ceil(256) * 256;
+        let readback_bytes = (bytes_per_row as u64) * (h as u64);
+        let limits = device.limits();
+        validate_mol3d_buffer_limits(&limits, "mol3d-png-readback", readback_bytes, false)?;
+        validate_scene_gpu_buffer_limits(&limits, scene)?;
+
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mol3d-png-readback"),
-            size: (bytes_per_row * h) as u64,
+            size: readback_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -3757,6 +3921,9 @@ impl Mol3dPipelineResource {
             label: Some("mol3d-offscreen-readback-enc"),
         });
         self.record_offscreen_3d_pass(device, queue, &mut encoder, w, h, uniforms, scene);
+        if let Some(err) = self.last_upload_error.as_ref() {
+            return Err(err.clone());
+        }
 
         let Some(target) = self.target.as_ref() else {
             return Err("Offscreen 3D target unavailable".to_string());
@@ -3782,11 +3949,23 @@ impl Mol3dPipelineResource {
                 depth_or_array_layers: 1,
             },
         );
-        queue.submit(Some(encoder.finish()));
+        let sub_idx = queue.submit(Some(encoder.finish()));
 
         let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(sub_idx),
+                timeout: Some(std::time::Duration::from_secs(30)),
+            })
+            .map_err(|e| format!("GPU device.poll failed during offscreen 3D readback: {e}"))?;
+        let map_res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("Timed out waiting for offscreen 3D map_async callback: {e}"))?;
+        map_res.map_err(|e| format!("Offscreen 3D readback map_async failed: {e}"))?;
         let mapped = slice
             .get_mapped_range()
             .map_err(|e| format!("Failed mapping offscreen 3D readback buffer: {e}"))?;
@@ -4184,14 +4363,7 @@ impl Mol3dViewerPanel {
         let mut ens = parse_structure_auto(text)?;
         ens.bind_to_nmr_sequence(nmr_seq, nmr_seq_ids);
         self.camera.fit_ensemble(&ens);
-        self.status_banner = format!(
-            "{} — {} conformer(s), {} residues, {} atoms (mean CA RMSD {:.2} Å)",
-            ens.title,
-            ens.models.len(),
-            ens.residue_count_model0(),
-            ens.total_atom_count(),
-            ens.mean_ensemble_ca_rmsd
-        );
+        self.status_banner = format_ensemble_status_banner(&ens);
         self.ensemble = Some(ens);
         self.recompute_restraints_now();
         self.rebuild_scene_now();
@@ -4207,13 +4379,7 @@ impl Mol3dViewerPanel {
     ) {
         ens.bind_to_nmr_sequence(nmr_seq, nmr_seq_ids);
         self.camera.fit_ensemble(&ens);
-        self.status_banner = format!(
-            "{} — {} conformer(s), {} residues, {} atoms",
-            ens.title,
-            ens.models.len(),
-            ens.residue_count_model0(),
-            ens.total_atom_count()
-        );
+        self.status_banner = format_ensemble_status_banner(&ens);
         self.ensemble = Some(ens);
         self.recompute_restraints_now();
         self.rebuild_scene_now();
@@ -4479,7 +4645,7 @@ impl Mol3dViewerPanel {
                     {
                         self.flush_pending_updates();
                         let uni = self.camera.to_gpu_uniforms(1600.0, 1200.0, DEFAULT_BG_RGBA);
-                        if let Ok(png) = res.export_offscreen_png(
+                        match res.export_offscreen_png(
                             &rs.device,
                             &rs.queue,
                             1600,
@@ -4487,13 +4653,32 @@ impl Mol3dViewerPanel {
                             &uni,
                             &self.scene,
                         ) {
-                            let out_path = std::env::temp_dir().join("nmr_structure_3d.png");
-                            let _ = std::fs::write(&out_path, &png);
-                            self.last_exported_png_bytes = Some(png);
-                            self.status_banner =
-                                format!("Exported 1600x1200 PNG ({})", out_path.display());
+                            Ok(png) => {
+                                let out_path = std::env::temp_dir().join("nmr_structure_3d.png");
+                                match write_mol3d_export_file(&out_path, &png, "PNG") {
+                                    Ok(()) => {
+                                        self.last_exported_png_bytes = Some(png);
+                                        self.status_banner = format!(
+                                            "Exported 1600x1200 PNG ({})",
+                                            out_path.display()
+                                        );
+                                    }
+                                    Err(err) => {
+                                        self.status_banner = err;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                self.status_banner = format!("PNG export failed: {err}");
+                            }
                         }
+                    } else {
+                        self.status_banner =
+                            "PNG export failed: 3D GPU pipeline unavailable".to_string();
                     }
+                } else {
+                    self.status_banner =
+                        "PNG export failed: WebGPU render state unavailable".to_string();
                 }
             }
 
@@ -4512,14 +4697,30 @@ impl Mol3dViewerPanel {
                         1200,
                         900,
                     );
-                    ui.ctx().copy_text(svg.clone());
                     #[cfg(not(target_arch = "wasm32"))]
                     {
                         let out_path = std::env::temp_dir().join("nmr_structure_3d.svg");
-                        let _ = std::fs::write(&out_path, &svg);
+                        match write_mol3d_export_file(&out_path, svg.as_bytes(), "SVG") {
+                            Ok(()) => {
+                                ui.ctx().copy_text(svg.clone());
+                                self.last_exported_svg = Some(svg);
+                                self.status_banner = format!(
+                                    "Exported vector SVG ({}, copied to clipboard).",
+                                    out_path.display()
+                                );
+                            }
+                            Err(err) => {
+                                self.status_banner = err;
+                            }
+                        }
                     }
-                    self.last_exported_svg = Some(svg);
-                    self.status_banner = "Exported vector SVG (copied to clipboard).".to_string();
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        ui.ctx().copy_text(svg.clone());
+                        self.last_exported_svg = Some(svg);
+                        self.status_banner =
+                            "Exported vector SVG (copied to clipboard).".to_string();
+                    }
                 }
             }
         });
@@ -4779,5 +4980,144 @@ impl Mol3dViewerPanel {
 
         ui.small(&self.status_banner);
         emitted_sync
+    }
+}
+
+/// Format the viewport status banner summarizing conformer count, residue/atom totals, and
+/// `Option<f64>` ensemble `CA` RMSD (`None` for single conformers or `< 3` `CA` guide atoms).
+pub fn format_ensemble_status_banner(ens: &StructureEnsemble3d) -> String {
+    let rmsd_suffix = match ens.mean_ensemble_ca_rmsd_opt {
+        Some(rmsd) => format!("(mean CA RMSD {rmsd:.2} Å)"),
+        None if ens.models.len() <= 1 => "(single conformer)".to_string(),
+        None => "(CA RMSD n/a: <3 CAs)".to_string(),
+    };
+    format!(
+        "{} — {} conformer(s), {} residues, {} atoms {rmsd_suffix}",
+        ens.title,
+        ens.models.len(),
+        ens.residue_count_model0(),
+        ens.total_atom_count()
+    )
+}
+
+/// Write exported 3D snapshot bytes (`PNG` or `SVG`) to `path`, propagating filesystem I/O errors
+/// instead of silently reporting success.
+pub fn write_mol3d_export_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+    format_label: &str,
+) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|err| {
+        format!(
+            "{format_label} export failed writing '{}': {err}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p2_truncated_mmcif_rows_rejected_cleanly() {
+        let truncated_trailing = "\
+data_trunc
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N ALA 1 0.000 0.000 0.000
+ATOM 2 CA ALA 1 1.458 0.000
+";
+        let err1 = parse_mmcif_ensemble(truncated_trailing)
+            .expect_err("truncated trailing _atom_site row must error");
+        assert!(
+            err1.contains("Truncated mmCIF _atom_site row 2"),
+            "got: {err1}"
+        );
+
+        let truncated_before_next_loop = "\
+data_trunc_mid
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N ALA 1 0.000 0.000 0.000
+ATOM 2 CA ALA 1 1.458
+loop_
+_audit_author.name
+'Author'
+";
+        let err2 = parse_mmcif_ensemble(truncated_before_next_loop)
+            .expect_err("mid-row truncated _atom_site before next loop_ must error");
+        assert!(
+            err2.contains("Truncated mmCIF _atom_site row 2"),
+            "got: {err2}"
+        );
+    }
+
+    #[test]
+    fn p2_fewer_than_three_ca_ensemble_rmsd_is_none() {
+        let dipeptide_two_models = "\
+MODEL        1
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00 10.00           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00 10.00           C
+ATOM      3  N   GLY A   2       2.900   1.200   0.000  1.00 10.00           N
+ATOM      4  CA  GLY A   2       4.350   1.200   0.000  1.00 10.00           C
+ENDMDL
+MODEL        2
+ATOM      1  N   ALA A   1      10.000   5.000  -3.000  1.00 10.00           N
+ATOM      2  CA  ALA A   1      11.458   5.000  -3.000  1.00 10.00           C
+ATOM      3  N   GLY A   2      12.900   6.200  -3.000  1.00 10.00           N
+ATOM      4  CA  GLY A   2      14.350   6.200  -3.000  1.00 10.00           C
+ENDMDL
+END
+";
+        let ens = parse_pdb_ensemble(dipeptide_two_models)
+            .expect("2-CA dipeptide ensemble should parse without unsuperposed RMSD corruption");
+        assert_eq!(ens.models.len(), 2);
+        assert_eq!(ens.models[0].kabsch_rmsd_to_ref_opt, None);
+        assert_eq!(ens.models[1].kabsch_rmsd_to_ref_opt, None);
+        assert!(ens.models[1].kabsch_rmsd_to_ref.is_nan());
+        assert_eq!(ens.mean_ensemble_ca_rmsd_opt, None);
+        assert!(ens.mean_ensemble_ca_rmsd.is_nan());
+        let banner = format_ensemble_status_banner(&ens);
+        assert!(banner.contains("CA RMSD n/a: <3 CAs"), "banner={banner}");
+    }
+
+    #[test]
+    fn p2_gpu_buffer_limits_and_export_file_io_errors_surface_cleanly() {
+        let mut tiny_limits = wgpu::Limits::downlevel_webgl2_defaults();
+        tiny_limits.max_buffer_size = 512;
+        tiny_limits.max_storage_buffer_binding_size = 256;
+
+        let err_buf = validate_mol3d_buffer_limits(&tiny_limits, "test-vbo", 1024, false)
+            .expect_err("buffer exceeding max_buffer_size must fail pre-check");
+        assert!(err_buf.contains("max_buffer_size"), "got: {err_buf}");
+
+        let err_ssbo = validate_mol3d_buffer_limits(&tiny_limits, "test-ssbo", 384, true)
+            .expect_err("buffer exceeding max_storage_buffer_binding_size must fail pre-check");
+        assert!(
+            err_ssbo.contains("max_storage_buffer_binding_size"),
+            "got: {err_ssbo}"
+        );
+
+        let bad_dir_path = std::env::temp_dir()
+            .join("nonexistent_nmr_mol3d_export_dir_p13_test")
+            .join("out.png");
+        let io_err = write_mol3d_export_file(&bad_dir_path, b"PNG", "PNG")
+            .expect_err("writing into nonexistent parent directory must propagate I/O error");
+        assert!(io_err.contains("PNG export failed"), "got: {io_err}");
     }
 }
