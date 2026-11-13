@@ -221,10 +221,18 @@ fn t10_5_webgpu_ubiquitin_and_mbp_1ezp_accuracy_hc_precision_and_walltime() {
             sol_parity_err < 1.0e-4,
             "{name}: consensus objective parity {sol_parity_err:.6e} >= 1e-4"
         );
-        // Allow generous CI/thermal margin (P2) while reporting measured wall time on stdout.
+        // Allow generous CI/thermal margin (P2) while reporting measured wall time on stdout;
+        // Mesa llvmpipe/lavapipe on headless Linux CI emulates WebGPU on CPU.
+        let adapter_lc = engine.adapter_name.to_ascii_lowercase();
+        let max_gpu_secs = if adapter_lc.contains("llvmpipe") || adapter_lc.contains("lavapipe") {
+            180.0
+        } else {
+            15.0
+        };
         assert!(
-            gpu_secs < 15.0,
-            "{name}: WebGPU solve wall time {gpu_secs:.3} s exceeded 15.0 s sanity limit"
+            gpu_secs < max_gpu_secs,
+            "{name}: WebGPU solve wall time {gpu_secs:.3} s exceeded {max_gpu_secs:.1} s sanity limit (adapter: {})",
+            engine.adapter_name
         );
         assert!(
             m.accuracy_pct >= min_acc_pct,
