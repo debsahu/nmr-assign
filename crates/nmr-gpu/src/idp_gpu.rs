@@ -15,12 +15,12 @@
 use bytemuck::{Pod, Zeroable};
 use nmr_core::c13_detected::C13PickedDataset;
 use nmr_core::idp_solver::{
-    build_idp_initial_replicas, build_idp_valid_slots, consensus_and_calibrate_idp,
-    crossover_idp_states, estimate_idp_reference_offsets, evaluate_idp_total_score,
-    polish_idp_state, predict_ncidp_shifts, register_and_build_con_dipeptide_systems,
-    ConDipeptideSystem, IdpAssignResult, IdpReplicaState, IdpShiftOffsets, IdpSolverConfig,
-    IDP_BG_CA_MUS, IDP_BG_CB_MUS, IDP_BG_C_MUS, IDP_BG_N_MUS, IDP_BG_SC_MUS, MAX_IDP_CANDS,
-    MAX_IDP_SC_CANDS,
+    build_idp_initial_replicas, build_idp_valid_slots, check_idp_matrix_bounds,
+    consensus_and_calibrate_idp, crossover_idp_states, estimate_idp_reference_offsets,
+    evaluate_idp_total_score, polish_idp_state, predict_ncidp_shifts,
+    register_and_build_con_dipeptide_systems, ConDipeptideSystem, IdpAssignResult, IdpReplicaState,
+    IdpShiftOffsets, IdpSolverConfig, IDP_BG_CA_MUS, IDP_BG_CB_MUS, IDP_BG_C_MUS, IDP_BG_N_MUS,
+    IDP_BG_SC_MUS, MAX_IDP_CANDS, MAX_IDP_SC_CANDS,
 };
 use nmr_core::rng::Rng;
 use nmr_core::solver::{Matrix2D, FORBID};
@@ -29,9 +29,9 @@ use wgpu::util::DeviceExt;
 use crate::GpuEngine;
 
 const CHUNK_STEPS: u32 = 32_768;
-const SYS_FLOAT_STRIDE: usize = 38;
+const SYS_FLOAT_STRIDE: usize = 32;
 const SEQ_FLOAT_STRIDE: usize = 12;
-const SYS_INT_STRIDE: usize = 8;
+const SYS_INT_STRIDE: usize = 7;
 const SEQ_INT_STRIDE: usize = 2;
 
 #[repr(C)]
@@ -67,7 +67,7 @@ struct IdpParamsGpu {
     sigma_seq_ca: f32,
     sigma_seq_c: f32,
 
-    sigma_seq_n: f32,
+    w_mult: f32,
     t_start: f32,
     t_end: f32,
     score_out_mode: f32,
@@ -143,7 +143,6 @@ fn pack_idp_scoring_inputs(
         let n_ca_prev = push_padded(&mut ro_floats, &sys.ca_prev, MAX_IDP_CANDS);
         let n_cb_prev = push_padded(&mut ro_floats, &sys.cb_prev, MAX_IDP_CANDS);
         let n_c_curr = push_padded(&mut ro_floats, &sys.c_curr, MAX_IDP_CANDS);
-        let n_n_next = push_padded(&mut ro_floats, &sys.n_next, MAX_IDP_CANDS);
         let n_sc_prev = push_padded(&mut ro_floats, &sys.sidechain_c_prev, MAX_IDP_SC_CANDS);
         debug_assert_eq!(ro_floats.len() - base_f, SYS_FLOAT_STRIDE);
 
@@ -155,7 +154,7 @@ fn pack_idp_scoring_inputs(
             + u32::from(n_c_curr > 0)
             + u32::from(n_sc_prev > 0);
         ro_ints.extend_from_slice(&[
-            n_ca_curr, n_ca_prev, n_cb_prev, n_c_curr, n_n_next, n_sc_prev, flags, n_3d_ch,
+            n_ca_curr, n_ca_prev, n_cb_prev, n_c_curr, n_sc_prev, flags, n_3d_ch,
         ]);
     }
 
@@ -210,7 +209,7 @@ fn pack_idp_scoring_inputs(
         pair_floor: cfg.pair_floor as f32,
         sigma_seq_ca: cfg.sigma_seq_ca as f32,
         sigma_seq_c: cfg.sigma_seq_c as f32,
-        sigma_seq_n: cfg.sigma_seq_n as f32,
+        w_mult: (cfg.w_mult as f32).max(0.0),
         t_start: cfg.t_start as f32,
         t_end: cfg.t_end as f32,
         score_out_mode: 1.0,
@@ -326,6 +325,7 @@ impl<'a> IdpGpuSolver<'a> {
 
         let s_len = systems.len();
         let k_len = sequence.len();
+        check_idp_matrix_bounds(s_len, k_len)?;
         if s_len == 0 || k_len < 2 {
             return Ok((
                 Matrix2D::filled(s_len, k_len, FORBID),
@@ -491,6 +491,7 @@ impl<'a> IdpGpuSolver<'a> {
 
         let s_len = systems.len();
         let k_len = sequence.len();
+        check_idp_matrix_bounds(s_len, k_len)?;
         let fitted_offsets = if cfg.auto_reference_offset {
             estimate_idp_reference_offsets(systems, sequence, cfg)
         } else {
@@ -651,7 +652,7 @@ impl<'a> IdpGpuSolver<'a> {
                     pair_floor: cfg.pair_floor as f32,
                     sigma_seq_ca: cfg.sigma_seq_ca as f32,
                     sigma_seq_c: cfg.sigma_seq_c as f32,
-                    sigma_seq_n: cfg.sigma_seq_n as f32,
+                    w_mult: (cfg.w_mult as f32).max(0.0),
                     t_start: gen_t_start as f32,
                     t_end: cfg.t_end as f32,
                     score_out_mode: 0.0,

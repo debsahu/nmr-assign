@@ -259,6 +259,53 @@ pub struct C13PickedDataset {
     pub strip_peaks: Vec<C13Strip3DPeak>,
 }
 
+/// Maximum `13C'` inter-experiment registration search half-width (`±0.40 ppm`) in 3D cube pickers.
+pub const C13_PICKER_MAX_DRIFT_C_PRIME_PPM: f64 = 0.40;
+/// Boundary warning threshold (`|ΔC'| >= 0.38 ppm`) indicating 3D picker `13C'` drift hit its clamp.
+pub const C13_PICKER_WARN_DRIFT_C_PRIME_PPM: f64 = 0.38;
+/// Maximum `15N` inter-experiment registration search half-width (`±0.60 ppm`) in 3D cube pickers.
+pub const C13_PICKER_MAX_DRIFT_N15_PPM: f64 = 0.60;
+/// Boundary warning threshold (`|ΔN| >= 0.57 ppm`) indicating 3D picker `15N` drift hit its clamp.
+pub const C13_PICKER_WARN_DRIFT_N15_PPM: f64 = 0.57;
+
+/// Carrier-drift telemetry and clamp-boundary diagnostic emitted by 3D `13C`-detected cube registration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct C13PickerDriftDiagnostic {
+    pub exp: C13DetectedExp,
+    pub d_c_prime_ppm: f64,
+    pub d_n15_ppm: f64,
+    pub c_prime_clamp_hit: bool,
+    pub n15_clamp_hit: bool,
+    pub warning: Option<String>,
+}
+
+impl C13PickerDriftDiagnostic {
+    pub fn from_fitted(exp: C13DetectedExp, d_c_prime_ppm: f64, d_n15_ppm: f64) -> Self {
+        let c_prime_clamp_hit = d_c_prime_ppm.abs() >= C13_PICKER_WARN_DRIFT_C_PRIME_PPM;
+        let n15_clamp_hit = d_n15_ppm.abs() >= C13_PICKER_WARN_DRIFT_N15_PPM;
+        let warning = if c_prime_clamp_hit || n15_clamp_hit {
+            Some(format!(
+                "3D {} picker carrier-drift registration hit search clamp (dC'={:+.3} ppm [max ±{:.2}], dN={:+.3} ppm [max ±{:.2}]); verify spectrometer carrier referencing",
+                exp.as_str(),
+                d_c_prime_ppm,
+                C13_PICKER_MAX_DRIFT_C_PRIME_PPM,
+                d_n15_ppm,
+                C13_PICKER_MAX_DRIFT_N15_PPM
+            ))
+        } else {
+            None
+        };
+        Self {
+            exp,
+            d_c_prime_ppm,
+            d_n15_ppm,
+            c_prime_clamp_hit,
+            n15_clamp_hit,
+            warning,
+        }
+    }
+}
+
 /// Field-strength-invariant configuration for `13C`-detected 2D/3D IDP peak picking.
 ///
 /// Every physical linewidth, IPAP decoupling residual cutoff, and strip matching radius is
@@ -1198,7 +1245,7 @@ fn estimate_3d_con_cube_offset(
     let mut best_dc = 0.0f64;
     let mut best_dn = 0.0f64;
 
-    for ic_s in -14i32..=14 {
+    for ic_s in -16i32..=16 {
         let dc = (ic_s as f64) * 0.025;
         for in_s in -15i32..=15 {
             let dn = (in_s as f64) * 0.04;
@@ -1211,13 +1258,17 @@ fn estimate_3d_con_cube_offset(
         }
     }
 
-    // Fine 2D refinement around best coarse shift
+    // Fine 2D refinement around best coarse shift (clamped to `±0.40 ppm C'`, `±0.60 ppm N`)
     let c0 = best_dc;
     let n0 = best_dn;
     for ic_s in -6i32..=6 {
-        let dc = c0 + (ic_s as f64) * 0.005;
+        let dc = (c0 + (ic_s as f64) * 0.005).clamp(
+            -C13_PICKER_MAX_DRIFT_C_PRIME_PPM,
+            C13_PICKER_MAX_DRIFT_C_PRIME_PPM,
+        );
         for in_s in -6i32..=6 {
-            let dn = n0 + (in_s as f64) * 0.008;
+            let dn = (n0 + (in_s as f64) * 0.008)
+                .clamp(-C13_PICKER_MAX_DRIFT_N15_PPM, C13_PICKER_MAX_DRIFT_N15_PPM);
             let sc = eval_shift(dc, dn);
             if sc > best_score {
                 best_score = sc;
@@ -1345,8 +1396,22 @@ pub fn pick_con_anchored_3d(
     con_roots: &[Con2DPeak],
     cfg: &C13PickerConfig,
 ) -> Vec<C13Strip3DPeak> {
+    pick_con_anchored_3d_with_diagnostics(spec, exp, con_roots, cfg).0
+}
+
+/// Pick 3D peaks from `CANCO`, `CBCACON`, `CCC(CO)N`, or `NCACO` anchored on `2D CON` roots and
+/// return explicit carrier-drift registration diagnostics (including `±0.40 ppm C'` / `±0.60 ppm N` clamp warnings).
+pub fn pick_con_anchored_3d_with_diagnostics(
+    spec: &Spectrum3D,
+    exp: C13DetectedExp,
+    con_roots: &[Con2DPeak],
+    cfg: &C13PickerConfig,
+) -> (Vec<C13Strip3DPeak>, C13PickerDriftDiagnostic) {
     if spec.nx() < 3 || spec.ny() < 3 || spec.nz() < 3 || con_roots.is_empty() {
-        return Vec::new();
+        return (
+            Vec::new(),
+            C13PickerDriftDiagnostic::from_fitted(exp, 0.0, 0.0),
+        );
     }
     let dims = identify_3d_axes(spec);
     let axes = [&spec.axis_x, &spec.axis_y, &spec.axis_z];
@@ -1372,6 +1437,7 @@ pub fn pick_con_anchored_3d(
     } else {
         (0.0, 0.0)
     };
+    let diag = C13PickerDriftDiagnostic::from_fitted(exp, dc_reg, dn_reg);
 
     let tol_c_ppm =
         hz_to_ppm(cfg.strip_tol_c_prime_hz, ax_c.obs_mhz, 150.9).max(0.65 * ax_c.step_ppm.abs());
@@ -1469,7 +1535,53 @@ pub fn pick_con_anchored_3d(
         }
     }
 
-    out
+    (out, diag)
+}
+
+/// Unlabelled nearest-neighbor Gaussian kernel registration of 1D `3D NCACO` `C'` or `N` axis
+/// observations `obs` onto `2D CON` reference projections `ref_vals` (`obs ≈ ref + d`), returning
+/// `0.0` unless the fitted shift `best_d` strictly beats `d = 0.0` by `> 1.5%`.
+pub fn fit_ncaco_1d_offset(obs: &[f64], ref_vals: &[f64], max_shift: f64, bw: f64) -> f64 {
+    if obs.len() < 4 || ref_vals.is_empty() || max_shift <= 0.0 || bw <= 0.0 {
+        return 0.0;
+    }
+    let eval = |d: f64| -> f64 {
+        let mut s = 0.0f64;
+        for &x in obs {
+            let near = ref_vals
+                .iter()
+                .map(|&y| ((x - d - y) / bw).powi(2))
+                .fold(f64::INFINITY, f64::min);
+            s += (-0.5 * near).exp();
+        }
+        s
+    };
+    let s_zero = eval(0.0);
+    let mut best_d = 0.0f64;
+    let mut best_s = s_zero;
+    for step in -80i32..=80 {
+        let d = (step as f64) * (max_shift / 80.0);
+        let s = eval(d);
+        if s > best_s {
+            best_s = s;
+            best_d = d;
+        }
+    }
+    let d0 = best_d;
+    let fine_step = (max_shift / 800.0).max(0.0005);
+    for step in -10i32..=10 {
+        let d = (d0 + (step as f64) * fine_step).clamp(-max_shift, max_shift);
+        let s = eval(d);
+        if s > best_s {
+            best_s = s;
+            best_d = d;
+        }
+    }
+    if best_s > 1.015 * s_zero && best_d.abs() >= 0.008 {
+        best_d
+    } else {
+        0.0
+    }
 }
 
 /// Pick 3D `NCACO` `(N(i), CA(i), C'(i))` peaks across the cube and attach/register `N(i)` to
@@ -1482,7 +1594,7 @@ fn pick_ncaco_3d_planes(
     c_bounds: (f64, f64),
     ca_bounds: (f64, f64),
     cfg: &C13PickerConfig,
-) -> Vec<C13Strip3DPeak> {
+) -> (Vec<C13Strip3DPeak>, C13PickerDriftDiagnostic) {
     let axes = [&spec.axis_x, &spec.axis_y, &spec.axis_z];
     let ax_c = axes[dims.0];
     let ax_n = axes[dims.1];
@@ -1558,37 +1670,18 @@ fn pick_ncaco_3d_planes(
     // Unsupervised 1D registration of NCACO `N` and `C'` onto `CON` `N` and `C'` distributions
     let (dc_reg, dn_reg) =
         if cfg.auto_register_3d_cubes && raw_3d.len() >= 5 && con_roots.len() >= 5 {
-            let fit_1d = |obs: &[f64], ref_vals: &[f64], max_shift: f64, bw: f64| -> f64 {
-                let mut best_d = 0.0f64;
-                let mut best_s = -1.0f64;
-                for step in -60i32..=60 {
-                    let d = (step as f64) * (max_shift / 60.0);
-                    let mut s = 0.0f64;
-                    for &x in obs {
-                        let near = ref_vals
-                            .iter()
-                            .map(|&y| ((x - d - y) / bw).powi(2))
-                            .fold(f64::INFINITY, f64::min);
-                        s += (-0.5 * near).exp();
-                    }
-                    if s > best_s {
-                        best_s = s;
-                        best_d = d;
-                    }
-                }
-                best_d
-            };
             let obs_c: Vec<f64> = raw_3d.iter().map(|p| p.0).collect();
             let ref_c: Vec<f64> = con_roots.iter().map(|r| r.c_prev_ppm).collect();
             let obs_n: Vec<f64> = raw_3d.iter().map(|p| p.1).collect();
             let ref_n: Vec<f64> = con_roots.iter().map(|r| r.n_curr_ppm).collect();
             (
-                fit_1d(&obs_c, &ref_c, 0.40, 0.05),
-                fit_1d(&obs_n, &ref_n, 0.60, 0.14),
+                fit_ncaco_1d_offset(&obs_c, &ref_c, C13_PICKER_MAX_DRIFT_C_PRIME_PPM, 0.05),
+                fit_ncaco_1d_offset(&obs_n, &ref_n, C13_PICKER_MAX_DRIFT_N15_PPM, 0.14),
             )
         } else {
             (0.0, 0.0)
         };
+    let diag = C13PickerDriftDiagnostic::from_fitted(C13DetectedExp::Ncaco3D, dc_reg, dn_reg);
 
     let tol_n_match = hz_to_ppm(cfg.strip_tol_n15_hz * 1.6, ax_n.obs_mhz, 60.8).max(0.18);
     let mut out = Vec::with_capacity(raw_3d.len());
@@ -1626,7 +1719,36 @@ fn pick_ncaco_3d_planes(
             });
         }
     }
-    out
+    (out, diag)
+}
+
+/// Pick a complete `C13PickedDataset` (`CON` + optional `CACO` + all 3D cubes) from `SimulatedIdpCubes`
+/// along with per-cube carrier-drift diagnostics.
+pub fn pick_simulated_c13_dataset_with_diagnostics(
+    cubes: &SimulatedIdpCubes,
+    cfg: &C13PickerConfig,
+) -> (C13PickedDataset, Vec<C13PickerDriftDiagnostic>) {
+    let con_roots = pick_con_2d(&cubes.con_2d, cfg);
+    let caco_peaks = cubes
+        .caco_2d
+        .as_ref()
+        .map(|s| pick_caco_2d(s, cfg))
+        .unwrap_or_default();
+    let mut strip_peaks = Vec::new();
+    let mut diags = Vec::with_capacity(cubes.cubes_3d.len());
+    for (exp, cube) in &cubes.cubes_3d {
+        let (pks, diag) = pick_con_anchored_3d_with_diagnostics(cube, *exp, &con_roots, cfg);
+        strip_peaks.extend(pks);
+        diags.push(diag);
+    }
+    (
+        C13PickedDataset {
+            con_roots,
+            caco_peaks,
+            strip_peaks,
+        },
+        diags,
+    )
 }
 
 // ============================================================================
@@ -1676,10 +1798,20 @@ pub struct IdpCubeSimConfig {
     /// Optional model-mismatched random shift perturbation `(sd_n, sd_c_prime, sd_ca, sd_cb)` in ppm
     /// applied per residue before rendering (independent of `ncIDP`).
     pub empirical_scatter_ppm: Option<(f64, f64, f64, f64)>,
+    /// Optional independent per-experiment per-peak Gaussian jitter `(sd_c_prime, sd_n, sd_c_aliph)`
+    /// in ppm modelling realistic peak-center matching noise (`sigma_seq ~ 0.05–0.10 ppm CA`) across cubes.
+    pub per_peak_jitter_ppm: Option<(f64, f64, f64)>,
     /// Probability of dropping an individual 3D relay peak (`default = 0.0`).
     pub p_missing_3d_relay: f64,
+    /// Fractional rate of spurious 2D `CON` noise roots (`default = 0.0`).
+    pub spurious_con_rate: f64,
     /// Fractional rate of spurious 3D artifact peaks (`default = 0.0`).
     pub spurious_3d_rate: f64,
+    /// Relative amplitude of spurious 3D peaks relative to `1J` signal (`default = 0.32`, `1.0` = equal-height).
+    pub spurious_3d_rel_amp: f64,
+    /// Probability per `CON` strip of injecting a spurious 3D aliphatic artifact right on the `(C'(i-1), N(i))`
+    /// strip at `spurious_3d_rel_amp` (`default = 0.0`).
+    pub spurious_strip_artifact_rate: f64,
     pub seed: u64,
 }
 
@@ -1711,8 +1843,12 @@ impl Default for IdpCubeSimConfig {
             ],
             exp_offsets: BTreeMap::new(),
             empirical_scatter_ppm: None,
+            per_peak_jitter_ppm: None,
             p_missing_3d_relay: 0.0,
+            spurious_con_rate: 0.0,
             spurious_3d_rate: 0.0,
+            spurious_3d_rel_amp: 0.32,
+            spurious_strip_artifact_rate: 0.0,
             seed: 42,
         }
     }
@@ -1974,6 +2110,20 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
             splat_2d_gaussian(&mut con_2d, cp - ipap_j_ppm, nc, sig_cp, sig_n, sat_amp);
         }
     }
+    if cfg.spurious_con_rate > 0.0 && ground_truth_con.len() >= 2 {
+        let n_sp_con = ((ground_truth_con.len() as f64) * cfg.spurious_con_rate).round() as usize;
+        for _ in 0..n_sp_con {
+            let ia = rng.usize(ground_truth_con.len());
+            let mut ib = rng.usize(ground_truth_con.len());
+            if ib == ia {
+                ib = (ia + 1) % ground_truth_con.len();
+            }
+            let cp_sp = ground_truth_con[ia].1 + rng.normal(0.0, 0.22);
+            let nc_sp = ground_truth_con[ib].2 + rng.normal(0.0, 0.55);
+            let amp_sp = i0_2d * (0.78 + 0.24 * rng.f64());
+            splat_2d_gaussian(&mut con_2d, cp_sp, nc_sp, sig_cp, sig_n, amp_sp);
+        }
+    }
     let noise_2d = i0_2d / cfg.snr_2d.max(5.0);
     for v in &mut con_2d.data {
         *v += rng.normal(0.0, noise_2d) as f32;
@@ -2003,8 +2153,13 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                 1.0
             };
             let amp = sgn * i0_2d * (1.0 + rng.normal(0.0, 0.08)).clamp(0.70, 1.35);
-            let cp = c_val + dc_caco;
-            let cap = ca_val + dca_caco;
+            let (jc, jca) = if let Some((sdc, _, sdca)) = cfg.per_peak_jitter_ppm {
+                (rng.normal(0.0, sdc), rng.normal(0.0, sdca))
+            } else {
+                (0.0, 0.0)
+            };
+            let cp = c_val + dc_caco + jc;
+            let cap = ca_val + dca_caco + jca;
             splat_2d_gaussian(&mut spec, cp, cap, sig_cp, sig_ca, amp);
             if cfg.ipap_residual_frac > 0.0 {
                 let sat = amp * cfg.ipap_residual_frac;
@@ -2019,6 +2174,14 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
     } else {
         None
     };
+
+    // Empirical aliphatic pools for realistic strip-contaminating 3D artifacts (used only when enabled)
+    let emp_ca_pool: Vec<f64> = (0..seq_len)
+        .filter_map(|i| shifts.get(&(i, "CA".to_string())).copied())
+        .collect();
+    let emp_cb_pool: Vec<f64> = (0..seq_len)
+        .filter_map(|i| shifts.get(&(i, "CB".to_string())).copied())
+        .collect();
 
     // 3. Render requested 3D cubes (`CANCO`, `CBCACON`, `CCC(CO)N`, `NCACO`)
     let mut cubes_3d = Vec::new();
@@ -2058,11 +2221,21 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                     };
                     if let Some(&ca_i) = shifts.get(&(i, "CA".to_string())) {
                         if rng.f64() >= cfg.p_missing_3d_relay {
+                            let (jc, jn, ja) =
+                                if let Some((sdc, sdn, sda)) = cfg.per_peak_jitter_ppm {
+                                    (
+                                        rng.normal(0.0, sdc),
+                                        rng.normal(0.0, sdn),
+                                        rng.normal(0.0, sda),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0)
+                                };
                             splat_3d_gaussian(
                                 &mut cube,
-                                cp + dc,
-                                nc + dn,
-                                ca_i + da,
+                                cp + dc + jc,
+                                nc + dn + jn,
+                                ca_i + da + ja,
                                 sig_cp,
                                 sig_n,
                                 sig_ca,
@@ -2073,11 +2246,21 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                     }
                     if let Some(&ca_im1) = shifts.get(&(i - 1, "CA".to_string())) {
                         if rng.f64() >= cfg.p_missing_3d_relay {
+                            let (jc, jn, ja) =
+                                if let Some((sdc, sdn, sda)) = cfg.per_peak_jitter_ppm {
+                                    (
+                                        rng.normal(0.0, sdc),
+                                        rng.normal(0.0, sdn),
+                                        rng.normal(0.0, sda),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0)
+                                };
                             splat_3d_gaussian(
                                 &mut cube,
-                                cp + dc,
-                                nc + dn,
-                                ca_im1 + da,
+                                cp + dc + jc,
+                                nc + dn + jn,
+                                ca_im1 + da + ja,
                                 sig_cp,
                                 sig_n,
                                 sig_ca,
@@ -2085,6 +2268,22 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                             );
                             n_true_peaks += 1;
                         }
+                    }
+                    if cfg.spurious_strip_artifact_rate > 0.0
+                        && !emp_ca_pool.is_empty()
+                        && rng.f64() < cfg.spurious_strip_artifact_rate
+                    {
+                        let sa = emp_ca_pool[rng.usize(emp_ca_pool.len())] + rng.normal(0.0, 0.25);
+                        splat_3d_gaussian(
+                            &mut cube,
+                            cp + dc,
+                            nc + dn,
+                            sa + da,
+                            sig_cp,
+                            sig_n,
+                            sig_ca,
+                            cfg.spurious_3d_rel_amp.max(0.25) * i0_3d,
+                        );
                     }
                 }
             }
@@ -2098,11 +2297,21 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                     };
                     if let Some(&ca_im1) = shifts.get(&(i - 1, "CA".to_string())) {
                         if rng.f64() >= cfg.p_missing_3d_relay {
+                            let (jc, jn, ja) =
+                                if let Some((sdc, sdn, sda)) = cfg.per_peak_jitter_ppm {
+                                    (
+                                        rng.normal(0.0, sdc),
+                                        rng.normal(0.0, sdn),
+                                        rng.normal(0.0, sda),
+                                    )
+                                } else {
+                                    (0.0, 0.0, 0.0)
+                                };
                             splat_3d_gaussian(
                                 &mut cube,
-                                cp + dc,
-                                nc + dn,
-                                ca_im1 + da,
+                                cp + dc + jc,
+                                nc + dn + jn,
+                                ca_im1 + da + ja,
                                 sig_cp,
                                 sig_n,
                                 sig_ca,
@@ -2119,11 +2328,21 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                                 } else {
                                     1.0
                                 };
+                                let (jc, jn, jb) =
+                                    if let Some((sdc, sdn, sda)) = cfg.per_peak_jitter_ppm {
+                                        (
+                                            rng.normal(0.0, sdc),
+                                            rng.normal(0.0, sdn),
+                                            rng.normal(0.0, sda * 1.15),
+                                        )
+                                    } else {
+                                        (0.0, 0.0, 0.0)
+                                    };
                                 splat_3d_gaussian(
                                     &mut cube,
-                                    cp + dc,
-                                    nc + dn,
-                                    cb_im1 + da,
+                                    cp + dc + jc,
+                                    nc + dn + jn,
+                                    cb_im1 + da + jb,
                                     sig_cp,
                                     sig_n,
                                     sig_cb,
@@ -2134,6 +2353,37 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                                 n_true_peaks += 1;
                             }
                         }
+                    }
+                    if cfg.spurious_strip_artifact_rate > 0.0
+                        && !emp_ca_pool.is_empty()
+                        && rng.f64() < cfg.spurious_strip_artifact_rate
+                    {
+                        let is_cb_art = !emp_cb_pool.is_empty() && rng.f64() < 0.5;
+                        let (sa, sgn) = if is_cb_art {
+                            (
+                                emp_cb_pool[rng.usize(emp_cb_pool.len())] + rng.normal(0.0, 0.35),
+                                if cfg.cbcacon_opposite_phase {
+                                    -1.0
+                                } else {
+                                    1.0
+                                },
+                            )
+                        } else {
+                            (
+                                emp_ca_pool[rng.usize(emp_ca_pool.len())] + rng.normal(0.0, 0.25),
+                                1.0,
+                            )
+                        };
+                        splat_3d_gaussian(
+                            &mut cube,
+                            cp + dc,
+                            nc + dn,
+                            sa + da,
+                            sig_cp,
+                            sig_n,
+                            sig_cb,
+                            sgn * cfg.spurious_3d_rel_amp.max(0.25) * i0_3d,
+                        );
                     }
                 }
             }
@@ -2180,11 +2430,20 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
                         continue;
                     };
                     if rng.f64() >= cfg.p_missing_3d_relay {
+                        let (jc, jn, ja) = if let Some((sdc, sdn, sda)) = cfg.per_peak_jitter_ppm {
+                            (
+                                rng.normal(0.0, sdc),
+                                rng.normal(0.0, sdn),
+                                rng.normal(0.0, sda),
+                            )
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        };
                         splat_3d_gaussian(
                             &mut cube,
-                            c_i + dc,
-                            nc + dn,
-                            ca_i + da,
+                            c_i + dc + jc,
+                            nc + dn + jn,
+                            ca_i + da + ja,
                             sig_cp,
                             sig_n,
                             sig_ca,
@@ -2199,11 +2458,21 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
 
         // Inject spurious 3D noise peaks if configured
         let n_spurious = ((n_true_peaks as f64) * cfg.spurious_3d_rate.max(0.0)).round() as usize;
+        let rel_amp = cfg.spurious_3d_rel_amp.max(0.05);
         for _ in 0..n_spurious {
             let sc = 169.0 + rng.f64() * 10.5;
             let sn = 106.0 + rng.f64() * 35.0;
             let sa = (alo + 2.0) + rng.f64() * (ahi - alo - 4.0).max(1.0);
-            splat_3d_gaussian(&mut cube, sc, sn, sa, sig_cp, sig_n, sig_cb, 0.32 * i0_3d);
+            splat_3d_gaussian(
+                &mut cube,
+                sc,
+                sn,
+                sa,
+                sig_cp,
+                sig_n,
+                sig_cb,
+                rel_amp * i0_3d,
+            );
         }
 
         for v in &mut cube.data {

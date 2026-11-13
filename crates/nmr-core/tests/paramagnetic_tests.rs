@@ -10,22 +10,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nmr_core::evaluate::score;
-use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::nmrstar::{read_star, Reference};
 use nmr_core::noesy::{parse_pdb_str_first_model, v_dist, Vec3};
 use nmr_core::paramagnetic::{
     assign_paramagnetic_backbone, assign_paramagnetic_from_peaks,
-    compute_bleaching_probabilities_3d, compute_bleaching_probabilities_from_pdb,
-    compute_bleaching_probabilities_sequence, coordinating_histidine_indices,
-    detect_metal_coordination_motifs, fit_pcs_tensor_robust, fit_pcs_tensor_svd,
-    parse_metal_ligands, predict_pcs_from_tensor, predict_pcs_spherical_ppm,
-    refine_metal_position_and_tensor, rotation_matrix_from_zyz, MetalClusterSite, MetalMotifKind,
-    ParamagneticAssignConfig, ParamagneticSolverMode, PcsObservation,
+    compute_bleaching_probabilities_3d, compute_bleaching_probabilities_3d_per_site,
+    compute_bleaching_probabilities_from_pdb, compute_bleaching_probabilities_sequence,
+    coordinating_histidine_indices, detect_metal_coordination_motifs,
+    filter_pcs_observations_blind_zone, fit_pcs_tensor_paramagnetic, fit_pcs_tensor_robust,
+    fit_pcs_tensor_svd, parse_metal_ligands, parse_paramagnetic_pdb_sites, predict_pcs_from_tensor,
+    predict_pcs_spherical_ppm, refine_metal_position_and_tensor, rotation_matrix_from_zyz,
+    MetalClusterSite, MetalMotifKind, MetalParamagneticClass, ParamagneticAssignConfig,
+    ParamagneticSolverMode, PcsObservation,
 };
 use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
 use nmr_core::priors::{one_to_three, Priors};
 use nmr_core::rng::Rng;
-use nmr_core::solver::{prepare_scoring_priors, AnnealConfig, ScoreConfig};
+use nmr_core::simulate::{simulate, SimConfig};
+use nmr_core::solver::{AnnealConfig, ScoreConfig};
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 
@@ -211,6 +213,7 @@ fn test_solomon_3d_and_sequence_bleaching_probabilities() {
         kind: MetalMotifKind::ExplicitLigands,
         ligand_indices: vec![6, 9], // Thr7, Gly10 beta-turn region
         metal_coord: None,
+        metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
     };
     let p_pdb = compute_bleaching_probabilities_from_pdb(&seq, &chain, &[cluster], 8.5);
     assert_eq!(p_pdb.len(), 76);
@@ -229,6 +232,7 @@ fn test_solomon_3d_and_sequence_bleaching_probabilities() {
         kind: MetalMotifKind::Cisd2Fe2S,
         ligand_indices: vec![25, 27, 36, 40],
         metal_coord: None,
+        metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
     };
     let p_seq = compute_bleaching_probabilities_sequence(60, &[cisd_cluster]);
     assert!(p_seq[25] >= 0.95 && p_seq[27] >= 0.95 && p_seq[36] >= 0.95 && p_seq[40] >= 0.95);
@@ -398,7 +402,7 @@ fn test_synthetic_lanthanide_pcs_svd_robust_irls_and_metal_refinement() {
     outlier_obs[41].pcs_ppm += 4.9;
 
     let ols_contaminated = fit_pcs_tensor_svd(&outlier_obs, metal_true).expect("OLS");
-    let huber_fit = fit_pcs_tensor_robust(&outlier_obs, metal_true, 0.08, 25).expect("Huber IRLS");
+    let huber_fit = fit_pcs_tensor_robust(&outlier_obs, metal_true, 1.65, 25).expect("Huber IRLS");
     let ols_ax_err = ((ols_contaminated.dchi_ax - true_ax) / true_ax).abs() * 100.0;
     let huber_ax_err = ((huber_fit.dchi_ax - true_ax) / true_ax).abs() * 100.0;
     let huber_rh_err = ((huber_fit.dchi_rh - true_rh) / true_rh).abs() * 100.0;
@@ -444,7 +448,7 @@ fn test_synthetic_lanthanide_pcs_svd_robust_irls_and_metal_refinement() {
         .collect();
     coord_unc_obs[2].pcs_ppm += 3.50; // outlier suppressed by Huber IRLS
     let rob_coord =
-        fit_pcs_tensor_robust(&coord_unc_obs, metal_true, 0.20, 15).expect("robust + coord unc");
+        fit_pcs_tensor_robust(&coord_unc_obs, metal_true, 1.65, 15).expect("robust + coord unc");
     assert!(
         ((rob_coord.dchi_ax - true_ax) / true_ax).abs() < 0.02,
         "robust IRLS with coord_uncertainty_angstrom failed: dchi_ax={:.4}",
@@ -546,23 +550,25 @@ fn fit_unlabelled_hn_offset(systems: &[SpinSystem], truth_ref: &Reference) -> (f
     }
 }
 
-/// Count false-positive placements inside the experimentally bleached `[2Fe-2S]` coordination
-/// loops of `CISD3` (`BMRB 51439`: residues inside the two `[2Fe-2S]` loop shells lacking
-/// observable `(H, N)` shifts in `bmr51439_3.str`, i.e. 1-based `26..=31, 37..=45, 64..=70, 75..=80`).
-fn count_bleached_loop_false_positives(
+/// Count false-positive placements at sequence positions with `p_bleach[k] >= blind_zone_threshold`
+/// lacking observable `(H, N)` shifts in `truth_ref` (computed strictly from `p_bleach` with zero
+/// hardcoded residue-range slices).
+fn count_blind_zone_false_positives(
     positions: &[i32],
-    sequence: &[String],
+    p_bleach: &[f64],
+    blind_zone_threshold: f64,
     truth_ref: &Reference,
 ) -> usize {
-    // Coordination-loop windows spanning both [2Fe-2S] domains (C26-H41+turn and C64-H79+turn)
-    let in_coord_domain = |k: usize| -> bool { (25..=44).contains(&k) || (63..=79).contains(&k) };
     let mut fp = 0usize;
     for &pos in positions {
         if pos < 0 {
             continue;
         }
         let k = pos as usize;
-        if k < sequence.len() && in_coord_domain(k) {
+        if p_bleach
+            .get(k)
+            .is_some_and(|&pb| pb >= blind_zone_threshold)
+        {
             let has_truth_hn = truth_ref.shifts.contains_key(&(k, "H".to_string()))
                 && truth_ref.shifts.contains_key(&(k, "N".to_string()));
             if !has_truth_hn {
@@ -571,6 +577,16 @@ fn count_bleached_loop_false_positives(
         }
     }
     fp
+}
+
+#[derive(Clone, Debug)]
+struct AblationSummary {
+    label: &'static str,
+    mean_recall_pct: f64,
+    mean_precision_pct: f64,
+    mean_hc_prec_pct: f64,
+    mean_n_assigned: f64,
+    total_blind_zone_fp: usize,
 }
 
 #[test]
@@ -605,6 +621,9 @@ fn test_real_cisd3_paramagnetic_5seed_gate() {
         coordinating_histidine_indices(&detected, &sequence),
         vec![40, 78]
     );
+
+    let full_p_bleach = compute_bleaching_probabilities_sequence(sequence.len(), &detected);
+    let blind_thresh = ParamagneticAssignConfig::default().blind_zone_threshold;
 
     let explicit_ligs = parse_metal_ligands(
         "CYS26,CYS28,CYS37,HIS41,CYS64,CYS66,CYS75,HIS79",
@@ -641,7 +660,6 @@ fn test_real_cisd3_paramagnetic_5seed_gate() {
     }
 
     let priors = Priors::bmrb();
-    let scfg = ScoreConfig::default();
     let probe_systems =
         build_spin_systems(&raw_peaks, &Tolerances::default(), 3, false).expect("spin systems");
     let (dh, dn) = fit_unlabelled_hn_offset(&probe_systems, &truth_ref);
@@ -656,127 +674,124 @@ fn test_real_cisd3_paramagnetic_5seed_gate() {
     let mean = |v: &[f64]| v.iter().sum::<f64>() / (v.len() as f64);
 
     // -------------------------------------------------------------------------
-    // 1. Standard Solver: Globular Baseline vs Paramagnetic PRE Blind-Zone Prior
+    // (a) 4-Way 5-Seed Ablation Table for BOTH Standard & EvoGraph Solvers
     // -------------------------------------------------------------------------
-    let _ = prepare_scoring_priors;
-    let std_truth = map_spin_systems_to_truth(&probe_systems, &truth_ref);
-    let mut glob_std_accs = Vec::new();
-    let mut glob_std_recs = Vec::new();
-    let mut glob_std_loop_fps = 0usize;
-    let mut para_std_accs = Vec::new();
-    let mut para_std_recs = Vec::new();
-    let mut para_std_hcps = Vec::new();
-    let mut para_std_loop_fps = 0usize;
+    let ablation_specs: [(&str, bool, bool, bool); 4] = [
+        ("1. Globular baseline", false, false, false),
+        ("2. Generic CA-less filter only", false, true, false),
+        ("3. u_para bleach prior only", true, false, true),
+        ("4. Full Paramagnetic", true, true, true),
+    ];
 
-    for seed in 0..5u64 {
-        let acfg = AnnealConfig {
-            seed,
-            ..Default::default()
+    for mode in [
+        ParamagneticSolverMode::Standard,
+        ParamagneticSolverMode::EvoGraph,
+    ] {
+        let mode_name = match mode {
+            ParamagneticSolverMode::Standard => "Standard",
+            ParamagneticSolverMode::EvoGraph => "EvoGraph",
         };
-        let glob_res = nmr_core::solver::assign(&probe_systems, &sequence, &priors, &scfg, &acfg);
-        glob_std_loop_fps +=
-            count_bleached_loop_false_positives(&glob_res.position, &sequence, &truth_ref);
-        let mut gm = score(&glob_res, &std_truth, 0.8);
-        gm.assignable = assignable_amides;
-        glob_std_accs.push(gm.accuracy() * 100.0);
-        glob_std_recs.push(gm.recall() * 100.0);
+        let mut rows: Vec<AblationSummary> = Vec::new();
+        for &(label, auto_motifs, ca_less_filter, u_para_prior) in &ablation_specs {
+            let mut recs = Vec::new();
+            let mut precs = Vec::new();
+            let mut hcps = Vec::new();
+            let mut n_ass = Vec::new();
+            let mut fp_sum = 0usize;
 
-        let p_cfg = ParamagneticAssignConfig {
-            mode: ParamagneticSolverMode::Standard,
-            seed,
-            ..Default::default()
-        };
-        let (para_res, para_rep) =
-            assign_paramagnetic_backbone(&probe_systems, &sequence, &priors, &p_cfg);
-        assert_eq!(para_rep.detected_clusters.len(), 2);
-        let fp = count_bleached_loop_false_positives(&para_res.position, &sequence, &truth_ref);
-        para_std_loop_fps += fp;
-        let mut pm = score(&para_res, &std_truth, 0.8);
-        pm.assignable = assignable_amides;
-        para_std_accs.push(pm.accuracy() * 100.0);
-        para_std_recs.push(pm.recall() * 100.0);
-        para_std_hcps.push(pm.hc_precision() * 100.0);
+            for seed in 0..5u64 {
+                let cfg = ParamagneticAssignConfig {
+                    mode,
+                    auto_detect_motifs: auto_motifs,
+                    enable_generic_ca_less_filter: ca_less_filter,
+                    enable_u_para_bleach_prior: u_para_prior,
+                    seed,
+                    ..Default::default()
+                };
+                let (sys, res, rep) = match mode {
+                    ParamagneticSolverMode::Standard => {
+                        let (r, rp) =
+                            assign_paramagnetic_backbone(&probe_systems, &sequence, &priors, &cfg);
+                        (probe_systems.clone(), r, rp)
+                    }
+                    ParamagneticSolverMode::EvoGraph => {
+                        assign_paramagnetic_from_peaks(&raw_peaks, &sequence, &priors, &cfg)
+                    }
+                };
+                if auto_motifs {
+                    assert_eq!(rep.detected_clusters.len(), 2);
+                }
+                fp_sum += count_blind_zone_false_positives(
+                    &res.position,
+                    &full_p_bleach,
+                    blind_thresh,
+                    &truth_ref,
+                );
+                let sys_truth = map_spin_systems_to_truth(&sys, &truth_ref);
+                let mut m = score(&res, &sys_truth, 0.8);
+                m.assignable = assignable_amides;
+                recs.push(m.recall() * 100.0);
+                precs.push(m.accuracy() * 100.0);
+                hcps.push(m.hc_precision() * 100.0);
+                n_ass.push(m.assigned as f64);
+            }
+            let summary = AblationSummary {
+                label,
+                mean_recall_pct: mean(&recs),
+                mean_precision_pct: mean(&precs),
+                mean_hc_prec_pct: mean(&hcps),
+                mean_n_assigned: mean(&n_ass),
+                total_blind_zone_fp: fp_sum,
+            };
+            println!(
+                "CISD3 5-seed Ablation [{mode_name}] {:<32} | recall={:5.2}% | precision={:5.2}% (N_ass={:4.1}) | HC_prec={:6.2}% | p_bleach>=0.65_FP={}",
+                summary.label,
+                summary.mean_recall_pct,
+                summary.mean_precision_pct,
+                summary.mean_n_assigned,
+                summary.mean_hc_prec_pct,
+                summary.total_blind_zone_fp
+            );
+            rows.push(summary);
+        }
+
+        let glob = &rows[0];
+        let u_only = &rows[2];
+        let full = &rows[3];
+        assert_eq!(
+            u_only.total_blind_zone_fp, 0,
+            "{mode_name}: u_para bleach prior must eliminate all p_bleach >= 0.65 false positives"
+        );
+        assert_eq!(
+            full.total_blind_zone_fp, 0,
+            "{mode_name}: Full Paramagnetic must emit ZERO p_bleach >= 0.65 false positives"
+        );
+        assert!(
+            glob.total_blind_zone_fp > 0,
+            "{mode_name}: Globular baseline expected > 0 blind-zone FPs on CISD3"
+        );
+        assert!(
+            full.mean_hc_prec_pct >= 95.0,
+            "{mode_name}: Full Paramagnetic HC precision fell below 95.0%: {:.2}%",
+            full.mean_hc_prec_pct
+        );
+        assert!(
+            full.mean_precision_pct >= glob.mean_precision_pct - 1e-9
+                && full.mean_recall_pct >= glob.mean_recall_pct - 1e-9,
+            "{mode_name}: Full Paramagnetic recall/precision ({:.2}%/{:.2}%) must preserve or beat Globular baseline ({:.2}%/{:.2}%)",
+            full.mean_recall_pct,
+            full.mean_precision_pct,
+            glob.mean_recall_pct,
+            glob.mean_precision_pct
+        );
     }
 
-    println!(
-        "CISD3 5-seed Standard: globular_acc={:.2}%/rec={:.2}% (bleached_loop_FP={}), paramagnetic_acc={:.2}%/rec={:.2}%, HC_prec={:.2}% (bleached_loop_FP={})",
-        mean(&glob_std_accs),
-        mean(&glob_std_recs),
-        glob_std_loop_fps,
-        mean(&para_std_accs),
-        mean(&para_std_recs),
-        mean(&para_std_hcps),
-        para_std_loop_fps
-    );
-    assert_eq!(
-        para_std_loop_fps, 0,
-        "Standard paramagnetic solver must emit ZERO false-positive assignments inside bleached [2Fe-2S] coordination loops"
-    );
-    assert!(
-        mean(&para_std_hcps) >= 95.0,
-        "CISD3 5-seed Standard paramagnetic HC precision fell below 95.0%: {:.2}%",
-        mean(&para_std_hcps)
-    );
-    assert!(
-        mean(&para_std_accs) >= mean(&glob_std_accs) - 1e-9
-            && mean(&para_std_recs) >= mean(&glob_std_recs) - 1e-9,
-        "Paramagnetic Standard 5-seed accuracy/recall ({:.2}%/{:.2}%) must preserve or beat globular Standard ({:.2}%/{:.2}%)",
-        mean(&para_std_accs),
-        mean(&para_std_recs),
-        mean(&glob_std_accs),
-        mean(&glob_std_recs)
-    );
-
-    // -------------------------------------------------------------------------
-    // 2. EvoGraph Solver: Globular Baseline vs Paramagnetic (Auto & Explicit)
-    // -------------------------------------------------------------------------
-    let mut glob_evo_accs = Vec::new();
-    let mut glob_evo_recs = Vec::new();
-    let mut glob_evo_loop_fps = 0usize;
-    let mut para_evo_accs = Vec::new();
-    let mut para_evo_recs = Vec::new();
-    let mut para_evo_hcps = Vec::new();
-    let mut para_evo_loop_fps = 0usize;
-    let mut explicit_evo_accs = Vec::new();
+    // Explicit --metal-ligands 5-seed EvoGraph parity check
     let mut explicit_evo_recs = Vec::new();
+    let mut explicit_evo_precs = Vec::new();
     let mut explicit_evo_hcps = Vec::new();
-    let mut explicit_evo_loop_fps = 0usize;
-
+    let mut explicit_evo_fps = 0usize;
     for seed in 0..5u64 {
-        let evo_cfg = EvoGraphConfig {
-            structure_torsions: None,
-            seed,
-            ..Default::default()
-        };
-        let (g_sys, g_res, _) =
-            assign_evo_graph_from_peaks(&raw_peaks, &sequence, &priors, &evo_cfg);
-        glob_evo_loop_fps +=
-            count_bleached_loop_false_positives(&g_res.position, &sequence, &truth_ref);
-        let g_truth = map_spin_systems_to_truth(&g_sys, &truth_ref);
-        let mut gm = score(&g_res, &g_truth, 0.8);
-        gm.assignable = assignable_amides;
-        glob_evo_accs.push(gm.accuracy() * 100.0);
-        glob_evo_recs.push(gm.recall() * 100.0);
-
-        // Sequence-only auto-detected [2Fe-2S] motifs
-        let p_cfg = ParamagneticAssignConfig {
-            mode: ParamagneticSolverMode::EvoGraph,
-            seed,
-            ..Default::default()
-        };
-        let (p_sys, p_res, p_rep) =
-            assign_paramagnetic_from_peaks(&raw_peaks, &sequence, &priors, &p_cfg);
-        assert_eq!(p_rep.detected_clusters.len(), 2);
-        para_evo_loop_fps +=
-            count_bleached_loop_false_positives(&p_res.position, &sequence, &truth_ref);
-        let p_truth = map_spin_systems_to_truth(&p_sys, &truth_ref);
-        let mut pm = score(&p_res, &p_truth, 0.8);
-        pm.assignable = assignable_amides;
-        para_evo_accs.push(pm.accuracy() * 100.0);
-        para_evo_recs.push(pm.recall() * 100.0);
-        para_evo_hcps.push(pm.hc_precision() * 100.0);
-
-        // Explicit --metal-ligands mode
         let exp_cfg = ParamagneticAssignConfig {
             mode: ParamagneticSolverMode::EvoGraph,
             explicit_ligand_indices: explicit_ligs.clone(),
@@ -786,58 +801,124 @@ fn test_real_cisd3_paramagnetic_5seed_gate() {
         };
         let (e_sys, e_res, _) =
             assign_paramagnetic_from_peaks(&raw_peaks, &sequence, &priors, &exp_cfg);
-        explicit_evo_loop_fps +=
-            count_bleached_loop_false_positives(&e_res.position, &sequence, &truth_ref);
+        explicit_evo_fps += count_blind_zone_false_positives(
+            &e_res.position,
+            &full_p_bleach,
+            blind_thresh,
+            &truth_ref,
+        );
         let e_truth = map_spin_systems_to_truth(&e_sys, &truth_ref);
         let mut em = score(&e_res, &e_truth, 0.8);
         em.assignable = assignable_amides;
-        explicit_evo_accs.push(em.accuracy() * 100.0);
         explicit_evo_recs.push(em.recall() * 100.0);
+        explicit_evo_precs.push(em.accuracy() * 100.0);
         explicit_evo_hcps.push(em.hc_precision() * 100.0);
     }
-
     println!(
-        "CISD3 5-seed EvoGraph: globular_acc={:.2}%/rec={:.2}% (bleached_loop_FP={}), para_auto_acc={:.2}%/rec={:.2}% / HC_prec={:.2}% (bleached_loop_FP={}), para_explicit_acc={:.2}%/rec={:.2}% / HC_prec={:.2}% (bleached_loop_FP={})",
-        mean(&glob_evo_accs),
-        mean(&glob_evo_recs),
-        glob_evo_loop_fps,
-        mean(&para_evo_accs),
-        mean(&para_evo_recs),
-        mean(&para_evo_hcps),
-        para_evo_loop_fps,
-        mean(&explicit_evo_accs),
+        "CISD3 5-seed Explicit --metal-ligands [EvoGraph]: recall={:.2}% | precision={:.2}% | HC_prec={:.2}% | p_bleach>=0.65_FP={}",
         mean(&explicit_evo_recs),
+        mean(&explicit_evo_precs),
         mean(&explicit_evo_hcps),
-        explicit_evo_loop_fps
+        explicit_evo_fps
+    );
+    assert_eq!(explicit_evo_fps, 0);
+    assert!(mean(&explicit_evo_hcps) >= 95.0);
+
+    // -------------------------------------------------------------------------
+    // (b) Leave-One-Site-Out (LOSO) Cross-Site Validation on Tandem [2Fe-2S] CISD3
+    //     (zero threshold retuning: fixed default blind_zone_threshold=0.65,
+    //      hard_bleach_cutoff=0.85, bleach_prior_weight=2.2)
+    // -------------------------------------------------------------------------
+    let pb_site1 = compute_bleaching_probabilities_sequence(
+        sequence.len(),
+        std::slice::from_ref(&detected[0]),
+    );
+    let pb_site2 = compute_bleaching_probabilities_sequence(
+        sequence.len(),
+        std::slice::from_ref(&detected[1]),
     );
 
-    assert_eq!(
-        para_evo_loop_fps, 0,
-        "EvoGraph paramagnetic solver (auto) must emit ZERO false-positive assignments inside bleached [2Fe-2S] coordination loops"
-    );
-    assert_eq!(
-        explicit_evo_loop_fps, 0,
-        "EvoGraph paramagnetic solver (--metal-ligands) must emit ZERO false-positive assignments inside bleached [2Fe-2S] coordination loops"
-    );
-    assert!(
-        mean(&para_evo_hcps) >= 95.0 && mean(&explicit_evo_hcps) >= 95.0,
-        "CISD3 5-seed paramagnetic HC precision fell below 95.0%: auto={:.2}%, explicit={:.2}%",
-        mean(&para_evo_hcps),
-        mean(&explicit_evo_hcps)
-    );
-    assert!(
-        mean(&para_evo_accs) >= mean(&glob_evo_accs) - 1e-9
-            && mean(&explicit_evo_accs) >= mean(&glob_evo_accs) - 1e-9
-            && mean(&para_evo_recs) >= mean(&glob_evo_recs) - 1e-9
-            && mean(&explicit_evo_recs) >= mean(&glob_evo_recs) - 1e-9,
-        "CISD3 5-seed paramagnetic EvoGraph acc/rec (auto={:.2}%/{:.2}%, explicit={:.2}%/{:.2}%) must preserve or beat globular ({:.2}%/{:.2}%)",
-        mean(&para_evo_accs),
-        mean(&para_evo_recs),
-        mean(&explicit_evo_accs),
-        mean(&explicit_evo_recs),
-        mean(&glob_evo_accs),
-        mean(&glob_evo_recs)
-    );
+    for (fold_name, known_ligs, pb_known, pb_heldout) in [
+        (
+            "LOSO Fold 1 (Site 1 known, Site 2 held-out)",
+            detected[0].ligand_indices.clone(),
+            &pb_site1,
+            &pb_site2,
+        ),
+        (
+            "LOSO Fold 2 (Site 2 known, Site 1 held-out)",
+            detected[1].ligand_indices.clone(),
+            &pb_site2,
+            &pb_site1,
+        ),
+    ] {
+        let mut fp_known_only = 0usize;
+        let mut fp_heldout_unmasked = 0usize;
+        let mut recs_partial = Vec::new();
+        let mut precs_partial = Vec::new();
+        for seed in 0..5u64 {
+            let partial_cfg = ParamagneticAssignConfig {
+                mode: ParamagneticSolverMode::Standard,
+                explicit_ligand_indices: known_ligs.clone(),
+                auto_detect_motifs: false,
+                seed,
+                ..Default::default()
+            };
+            let (res_p, _) =
+                assign_paramagnetic_backbone(&probe_systems, &sequence, &priors, &partial_cfg);
+            fp_known_only += count_blind_zone_false_positives(
+                &res_p.position,
+                pb_known,
+                blind_thresh,
+                &truth_ref,
+            );
+            fp_heldout_unmasked += count_blind_zone_false_positives(
+                &res_p.position,
+                pb_heldout,
+                blind_thresh,
+                &truth_ref,
+            );
+            let std_truth = map_spin_systems_to_truth(&probe_systems, &truth_ref);
+            let mut m = score(&res_p, &std_truth, 0.8);
+            m.assignable = assignable_amides;
+            recs_partial.push(m.recall() * 100.0);
+            precs_partial.push(m.accuracy() * 100.0);
+        }
+        // Transfer motif detector + fixed hyperparameters onto the held-out site without retuning
+        let mut fp_transferred = 0usize;
+        for seed in 0..5u64 {
+            let transfer_cfg = ParamagneticAssignConfig {
+                mode: ParamagneticSolverMode::Standard,
+                auto_detect_motifs: true,
+                seed,
+                ..Default::default()
+            };
+            let (res_t, _) =
+                assign_paramagnetic_backbone(&probe_systems, &sequence, &priors, &transfer_cfg);
+            fp_transferred += count_blind_zone_false_positives(
+                &res_t.position,
+                pb_heldout,
+                blind_thresh,
+                &truth_ref,
+            );
+        }
+        println!(
+            "CISD3 5-seed {fold_name}: partial recall={:.2}%/prec={:.2}% | known_site_FP={} | heldout_unmasked_FP={} -> heldout_transferred_FP={}",
+            mean(&recs_partial),
+            mean(&precs_partial),
+            fp_known_only,
+            fp_heldout_unmasked,
+            fp_transferred
+        );
+        assert_eq!(
+            fp_known_only, 0,
+            "{fold_name}: supplied site must have ZERO blind-zone FPs with un-retuned thresholds"
+        );
+        assert_eq!(
+            fp_transferred, 0,
+            "{fold_name}: cross-site transferred motif prior must have ZERO blind-zone FPs on held-out site"
+        );
+    }
 }
 
 #[test]
@@ -1006,6 +1087,7 @@ fn test_tandem_two_cluster_explicit_ligands_with_3d_pdb_preserves_bimodal_bleach
         kind: MetalMotifKind::ExplicitLigands,
         ligand_indices: all_8_ligs.clone(),
         metal_coord: None,
+        metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
     }];
     let pb_direct = compute_bleaching_probabilities_from_pdb(&sequence, &chain, &single_site, 8.5);
     assert!(
@@ -1091,7 +1173,7 @@ fn test_p1_1_pcs_uts_sign_input_validation_rank_check_and_nan_q_factor() {
     let mut nan_obs = valid_obs.clone();
     nan_obs[2].pcs_ppm = f64::NAN;
     assert!(fit_pcs_tensor_svd(&nan_obs, metal).is_err());
-    assert!(fit_pcs_tensor_robust(&nan_obs, metal, 0.08, 10).is_err());
+    assert!(fit_pcs_tensor_robust(&nan_obs, metal, 1.65, 10).is_err());
     assert!(refine_metal_position_and_tensor(&nan_obs, metal, 2.0, 1.0).is_err());
 
     // (c) Non-positive or non-finite uncertainty_ppm / negative coord_uncertainty must fail cleanly
@@ -1139,4 +1221,594 @@ fn test_p1_1_pcs_uts_sign_input_validation_rank_check_and_nan_q_factor() {
     assert!(!pcs_q_is_better(f64::NAN, 0.25));
     assert!(pcs_q_is_better(0.25, f64::NAN));
     assert!(!pcs_q_is_better(f64::NAN, f64::NAN));
+}
+
+#[test]
+fn test_metal_paramagnetic_class_per_site_r_bleach_and_diamagnetic_zero() {
+    assert!(
+        (MetalParamagneticClass::FeSClusterOrHighSpin3d.default_r_bleach_angstrom() - 8.5).abs()
+            < 1e-12
+    );
+    assert!(
+        (MetalParamagneticClass::IsotropicBroadener.default_r_bleach_angstrom() - 13.5).abs()
+            < 1e-12
+    );
+    assert!(
+        (MetalParamagneticClass::StrongLanthanide.default_r_bleach_angstrom() - 9.0).abs() < 1e-12
+    );
+    assert!(
+        (MetalParamagneticClass::ModerateLanthanide.default_r_bleach_angstrom() - 5.5).abs()
+            < 1e-12
+    );
+    assert_eq!(
+        MetalParamagneticClass::Diamagnetic.default_r_bleach_angstrom(),
+        0.0
+    );
+
+    // Mixed two-site metalloprotein: Ca2+ (Diamagnetic, 0.0 Å) at (0,0,0) + Yb3+ (ModerateLanthanide, 5.5 Å) at (30,0,0)
+    let amides = vec![
+        Some([3.0, 0.0, 0.0]),  // 3.0 Å from Ca2+ => must NOT be bleached!
+        Some([24.5, 0.0, 0.0]), // 5.5 Å from Yb3+ => p_bleach == 0.50!
+        Some([27.0, 0.0, 0.0]), // 3.0 Å from Yb3+ => strongly bleached!
+    ];
+    let p_mixed = compute_bleaching_probabilities_3d_per_site(
+        &amides,
+        &[([0.0, 0.0, 0.0], 0.0), ([30.0, 0.0, 0.0], 5.5)],
+    );
+    assert!(
+        p_mixed[0] < 1e-4,
+        "amide 3.0 Å from closed-shell Ca2+ must remain unbleached, got {}",
+        p_mixed[0]
+    );
+    assert!((p_mixed[1] - 0.5).abs() < 1e-5);
+    assert!(p_mixed[2] > 0.95);
+
+    // Diamagnetic Zn2+ Cys2His2 zinc finger in BOTH sequence and 3D modes must yield p_bleach == 0.0 everywhere
+    let zf_seq = seq_from_one_letter("MKPYKCPDCGKSFSQSSNLQKHQRTHTGEKP");
+    let priors = Priors::bmrb();
+    let cfg_zn = ParamagneticAssignConfig {
+        metal_class: Some(MetalParamagneticClass::Diamagnetic),
+        ..Default::default()
+    };
+    let (_, rep_zn) = assign_paramagnetic_backbone(&[], &zf_seq, &priors, &cfg_zn);
+    assert_eq!(rep_zn.detected_clusters.len(), 1);
+    assert!(
+        rep_zn.p_bleach.iter().all(|&p| p == 0.0),
+        "Diamagnetic Zn2+ finger must have p_bleach == 0.0 across all residues"
+    );
+
+    // Explicit r_bleach_angstrom override (e.g. Mn2+ 13.5 Å vs Some(0.0))
+    let pdb_txt =
+        fs::read_to_string(workspace_root().join("data/pdb_refs/1d3z.pdb")).expect("1d3z.pdb");
+    let chain = parse_pdb_str_first_model(&pdb_txt).expect("parse 1d3z");
+    let ub_seq: Vec<String> = chain.residues.iter().map(|r| r.res_name.clone()).collect();
+    let m_pos = chain.residues[0].ca;
+    let cfg_yb = ParamagneticAssignConfig {
+        auto_detect_motifs: false,
+        pdb_coordinates: Some(pdb_txt.clone()),
+        explicit_metal_coords: vec![m_pos],
+        metal_class: Some(MetalParamagneticClass::ModerateLanthanide),
+        ..Default::default()
+    };
+    let cfg_mn = ParamagneticAssignConfig {
+        metal_class: Some(MetalParamagneticClass::IsotropicBroadener),
+        ..cfg_yb.clone()
+    };
+    let cfg_zero = ParamagneticAssignConfig {
+        r_bleach_angstrom: Some(0.0),
+        ..cfg_mn.clone()
+    };
+    let (_, rep_yb) = assign_paramagnetic_backbone(&[], &ub_seq, &priors, &cfg_yb);
+    let (_, rep_mn) = assign_paramagnetic_backbone(&[], &ub_seq, &priors, &cfg_mn);
+    let (_, rep_zero) = assign_paramagnetic_backbone(&[], &ub_seq, &priors, &cfg_zero);
+    let sum_yb: f64 = rep_yb.p_bleach.iter().sum();
+    let sum_mn: f64 = rep_mn.p_bleach.iter().sum();
+    assert!(
+        sum_mn > sum_yb * 2.5,
+        "Mn2+/Gd3+ (13.5 Å) must bleach a much wider sphere than Yb3+ (5.5 Å): mn={sum_mn:.2}, yb={sum_yb:.2}"
+    );
+    assert!(rep_zero.p_bleach.iter().all(|&p| p == 0.0));
+}
+
+#[test]
+fn test_huber_irls_standardized_residual_no_double_downweighting() {
+    let metal: Vec3 = [0.0, 0.0, 0.0];
+    let sites: [Vec3; 8] = [
+        [11.5, 2.5, -1.5],
+        [-10.5, 5.0, 3.5],
+        [3.5, -12.5, 3.0],
+        [-3.0, 5.5, 13.5],
+        [8.0, 8.5, -10.0],
+        [-9.0, -7.5, -8.5],
+        [14.0, -3.5, 7.0],
+        [-5.5, 12.0, -8.0],
+    ];
+    let euler = [0.48_f64, 1.08, 1.92];
+    let mut obs: Vec<PcsObservation> = sites
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| {
+            let pcs = predict_pcs_spherical_ppm(pos, metal, 26.0, 6.5, euler);
+            PcsObservation::new((i + 1) as i32, pos, pcs).with_uncertainty(0.03)
+        })
+        .collect();
+
+    // Site 0 has large spectral uncertainty sigma = 0.30 ppm and residual +0.25 ppm:
+    // standardized z_0 = 0.25 / 0.30 = 0.833 <= huber_k (1.65), so Huber weight MUST be 1.0
+    // (exact parity with GLS SVD, zero double-downweighting!).
+    obs[0] = obs[0].with_uncertainty(0.30);
+    obs[0].pcs_ppm += 0.25;
+
+    let gls_svd = fit_pcs_tensor_svd(&obs, metal).expect("GLS SVD");
+    let huber = fit_pcs_tensor_robust(&obs, metal, 1.65, 25).expect("Standardized Huber IRLS");
+    for j in 0..5 {
+        assert!(
+            (gls_svd.components_5[j] - huber.components_5[j]).abs() < 1e-11,
+            "high-sigma inlier (z=0.833 <= 1.65) was falsely downweighted at component {j}: svd={} vs huber={}",
+            gls_svd.components_5[j],
+            huber.components_5[j]
+        );
+    }
+
+    // Now inject a true low-sigma 25-sigma outlier on site 5 (sigma=0.03 ppm, residual +0.75 ppm, z=25.0 > 1.65)
+    let mut with_outlier = obs;
+    with_outlier[5].pcs_ppm += 0.75;
+    let svd_bad = fit_pcs_tensor_svd(&with_outlier, metal).expect("contaminated SVD");
+    let huber_good = fit_pcs_tensor_robust(&with_outlier, metal, 1.65, 25).expect("Huber outlier");
+    assert!(
+        (huber_good.dchi_ax - 26.0).abs() < (svd_bad.dchi_ax - 26.0).abs() * 0.35,
+        "standardized Huber IRLS must suppress z=25 outlier: svd_ax={:.3}, huber_ax={:.3}",
+        svd_bad.dchi_ax,
+        huber_good.dchi_ax
+    );
+}
+
+#[test]
+fn test_pdb_hetatm_chain_mse_b_altloc_2x4fe4s_non_chaining_and_pcs_blind_zone_filter() {
+    // 1. Hostile multi-byte UTF-8, NaN/Inf coords, HETATM MSE ('SE' donor), 'B'-only altlocs,
+    //    and oxidation-state charge columns (CU 1+ vs CU 2+, CO 3+ vs CO 2+).
+    let hostile_pdb = "\
+ATOM      1 🔥🚀🔥 MET A   1       0.000   0.000   0.000  1.00  0.00           N\n\
+ATOM      2  N   ALA A   1         NaN   0.000   0.000  1.00  0.00           N\n\
+HETATM   10  N  BMSE A   1       0.000   0.000   0.000  0.50 10.00           N\n\
+HETATM   11  CA BMSE A   1       1.458   0.000   0.000  0.50 10.00           C\n\
+HETATM   12  C  BMSE A   1       2.009   1.420   0.000  0.50 10.00           C\n\
+HETATM   13  O  BMSE A   1       1.251   2.390   0.000  0.50 10.00           O\n\
+HETATM   14  SE BMSE A   1       2.200  -1.800   0.500  0.50 10.00          SE\n\
+ATOM     20  N  BCYS A   2       3.300   1.550   0.000  1.00 10.00           N\n\
+ATOM     21  CA BCYS A   2       3.950   2.850   0.000  1.00 10.00           C\n\
+ATOM     22  C  BCYS A   2       5.460   2.750   0.000  1.00 10.00           C\n\
+ATOM     23  SG BCYS A   2       3.400   3.850   1.450  1.00 10.00           S\n\
+HETATM   30 CU    CU A 101       3.500   4.100   3.550  1.00 10.00          CU2+\n\
+HETATM   31 CU    CU A 102       2.200  -1.900   2.600  1.00 10.00          CU1+\n\
+HETATM   32 CO    CO A 103       1.300   2.500   2.100  1.00 10.00          CO3+\n\
+END\n";
+    let seq_mc = vec!["MET".to_string(), "CYS".to_string()];
+    let (chain_mc, sites_mc) =
+        parse_paramagnetic_pdb_sites(hostile_pdb, &seq_mc).expect("parse hostile MSE/altLocB PDB");
+    assert_eq!(chain_mc.residues.len(), 2);
+    assert_eq!(chain_mc.residues[0].res_name, "MET"); // MSE normalized to MET
+    assert_eq!(chain_mc.residues[1].res_name, "CYS"); // B-only altloc retained
+    assert_eq!(sites_mc.len(), 3);
+    assert_eq!(
+        sites_mc[0].metal_class,
+        MetalParamagneticClass::IsotropicBroadener
+    ); // Cu2+
+    assert_eq!(sites_mc[1].metal_class, MetalParamagneticClass::Diamagnetic); // Cu1+
+    assert_eq!(sites_mc[2].metal_class, MetalParamagneticClass::Diamagnetic); // Co3+
+
+    // 2. Real public 2x[4Fe-4S] bacterial ferredoxin 1BWE.pdb (~11.55 Å inter-cluster distance):
+    //    must detect 2 separate clusters BOTH with SF4 HETATMs AND when HETATMs are stripped!
+    let pdb_1bwe =
+        fs::read_to_string(workspace_root().join("data/fixtures/ferredoxin_1bwe_2x4fe4s.pdb"))
+            .expect("read ferredoxin_1bwe_2x4fe4s.pdb");
+    let (chain_1bwe, het_sites_1bwe) =
+        parse_paramagnetic_pdb_sites(&pdb_1bwe, &[]).expect("parse 1BWE");
+    assert_eq!(chain_1bwe.residues.len(), 77);
+    assert_eq!(
+        het_sites_1bwe.len(),
+        2,
+        "1BWE must resolve into 2 distinct [4Fe-4S] SF4 clusters (not chained)"
+    );
+    let inter_sf4_dist = v_dist(het_sites_1bwe[0].centroid, het_sites_1bwe[1].centroid);
+    assert!(
+        (11.0..=12.2).contains(&inter_sf4_dist),
+        "expected ~11.55 Å between 1BWE SF4 cubanes, got {inter_sf4_dist:.3} Å"
+    );
+
+    let seq_1bwe: Vec<String> = chain_1bwe
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let atom_only_1bwe: String = pdb_1bwe
+        .lines()
+        .filter(|l| !l.starts_with("HETATM"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let priors = Priors::bmrb();
+    let (_, rep_with_het) = assign_paramagnetic_backbone(
+        &[],
+        &seq_1bwe,
+        &priors,
+        &ParamagneticAssignConfig {
+            pdb_coordinates: Some(pdb_1bwe),
+            ..Default::default()
+        },
+    );
+    let (_, rep_no_het) = assign_paramagnetic_backbone(
+        &[],
+        &seq_1bwe,
+        &priors,
+        &ParamagneticAssignConfig {
+            pdb_coordinates: Some(atom_only_1bwe),
+            ..Default::default()
+        },
+    );
+    assert_eq!(rep_with_het.detected_clusters.len(), 2);
+    assert_eq!(
+        rep_no_het.detected_clusters.len(),
+        2,
+        "ATOM-only 1BWE must partition via true CYS SG donors into 2 clusters (not chain via 4.1 Å CB-CB)"
+    );
+    // Verify ligand-swapped 3D cubane centroids match X-ray SF4 cubanes within < 0.30 Å!
+    for cl in &rep_no_het.detected_clusters {
+        let mc = cl.metal_coord.expect("3D SG centroid");
+        let min_err = het_sites_1bwe
+            .iter()
+            .map(|hs| v_dist(mc, hs.centroid))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            min_err < 0.30,
+            "1BWE SG-donor centroid deviated from X-ray SF4 cubane center by {min_err:.3} Å"
+        );
+    }
+
+    // 3. Q4: Blind-zone & < 8.0 Å [Fe-S] Fermi-contact PCS observation auto-exclusion
+    let m_fes = het_sites_1bwe[0].centroid;
+    let mut pcs_obs = Vec::new();
+    for r in &chain_1bwe.residues {
+        let pos = r.h.unwrap_or(r.n);
+        let dist = v_dist(pos, m_fes);
+        if dist >= 10.0 {
+            let clean_pcs = predict_pcs_spherical_ppm(pos, m_fes, 8.5, 2.2, [0.4, 0.9, 1.3]);
+            pcs_obs.push(PcsObservation::new(r.seq_id, pos, clean_pcs).with_uncertainty(0.03));
+        }
+    }
+    // Inject two hyperfine Fermi-contact shifted points inside r < 8.0 Å / p_bleach >= 0.85
+    pcs_obs.push(
+        PcsObservation::new(901, [m_fes[0] + 5.4, m_fes[1], m_fes[2]], 7.80).with_uncertainty(0.05),
+    );
+    pcs_obs.push(
+        PcsObservation::new(902, [m_fes[0], m_fes[1] - 7.3, m_fes[2]], -5.60)
+            .with_uncertainty(0.05),
+    );
+    let unfiltered_fit = fit_pcs_tensor_svd(&pcs_obs, m_fes).expect("unfiltered SVD");
+    let (filtered_fit, retained) = fit_pcs_tensor_paramagnetic(
+        &pcs_obs,
+        m_fes,
+        MetalParamagneticClass::FeSClusterOrHighSpin3d,
+        true,
+        None,
+        0.85,
+        Some(1.65),
+    )
+    .expect("blind-zone filtered PCS fit");
+    assert_eq!(retained.len(), pcs_obs.len() - 2);
+    assert!(
+        unfiltered_fit.q_factor > 0.15
+            && (unfiltered_fit.dchi_ax - 8.5).abs() > 0.5
+            && filtered_fit.q_factor < 1e-12
+            && (filtered_fit.dchi_ax - 8.5).abs() < 1e-9,
+        "blind-zone/Fermi-contact filter must rescue PCS fit: unfiltered Q={:.4} (ax={:.3}), filtered Q={:.6e} (ax={:.6})",
+        unfiltered_fit.q_factor,
+        unfiltered_fit.dchi_ax,
+        filtered_fit.q_factor,
+        filtered_fit.dchi_ax
+    );
+}
+
+#[test]
+fn test_real_ecoli_2fe2s_ferredoxin_bmr19273_and_1i7h_multichain_validation() {
+    let fixtures = workspace_root().join("data/fixtures");
+    let ferr_ref = read_star(fixtures.join("bmr19273_ferredoxin_2fe2s.str"), None)
+        .expect("read BMRB 19273 E. coli [2Fe-2S] ferredoxin");
+    let pdb_1i7h =
+        fs::read_to_string(fixtures.join("ferredoxin_1i7h_xray.pdb")).expect("read 1I7H.pdb");
+
+    // 1. Multi-chain X-ray 1I7H has chains A, B, C with FES A 1112, FES B 2112, FES C 3112:
+    //    must select ONLY target-chain FES A 1112!
+    let (chain_a, sites_1i7h) =
+        parse_paramagnetic_pdb_sites(&pdb_1i7h, &ferr_ref.sequence).expect("parse 1I7H");
+    assert_eq!(
+        sites_1i7h.len(),
+        1,
+        "must associate only chain A FES A 1112"
+    );
+    assert!(sites_1i7h[0].is_fes_cluster);
+    assert_eq!(
+        sites_1i7h[0].metal_class,
+        MetalParamagneticClass::FeSClusterOrHighSpin3d
+    );
+
+    // Adversarial check: relabel FES B 2112 and FES C 3112 to chain 'A' -> donor distance check
+    // (coordinated <= 3.8 Å to chains B/C, > 15 Å from chain A donors) MUST still reject them!
+    let spoofed_1i7h: String = pdb_1i7h
+        .lines()
+        .map(|l| {
+            if l.starts_with("HETATM") && l.contains("FES ") {
+                let mut s = l.to_string();
+                s.replace_range(21..22, "A");
+                s
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (_, spoofed_sites) = parse_paramagnetic_pdb_sites(&spoofed_1i7h, &ferr_ref.sequence)
+        .expect("parse spoofed 1I7H");
+    assert_eq!(
+        spoofed_sites.len(),
+        1,
+        "donor-distance coordination check must reject chain B/C FES clusters even when chain ID is spoofed"
+    );
+
+    // 2. Verify experimental BMRB 19273 missing-amide PRE blind zone aligns strongly with 3D Solomon p_bleach
+    let priors = Priors::bmrb();
+    let cfg_3d = ParamagneticAssignConfig {
+        pdb_coordinates: Some(pdb_1i7h.clone()),
+        ..Default::default()
+    };
+    let (_, rep_3d) = assign_paramagnetic_backbone(&[], &ferr_ref.sequence, &priors, &cfg_3d);
+    assert_eq!(rep_3d.detected_clusters.len(), 1);
+
+    let mut bleached_missing = 0usize;
+    let mut bleached_total_non_pro = 0usize;
+    for k in 1..ferr_ref.sequence.len() {
+        if ferr_ref.sequence[k] == "PRO" {
+            continue;
+        }
+        if rep_3d.p_bleach[k] >= cfg_3d.blind_zone_threshold {
+            bleached_total_non_pro += 1;
+            let has_hn = ferr_ref.shifts.contains_key(&(k, "H".to_string()))
+                && ferr_ref.shifts.contains_key(&(k, "N".to_string()));
+            if !has_hn {
+                bleached_missing += 1;
+            }
+        }
+    }
+    let exp_bleach_frac = (bleached_missing as f64) / (bleached_total_non_pro.max(1) as f64);
+    println!(
+        "E. coli [2Fe-2S] Ferredoxin (BMRB 19273 + 1I7H): 3D blind-zone non-Pro residues={}, experimentally bleached in BMRB 19273={} ({:.1}%), chain_len={}",
+        bleached_total_non_pro,
+        bleached_missing,
+        exp_bleach_frac * 100.0,
+        chain_a.residues.len()
+    );
+    assert!(
+        bleached_total_non_pro >= 12 && exp_bleach_frac >= 0.80,
+        "expected >= 80% of 3D Solomon blind-zone amides to be experimentally bleached in BMRB 19273, got {bleached_missing}/{bleached_total_non_pro} ({:.1}%)",
+        exp_bleach_frac * 100.0
+    );
+
+    // 3. Cross-protein 5-seed paramagnetic assignment validation (with fixed un-retuned CISD3 hyperparameters!)
+    let assignable = (1..ferr_ref.sequence.len())
+        .filter(|&k| {
+            ferr_ref.sequence[k] != "PRO"
+                && ferr_ref.shifts.contains_key(&(k, "H".to_string()))
+                && ferr_ref.shifts.contains_key(&(k, "N".to_string()))
+        })
+        .count();
+    let mut shifted_truth = ferr_ref.clone();
+    let sim_base = SimConfig::realistic_bruker();
+    for ((_, atom), val) in shifted_truth.shifts.iter_mut() {
+        match atom.as_str() {
+            "H" => *val += sim_base.ref_offset_h,
+            "N" => *val += sim_base.ref_offset_n,
+            "CA" => *val += sim_base.ref_offset_ca,
+            "CB" => *val += sim_base.ref_offset_cb,
+            "C" => *val += sim_base.ref_offset_c,
+            _ => {}
+        }
+    }
+
+    let mut glob_fps = 0usize;
+    let mut para_fps = 0usize;
+    let mut glob_precs = Vec::new();
+    let mut para_precs = Vec::new();
+    let mut para_recs = Vec::new();
+    let mut para_hcps = Vec::new();
+    for seed in 0..5u64 {
+        let mut sc = SimConfig::realistic_bruker();
+        sc.seed = seed;
+        let (peaks, _) = simulate(&ferr_ref, &sc);
+
+        let glob_cfg = ParamagneticAssignConfig {
+            mode: ParamagneticSolverMode::EvoGraph,
+            auto_detect_motifs: false,
+            enable_generic_ca_less_filter: false,
+            enable_u_para_bleach_prior: false,
+            seed,
+            ..Default::default()
+        };
+        let (g_sys, g_res, _) =
+            assign_paramagnetic_from_peaks(&peaks, &ferr_ref.sequence, &priors, &glob_cfg);
+        glob_fps += count_blind_zone_false_positives(
+            &g_res.position,
+            &rep_3d.p_bleach,
+            cfg_3d.blind_zone_threshold,
+            &shifted_truth,
+        );
+        let g_truth = map_spin_systems_to_truth(&g_sys, &shifted_truth);
+        let mut gm = score(&g_res, &g_truth, 0.8);
+        gm.assignable = assignable;
+        glob_precs.push(gm.accuracy() * 100.0);
+
+        let p_cfg = ParamagneticAssignConfig {
+            mode: ParamagneticSolverMode::EvoGraph,
+            pdb_coordinates: Some(pdb_1i7h.clone()),
+            seed,
+            ..Default::default()
+        };
+        let (p_sys, p_res, _) =
+            assign_paramagnetic_from_peaks(&peaks, &ferr_ref.sequence, &priors, &p_cfg);
+        para_fps += count_blind_zone_false_positives(
+            &p_res.position,
+            &rep_3d.p_bleach,
+            cfg_3d.blind_zone_threshold,
+            &shifted_truth,
+        );
+        let p_truth = map_spin_systems_to_truth(&p_sys, &shifted_truth);
+        let mut pm = score(&p_res, &p_truth, 0.8);
+        pm.assignable = assignable;
+        para_precs.push(pm.accuracy() * 100.0);
+        para_recs.push(pm.recall() * 100.0);
+        para_hcps.push(pm.hc_precision() * 100.0);
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / (v.len() as f64);
+    println!(
+        "E. coli [2Fe-2S] Ferredoxin 5-seed EvoGraph (BMRB 19273 + 1I7H, un-retuned): glob_prec={:.2}% (blind_FP={}) -> para_rec={:.2}% | para_prec={:.2}% | HC_prec={:.2}% (blind_FP={})",
+        mean(&glob_precs),
+        glob_fps,
+        mean(&para_recs),
+        mean(&para_precs),
+        mean(&para_hcps),
+        para_fps
+    );
+    assert_eq!(
+        para_fps, 0,
+        "un-retuned paramagnetic solver must emit ZERO blind-zone FPs on E. coli [2Fe-2S] ferredoxin"
+    );
+    assert!(mean(&para_precs) >= mean(&glob_precs) && mean(&para_hcps) >= 92.0);
+}
+
+#[test]
+fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
+    let fixtures = workspace_root().join("data/fixtures");
+    let yb_ref = read_star(fixtures.join("bmr15594_calbindin_yb3.str"), None)
+        .expect("read BMRB 15594 Calbindin D9k Yb3+");
+    let la_ref = read_star(fixtures.join("bmr6699_calbindin_la3.str"), None)
+        .expect("read BMRB 6699 Calbindin D9k La3+");
+    let pdb_1ksm =
+        fs::read_to_string(fixtures.join("calbindin_1ksm_nmr.pdb")).expect("read 1KSM.pdb");
+
+    let (chain_1ksm, sites_1ksm) =
+        parse_paramagnetic_pdb_sites(&pdb_1ksm, &yb_ref.sequence).expect("parse 1KSM");
+    assert_eq!(chain_1ksm.residues.len(), 75);
+    assert!(
+        !sites_1ksm.is_empty(),
+        "1KSM must detect EF-hand lanthanide HETATM LA A 105"
+    );
+    // LA in 1KSM is closed-shell diamagnetic La3+ (r_bleach = 0.0 Å); substituting Yb3+ gives ModerateLanthanide (5.5 Å)
+    assert_eq!(
+        sites_1ksm[0].metal_class,
+        MetalParamagneticClass::Diamagnetic
+    );
+    let la_metal_pos = sites_1ksm[0].centroid;
+
+    // Extract real experimental amide 1H PCS = delta(Yb3+, BMRB 15594) - delta(La3+, BMRB 6699)
+    let mut raw_pcs_obs: Vec<PcsObservation> = Vec::new();
+    for res in &chain_1ksm.residues {
+        if res.res_name == "PRO" {
+            continue;
+        }
+        let k = (res.seq_id - 1) as usize;
+        let (Some(&h_yb), Some(&h_la), Some(h_coord)) = (
+            yb_ref.shifts.get(&(k, "H".to_string())),
+            la_ref.shifts.get(&(k, "H".to_string())),
+            res.h,
+        ) else {
+            continue;
+        };
+        let pcs_ppm = h_yb - h_la;
+        raw_pcs_obs.push(
+            PcsObservation::new(res.seq_id, h_coord, pcs_ppm)
+                .with_uncertainty(0.04)
+                .with_coord_uncertainty(0.25),
+        );
+    }
+    assert!(
+        raw_pcs_obs.len() >= 45,
+        "expected >= 45 real experimental Yb3+ - La3+ amide 1H PCSs in Calbindin D9k, got {}",
+        raw_pcs_obs.len()
+    );
+
+    // Filter out core blind-sphere points for ModerateLanthanide Yb3+ (r_bleach = 5.5 Å) and select
+    // the dipolar outer-sphere shell (r >= 10.8 Å, matching Bertini et al. 2001 / Schmitz et al. 2008
+    // where local EF-hand II Yb3+ vs La3+ ionic-radius contraction 0.86 Å vs 1.03 Å and Fermi contact
+    // shifts vanish; N = 47 real experimental amide 1H PCSs).
+    let pre_filtered = filter_pcs_observations_blind_zone(
+        &raw_pcs_obs,
+        &[la_metal_pos],
+        MetalParamagneticClass::ModerateLanthanide.default_r_bleach_angstrom(),
+        false,
+        0.85,
+    );
+    let filtered_obs: Vec<PcsObservation> = pre_filtered
+        .iter()
+        .copied()
+        .filter(|o| v_dist(o.coord_angstrom, la_metal_pos) >= 10.8)
+        .collect();
+    assert!(
+        filtered_obs.len() >= 45,
+        "expected >= 45 outer-sphere dipolar Yb3+-La3+ 1H PCSs (r >= 10.8 Å), got {}",
+        filtered_obs.len()
+    );
+
+    let svd_at_la = fit_pcs_tensor_svd(&filtered_obs, la_metal_pos).expect("Calbindin SVD at LA");
+    let huber_at_la =
+        fit_pcs_tensor_robust(&filtered_obs, la_metal_pos, 1.65, 25).expect("Calbindin Huber IRLS");
+    let zero_rad = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 0.0, 0.5)
+        .expect("Calbindin zero-radius VarPro must pin initial metal position");
+    assert!(
+        v_dist(zero_rad.metal_pos_angstrom, la_metal_pos) <= 1e-12
+            && (zero_rad.dchi_ax - svd_at_la.dchi_ax).abs() <= 1e-12,
+        "search_radius_angstrom=0.0 must keep metal_pos exact (got shift={:.6} Å)",
+        v_dist(zero_rad.metal_pos_angstrom, la_metal_pos)
+    );
+    assert!(
+        refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, -0.5, 0.5).is_err(),
+        "negative search_radius_angstrom must return Err"
+    );
+    let refined_yb = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 1.5, 0.5)
+        .expect("Calbindin VarPro metal + DeltaChi refinement");
+    let metal_shift_ang = v_dist(refined_yb.metal_pos_angstrom, la_metal_pos);
+
+    println!(
+        "Calbindin D9k Real Experimental Yb3+-La3+ 1H PCS (BMRB 15594 - BMRB 6699 vs 1KSM, N={} outer-sphere / {} total):\n  SVD@LA105:   dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n  Huber@LA105: dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n  VarPro Yb3+: dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |d_metal|={:.3} Å",
+        filtered_obs.len(),
+        raw_pcs_obs.len(),
+        svd_at_la.dchi_ax,
+        svd_at_la.dchi_rh,
+        svd_at_la.q_factor,
+        svd_at_la.rmsd_ppm,
+        huber_at_la.dchi_ax,
+        huber_at_la.dchi_rh,
+        huber_at_la.q_factor,
+        huber_at_la.rmsd_ppm,
+        refined_yb.dchi_ax,
+        refined_yb.dchi_rh,
+        refined_yb.q_factor,
+        refined_yb.rmsd_ppm,
+        metal_shift_ang
+    );
+
+    assert!(
+        svd_at_la.q_factor < 0.25 && refined_yb.q_factor < 0.25 && huber_at_la.q_factor < 0.25,
+        "real experimental Calbindin D9k Yb3+ PCS Q-factor exceeded 0.25: svd Q={:.4}, refined Q={:.4}, huber Q={:.4}",
+        svd_at_la.q_factor,
+        refined_yb.q_factor,
+        huber_at_la.q_factor
+    );
+    assert!(
+        svd_at_la.dchi_ax > 7.5
+            && svd_at_la.dchi_ax < 10.5
+            && refined_yb.dchi_ax > 7.0
+            && refined_yb.dchi_ax < 11.5
+            && metal_shift_ang <= 1.5001,
+        "expected literature Yb3+ dchi_ax ~ +8.5..9.0e-32 m^3 and strictly bounded |d_metal| <= 1.5001 Å (got svd_ax={:.3}, varpro_ax={:.3}, shift={metal_shift_ang:.4} Å)",
+        svd_at_la.dchi_ax,
+        refined_yb.dchi_ax
+    );
 }

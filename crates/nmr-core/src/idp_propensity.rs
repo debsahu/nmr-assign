@@ -880,65 +880,65 @@ fn local_d2d_log_evidence(res: &str, sec: &BTreeMap<String, f64>) -> Option<[f64
 
     if let Some(&dca) = sec.get("CA") {
         let (mu_a, mu_b, mu_p, mu_c, sd) = if is_gly {
-            (0.95, -0.60, -0.18, 0.08, 0.78)
+            (1.10, -0.64, -0.18, 0.08, 0.80)
         } else if is_pro {
-            (1.65, -0.90, -0.25, 0.10, 1.15)
+            (1.80, -0.97, -0.25, 0.10, 1.16)
         } else {
-            (2.15, -1.00, -0.32, 0.15, 1.25)
+            (2.72, -1.09, -0.32, 0.14, 1.25)
         };
         ll[0] += basin_atom_ll(dca, mu_a, sd, 1);
         ll[1] += basin_atom_ll(dca, mu_b, sd, -1);
         ll[2] += basin_atom_ll(dca, mu_p, sd * 0.90, 0);
-        ll[3] += basin_atom_ll(dca, mu_c, sd * 0.95, 0);
+        ll[3] += basin_atom_ll(dca, mu_c, sd * 0.96, 0);
         used += 1;
     }
 
     if !is_gly {
         if let Some(&dcb) = sec.get("CB") {
-            let sd = 1.50;
-            ll[0] += basin_atom_ll(dcb, -0.85, sd, -1);
-            ll[1] += basin_atom_ll(dcb, 1.40, sd, 1);
+            let sd = 1.48;
+            ll[0] += basin_atom_ll(dcb, -1.14, sd, -1);
+            ll[1] += basin_atom_ll(dcb, 1.50, sd, 1);
             ll[2] += basin_atom_ll(dcb, 0.02, sd * 0.90, 0);
-            ll[3] += basin_atom_ll(dcb, -0.05, sd * 0.95, 0);
+            ll[3] += basin_atom_ll(dcb, -0.04, sd * 0.96, 0);
             used += 1;
         }
     }
 
     if let Some(&dc) = sec.get("C") {
         let (mu_a, mu_b, mu_p, mu_c, sd) = if is_gly {
-            (0.95, -0.68, -0.25, 0.05, 0.95)
+            (1.10, -0.72, -0.25, 0.05, 0.96)
         } else {
-            (1.50, -0.95, -0.38, 0.08, 1.25)
+            (1.88, -1.02, -0.36, 0.07, 1.25)
         };
         ll[0] += basin_atom_ll(dc, mu_a, sd, 1);
         ll[1] += basin_atom_ll(dc, mu_b, sd, -1);
         ll[2] += basin_atom_ll(dc, mu_p, sd * 0.90, 0);
-        ll[3] += basin_atom_ll(dc, mu_c, sd * 0.95, 0);
+        ll[3] += basin_atom_ll(dc, mu_c, sd * 0.96, 0);
         used += 1;
     }
 
     if let Some(&dha) = sec.get("HA") {
         let sd = 0.30;
-        ll[0] += basin_atom_ll(dha, -0.27, sd, -1);
-        ll[1] += basin_atom_ll(dha, 0.28, sd, 1);
-        ll[2] += basin_atom_ll(dha, 0.02, sd * 0.90, 0);
-        ll[3] += basin_atom_ll(dha, -0.02, sd * 0.95, 0);
+        ll[0] += basin_atom_ll(dha, -0.30, sd, -1);
+        ll[1] += basin_atom_ll(dha, 0.32, sd, 1);
+        ll[2] += basin_atom_ll(dha, 0.02, sd * 0.91, 0);
+        ll[3] += basin_atom_ll(dha, -0.02, sd * 0.97, 0);
         used += 1;
     }
 
     if !is_pro {
         if let Some(&dh) = sec.get("H") {
             let sd = 0.52;
-            ll[0] += basin_atom_ll(dh, -0.24, sd, -1);
-            ll[1] += basin_atom_ll(dh, 0.30, sd, 1);
+            ll[0] += basin_atom_ll(dh, -0.27, sd, -1);
+            ll[1] += basin_atom_ll(dh, 0.33, sd, 1);
             ll[2] += basin_atom_ll(dh, -0.03, sd, 0);
             ll[3] += basin_atom_ll(dh, 0.0, sd, 0);
             used += 1;
         }
         if let Some(&dn) = sec.get("N") {
             let sd = 3.10;
-            ll[0] += basin_atom_ll(dn, -1.35, sd, -1);
-            ll[1] += basin_atom_ll(dn, 1.65, sd, 1);
+            ll[0] += basin_atom_ll(dn, -1.50, sd, -1);
+            ll[1] += basin_atom_ll(dn, 1.82, sd, 1);
             ll[2] += basin_atom_ll(dn, -0.20, sd, 0);
             ll[3] += basin_atom_ll(dn, 0.0, sd, 0);
             used += 1;
@@ -1004,7 +1004,9 @@ fn forward_backward_d2d(
         return Vec::new();
     }
 
-    // Window-coupled emission log-potentials (Camilloni et al. 2012 local 3-residue coupling)
+    // Emission log-potentials with helix/strand nucleation barrier encoded in the cooperative
+    // transition matrix below so genuine multi-residue H-bonded elements retain crisp edges while
+    // isolated 1-2 residue loop/turn dihedral spikes remain Coil/PPII.
     let mut emit = vec![[0.0_f64; 4]; n];
     for k in 0..n {
         let Some(ll_c) = local_ll[k] else {
@@ -1016,43 +1018,49 @@ fn forward_backward_d2d(
             .get(k + 1)
             .is_some_and(|nx| nx.eq_ignore_ascii_case("PRO"));
 
-        let res_bias = if is_pro {
-            [-0.35_f64, -0.75, 0.32, 0.0]
+        let res_bias = if is_pro && next_pro {
+            // Schimmel & Flory (1968): Pro preceding Pro is sterically excluded from the alpha_R basin
+            [-1.60_f64, -0.85, 0.72, 0.04]
+        } else if is_pro {
+            [-0.10_f64, -0.78, 0.28, 0.04]
         } else if next_pro {
-            [-0.30_f64, -0.05, 0.20, 0.0]
+            [-0.42_f64, -0.08, 0.22, 0.03]
         } else if is_gly {
-            [-0.28_f64, -0.28, -0.50, 0.18]
+            [-0.36_f64, -0.28, -0.50, 0.20]
         } else {
-            [-0.08_f64, -0.05, -0.22, 0.0]
+            [-0.20_f64, -0.05, -0.22, 0.04]
         };
 
         for s in 0..4 {
-            emit[k][s] = res_bias[s] + 1.05 * ll_c[s];
+            emit[k][s] = res_bias[s] + 1.07 * ll_c[s];
         }
     }
 
-    // Log-transition matrix ln T(prev -> curr)
+    // Cooperative log-transition matrix ln T(prev -> curr): high intra-element persistence
+    // paired with realistic Coil->Alpha/Beta nucleation cost suppresses isolated loop false
+    // positives while permitting direct Alpha<->Beta secondary-structure cap junctions.
     let trans_std: [[f64; 4]; 4] = [
-        [0.76_f64.ln(), 0.02_f64.ln(), 0.06_f64.ln(), 0.16_f64.ln()],
-        [0.02_f64.ln(), 0.74_f64.ln(), 0.07_f64.ln(), 0.17_f64.ln()],
-        [0.08_f64.ln(), 0.11_f64.ln(), 0.44_f64.ln(), 0.37_f64.ln()],
-        [0.10_f64.ln(), 0.13_f64.ln(), 0.27_f64.ln(), 0.50_f64.ln()],
+        [0.81_f64.ln(), 0.07_f64.ln(), 0.04_f64.ln(), 0.08_f64.ln()],
+        [0.07_f64.ln(), 0.79_f64.ln(), 0.04_f64.ln(), 0.10_f64.ln()],
+        [0.04_f64.ln(), 0.09_f64.ln(), 0.47_f64.ln(), 0.40_f64.ln()],
+        [0.04_f64.ln(), 0.09_f64.ln(), 0.29_f64.ln(), 0.58_f64.ln()],
     ];
-    // Proline lacks HN to donate an internal alpha-helix i->i-4 H-bond (except N-cap)
+    // Proline lacks an amide HN proton and blocks incoming Alpha->Alpha propagation across all k >= 1,
+    // while still permitting Coil/PPII -> N-cap Pro initiation when followed by non-Pro helical residues.
     let trans_into_pro: [[f64; 4]; 4] = [
-        [0.18_f64.ln(), 0.04_f64.ln(), 0.44_f64.ln(), 0.34_f64.ln()],
-        [0.03_f64.ln(), 0.30_f64.ln(), 0.35_f64.ln(), 0.32_f64.ln()],
-        [0.06_f64.ln(), 0.08_f64.ln(), 0.50_f64.ln(), 0.36_f64.ln()],
-        [0.08_f64.ln(), 0.08_f64.ln(), 0.46_f64.ln(), 0.38_f64.ln()],
+        [0.10_f64.ln(), 0.04_f64.ln(), 0.50_f64.ln(), 0.36_f64.ln()],
+        [0.06_f64.ln(), 0.24_f64.ln(), 0.37_f64.ln(), 0.33_f64.ln()],
+        [0.18_f64.ln(), 0.05_f64.ln(), 0.44_f64.ln(), 0.33_f64.ln()],
+        [0.18_f64.ln(), 0.05_f64.ln(), 0.42_f64.ln(), 0.35_f64.ln()],
     ];
-    let init_log = [0.16_f64.ln(), 0.18_f64.ln(), 0.26_f64.ln(), 0.40_f64.ln()];
+    let init_log = [0.10_f64.ln(), 0.14_f64.ln(), 0.28_f64.ln(), 0.48_f64.ln()];
 
     let mut fwd = vec![[0.0_f64; 4]; n];
     for s in 0..4 {
         fwd[0][s] = init_log[s] + emit[0][s];
     }
     for k in 1..n {
-        let tmat = if sequence[k].eq_ignore_ascii_case("PRO") && k > 2 {
+        let tmat = if sequence[k].eq_ignore_ascii_case("PRO") {
             &trans_into_pro
         } else {
             &trans_std
@@ -1070,7 +1078,7 @@ fn forward_backward_d2d(
 
     let mut bwd = vec![[0.0_f64; 4]; n];
     for k in (0..n.saturating_sub(1)).rev() {
-        let tmat = if sequence[k + 1].eq_ignore_ascii_case("PRO") && (k + 1) > 2 {
+        let tmat = if sequence[k + 1].eq_ignore_ascii_case("PRO") {
             &trans_into_pro
         } else {
             &trans_std

@@ -16,13 +16,13 @@
 //! 4. Cornilescu, G., Marquardt, J. L., Ottiger, M. & Bax, A. (1998). *J. Am. Chem. Soc.* 120(27),
 //!    6836–6837 (anisotropic quality factor $Q$).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::PI;
 
 use serde::{Deserialize, Serialize};
 
 use crate::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig, EvoGraphReport};
-use crate::noesy::{parse_pdb_str_first_model, v_dist, PdbChain, Vec3};
+use crate::noesy::{reconstruct_ca_substituents, v_dist, v_unit, PdbChain, PdbResidue, Vec3};
 use crate::peaks::Peak;
 use crate::priors::{one_to_three, Priors};
 use crate::solver::{
@@ -54,7 +54,7 @@ pub enum MetalMotifKind {
     Cisd2Fe2S,
     /// Rieske `[2Fe-2S]` `2Cys-2His` motif (`C-X-H-X(12..45)-C-X2-H`).
     Rieske2Fe2S,
-    /// Bacterial/plant ferredoxin `[2Fe-2S]` or `[4Fe-4S]` `4Cys` motif (`C-X2-C-X2-C-X3-C` / `C-X(4..5)-C-X2-C-X(n)-C`).
+    /// Bacterial/plant ferredoxin `[2Fe-2S]` or `[4Fe-4S]` `4Cys` motif (`C-X(2..4)-C-X2-C-X3-C` / `C-X(4..5)-C-X2-C-X(n)-C`).
     FerredoxinFeS,
     /// Rubredoxin or tetrahedral `Cys4` metal site (`C-X(2..4)-C-X(8..32)-C-X(2..4)-C`).
     RubredoxinOrCys4,
@@ -64,14 +64,68 @@ pub enum MetalMotifKind {
     Cys2HisCysFinger,
 }
 
+impl MetalMotifKind {
+    /// Whether this motif represents a polynuclear iron-sulfur cluster (`[2Fe-2S]`, `[3Fe-4S]`, `[4Fe-4S]`)
+    /// subject to `< 8.0 Å` Fermi-contact / spin-delocalization shifts (`Bertini et al. 2002`).
+    #[inline]
+    pub fn is_fes_cluster(self) -> bool {
+        matches!(
+            self,
+            Self::Cisd2Fe2S | Self::Rieske2Fe2S | Self::FerredoxinFeS
+        )
+    }
+
+    /// Default paramagnetic electronic relaxation class when no PDB ion or explicit override is given.
+    #[inline]
+    pub fn default_paramagnetic_class(self) -> MetalParamagneticClass {
+        MetalParamagneticClass::FeSClusterOrHighSpin3d
+    }
+}
+
+/// Electronic relaxation / susceptibility class of a metalloprotein cofactor (`Bertini, Luchinat & Parigi,
+/// Prog. Nucl. Magn. Reson. Spectrosc. 2002, 40, 249–273`), governing the characteristic `15N`-HSQC
+/// Solomon–Bloembergen / Curie-spin amide `PRE` bleaching radius $r_{\text{bleach}}$.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MetalParamagneticClass {
+    /// Antiferromagnetically coupled `[2Fe-2S]`/`[4Fe-4S]`/`[3Fe-4S]` clusters, mononuclear high-spin
+    /// rubredoxin `Fe2+`/`Fe3+`, and fast-relaxing high-spin `3d` ions (`Co2+`, `Ni2+`): $r_{\text{bleach}} = 8.5\text{ Å}$.
+    #[default]
+    FeSClusterOrHighSpin3d,
+    /// Slow-electron-relaxation isotropic `PRE` broadeners (`Gd3+`, `Mn2+`, type-2 `Cu2+`): $r_{\text{bleach}} = 13.5\text{ Å}$.
+    IsotropicBroadener,
+    /// Strongly anisotropic Curie-spin lanthanides (`Tb3+`, `Dy3+`, `Tm3+`, `Ho3+`, `Er3+`): $r_{\text{bleach}} = 9.0\text{ Å}$.
+    StrongLanthanide,
+    /// Moderate-susceptibility fast-relaxing lanthanides (`Yb3+`, `Ce3+`, `Pr3+`, `Nd3+`, `Sm3+`, `Eu3+`): $r_{\text{bleach}} = 5.5\text{ Å}$.
+    ModerateLanthanide,
+    /// Closed-shell or low-spin diamagnetic metal cofactors (`Zn2+`, `Cu+`, low-spin `Co3+`, `Mg2+`,
+    /// `Ca2+`, `La3+`, `Lu3+`, low-spin `Fe2+`): $r_{\text{bleach}} = 0.0\text{ Å}$ (zero `PRE` bleaching).
+    Diamagnetic,
+}
+
+impl MetalParamagneticClass {
+    /// Characteristic `1H^N` `15N`-HSQC bleaching radius $r_{\text{bleach}}$ in Å (`Bertini et al. 2002`).
+    #[inline]
+    pub fn default_r_bleach_angstrom(self) -> f64 {
+        match self {
+            Self::FeSClusterOrHighSpin3d => 8.5,
+            Self::IsotropicBroadener => 13.5,
+            Self::StrongLanthanide => 9.0,
+            Self::ModerateLanthanide => 5.5,
+            Self::Diamagnetic => 0.0,
+        }
+    }
+}
+
 /// Detected or user-specified metal coordination cluster.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetalClusterSite {
     pub kind: MetalMotifKind,
-    /// Sorted 0-based sequence indices of coordinating residues (`Cys`, `His`, `Asp`, `Glu`).
+    /// Sorted 0-based sequence indices of coordinating residues (`Cys`, `His`, `Asp`, `Glu`, `Met`/`Mse`).
     pub ligand_indices: Vec<usize>,
     /// Optional 3D Cartesian coordinate `(x, y, z)` in Å of the metal center.
     pub metal_coord: Option<Vec3>,
+    /// Electronic relaxation / `PRE` bleaching class of this metal site.
+    pub metal_class: MetalParamagneticClass,
 }
 
 /// Parse an explicit `--metal-ligands` specification such as `"CYS42,CYS45,HIS68,CYS71"`,
@@ -188,6 +242,7 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
                     kind: MetalMotifKind::Cisd2Fe2S,
                     ligand_indices: ligs.to_vec(),
                     metal_coord: None,
+                    metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
                 });
                 i = ligs[3] + 1;
                 continue;
@@ -196,24 +251,33 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
         i += 1;
     }
 
-    // Pass 2: Bacterial [4Fe-4S] / [2Fe-2S] ferredoxin:
-    //   (a) C - X2 - C - X2 - C - X3 - C
-    //   (b) Plant/vertebrate [2Fe-2S]: C - X(4..5) - C - X2 - C - X(18..38) - C
+    // Pass 2: Bacterial [4Fe-4S] / [3Fe-4S] / [2Fe-2S] ferredoxin:
+    //   (a) C - X(2..4) - C - X2 - C - X3 - C (canonical C-X2-C-X2-C-X3-C + Fe7S8/Fe8S8 C-X4-C-X2-C-X3-C)
+    //   (b) Plant/vertebrate/ISC [2Fe-2S]: C - X(4..5) - C - X2 - C - X(18..38) - C
     i = 0;
     while i + 9 < n {
-        if is_aa(i, "CYS", &used, &up)
-            && is_aa(i + 3, "CYS", &used, &up)
-            && is_aa(i + 6, "CYS", &used, &up)
-            && is_aa(i + 10, "CYS", &used, &up)
-        {
-            let ligs = [i, i + 3, i + 6, i + 10];
-            mark_used(&mut used, &ligs);
-            sites.push(MetalClusterSite {
-                kind: MetalMotifKind::FerredoxinFeS,
-                ligand_indices: ligs.to_vec(),
-                metal_coord: None,
-            });
-            i = ligs[3] + 1;
+        let mut matched_2a = false;
+        for d1 in [3usize, 5, 4] {
+            if i + d1 + 7 < n
+                && is_aa(i, "CYS", &used, &up)
+                && is_aa(i + d1, "CYS", &used, &up)
+                && is_aa(i + d1 + 3, "CYS", &used, &up)
+                && is_aa(i + d1 + 7, "CYS", &used, &up)
+            {
+                let ligs = [i, i + d1, i + d1 + 3, i + d1 + 7];
+                mark_used(&mut used, &ligs);
+                sites.push(MetalClusterSite {
+                    kind: MetalMotifKind::FerredoxinFeS,
+                    ligand_indices: ligs.to_vec(),
+                    metal_coord: None,
+                    metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
+                });
+                i = ligs[3] + 1;
+                matched_2a = true;
+                break;
+            }
+        }
+        if matched_2a {
             continue;
         }
         for gap1 in [5usize, 6] {
@@ -232,6 +296,7 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
                         kind: MetalMotifKind::FerredoxinFeS,
                         ligand_indices: ligs.to_vec(),
                         metal_coord: None,
+                        metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
                     });
                     i = c4;
                     break;
@@ -255,6 +320,7 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
                     kind: MetalMotifKind::Rieske2Fe2S,
                     ligand_indices: ligs.to_vec(),
                     metal_coord: None,
+                    metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
                 });
                 i = h4 + 1;
                 continue;
@@ -281,6 +347,7 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
                 kind: MetalMotifKind::Cys2HisCysFinger,
                 ligand_indices: ligs.to_vec(),
                 metal_coord: None,
+                metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
             });
             i += 14;
             continue;
@@ -306,6 +373,7 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
                             kind: MetalMotifKind::Cys2His2Finger,
                             ligand_indices: ligs.to_vec(),
                             metal_coord: None,
+                            metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
                         });
                         i = h2 + 1;
                         matched = true;
@@ -334,6 +402,7 @@ pub fn detect_metal_coordination_motifs(sequence: &[String]) -> Vec<MetalCluster
                             kind: MetalMotifKind::RubredoxinOrCys4,
                             ligand_indices: ligs.to_vec(),
                             metal_coord: None,
+                            metal_class: MetalParamagneticClass::FeSClusterOrHighSpin3d,
                         });
                         i = c4 + 1;
                         matched = true;
@@ -382,15 +451,15 @@ pub fn coordinating_histidine_indices(
 // ============================================================================
 
 /// Compute exact 3D Solomon–Bloembergen dipolar `PRE` bleaching probability
-/// $$p_{\text{bleach}}(k) = \frac{\sum_m (r_{\text{bleach}} / r_{k,m})^6}{1 + \sum_m (r_{\text{bleach}} / r_{k,m})^6} \in [0, 1]$$
-/// (`Solomon, Phys. Rev. 1955`; `Bertini, Luchinat & Parigi 2002`).
-pub fn compute_bleaching_probabilities_3d(
+/// $$p_{\text{bleach}}(k) = \frac{\sum_m (r_{\text{bleach},m} / r_{k,m})^6}{1 + \sum_m (r_{\text{bleach},m} / r_{k,m})^6} \in [0, 1]$$
+/// allowing each metal center $m$ to carry its own characteristic electronic relaxation bleaching
+/// radius $r_{\text{bleach},m}$ (`Solomon, Phys. Rev. 1955`; `Bertini, Luchinat & Parigi 2002`).
+pub fn compute_bleaching_probabilities_3d_per_site(
     amide_coords: &[Option<Vec3>],
-    metal_coords: &[Vec3],
-    r_bleach_angstrom: f64,
+    sites: &[(Vec3, f64)],
 ) -> Vec<f64> {
     let n = amide_coords.len();
-    if metal_coords.is_empty() || r_bleach_angstrom <= 0.0 {
+    if sites.is_empty() || sites.iter().all(|&(_, rb)| rb <= 0.0) {
         return vec![0.0; n];
     }
     let mut out = vec![0.0_f64; n];
@@ -399,19 +468,608 @@ pub fn compute_bleaching_probabilities_3d(
             continue;
         };
         let mut gamma_ratio = 0.0_f64;
-        for &m in metal_coords {
+        for &(m, r_bleach) in sites {
+            if r_bleach <= 0.0 {
+                continue;
+            }
             let r = v_dist(*pos, m).max(0.5);
-            gamma_ratio += (r_bleach_angstrom / r).powi(6);
+            gamma_ratio += (r_bleach / r).powi(6);
         }
         out[k] = (gamma_ratio / (1.0 + gamma_ratio)).clamp(0.0, 1.0);
     }
     out
 }
 
+/// Compute exact 3D Solomon–Bloembergen dipolar `PRE` bleaching probability
+/// $$p_{\text{bleach}}(k) = \frac{\sum_m (r_{\text{bleach}} / r_{k,m})^6}{1 + \sum_m (r_{\text{bleach}} / r_{k,m})^6} \in [0, 1]$$
+/// (`Solomon, Phys. Rev. 1955`; `Bertini, Luchinat & Parigi 2002`).
+pub fn compute_bleaching_probabilities_3d(
+    amide_coords: &[Option<Vec3>],
+    metal_coords: &[Vec3],
+    r_bleach_angstrom: f64,
+) -> Vec<f64> {
+    if metal_coords.is_empty() || r_bleach_angstrom <= 0.0 {
+        return vec![0.0; amide_coords.len()];
+    }
+    let sites: Vec<(Vec3, f64)> = metal_coords
+        .iter()
+        .map(|&m| (m, r_bleach_angstrom))
+        .collect();
+    compute_bleaching_probabilities_3d_per_site(amide_coords, &sites)
+}
+
+#[derive(Clone, Debug)]
+struct ParsedHetMetalCluster {
+    centroid: Vec3,
+    metal_class: MetalParamagneticClass,
+    is_fes_cluster: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedParamagneticPdb {
+    chain: PdbChain,
+    /// Per-residue true sidechain donor coordinates (`SG`, `ND1`/`NE2`, `OD1`/`OD2`, `OE1`/`OE2`, `SD`/`SE`).
+    sidechain_donors: Vec<Vec<Vec3>>,
+    /// Metal cofactor clusters associated with `chain`.
+    het_clusters: Vec<ParsedHetMetalCluster>,
+}
+
+#[inline]
+fn pdb_ascii_field(bytes: &[u8], start: usize, end: usize) -> Option<&str> {
+    if start > end || end > bytes.len() {
+        return None;
+    }
+    let sub = &bytes[start..end];
+    if !sub.is_ascii() {
+        return None;
+    }
+    std::str::from_utf8(sub).ok()
+}
+
+fn infer_hetatm_metal_or_chalcogen(
+    res_name: &str,
+    atom_name: &str,
+    elem_col: &str,
+    charge_col: &str,
+) -> Option<(bool, MetalParamagneticClass, bool)> {
+    const FES_RESIDUES: &[&str] = &["FES", "SF4", "F3S", "FS4", "FS2", "FS3"];
+    const HEME_RESIDUES: &[&str] = &["HEM", "HEC", "HEA", "HEB", "SRM"];
+    const KNOWN_METAL_RESIDUES: &[&str] = &[
+        "FES", "SF4", "F3S", "FS4", "FS2", "FS3", "FE", "FE2", "CO", "3CO", "CU", "CU1", "CUA",
+        "NI", "MN", "MN3", "GD", "TB", "DY", "TM", "HO", "ER", "YB", "CE", "PR", "ND", "SM", "EU",
+        "ZN", "MG", "CA", "LA", "LU", "HEM", "HEC", "HEA", "HEB", "SRM",
+    ];
+
+    let is_fes_res = FES_RESIDUES.contains(&res_name);
+    let elem = if !elem_col.is_empty() {
+        elem_col.to_string()
+    } else if KNOWN_METAL_RESIDUES.contains(&res_name) {
+        let lead: String = atom_name
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        if lead.is_empty() {
+            return None;
+        }
+        lead
+    } else {
+        return None;
+    };
+
+    if is_fes_res && matches!(elem.as_str(), "S" | "SE") {
+        return Some((false, MetalParamagneticClass::FeSClusterOrHighSpin3d, true));
+    }
+
+    // Guard against polypeptide/organic carbon (`CA`) when col 77-78 is blank unless residue is `CA`
+    if elem == "CA" && res_name != "CA" && elem_col != "CA" {
+        return None;
+    }
+    // In heme cofactors, only the central metal atom (`FE`, `CO`, `ZN`, `MN`) is the metal center
+    if HEME_RESIDUES.contains(&res_name)
+        && !matches!(elem.as_str(), "FE" | "CO" | "ZN" | "MN" | "NI" | "CU")
+    {
+        return None;
+    }
+
+    let class = match elem.as_str() {
+        "FE" => MetalParamagneticClass::FeSClusterOrHighSpin3d,
+        "NI" => MetalParamagneticClass::FeSClusterOrHighSpin3d,
+        "CO" => {
+            if res_name == "3CO" || charge_col.contains('3') {
+                MetalParamagneticClass::Diamagnetic
+            } else {
+                MetalParamagneticClass::FeSClusterOrHighSpin3d
+            }
+        }
+        "CU" => {
+            if res_name == "CU1" || charge_col.contains('1') {
+                MetalParamagneticClass::Diamagnetic
+            } else {
+                MetalParamagneticClass::IsotropicBroadener
+            }
+        }
+        "GD" | "MN" => MetalParamagneticClass::IsotropicBroadener,
+        "TB" | "DY" | "TM" | "HO" | "ER" => MetalParamagneticClass::StrongLanthanide,
+        "YB" | "CE" | "PR" | "ND" | "SM" | "EU" => MetalParamagneticClass::ModerateLanthanide,
+        "ZN" | "MG" | "CA" | "LA" | "LU" => MetalParamagneticClass::Diamagnetic,
+        _ => return None,
+    };
+
+    Some((true, class, is_fes_res))
+}
+
+/// ASCII-safe, hostile-UTF8-proof first-model metalloprotein PDB parser:
+/// - Treats full-backbone `HETATM ... MSE` selenomethionine residues as `MET` (`SE` sidechain donor);
+/// - Accepts `'B'`-only alternate locations when `' '`/`'A'`/`'1'` is absent, upgrading to primary altloc if seen;
+/// - Extracts true coordinating sidechain donor atoms (`SG`, `ND1`/`NE2`, `OD1`/`OD2`, `OE1`/`OE2`, `SD`/`SE`);
+/// - Associates `HETATM` metal ions and `[Fe-S]` bridging chalcogens strictly with the target protein chain
+///   (`<= 3.8 Å` to a target-chain donor, OR on `target_chain` and not coordinated `<= 3.8 Å` to another chain),
+///   clustering polynuclear `[2Fe-2S]`/`[4Fe-4S]` sites via `<= 4.5 Å` metal/chalcogen connectivity.
+fn parse_paramagnetic_pdb_first_model(
+    pdb_text: &str,
+    sequence: &[String],
+) -> Option<ParsedParamagneticPdb> {
+    #[derive(Clone, Default)]
+    struct RawRes {
+        chain_id: char,
+        seq_id: i32,
+        i_code: char,
+        res_name: String,
+        atoms: BTreeMap<String, (Vec3, bool)>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RawHetNode {
+        chain_id: char,
+        seq_id: i32,
+        pos: Vec3,
+        is_metal: bool,
+        metal_class: MetalParamagneticClass,
+        is_fes_cluster: bool,
+    }
+
+    const POLYPEPTIDE_RES: &[&str] = &[
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET",
+        "MSE", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "HID", "HIE", "HIP", "CYX",
+    ];
+
+    let mut chain_order: Vec<char> = Vec::new();
+    let mut chain_res_map: BTreeMap<char, Vec<RawRes>> = BTreeMap::new();
+    let mut raw_hets: Vec<RawHetNode> = Vec::new();
+    let mut seen_any_record = false;
+
+    for line in pdb_text.lines() {
+        let bytes = line.as_bytes();
+        if bytes.starts_with(b"ENDMDL") && seen_any_record {
+            break;
+        }
+        let is_atom = bytes.starts_with(b"ATOM  ");
+        let is_het = bytes.starts_with(b"HETATM");
+        if (!is_atom && !is_het) || bytes.len() < 54 {
+            continue;
+        }
+
+        let Some(atom_raw) = pdb_ascii_field(bytes, 12, 16) else {
+            continue;
+        };
+        let Some(alt_raw) = pdb_ascii_field(bytes, 16, 17) else {
+            continue;
+        };
+        let Some(res_raw) = pdb_ascii_field(bytes, 17, 20) else {
+            continue;
+        };
+        let Some(chain_raw) = pdb_ascii_field(bytes, 21, 22) else {
+            continue;
+        };
+        let Some(seq_raw) = pdb_ascii_field(bytes, 22, 26) else {
+            continue;
+        };
+        let Some(icode_raw) = pdb_ascii_field(bytes, 26, 27) else {
+            continue;
+        };
+        let Some(x_raw) = pdb_ascii_field(bytes, 30, 38) else {
+            continue;
+        };
+        let Some(y_raw) = pdb_ascii_field(bytes, 38, 46) else {
+            continue;
+        };
+        let Some(z_raw) = pdb_ascii_field(bytes, 46, 54) else {
+            continue;
+        };
+
+        let (Ok(x), Ok(y), Ok(z)) = (
+            x_raw.trim().parse::<f64>(),
+            y_raw.trim().parse::<f64>(),
+            z_raw.trim().parse::<f64>(),
+        ) else {
+            continue;
+        };
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
+        seen_any_record = true;
+        let pos: Vec3 = [x, y, z];
+
+        let alt_ch = alt_raw.as_bytes()[0];
+        let is_primary_alt = matches!(alt_ch, b' ' | b'A' | b'1');
+        let res_up = res_raw.trim().to_ascii_uppercase();
+        let atom_up = atom_raw.trim().to_ascii_uppercase();
+        let chain_ch = chain_raw.as_bytes()[0] as char;
+        let i_code = icode_raw.as_bytes()[0] as char;
+
+        let is_mse_poly = is_het && res_up == "MSE";
+        if is_atom || (is_mse_poly && POLYPEPTIDE_RES.contains(&res_up.as_str())) {
+            let Ok(seq_id) = seq_raw.trim().parse::<i32>() else {
+                continue;
+            };
+            let norm_res = match res_up.as_str() {
+                "MSE" => "MET",
+                "HID" | "HIE" | "HIP" => "HIS",
+                "CYX" => "CYS",
+                other => {
+                    if !POLYPEPTIDE_RES.contains(&other) && is_het {
+                        continue;
+                    }
+                    other
+                }
+            };
+            let norm_atom = match atom_up.as_str() {
+                "HN" | "H1" => "H".to_string(),
+                other => other.to_string(),
+            };
+
+            if !chain_order.contains(&chain_ch) {
+                chain_order.push(chain_ch);
+            }
+            let list = chain_res_map.entry(chain_ch).or_default();
+            let entry_idx = if let Some(pos_idx) = list
+                .iter()
+                .position(|r| r.seq_id == seq_id && r.i_code == i_code)
+            {
+                pos_idx
+            } else {
+                list.push(RawRes {
+                    chain_id: chain_ch,
+                    seq_id,
+                    i_code,
+                    res_name: norm_res.to_string(),
+                    atoms: BTreeMap::new(),
+                });
+                list.len() - 1
+            };
+            let res_entry = &mut list[entry_idx];
+            match res_entry.atoms.get(&norm_atom) {
+                None => {
+                    res_entry.atoms.insert(norm_atom, (pos, is_primary_alt));
+                }
+                Some(&(_, was_primary)) if !was_primary && is_primary_alt => {
+                    res_entry.atoms.insert(norm_atom, (pos, true));
+                }
+                _ => {}
+            }
+            if is_atom {
+                continue;
+            }
+        }
+
+        if is_het && res_up != "MSE" {
+            let elem_col: String = pdb_ascii_field(bytes, 76, bytes.len().min(78))
+                .unwrap_or("")
+                .bytes()
+                .filter(|b| b.is_ascii_alphabetic())
+                .map(|b| (b as char).to_ascii_uppercase())
+                .collect();
+            let charge_col: String = pdb_ascii_field(bytes, 78, bytes.len().min(80))
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            let het_seq_id = seq_raw.trim().parse::<i32>().unwrap_or(0);
+            if let Some((is_metal, metal_class, is_fes_cluster)) =
+                infer_hetatm_metal_or_chalcogen(&res_up, &atom_up, &elem_col, &charge_col)
+            {
+                raw_hets.push(RawHetNode {
+                    chain_id: chain_ch,
+                    seq_id: het_seq_id,
+                    pos,
+                    is_metal,
+                    metal_class,
+                    is_fes_cluster,
+                });
+            }
+        }
+    }
+
+    // Build complete polypeptide chains (residues having N, CA, C) and select target chain
+    let extract_sidechain_donors =
+        |res_name: &str, atoms: &BTreeMap<String, (Vec3, bool)>| -> Vec<Vec3> {
+            let names: &[&str] = match res_name {
+                "CYS" => &["SG"],
+                "HIS" => &["ND1", "NE2"],
+                "ASP" => &["OD1", "OD2"],
+                "GLU" => &["OE1", "OE2"],
+                "MET" => &["SD", "SE"],
+                _ => &[],
+            };
+            let mut out = Vec::new();
+            for &nm in names {
+                if let Some(&(c, _)) = atoms.get(nm) {
+                    out.push(c);
+                }
+            }
+            out
+        };
+
+    struct BuiltChainCandidate {
+        chain_id: char,
+        residues: Vec<PdbResidue>,
+        sc_donors: Vec<Vec<Vec3>>,
+        all_chain_donors: Vec<Vec3>,
+    }
+
+    let mut built_chains: Vec<BuiltChainCandidate> = Vec::new();
+    for ch in chain_order {
+        let Some(raw_list) = chain_res_map.get(&ch) else {
+            continue;
+        };
+        let mut residues: Vec<PdbResidue> = Vec::new();
+        let mut sc_donors = Vec::new();
+        let mut all_chain_donors = Vec::new();
+        for r in raw_list {
+            let (Some(&(n, _)), Some(&(ca, _)), Some(&(c, _))) =
+                (r.atoms.get("N"), r.atoms.get("CA"), r.atoms.get("C"))
+            else {
+                continue;
+            };
+            let sc = extract_sidechain_donors(&r.res_name, &r.atoms);
+            for &dc in &sc {
+                all_chain_donors.push(dc);
+            }
+            let o_pos = r.atoms.get("O").map(|x| x.0).unwrap_or(c);
+            if r.atoms.contains_key("O") {
+                all_chain_donors.push(o_pos);
+            }
+            let (rec_cb, rec_ha, rec_ha3, rec_qb) =
+                reconstruct_ca_substituents(&r.res_name, n, ca, c);
+            let h_coord = if let Some(&(h_exp, _)) = r.atoms.get("H") {
+                Some(h_exp)
+            } else if r.res_name != "PRO" {
+                residues.last().and_then(|prev| {
+                    if v_dist(prev.c, n) <= 2.0 {
+                        let u_cn = v_unit([n[0] - prev.c[0], n[1] - prev.c[1], n[2] - prev.c[2]]);
+                        let u_can = v_unit([n[0] - ca[0], n[1] - ca[1], n[2] - ca[2]]);
+                        let dir =
+                            v_unit([u_cn[0] + u_can[0], u_cn[1] + u_can[1], u_cn[2] + u_can[2]]);
+                        Some([
+                            n[0] + 1.01 * dir[0],
+                            n[1] + 1.01 * dir[1],
+                            n[2] + 1.01 * dir[2],
+                        ])
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            residues.push(PdbResidue {
+                seq_id: r.seq_id,
+                res_name: r.res_name.clone(),
+                chain_id: r.chain_id,
+                n,
+                h: h_coord,
+                ca,
+                ha: r
+                    .atoms
+                    .get("HA")
+                    .or_else(|| r.atoms.get("HA2"))
+                    .map(|x| x.0)
+                    .unwrap_or(rec_ha),
+                ha3: r.atoms.get("HA3").map(|x| x.0).or(rec_ha3),
+                c,
+                o: o_pos,
+                cb: r.atoms.get("CB").map(|x| x.0).or(rec_cb),
+                qb: rec_qb,
+            });
+            sc_donors.push(sc);
+        }
+        if !residues.is_empty() {
+            built_chains.push(BuiltChainCandidate {
+                chain_id: ch,
+                residues,
+                sc_donors,
+                all_chain_donors,
+            });
+        }
+    }
+
+    if built_chains.is_empty() {
+        return None;
+    }
+
+    let best_chain_idx = if sequence.is_empty() {
+        0
+    } else {
+        let seq_pairs: Vec<(i32, &str)> = sequence
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i + 1) as i32, s.as_str()))
+            .collect();
+        built_chains
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, cand)| {
+                let pdb_pairs: Vec<(i32, &str)> = cand
+                    .residues
+                    .iter()
+                    .map(|r| (r.seq_id, r.res_name.as_str()))
+                    .collect();
+                crate::dihedrals::align_by_res_names(&seq_pairs, &pdb_pairs).len()
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    };
+
+    let mut other_donors = Vec::new();
+    for (idx, cand) in built_chains.iter().enumerate() {
+        if idx != best_chain_idx {
+            other_donors.extend(cand.all_chain_donors.iter().copied());
+        }
+    }
+    let BuiltChainCandidate {
+        chain_id: target_ch,
+        residues: target_residues,
+        sc_donors: target_sc_donors,
+        all_chain_donors: target_all_donors,
+    } = built_chains.swap_remove(best_chain_idx);
+
+    // Filter HETATM metal / bridging-S nodes strictly to those coordinated to target_ch
+    // (<= 3.8 Å to a target-chain donor, OR on target_ch and not coordinated <= 3.8 Å to another chain)
+    let accepted_hets: Vec<RawHetNode> = raw_hets
+        .into_iter()
+        .filter(|h| {
+            let d_target = target_all_donors
+                .iter()
+                .map(|&d| v_dist(h.pos, d))
+                .fold(f64::INFINITY, f64::min);
+            if d_target <= 3.8 {
+                return true;
+            }
+            let d_other = other_donors
+                .iter()
+                .map(|&d| v_dist(h.pos, d))
+                .fold(f64::INFINITY, f64::min);
+            h.chain_id == target_ch
+                && d_other > 3.8
+                && (h.metal_class != MetalParamagneticClass::Diamagnetic || d_target <= 4.5)
+        })
+        .collect();
+
+    // Connected components over accepted metal + bridging-chalcogen nodes (<= 4.5 Å)
+    let m = accepted_hets.len();
+    let mut visited = vec![false; m];
+    let mut het_clusters = Vec::new();
+    for start in 0..m {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut queue = vec![start];
+        let mut head = 0usize;
+        let mut metal_pts = Vec::new();
+        let mut classes = Vec::new();
+        let mut comp_is_fes = false;
+        while head < queue.len() {
+            let cur = queue[head];
+            head += 1;
+            let node = accepted_hets[cur];
+            comp_is_fes |= node.is_fes_cluster;
+            if node.is_metal {
+                metal_pts.push(node.pos);
+                classes.push(node.metal_class);
+            }
+            for next in 0..m {
+                if visited[next] {
+                    continue;
+                }
+                let other = accepted_hets[next];
+                let d = v_dist(node.pos, other.pos);
+                let same_cofactor_res = node.chain_id == other.chain_id
+                    && node.seq_id == other.seq_id
+                    && node.seq_id != 0;
+                let polynuclear_fes_link = (node.is_fes_cluster && other.is_fes_cluster)
+                    || (node.metal_class == MetalParamagneticClass::FeSClusterOrHighSpin3d
+                        && other.metal_class == MetalParamagneticClass::FeSClusterOrHighSpin3d
+                        && d <= 3.3);
+                if d <= 4.5 && (same_cofactor_res || polynuclear_fes_link) {
+                    visited[next] = true;
+                    queue.push(next);
+                }
+            }
+        }
+        if metal_pts.is_empty() {
+            continue;
+        }
+        let inv = 1.0 / (metal_pts.len() as f64);
+        let sx: f64 = metal_pts.iter().map(|p| p[0]).sum();
+        let sy: f64 = metal_pts.iter().map(|p| p[1]).sum();
+        let sz: f64 = metal_pts.iter().map(|p| p[2]).sum();
+        // Pick strongest-bleaching class in the component (or FeSClusterOrHighSpin3d for Fe-S clusters)
+        let cls = if comp_is_fes {
+            MetalParamagneticClass::FeSClusterOrHighSpin3d
+        } else {
+            classes
+                .into_iter()
+                .max_by(|a, b| {
+                    a.default_r_bleach_angstrom()
+                        .total_cmp(&b.default_r_bleach_angstrom())
+                })
+                .unwrap_or_default()
+        };
+        het_clusters.push(ParsedHetMetalCluster {
+            centroid: [sx * inv, sy * inv, sz * inv],
+            metal_class: cls,
+            is_fes_cluster: comp_is_fes,
+        });
+    }
+
+    // Order paramagnetic clusters ahead of closed-shell diamagnetic cofactors while preserving PDB order
+    het_clusters.sort_by_key(|hc| {
+        if hc.metal_class == MetalParamagneticClass::Diamagnetic {
+            1u8
+        } else {
+            0u8
+        }
+    });
+
+    Some(ParsedParamagneticPdb {
+        chain: PdbChain {
+            residues: target_residues,
+        },
+        sidechain_donors: target_sc_donors,
+        het_clusters,
+    })
+}
+
+/// Metal cofactor cluster extracted from a first-model metalloprotein PDB structure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParsedPdbMetalSite {
+    pub centroid: Vec3,
+    pub metal_class: MetalParamagneticClass,
+    pub is_fes_cluster: bool,
+}
+
+/// Parse the target polypeptide chain (supporting `HETATM ... MSE` selenomethionine and `'B'`-only
+/// alternate locations) together with target-chain-associated `HETATM` metal/cofactor clusters.
+pub fn parse_paramagnetic_pdb_sites(
+    pdb_text: &str,
+    sequence: &[String],
+) -> Option<(PdbChain, Vec<ParsedPdbMetalSite>)> {
+    let parsed = parse_paramagnetic_pdb_first_model(pdb_text, sequence)?;
+    let sites = parsed
+        .het_clusters
+        .into_iter()
+        .map(|hc| ParsedPdbMetalSite {
+            centroid: hc.centroid,
+            metal_class: hc.metal_class,
+            is_fes_cluster: hc.is_fes_cluster,
+        })
+        .collect();
+    Some((parsed.chain, sites))
+}
+
+/// Default 3D single-linkage cutoff (`6.4 Å`) over true coordinating sidechain donor atoms
+/// (`CYS SG`, `HIS ND1/NE2`, `ASP OD*`, `GLU OE*`, `MET/MSE SD/SE`):
+/// - Keeps tetrahedral `[4Fe-4S]`/`[2Fe-2S]`/`Cys2His2` coordination spheres connected
+///   ($d(\text{S}^\gamma, \text{S}^\gamma) \approx 5.5\text{--}6.2\text{ Å}$);
+/// - Cleanly separates adjacent clusters in bacterial `2x[4Fe-4S]` ferredoxins (~11.5 Å center-to-center,
+///   inter-cluster $d(\text{S}^\gamma, \text{S}^\gamma) \ge 6.7\text{ Å}$ even where backbone/$\text{C}^\beta$
+///   atoms approach within `4.1 Å`).
+const DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM: f64 = 6.4;
+
 /// Partition explicit or detected coordinating ligand indices into 3D single-linkage donor
-/// clusters (`CB`/`CA` distance `<= cutoff_angstrom`, default `8.5 Å`) and compute one metal
-/// centroid per cluster so multi-site metalloproteins (e.g. tandem `[2Fe-2S]` domains) never
-/// collapse into a single midpoint phantom site.
+/// clusters (`<= cutoff_angstrom`, default `6.4 Å` on true sidechain `SG`/`ND1`/`OD*`/`OE*` donors)
+/// and compute one metal centroid per cluster so closely spaced multi-cluster proteins
+/// (e.g. `2x[4Fe-4S]` bacterial ferredoxins ~11.5 Å apart) never chain into a single midpoint phantom.
 fn partition_ligands_3d_single_linkage(
     ligand_indices: &[usize],
     donor_coords: &[Option<Vec3>],
@@ -493,9 +1151,57 @@ fn align_pdb_amides_and_donors(
     (amide_coords, donor_coords)
 }
 
+fn align_parsed_paramagnetic_pdb(
+    sequence: &[String],
+    parsed: &ParsedParamagneticPdb,
+) -> (Vec<Option<Vec3>>, Vec<Option<Vec3>>) {
+    let n = sequence.len();
+    let seq_pairs: Vec<(i32, &str)> = sequence
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ((i + 1) as i32, s.as_str()))
+        .collect();
+    let pdb_pairs: Vec<(i32, &str)> = parsed
+        .chain
+        .residues
+        .iter()
+        .map(|r| (r.seq_id, r.res_name.as_str()))
+        .collect();
+    let aligned = crate::dihedrals::align_by_res_names(&seq_pairs, &pdb_pairs);
+
+    let mut amide_coords: Vec<Option<Vec3>> = vec![None; n];
+    let mut donor_coords: Vec<Option<Vec3>> = vec![None; n];
+    for (k, p_idx) in aligned {
+        if k < n && p_idx < parsed.chain.residues.len() {
+            let pres = &parsed.chain.residues[p_idx];
+            amide_coords[k] = Some(pres.h.unwrap_or(pres.n));
+            let sc = parsed
+                .sidechain_donors
+                .get(p_idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let dc = if !sc.is_empty() {
+                let inv = 1.0 / (sc.len() as f64);
+                let sx: f64 = sc.iter().map(|p| p[0]).sum();
+                let sy: f64 = sc.iter().map(|p| p[1]).sum();
+                let sz: f64 = sc.iter().map(|p| p[2]).sum();
+                [sx * inv, sy * inv, sz * inv]
+            } else {
+                pres.cb.unwrap_or(pres.ca)
+            };
+            donor_coords[k] = Some(dc);
+        }
+    }
+    (amide_coords, donor_coords)
+}
+
 /// Extract aligned per-residue backbone amide `1H^N` (fallback `15N` for `Pro` / N-terminus)
 /// coordinates from a parsed [`PdbChain`] and estimate cluster metal coordinates from 3D
-/// single-linkage (`<= 8.5 Å`) ligand `CB`/`CA` centroids whenever `cluster.metal_coord` is `None`.
+/// single-linkage (`<= 6.4 Å`) ligand donor centroids whenever `cluster.metal_coord` is `None`.
+///
+/// Note: this convenience helper applies a uniform `r_bleach_angstrom` across paramagnetic sites;
+/// callers requiring per-metal `r_bleach` across heterogeneous multi-metal PDB cofactors should
+/// call [`compute_bleaching_probabilities_3d_per_site`] or [`assign_paramagnetic_backbone`].
 pub fn compute_bleaching_probabilities_from_pdb(
     sequence: &[String],
     pdb_chain: &PdbChain,
@@ -503,30 +1209,38 @@ pub fn compute_bleaching_probabilities_from_pdb(
     r_bleach_angstrom: f64,
 ) -> Vec<f64> {
     let n = sequence.len();
-    if n == 0 || clusters.is_empty() {
+    if n == 0 || clusters.is_empty() || r_bleach_angstrom <= 0.0 {
         return vec![0.0; n];
     }
 
     let (amide_coords, donor_coords) = align_pdb_amides_and_donors(sequence, pdb_chain);
 
-    let mut metal_sites = Vec::new();
+    let mut sites: Vec<(Vec3, f64)> = Vec::new();
     for cl in clusters {
+        if cl.metal_class == MetalParamagneticClass::Diamagnetic {
+            continue;
+        }
         if let Some(mc) = cl.metal_coord {
-            metal_sites.push(mc);
+            sites.push((mc, r_bleach_angstrom));
         } else {
-            for (_, centroid) in
-                partition_ligands_3d_single_linkage(&cl.ligand_indices, &donor_coords, 8.5)
-            {
-                metal_sites.push(centroid);
+            for (_, centroid) in partition_ligands_3d_single_linkage(
+                &cl.ligand_indices,
+                &donor_coords,
+                DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM,
+            ) {
+                sites.push((centroid, r_bleach_angstrom));
             }
         }
     }
 
-    compute_bleaching_probabilities_3d(&amide_coords, &metal_sites, r_bleach_angstrom)
+    compute_bleaching_probabilities_3d_per_site(&amide_coords, &sites)
 }
 
 /// Compute sequence-only `PRE` bleaching probability $p_{\text{bleach}}(k) \in [0, 1]$ from
 /// coordinating ligand motifs (`Cys`/`His`/`Asp`/`Glu`) when no 3D structure is provided.
+///
+/// Closed-shell diamagnetic sites ([`MetalParamagneticClass::Diamagnetic`], e.g. `Zn2+`, `Cu+`,
+/// `Co3+`, `Mg2+`, `Ca2+`, `La3+`, `Lu3+`) produce zero `PRE` bleaching ($p_{\text{bleach}} = 0$).
 ///
 /// Reflects covalent metalloprotein coordination geometry (`Bertini, Luchinat & Parigi 2002`):
 /// - Direct coordinating ligands $L_j$ and short intra-chelate linkers ($L_{j+1} - L_j \le 5$),
@@ -539,10 +1253,22 @@ pub fn compute_bleaching_probabilities_sequence(
     n_residues: usize,
     clusters: &[MetalClusterSite],
 ) -> Vec<f64> {
+    compute_bleaching_probabilities_sequence_with_override(n_residues, clusters, None)
+}
+
+fn compute_bleaching_probabilities_sequence_with_override(
+    n_residues: usize,
+    clusters: &[MetalClusterSite],
+    r_bleach_override: Option<f64>,
+) -> Vec<f64> {
+    if r_bleach_override.is_some_and(|r| r <= 0.0) {
+        return vec![0.0; n_residues];
+    }
     let mut survival = vec![1.0_f64; n_residues];
 
     for cl in clusters {
-        if cl.ligand_indices.is_empty() {
+        let eff_r = r_bleach_override.unwrap_or_else(|| cl.metal_class.default_r_bleach_angstrom());
+        if eff_r <= 0.0 || cl.ligand_indices.is_empty() {
             continue;
         }
         let mut sorted = cl.ligand_indices.clone();
@@ -626,8 +1352,12 @@ pub struct ParamagneticAssignConfig {
     pub pdb_coordinates: Option<String>,
     /// Optional explicit 3D metal ion coordinates in Å (overrides ligand-centroid estimate when PDB is given).
     pub explicit_metal_coords: Vec<Vec3>,
-    /// Characteristic Solomon `PRE` amide bleaching radius $r_{\text{bleach}}$ in Å (default `8.5 Å`).
-    pub r_bleach_angstrom: f64,
+    /// Optional explicit metal electronic-relaxation class override (`None` = infer per site from
+    /// PDB `HETATM` element/oxidation state or motif kind).
+    pub metal_class: Option<MetalParamagneticClass>,
+    /// Optional explicit Solomon `PRE` amide bleaching radius $r_{\text{bleach}}$ in Å
+    /// (`None` = use [`MetalParamagneticClass::default_r_bleach_angstrom`] per site).
+    pub r_bleach_angstrom: Option<f64>,
     /// Blind-zone threshold (`0.65`): placements in $p_{\text{bleach}}(k) \ge 0.65$ require multi-nucleus
     /// sequential chain corroboration into the diamagnetic scaffold or abstain cleanly.
     pub blind_zone_threshold: f64,
@@ -636,11 +1366,15 @@ pub struct ParamagneticAssignConfig {
     pub hard_bleach_cutoff: f64,
     /// Log-survival unary penalty scale applied in the blind-zone penumbra.
     pub bleach_prior_weight: f64,
+    /// Enable generic `CA`-less excess/artifact root filtering (independent of metal-motif coordinates).
+    pub enable_generic_ca_less_filter: bool,
+    /// Enable paramagnetic $u_{\text{para}}$ `PRE` blind-zone unary prior & penumbra corroboration gate.
+    pub enable_u_para_bleach_prior: bool,
     /// Underlying `(U, P)` scoring parameters.
     pub score_cfg: ScoreConfig,
     /// Underlying simulated annealing parameters.
     pub anneal_cfg: AnnealConfig,
-    ///Deterministic PRNG seed.
+    /// Deterministic PRNG seed.
     pub seed: u64,
 }
 
@@ -652,10 +1386,13 @@ impl Default for ParamagneticAssignConfig {
             auto_detect_motifs: true,
             pdb_coordinates: None,
             explicit_metal_coords: Vec::new(),
-            r_bleach_angstrom: 8.5,
+            metal_class: None,
+            r_bleach_angstrom: None,
             blind_zone_threshold: 0.65,
             hard_bleach_cutoff: 0.85,
             bleach_prior_weight: 2.2,
+            enable_generic_ca_less_filter: true,
+            enable_u_para_bleach_prior: true,
             score_cfg: ScoreConfig::default(),
             anneal_cfg: AnnealConfig::default(),
             seed: 0,
@@ -678,70 +1415,185 @@ fn resolve_clusters_and_bleaching(
     sequence: &[String],
     cfg: &ParamagneticAssignConfig,
 ) -> (Vec<MetalClusterSite>, Vec<f64>) {
+    let resolve_class = |base: MetalParamagneticClass| -> MetalParamagneticClass {
+        cfg.metal_class.unwrap_or(base)
+    };
+    let resolve_r = |cls: MetalParamagneticClass| -> f64 {
+        cfg.r_bleach_angstrom
+            .unwrap_or_else(|| cls.default_r_bleach_angstrom())
+    };
+
     let parsed_pdb = cfg
         .pdb_coordinates
         .as_deref()
-        .and_then(|txt| parse_pdb_str_first_model(txt).ok());
+        .and_then(|txt| parse_paramagnetic_pdb_first_model(txt, sequence));
 
-    let mut clusters = Vec::new();
-    if !cfg.explicit_ligand_indices.is_empty() {
+    let mut clusters: Vec<MetalClusterSite> = Vec::new();
+
+    if let Some(ref pdb) = parsed_pdb {
+        let (amides, donor_coords) = align_parsed_paramagnetic_pdb(sequence, pdb);
+
         if !cfg.explicit_metal_coords.is_empty() {
-            // Preserve all explicit metal coordinates; partition explicit ligands to nearest metal site when PDB is available
-            if let Some(ref chain) = parsed_pdb {
-                let (_, donor_coords) = align_pdb_amides_and_donors(sequence, chain);
-                let mut per_metal_ligs: Vec<Vec<usize>> =
-                    vec![Vec::new(); cfg.explicit_metal_coords.len()];
-                for &idx in &cfg.explicit_ligand_indices {
-                    if let Some(Some(dc)) = donor_coords.get(idx) {
-                        let best_m = cfg
-                            .explicit_metal_coords
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, a), (_, b)| v_dist(*dc, **a).total_cmp(&v_dist(*dc, **b)))
-                            .map(|(mi, _)| mi)
-                            .unwrap_or(0);
-                        per_metal_ligs[best_m].push(idx);
-                    } else {
-                        per_metal_ligs[0].push(idx);
+            let candidate_ligs: Vec<usize> = if !cfg.explicit_ligand_indices.is_empty() {
+                cfg.explicit_ligand_indices.clone()
+            } else if cfg.auto_detect_motifs {
+                detect_metal_coordination_motifs(sequence)
+                    .into_iter()
+                    .flat_map(|m| m.ligand_indices)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut per_metal_ligs: Vec<Vec<usize>> =
+                vec![Vec::new(); cfg.explicit_metal_coords.len()];
+            for &idx in &candidate_ligs {
+                if let Some(Some(dc)) = donor_coords.get(idx) {
+                    let best = cfg
+                        .explicit_metal_coords
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| v_dist(*dc, **a).total_cmp(&v_dist(*dc, **b)));
+                    if let Some((mi, mc)) = best {
+                        if !cfg.explicit_ligand_indices.is_empty() || v_dist(*dc, *mc) <= 6.5 {
+                            per_metal_ligs[mi].push(idx);
+                        }
+                    }
+                } else if !cfg.explicit_ligand_indices.is_empty() {
+                    per_metal_ligs[0].push(idx);
+                }
+            }
+
+            for (mc, mut ligs) in cfg
+                .explicit_metal_coords
+                .iter()
+                .copied()
+                .zip(per_metal_ligs)
+            {
+                ligs.sort_unstable();
+                ligs.dedup();
+                let inferred_cls = pdb
+                    .het_clusters
+                    .iter()
+                    .filter(|hc| v_dist(hc.centroid, mc) <= 3.5)
+                    .min_by(|a, b| v_dist(a.centroid, mc).total_cmp(&v_dist(b.centroid, mc)))
+                    .map(|hc| hc.metal_class)
+                    .unwrap_or(MetalParamagneticClass::FeSClusterOrHighSpin3d);
+                clusters.push(MetalClusterSite {
+                    kind: MetalMotifKind::ExplicitLigands,
+                    ligand_indices: ligs,
+                    metal_coord: Some(mc),
+                    metal_class: resolve_class(inferred_cls),
+                });
+            }
+        } else if !pdb.het_clusters.is_empty() {
+            let detected_motifs =
+                if cfg.explicit_ligand_indices.is_empty() && cfg.auto_detect_motifs {
+                    detect_metal_coordination_motifs(sequence)
+                } else {
+                    Vec::new()
+                };
+            let candidate_ligs: Vec<usize> = if !cfg.explicit_ligand_indices.is_empty() {
+                cfg.explicit_ligand_indices.clone()
+            } else {
+                detected_motifs
+                    .iter()
+                    .flat_map(|m| m.ligand_indices.iter().copied())
+                    .collect()
+            };
+
+            let mut per_het_ligs: Vec<Vec<usize>> = vec![Vec::new(); pdb.het_clusters.len()];
+            let mut unmatched_ligs: Vec<usize> = Vec::new();
+            for &idx in &candidate_ligs {
+                if let Some(Some(dc)) = donor_coords.get(idx) {
+                    let nearest = pdb
+                        .het_clusters
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            v_dist(*dc, a.centroid).total_cmp(&v_dist(*dc, b.centroid))
+                        });
+                    if let Some((hi, hc)) = nearest {
+                        if v_dist(*dc, hc.centroid) <= 5.5 {
+                            per_het_ligs[hi].push(idx);
+                            continue;
+                        }
                     }
                 }
-                for (mc, ligs) in cfg
-                    .explicit_metal_coords
-                    .iter()
-                    .copied()
-                    .zip(per_metal_ligs)
-                {
+                unmatched_ligs.push(idx);
+            }
+
+            // If explicit_ligand_indices were given and none matched a PDB HETATM cofactor,
+            // honour the explicit ligands directly via 3D donor single-linkage.
+            if !cfg.explicit_ligand_indices.is_empty()
+                && per_het_ligs.iter().all(Vec::is_empty)
+                && !unmatched_ligs.is_empty()
+            {
+                for (comp_ligs, centroid) in partition_ligands_3d_single_linkage(
+                    &unmatched_ligs,
+                    &donor_coords,
+                    DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM,
+                ) {
                     clusters.push(MetalClusterSite {
                         kind: MetalMotifKind::ExplicitLigands,
-                        ligand_indices: ligs,
-                        metal_coord: Some(mc),
+                        ligand_indices: comp_ligs,
+                        metal_coord: Some(centroid),
+                        metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
                     });
                 }
             } else {
-                for (mi, &mc) in cfg.explicit_metal_coords.iter().enumerate() {
+                for (hc, mut ligs) in pdb.het_clusters.iter().zip(per_het_ligs) {
+                    ligs.sort_unstable();
+                    ligs.dedup();
+                    let kind = if !cfg.explicit_ligand_indices.is_empty() {
+                        MetalMotifKind::ExplicitLigands
+                    } else if hc.is_fes_cluster {
+                        detected_motifs
+                            .iter()
+                            .find(|m| m.ligand_indices.iter().any(|l| ligs.contains(l)))
+                            .map(|m| m.kind)
+                            .unwrap_or(MetalMotifKind::FerredoxinFeS)
+                    } else {
+                        MetalMotifKind::ExplicitLigands
+                    };
                     clusters.push(MetalClusterSite {
-                        kind: MetalMotifKind::ExplicitLigands,
-                        ligand_indices: if mi == 0 {
-                            cfg.explicit_ligand_indices.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        metal_coord: Some(mc),
+                        kind,
+                        ligand_indices: ligs,
+                        metal_coord: Some(hc.centroid),
+                        metal_class: resolve_class(hc.metal_class),
                     });
                 }
+                if cfg.explicit_ligand_indices.is_empty() && !unmatched_ligs.is_empty() {
+                    for (comp_ligs, centroid) in partition_ligands_3d_single_linkage(
+                        &unmatched_ligs,
+                        &donor_coords,
+                        DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM,
+                    ) {
+                        if comp_ligs.len() >= 3 {
+                            clusters.push(MetalClusterSite {
+                                kind: MetalMotifKind::FerredoxinFeS,
+                                ligand_indices: comp_ligs,
+                                metal_coord: Some(centroid),
+                                metal_class: resolve_class(
+                                    MetalParamagneticClass::FeSClusterOrHighSpin3d,
+                                ),
+                            });
+                        }
+                    }
+                }
             }
-        } else if let Some(ref chain) = parsed_pdb {
-            let (_, donor_coords) = align_pdb_amides_and_donors(sequence, chain);
+        } else if !cfg.explicit_ligand_indices.is_empty() {
             let comps = partition_ligands_3d_single_linkage(
                 &cfg.explicit_ligand_indices,
                 &donor_coords,
-                8.5,
+                DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM,
             );
             if comps.is_empty() {
                 clusters.push(MetalClusterSite {
                     kind: MetalMotifKind::ExplicitLigands,
                     ligand_indices: cfg.explicit_ligand_indices.clone(),
                     metal_coord: None,
+                    metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
                 });
             } else {
                 for (comp_ligs, centroid) in comps {
@@ -749,18 +1601,114 @@ fn resolve_clusters_and_bleaching(
                         kind: MetalMotifKind::ExplicitLigands,
                         ligand_indices: comp_ligs,
                         metal_coord: Some(centroid),
+                        metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
                     });
                 }
+            }
+        } else if cfg.auto_detect_motifs {
+            let raw_motifs = detect_metal_coordination_motifs(sequence);
+            let mut pooled_with_coords = Vec::new();
+            let mut unmodeled_motifs = Vec::new();
+            for mut m in raw_motifs {
+                m.metal_class = resolve_class(m.metal_class);
+                if m.ligand_indices
+                    .iter()
+                    .any(|&idx| donor_coords.get(idx).and_then(|x| *x).is_some())
+                {
+                    pooled_with_coords.extend(m.ligand_indices.iter().copied());
+                } else {
+                    unmodeled_motifs.push(m);
+                }
+            }
+            for (comp_ligs, centroid) in partition_ligands_3d_single_linkage(
+                &pooled_with_coords,
+                &donor_coords,
+                DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM,
+            ) {
+                let has_his = comp_ligs.iter().any(|&idx| {
+                    sequence
+                        .get(idx)
+                        .is_some_and(|r| r.eq_ignore_ascii_case("HIS"))
+                });
+                let kind = if has_his {
+                    MetalMotifKind::Cisd2Fe2S
+                } else {
+                    MetalMotifKind::FerredoxinFeS
+                };
+                clusters.push(MetalClusterSite {
+                    kind,
+                    ligand_indices: comp_ligs,
+                    metal_coord: Some(centroid),
+                    metal_class: resolve_class(kind.default_paramagnetic_class()),
+                });
+            }
+            clusters.extend(unmodeled_motifs);
+        }
+
+        let mut sites_3d: Vec<(Vec3, f64)> = Vec::new();
+        let mut unmodeled_seq_clusters: Vec<MetalClusterSite> = Vec::new();
+        for cl in &clusters {
+            let rb = resolve_r(cl.metal_class);
+            if let Some(mc) = cl.metal_coord {
+                sites_3d.push((mc, rb));
+            } else {
+                let comps = partition_ligands_3d_single_linkage(
+                    &cl.ligand_indices,
+                    &donor_coords,
+                    DONOR_CLUSTER_LINKAGE_CUTOFF_ANGSTROM,
+                );
+                if comps.is_empty() {
+                    unmodeled_seq_clusters.push(cl.clone());
+                } else {
+                    for (_, cent) in comps {
+                        sites_3d.push((cent, rb));
+                    }
+                }
+            }
+        }
+
+        let mut p_bleach = compute_bleaching_probabilities_3d_per_site(&amides, &sites_3d);
+        if !unmodeled_seq_clusters.is_empty() {
+            let p_seq = compute_bleaching_probabilities_sequence_with_override(
+                sequence.len(),
+                &unmodeled_seq_clusters,
+                cfg.r_bleach_angstrom,
+            );
+            for (pb, ps) in p_bleach.iter_mut().zip(p_seq) {
+                *pb = 1.0 - (1.0 - *pb) * (1.0 - ps);
+            }
+        }
+        return (clusters, p_bleach);
+    }
+
+    // Sequence-only path (no PDB structure provided or unparseable PDB)
+    if !cfg.explicit_ligand_indices.is_empty() {
+        if !cfg.explicit_metal_coords.is_empty() {
+            for (mi, &mc) in cfg.explicit_metal_coords.iter().enumerate() {
+                clusters.push(MetalClusterSite {
+                    kind: MetalMotifKind::ExplicitLigands,
+                    ligand_indices: if mi == 0 {
+                        cfg.explicit_ligand_indices.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    metal_coord: Some(mc),
+                    metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
+                });
             }
         } else {
             clusters.push(MetalClusterSite {
                 kind: MetalMotifKind::ExplicitLigands,
                 ligand_indices: cfg.explicit_ligand_indices.clone(),
                 metal_coord: None,
+                metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
             });
         }
     } else if cfg.auto_detect_motifs {
         clusters = detect_metal_coordination_motifs(sequence);
+        for cl in &mut clusters {
+            cl.metal_class = resolve_class(cl.metal_class);
+        }
         for (idx, mc) in cfg.explicit_metal_coords.iter().copied().enumerate() {
             if let Some(cl) = clusters.get_mut(idx) {
                 cl.metal_coord = Some(mc);
@@ -769,6 +1717,7 @@ fn resolve_clusters_and_bleaching(
                     kind: MetalMotifKind::ExplicitLigands,
                     ligand_indices: Vec::new(),
                     metal_coord: Some(mc),
+                    metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
                 });
             }
         }
@@ -778,30 +1727,16 @@ fn resolve_clusters_and_bleaching(
                 kind: MetalMotifKind::ExplicitLigands,
                 ligand_indices: Vec::new(),
                 metal_coord: Some(mc),
+                metal_class: resolve_class(MetalParamagneticClass::FeSClusterOrHighSpin3d),
             });
         }
     }
 
-    let p_bleach = if let Some(ref chain) = parsed_pdb {
-        if !cfg.explicit_metal_coords.is_empty() {
-            let (amides, _) = align_pdb_amides_and_donors(sequence, chain);
-            compute_bleaching_probabilities_3d(
-                &amides,
-                &cfg.explicit_metal_coords,
-                cfg.r_bleach_angstrom,
-            )
-        } else {
-            compute_bleaching_probabilities_from_pdb(
-                sequence,
-                chain,
-                &clusters,
-                cfg.r_bleach_angstrom,
-            )
-        }
-    } else {
-        compute_bleaching_probabilities_sequence(sequence.len(), &clusters)
-    };
-
+    let p_bleach = compute_bleaching_probabilities_sequence_with_override(
+        sequence.len(),
+        &clusters,
+        cfg.r_bleach_angstrom,
+    );
     (clusters, p_bleach)
 }
 
@@ -836,9 +1771,7 @@ fn apply_paramagnetic_prior_to_unary(
     let n_slots: Vec<usize> = systems.iter().map(count_positive_carbon_slots).collect();
     let obs_ca: Vec<bool> = systems.iter().map(has_positive_ca).collect();
 
-    // Expected bleached non-Proline amides: in paramagnetic proteins, PRE wipes out real HSQC
-    // amides so `u.rows` drops below `sequence.len()`, hiding t1/sidechain artifact roots from
-    // globular `s_len > assignable` checks even though empty diamagnetic slots remain open.
+    let multi_slot_count = n_slots.iter().filter(|&&ns| ns >= 3).count();
     let total_bleached: f64 = sequence
         .iter()
         .enumerate()
@@ -846,9 +1779,22 @@ fn apply_paramagnetic_prior_to_unary(
         .filter(|&(_, r)| r != "PRO")
         .map(|(k, _)| p_bleach.get(k).copied().unwrap_or(0.0))
         .sum();
-    let multi_slot_count = n_slots.iter().filter(|&&ns| ns >= 3).count();
-    let has_para_artifact_risk =
-        cfg.score_cfg.forbid_ca_less_excess_roots && total_bleached >= 1.5 && multi_slot_count >= 6;
+    // Generic CA-less artifact/excess-root filter activates on triple-resonance datasets
+    // (`multi_slot_count >= 6`) whenever `enable_generic_ca_less_filter` is enabled, even when
+    // no metal motif or `u_para` bleach prior is supplied (`total_bleached == 0.0`), provided
+    // missing HSQC roots leave unoccupied non-Pro slots (`systems.len() + 2 <= non_pro` or `total_bleached >= 1.5`).
+    let non_pro_assignable = sequence
+        .iter()
+        .skip(1)
+        .filter(|r| r.as_str() != "PRO")
+        .count();
+    let has_missing_amide_slack = systems.len() > non_pro_assignable
+        || systems.len() + 3 <= non_pro_assignable
+        || total_bleached >= 1.5;
+    let apply_ca_less_filter = cfg.enable_generic_ca_less_filter
+        && cfg.score_cfg.forbid_ca_less_excess_roots
+        && multi_slot_count >= 6
+        && has_missing_amide_slack;
 
     let max_sup: Vec<usize> = systems
         .iter()
@@ -860,7 +1806,7 @@ fn apply_paramagnetic_prior_to_unary(
                 .unwrap_or(0)
         })
         .collect();
-    let best_p: Vec<f64> = if has_para_artifact_risk {
+    let best_p: Vec<f64> = if apply_ca_less_filter {
         (0..u.rows)
             .map(|s| {
                 (0..u.rows)
@@ -882,20 +1828,22 @@ fn apply_paramagnetic_prior_to_unary(
             if sc <= FORBID * 0.5 {
                 continue;
             }
-            let pb = p_bleach.get(k).copied().unwrap_or(0.0);
-            if pb >= cfg.hard_bleach_cutoff {
-                u.set(s, k, FORBID);
-                continue;
-            } else if pb >= cfg.blind_zone_threshold {
-                if ns < 2 {
+            if cfg.enable_u_para_bleach_prior {
+                let pb = p_bleach.get(k).copied().unwrap_or(0.0);
+                if pb >= cfg.hard_bleach_cutoff {
                     u.set(s, k, FORBID);
                     continue;
+                } else if pb >= cfg.blind_zone_threshold {
+                    if ns < 2 {
+                        u.set(s, k, FORBID);
+                        continue;
+                    }
+                    let surv = (1.0 - pb).max(0.05);
+                    sc += cfg.bleach_prior_weight * surv.ln();
                 }
-                let surv = (1.0 - pb).max(0.05);
-                sc += cfg.bleach_prior_weight * surv.ln();
             }
 
-            if has_para_artifact_risk {
+            if apply_ca_less_filter {
                 let res_k = sequence.get(k).map(String::as_str).unwrap_or("");
                 let prev_pro = k > 0 && sequence.get(k - 1).is_some_and(|r| r == "PRO");
                 if !obs_ca[s] && res_k != "GLY" && !prev_pro {
@@ -916,9 +1864,9 @@ fn apply_paramagnetic_prior_to_unary(
 
 /// Verify whether a tentative placement `s` at blind-zone penumbra residue `k`
 /// ($0.65 \le p_{\text{bleach}}(k) < 0.85$) is genuinely corroborated by:
-/// 1. Positive intrinsic typing `U_base(s, k) >= 1.5` and `>= 2` observed carbon slots;
-/// 2. An unbroken sequential walk of length `>= 3` (`P >= 2.2` at each step) reaching at least
-///    one diamagnetic scaffold residue ($p_{\text{bleach}} < 0.65$);
+/// 1. Positive intrinsic typing `U_base(s, k) >= 2.5` and `>= 2` observed carbon slots;
+/// 2. An unbroken sequential walk of `>= 2` links (`>= 3` residues, `P >= 2.8` at each step) reaching
+///    at least one diamagnetic scaffold residue ($p_{\text{bleach}} < 0.65$);
 /// 3. When the dataset includes `CB(i-1)` strips (e.g. `CBCACONH`/`HNCACB`) and `sequence[k] != "GLY"`,
 ///    survival of `CB(k)` as `CB(-1)` on `s_{k+1}` (diagnosing absence of `PRE` aliphatic bleaching).
 #[allow(clippy::too_many_arguments)]
@@ -1025,6 +1973,10 @@ fn filter_blind_zones_and_reoptimize(
     user_locks: &[(usize, usize)],
     preserve_diamag_anchors: bool,
 ) -> (AssignResult, usize) {
+    if !cfg.enable_u_para_bleach_prior && !cfg.enable_generic_ca_less_filter {
+        return (res, 0);
+    }
+
     let k_len = sequence.len();
     let s_len = systems.len();
     let locked_set: BTreeSet<(usize, usize)> = user_locks.iter().copied().collect();
@@ -1052,7 +2004,20 @@ fn filter_blind_zones_and_reoptimize(
             continue;
         }
         let k = pos as usize;
-        if locked_set.contains(&(s, k)) || p_bleach[k] < cfg.blind_zone_threshold {
+        if locked_set.contains(&(s, k)) {
+            continue;
+        }
+        // Evict forbidden CA-less excess/artifact placements (important in EvoGraph mode where
+        // inner fragment evolution runs on `u_base`)
+        if cfg.enable_generic_ca_less_filter
+            && u_para.get(s, k) <= FORBID * 0.5
+            && u_base.get(s, k) > FORBID * 0.5
+            && (!cfg.enable_u_para_bleach_prior || p_bleach[k] < cfg.blind_zone_threshold)
+        {
+            rejected_pairs.push((s, k));
+            continue;
+        }
+        if !cfg.enable_u_para_bleach_prior || p_bleach[k] < cfg.blind_zone_threshold {
             continue;
         }
         if !penumbra_placement_is_corroborated(
@@ -1072,7 +2037,12 @@ fn filter_blind_zones_and_reoptimize(
         }
     }
 
-    let n_abstained = rejected_pairs.len();
+    let n_abstained = rejected_pairs
+        .iter()
+        .filter(|&&(_, k)| {
+            cfg.enable_u_para_bleach_prior && p_bleach[k] >= cfg.blind_zone_threshold
+        })
+        .count();
     if !rejected_pairs.is_empty() {
         let _ = preserve_diamag_anchors;
         // 1. Evict all uncorroborated placements inside the PRE blind zone to the null state (-1)
@@ -1094,7 +2064,10 @@ fn filter_blind_zones_and_reoptimize(
         for s_free in evicted_backbone_roots {
             let mut best_k: Option<(usize, f64)> = None;
             for k_open in 0..k_len {
-                if at[k_open] != -1 || p_bleach[k_open] >= cfg.blind_zone_threshold {
+                if at[k_open] != -1
+                    || (cfg.enable_u_para_bleach_prior
+                        && p_bleach[k_open] >= cfg.blind_zone_threshold)
+                {
                     continue;
                 }
                 let u_val = u_para.get(s_free, k_open);
@@ -1124,21 +2097,23 @@ fn filter_blind_zones_and_reoptimize(
     }
 
     // Calibrate confidences in the paramagnetic penumbra so partially broadened shells reflect uncertainty
-    for s in 0..s_len {
-        let pos = res.position[s];
-        if pos < 0 {
-            res.confidence[s] = 0.0;
-            continue;
-        }
-        let k = pos as usize;
-        if locked_set.contains(&(s, k)) {
-            continue;
-        }
-        let pb = p_bleach[k];
-        if pb >= cfg.blind_zone_threshold {
-            res.confidence[s] *= (1.0 - 0.35 * pb).clamp(0.50, 0.85);
-        } else if pb >= 0.35 {
-            res.confidence[s] *= (1.0 - 0.15 * (pb - 0.35)).clamp(0.85, 1.0);
+    if cfg.enable_u_para_bleach_prior {
+        for s in 0..s_len {
+            let pos = res.position[s];
+            if pos < 0 {
+                res.confidence[s] = 0.0;
+                continue;
+            }
+            let k = pos as usize;
+            if locked_set.contains(&(s, k)) {
+                continue;
+            }
+            let pb = p_bleach[k];
+            if pb >= cfg.blind_zone_threshold {
+                res.confidence[s] *= (1.0 - 0.35 * pb).clamp(0.50, 0.85);
+            } else if pb >= 0.35 {
+                res.confidence[s] *= (1.0 - 0.15 * (pb - 0.35)).clamp(0.85, 1.0);
+            }
         }
     }
 
@@ -1159,8 +2134,12 @@ pub fn assign_paramagnetic_backbone(
         .filter(|&k| p_bleach[k] >= cfg.blind_zone_threshold)
         .collect();
 
-    let (eff_priors, _) = prepare_scoring_priors(systems, sequence, priors, &cfg.score_cfg);
-    let mut raw_scfg = cfg.score_cfg.clone();
+    let mut eff_scfg = cfg.score_cfg.clone();
+    if !cfg.enable_generic_ca_less_filter {
+        eff_scfg.forbid_ca_less_excess_roots = false;
+    }
+    let (eff_priors, _) = prepare_scoring_priors(systems, sequence, priors, &eff_scfg);
+    let mut raw_scfg = eff_scfg;
     raw_scfg.auto_reference = false;
     let u_base = unary_matrix(systems, sequence, &eff_priors, &raw_scfg);
     let p_mat = pair_matrix(systems, &raw_scfg);
@@ -1229,8 +2208,12 @@ pub fn assign_paramagnetic_from_peaks(
             (systems, res, rep)
         }
         ParamagneticSolverMode::EvoGraph => {
+            let mut evo_scfg = cfg.score_cfg.clone();
+            if !cfg.enable_generic_ca_less_filter {
+                evo_scfg.forbid_ca_less_excess_roots = false;
+            }
             let evo_cfg = EvoGraphConfig {
-                score_cfg: cfg.score_cfg.clone(),
+                score_cfg: evo_scfg.clone(),
                 seed: cfg.seed,
                 ..Default::default()
             };
@@ -1239,7 +2222,7 @@ pub fn assign_paramagnetic_from_peaks(
                 assign_evo_graph_from_peaks(peaks, sequence, priors, &evo_cfg);
 
             let eff_priors = evo_rep.shifted_priors(priors);
-            let mut raw_scfg = cfg.score_cfg.clone();
+            let mut raw_scfg = evo_scfg;
             raw_scfg.auto_reference = false;
             let u_base = unary_matrix(&systems, sequence, &eff_priors, &raw_scfg);
             let p_mat = pair_matrix(&systems, &raw_scfg);
@@ -1862,22 +2845,65 @@ pub fn fit_pcs_tensor_svd(
     Ok(build_delta_chi_tensor(metal_pos_angstrom, x, cond, obs))
 }
 
-/// Fit the 5-parameter $\Delta\boldsymbol{\chi}$ tensor with Huber Iteratively Reweighted Least
-/// Squares (`IRLS`) + SVD to suppress misassigned or contact-shifted PCS outliers, propagating
-/// `coord_uncertainty_angstrom` when present.
+/// Exclude pseudocontact shift (`PCS`) observations that fall inside the paramagnetic `PRE` core
+/// blind sphere ($p_{\text{bleach}} \ge \text{hard\_bleach\_cutoff}$, default `0.85`) or inside the
+/// covalent Fermi-contact / breakdown shell ($r < 8.0\text{ Å}$) of a polynuclear `[Fe-S]` cluster
+/// (`Bertini, Luchinat & Parigi, Prog. NMR Spectrosc. 2002`).
+pub fn filter_pcs_observations_blind_zone(
+    obs: &[PcsObservation],
+    metal_coords: &[Vec3],
+    r_bleach_angstrom: f64,
+    is_fes_cluster: bool,
+    hard_bleach_cutoff: f64,
+) -> Vec<PcsObservation> {
+    if metal_coords.is_empty() {
+        return obs.to_vec();
+    }
+    obs.iter()
+        .copied()
+        .filter(|o| {
+            let r_min = metal_coords
+                .iter()
+                .map(|&m| v_dist(o.coord_angstrom, m))
+                .fold(f64::INFINITY, f64::min);
+            if is_fes_cluster && r_min < 8.0 {
+                return false;
+            }
+            if r_bleach_angstrom > 0.0 {
+                let gamma_ratio: f64 = metal_coords
+                    .iter()
+                    .map(|&m| (r_bleach_angstrom / v_dist(o.coord_angstrom, m).max(0.5)).powi(6))
+                    .sum();
+                let p_bleach = gamma_ratio / (1.0 + gamma_ratio);
+                if p_bleach >= hard_bleach_cutoff {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Fit the 5-parameter $\Delta\boldsymbol{\chi}$ tensor with standardized-residual Huber Iteratively
+/// Reweighted Least Squares (`IRLS`) + SVD to suppress misassigned or contact-shifted PCS outliers
+/// without double-downweighting high-uncertainty observations (`Huber 1964`; `Schmitz et al. 2008`).
+///
+/// Each observation residual is standardized by its propagated effective standard deviation
+/// $\sigma_{i,\text{eff}}$ (`uncertainty_ppm` $\oplus$ `coord_uncertainty_angstrom`):
+/// $$z_i = \frac{|\Delta\delta^{\text{obs}}_i - \Delta\delta^{\text{calc}}_i|}{\sigma_{i,\text{eff}}}, \qquad w_{\text{Huber}}(z_i) = \begin{cases} 1, & z_i \le k_{\text{Huber}}, \\ \sqrt{k_{\text{Huber}} / z_i}, & z_i > k_{\text{Huber}}. \end{cases}$$
 pub fn fit_pcs_tensor_robust(
     obs: &[PcsObservation],
     metal_pos_angstrom: Vec3,
-    huber_delta_ppm: f64,
+    huber_k: f64,
     max_iters: usize,
 ) -> Result<DeltaChiTensor, String> {
-    if !huber_delta_ppm.is_finite() || huber_delta_ppm <= 0.0 {
+    if !huber_k.is_finite() || huber_k <= 0.0 {
         return Err(format!(
-            "invalid huber_delta_ppm ({huber_delta_ppm}): must be finite and > 0"
+            "invalid huber_k ({huber_k}): dimensionless Huber threshold must be finite and > 0"
         ));
     }
     let init = fit_pcs_tensor_svd(obs, metal_pos_angstrom)?;
-    let delta = huber_delta_ppm.max(0.01);
+    let k = huber_k.max(1e-6);
     let mut x = init.components_5;
     let mut cond = init.condition_number;
 
@@ -1887,13 +2913,10 @@ pub fn fit_pcs_tensor_robust(
         for o in obs {
             let base_row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
             let pred: f64 = base_row.iter().zip(&x).map(|(&r, &c)| r * c).sum();
-            let resid = (o.pcs_ppm - pred).abs();
-            let base_w = 1.0 / effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
-            let huber_w = if resid <= delta {
-                1.0
-            } else {
-                (delta / resid).sqrt()
-            };
+            let sig_eff = effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
+            let z_i = (o.pcs_ppm - pred).abs() / sig_eff;
+            let base_w = 1.0 / sig_eff;
+            let huber_w = if z_i <= k { 1.0 } else { (k / z_i).sqrt() };
             let w = base_w * huber_w;
             let mut row = base_row;
             for v in &mut row {
@@ -1919,9 +2942,39 @@ pub fn fit_pcs_tensor_robust(
     Ok(build_delta_chi_tensor(metal_pos_angstrom, x, cond, obs))
 }
 
+/// Automatically exclude core blind-sphere ($p_{\text{bleach}} \ge \text{hard\_bleach\_cutoff}$) and
+/// `[Fe-S]` Fermi-contact ($r < 8.0\text{ Å}$) observations before fitting the 5-parameter
+/// $\Delta\boldsymbol{\chi}$ tensor via exact SVD (`huber_k == None`) or standardized Huber IRLS
+/// (`huber_k == Some(k)`), returning `(fitted_tensor, retained_observations)`.
+pub fn fit_pcs_tensor_paramagnetic(
+    obs: &[PcsObservation],
+    metal_pos_angstrom: Vec3,
+    metal_class: MetalParamagneticClass,
+    is_fes_cluster: bool,
+    r_bleach_override: Option<f64>,
+    hard_bleach_cutoff: f64,
+    huber_k: Option<f64>,
+) -> Result<(DeltaChiTensor, Vec<PcsObservation>), String> {
+    let r_bleach = r_bleach_override.unwrap_or_else(|| metal_class.default_r_bleach_angstrom());
+    let filtered = filter_pcs_observations_blind_zone(
+        obs,
+        &[metal_pos_angstrom],
+        r_bleach,
+        is_fes_cluster,
+        hard_bleach_cutoff,
+    );
+    let tensor = match huber_k {
+        Some(k) => fit_pcs_tensor_robust(&filtered, metal_pos_angstrom, k, 25)?,
+        None => fit_pcs_tensor_svd(&filtered, metal_pos_angstrom)?,
+    };
+    Ok((tensor, filtered))
+}
+
 /// Variable-projection (`VarPro`) 3D metal-position and 5-parameter $\Delta\boldsymbol{\chi}$-tensor
-/// refinement (`Schmitz et al. 2008`): coarse 3D grid search around `initial_metal_pos` followed by
-/// 3D Nelder–Mead simplex optimization, solving exact 5-component linear SVD at every candidate site.
+/// refinement (`Schmitz et al. 2008`) strictly bounded to the ball
+/// $\|\mathbf{x}_{\text{M}} - \text{initial\_metal\_pos}\|_2 \le \text{search\_radius\_angstrom}$:
+/// coarse 3D grid search around `initial_metal_pos` followed by constrained 3D Nelder–Mead simplex
+/// optimization, solving exact 5-component linear SVD at every candidate site.
 pub fn refine_metal_position_and_tensor(
     obs: &[PcsObservation],
     initial_metal_pos: Vec3,
@@ -1936,6 +2989,11 @@ pub fn refine_metal_position_and_tensor(
             "non-finite initial_metal_pos or grid parameter in VarPro PCS refinement".to_string(),
         );
     }
+    if search_radius_angstrom < 0.0 {
+        return Err(format!(
+            "negative search_radius_angstrom ({search_radius_angstrom}) in VarPro PCS refinement"
+        ));
+    }
     validate_pcs_observation_slice(obs, 8)?;
     if obs.len() < 8 {
         return Err(format!(
@@ -1943,8 +3001,15 @@ pub fn refine_metal_position_and_tensor(
             obs.len()
         ));
     }
+    if search_radius_angstrom == 0.0 {
+        return fit_pcs_tensor_svd(obs, initial_metal_pos);
+    }
 
+    let rad = search_radius_angstrom;
     let eval_chi2 = |m: Vec3| -> f64 {
+        if v_dist(m, initial_metal_pos) > rad + 1e-12 {
+            return 1e30;
+        }
         for o in obs {
             if v_dist(o.coord_angstrom, m) < 2.0 {
                 return 1e30;
@@ -1965,45 +3030,45 @@ pub fn refine_metal_position_and_tensor(
         }
     };
 
-    // Stage 1: Coarse 3D grid search
+    // Stage 1: Coarse 3D grid search inside ||dm||_2 <= rad
     let mut best_m = initial_metal_pos;
     let mut best_f = eval_chi2(initial_metal_pos);
-    let rad = search_radius_angstrom.max(0.0);
     let step = grid_step_angstrom.max(0.25);
-    if rad > 0.0 {
-        let n_steps = (rad / step).ceil() as isize;
-        for ix in -n_steps..=n_steps {
-            for iy in -n_steps..=n_steps {
-                for iz in -n_steps..=n_steps {
-                    let dm = [(ix as f64) * step, (iy as f64) * step, (iz as f64) * step];
-                    if dm[0] * dm[0] + dm[1] * dm[1] + dm[2] * dm[2] > rad * rad * 1.01 {
-                        continue;
-                    }
-                    let cand = [
-                        initial_metal_pos[0] + dm[0],
-                        initial_metal_pos[1] + dm[1],
-                        initial_metal_pos[2] + dm[2],
-                    ];
-                    let f = eval_chi2(cand);
-                    if f < best_f {
-                        best_f = f;
-                        best_m = cand;
-                    }
+    let n_steps = (rad / step).ceil() as isize;
+    for ix in -n_steps..=n_steps {
+        for iy in -n_steps..=n_steps {
+            for iz in -n_steps..=n_steps {
+                let dm = [(ix as f64) * step, (iy as f64) * step, (iz as f64) * step];
+                if dm[0] * dm[0] + dm[1] * dm[1] + dm[2] * dm[2] > rad * rad {
+                    continue;
+                }
+                let cand = [
+                    initial_metal_pos[0] + dm[0],
+                    initial_metal_pos[1] + dm[1],
+                    initial_metal_pos[2] + dm[2],
+                ];
+                let f = eval_chi2(cand);
+                if f < best_f {
+                    best_f = f;
+                    best_m = cand;
                 }
             }
         }
     }
 
-    // Stage 2: 3D Nelder-Mead simplex refinement
-    let init_delta = (step * 0.45).clamp(0.05, 0.6);
-    let mut simplex: [(Vec3, f64); 4] = [
-        (best_m, best_f),
-        ([best_m[0] + init_delta, best_m[1], best_m[2]], 0.0),
-        ([best_m[0], best_m[1] + init_delta, best_m[2]], 0.0),
-        ([best_m[0], best_m[1], best_m[2] + init_delta], 0.0),
-    ];
-    for item in simplex.iter_mut().skip(1) {
-        item.1 = eval_chi2(item.0);
+    // Stage 2: Constrained 3D Nelder-Mead simplex refinement inside ||m - initial_metal_pos||_2 <= rad
+    let init_delta = (step * 0.45).clamp(0.02, 0.6).min(0.5 * rad);
+    let mut simplex: [(Vec3, f64); 4] = [(best_m, best_f); 4];
+    for axis in 0..3 {
+        let mut v = best_m;
+        v[axis] += init_delta;
+        if v_dist(v, initial_metal_pos) > rad {
+            v[axis] = best_m[axis] - init_delta;
+            if v_dist(v, initial_metal_pos) > rad {
+                v[axis] = 0.5 * (best_m[axis] + initial_metal_pos[axis]);
+            }
+        }
+        simplex[axis + 1] = (v, eval_chi2(v));
     }
 
     for _iter in 0..200 {

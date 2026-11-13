@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use nmr_core::c13_detected::{
-    c13_obs_mhz, hz_to_ppm, intrinsic_amide_h_exchange_rate, n15_obs_mhz, pick_caco_2d,
-    pick_con_2d, pick_con_anchored_3d, simulate_h1_exchange_vs_c13_con, simulate_idp_13c_cubes,
-    C13DetectedExp, C13PickerConfig, CacoPeakKind, IdpCubeSimConfig,
+    c13_obs_mhz, fit_ncaco_1d_offset, hz_to_ppm, intrinsic_amide_h_exchange_rate, n15_obs_mhz,
+    pick_caco_2d, pick_con_2d, pick_con_anchored_3d, pick_con_anchored_3d_with_diagnostics,
+    pick_simulated_c13_dataset_with_diagnostics, simulate_h1_exchange_vs_c13_con,
+    simulate_idp_13c_cubes, C13DetectedExp, C13PickerConfig, CacoPeakKind, IdpCubeSimConfig,
+    C13_PICKER_WARN_DRIFT_C_PRIME_PPM, C13_PICKER_WARN_DRIFT_N15_PPM,
 };
 use nmr_core::nmrstar::{read_star, read_star_all_atoms, Reference};
 
@@ -403,4 +405,125 @@ fn test_p1_2_ipap_full_j_53_5_hz_satellites_suppressed_at_5_and_8_percent_on_p53
             picked.len()
         );
     }
+}
+
+#[test]
+fn test_ncaco_fit_1d_offset_explicitly_beats_zero_and_rejects_flat_noise() {
+    let ref_vals = [
+        171.35, 172.80, 173.62, 174.45, 175.18, 175.92, 176.74, 177.40,
+    ];
+
+    for &inj_drift in &[0.26f64, -0.31f64] {
+        let obs: Vec<f64> = ref_vals
+            .iter()
+            .enumerate()
+            .map(|(i, &c0)| c0 + inj_drift + ((i as f64) * 0.002 - 0.007))
+            .collect();
+        let fitted = fit_ncaco_1d_offset(&obs, &ref_vals, 0.40, 0.035);
+        assert!(
+            fitted.abs() > 0.22 && (fitted - inj_drift).abs() <= 0.015,
+            "fit_ncaco_1d_offset must beat zero and recover {inj_drift:+.3} ppm drift; got {fitted:+.4} ppm"
+        );
+    }
+
+    // Zero drift returns 0.0
+    let fitted_zero = fit_ncaco_1d_offset(&ref_vals, &ref_vals, 0.40, 0.035);
+    assert!(
+        fitted_zero.abs() < 0.008,
+        "zero-drift observations must remain at 0.0 ppm, got {fitted_zero:+.4}"
+    );
+
+    // Far out-of-window / uncorrelated observations where no shift in [-0.40, +0.40] beats d=0.0 -> exact 0.0
+    let far_obs = [165.0, 165.5, 166.0, 166.5, 182.0, 182.5];
+    let fitted_far = fit_ncaco_1d_offset(&far_obs, &ref_vals, 0.40, 0.035);
+    assert_eq!(
+        fitted_far, 0.0,
+        "unmatched observations must not hallucinate non-zero carrier offset"
+    );
+}
+
+#[test]
+fn test_picker_carrier_drift_boundary_warning_at_0_38_ppm_clamp() {
+    let root = workspace_root();
+    let ref_data = read_star_all_atoms(
+        root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+        None,
+    )
+    .unwrap();
+    let mut sub = Reference::new(
+        ref_data.sequence[..28].to_vec(),
+        ref_data.seq_ids[..28].to_vec(),
+    );
+    for ((i, atom), &val) in &ref_data.shifts {
+        if *i < 28 {
+            sub.shifts.insert((*i, atom.clone()), val);
+        }
+    }
+
+    // (a) Extreme carrier drift exceeding ±0.40 ppm C' / ±0.60 ppm N picker search bounds
+    let mut extreme_offsets = BTreeMap::new();
+    extreme_offsets.insert(C13DetectedExp::Canco3D, (0.45, -0.64, 0.05));
+    extreme_offsets.insert(C13DetectedExp::Ncaco3D, (-0.44, 0.63, 0.04));
+
+    let sim_extreme = IdpCubeSimConfig {
+        proton_mhz: 700.0,
+        con_grid: (640, 640),
+        cube_3d_grid: (112, 112, 128),
+        experiments: vec![
+            C13DetectedExp::Con2D,
+            C13DetectedExp::Canco3D,
+            C13DetectedExp::Ncaco3D,
+        ],
+        exp_offsets: extreme_offsets,
+        seed: 91,
+        ..IdpCubeSimConfig::default()
+    };
+    let cubes_ext = simulate_idp_13c_cubes(&sub, &sim_extreme);
+    let picker_cfg = C13PickerConfig::default();
+    let con_roots = pick_con_2d(&cubes_ext.con_2d, &picker_cfg);
+    let canco_cube = &cubes_ext
+        .cubes_3d
+        .iter()
+        .find(|&&(exp, _)| exp == C13DetectedExp::Canco3D)
+        .unwrap()
+        .1;
+
+    let (_, diag_canco) = pick_con_anchored_3d_with_diagnostics(
+        canco_cube,
+        C13DetectedExp::Canco3D,
+        &con_roots,
+        &picker_cfg,
+    );
+    assert!(
+        diag_canco.c_prime_clamp_hit || diag_canco.n15_clamp_hit,
+        "CANCO drift (+0.45 C', -0.64 N) must trigger picker clamp warning: {diag_canco:?}"
+    );
+    assert!(
+        diag_canco.d_c_prime_ppm.abs() >= C13_PICKER_WARN_DRIFT_C_PRIME_PPM
+            || diag_canco.d_n15_ppm.abs() >= C13_PICKER_WARN_DRIFT_N15_PPM
+    );
+    assert!(diag_canco.warning.is_some());
+
+    let (_, diags_ext) = pick_simulated_c13_dataset_with_diagnostics(&cubes_ext, &picker_cfg);
+    assert!(
+        diags_ext.iter().filter(|d| d.warning.is_some()).count() >= 2,
+        "Both CANCO and NCACO clamped drifts must surface warnings: {diags_ext:?}"
+    );
+
+    // (b) Moderate drift (+0.12 C', -0.15 N) must NOT emit false-positive clamp warnings
+    let mut mod_offsets = BTreeMap::new();
+    mod_offsets.insert(C13DetectedExp::Canco3D, (0.12, -0.15, 0.05));
+    mod_offsets.insert(C13DetectedExp::Ncaco3D, (-0.11, 0.14, 0.04));
+    let sim_mod = IdpCubeSimConfig {
+        exp_offsets: mod_offsets,
+        ..sim_extreme
+    };
+    let cubes_mod = simulate_idp_13c_cubes(&sub, &sim_mod);
+    let (_, diags_mod) = pick_simulated_c13_dataset_with_diagnostics(&cubes_mod, &picker_cfg);
+    assert!(
+        diags_mod
+            .iter()
+            .all(|d| d.warning.is_none() && !d.c_prime_clamp_hit && !d.n15_clamp_hit),
+        "Moderate drift inside ±0.38/±0.57 ppm must not emit clamp warnings: {diags_mod:?}"
+    );
 }

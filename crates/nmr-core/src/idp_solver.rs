@@ -37,8 +37,42 @@ pub const IDP_FORBID_HALF: f32 = -5.0e8;
 /// Maximum per-channel candidate shifts packed per `ConDipeptideSystem` for CPU/WebGPU scoring.
 pub const MAX_IDP_CANDS: usize = 6;
 
+/// Maximum deduplicated `13CB(i-1)` candidates retained per spin system and in global `dCB` fitting.
+pub const MAX_IDP_CB_CANDS: usize = 4;
+
 /// Maximum sidechain `(i-1)` aliphatic `13C` TOCSY peaks (`CCC(CO)N`) packed per system.
 pub const MAX_IDP_SC_CANDS: usize = 6;
+
+/// Hard upper bound on `S * K` (and `S * S`) IDP scoring matrix cells (`25,000,000` cells = `200 MB f64`)
+/// preventing unbounded host/GPU allocation on pathological peak lists or sequences.
+pub const MAX_IDP_MATRIX_CELLS: usize = 25_000_000;
+
+/// Maximum inter-experiment carrier-drift search half-width (`±0.70 ppm`) in `register_and_build_con_dipeptide_systems`.
+pub const SOLVER_MAX_INTER_EXP_DRIFT_PPM: f64 = 0.70;
+
+/// Boundary warning threshold (`|drift| >= 0.65 ppm`) indicating solver inter-experiment drift hit its `±0.70 ppm` clamp.
+pub const SOLVER_WARN_INTER_EXP_DRIFT_PPM: f64 = 0.65;
+
+/// Validate that `S * K` and `S * S` matrix dimensions stay within `MAX_IDP_MATRIX_CELLS`.
+pub fn check_idp_matrix_bounds(s_len: usize, k_len: usize) -> Result<usize, String> {
+    let sk = s_len
+        .checked_mul(k_len)
+        .ok_or_else(|| format!("IDP matrix S*K overflowed usize (S={s_len}, K={k_len})"))?;
+    if sk > MAX_IDP_MATRIX_CELLS {
+        return Err(format!(
+            "IDP unary matrix S*K = {sk} (S={s_len}, K={k_len}) exceeds cap {MAX_IDP_MATRIX_CELLS}"
+        ));
+    }
+    let ss = s_len
+        .checked_mul(s_len)
+        .ok_or_else(|| format!("IDP pair matrix S*S overflowed usize (S={s_len})"))?;
+    if ss > MAX_IDP_MATRIX_CELLS {
+        return Err(format!(
+            "IDP pair matrix S*S = {ss} (S={s_len}) exceeds cap {MAX_IDP_MATRIX_CELLS}"
+        ));
+    }
+    Ok(sk)
+}
 
 /// Peptide-bond dipeptide spin system anchored on `2D CON(i)` (`13C'(i-1)` – `15N(i)`),
 /// active across ALL residue boundaries `k = 1..L-1` including `-Xaa-Pro-` and `-Pro-Pro-`!
@@ -56,18 +90,19 @@ pub struct ConDipeptideSystem {
     pub ca_curr: Vec<f64>,
     /// Candidate preceding `13CA(i-1)` shifts in ppm (`CBCACON` / `CANCO` / `CCC(CO)N` / `CACO`).
     pub ca_prev: Vec<f64>,
-    /// Candidate preceding `13CB(i-1)` shifts in ppm (`CBCACON` / `CCC(CO)N`).
+    /// Candidate preceding `13CB(i-1)` shifts in ppm (`CBCACON` / `CCC(CO)N`, up to `MAX_IDP_CB_CANDS = 4`).
     pub cb_prev: Vec<f64>,
     /// Candidate intraresidue `13C'(i)` shifts in ppm (`NCACO` / `CACO`), linking into `CON(i+1).c_prev`.
     pub c_curr: Vec<f64>,
-    /// Candidate sequential `15N(i+1)` shifts in ppm linking into `CON(i+1).n_curr`.
-    pub n_next: Vec<f64>,
     /// Additional preceding `(i-1)` aliphatic sidechain carbons (`CG*, CD*, CE*` from `CCC(CO)N`).
     pub sidechain_c_prev: Vec<f64>,
     /// Unlabelled constant-time `2D CACO` opposite-phase `Gly` indicator at `c_prev`.
     pub prev_gly_opposite_phase: bool,
     /// True when `CBCACON` strip evidence was observed/acquired for this dataset.
     pub has_cbcacon_evidence: bool,
+    /// Inter-experiment carrier-drift boundary warnings detected during unlabelled assembly.
+    #[serde(default)]
+    pub registration_warnings: Vec<String>,
 }
 
 impl ConDipeptideSystem {
@@ -81,10 +116,10 @@ impl ConDipeptideSystem {
             ca_prev: Vec::new(),
             cb_prev: Vec::new(),
             c_curr: Vec::new(),
-            n_next: Vec::new(),
             sidechain_c_prev: Vec::new(),
             prev_gly_opposite_phase: false,
             has_cbcacon_evidence: false,
+            registration_warnings: Vec::new(),
         }
     }
 
@@ -144,10 +179,14 @@ pub struct IdpSolverConfig {
     /// Sequential inter-system matching tolerances `(ppm)` in `P(s, t)`.
     pub sigma_seq_ca: f64,
     pub sigma_seq_c: f64,
-    pub sigma_seq_n: f64,
-    /// Per-atom unary LLR floor (`default = -10.0`).
+    /// Candidate-multiplicity ambiguity penalty weight `w_mult` (`-w_mult * ln(n_compatible)` in
+    /// sequential `P(s, t)` on both CPU and WebGPU, `default = 0.35`).
+    pub w_mult: f64,
+    /// Optional upstream 3D picker carrier-drift clamp warnings propagated into `IdpAssignResult` QC.
+    pub picker_warnings: Vec<String>,
+    /// Per-atom unary LLR floor (`default = -5.5`).
     pub llr_floor: f64,
-    /// Sequential pair score floor (`default = -6.0`).
+    /// Sequential pair score floor (`default = -3.8`).
     pub pair_floor: f64,
     /// Number of trajectories (`replicas`, `default = 48`).
     pub replicas: usize,
@@ -178,7 +217,8 @@ impl Default for IdpSolverConfig {
             sigma_pro_n_rc: 1.15,
             sigma_seq_ca: 0.085,
             sigma_seq_c: 0.055,
-            sigma_seq_n: 0.14,
+            w_mult: 0.35,
+            picker_warnings: Vec::new(),
             llr_floor: -5.5,
             pair_floor: -3.8,
             replicas: 48,
@@ -200,6 +240,10 @@ pub struct IdpAssignResult {
     pub position: Vec<i32>,
     /// Monotone calibrated posterior confidence in `[0.0, 1.0]` for each `ConDipeptideSystem`.
     pub confidence: Vec<f64>,
+    /// Pre-calibration combined Boltzmann specificity + replica consensus score in `[0.0, 1.0]`
+    /// before monotone `IDP_CALIBRATION_KNOTS` mapping and post-calibration QC `Warn`/`Abstain` damping.
+    #[serde(default)]
+    pub raw_posterior: Vec<f64>,
     pub score: f64,
     pub run_scores: Vec<f64>,
     pub fitted_offsets: IdpShiftOffsets,
@@ -669,9 +713,8 @@ pub fn estimate_idp_reference_offsets(
             .filter(|v| v.is_finite() && (13.0..=73.5).contains(v))
             .collect();
         cb_s.sort_by(|a, b| a.total_cmp(b));
-        if let Some(&first_cb) = cb_s.first() {
-            obs_cb.push(first_cb);
-        }
+        cb_s.dedup_by(|a, b| (*a - *b).abs() < 0.06);
+        obs_cb.extend(cb_s.into_iter().take(MAX_IDP_CB_CANDS));
     }
     obs_ca.sort_by(|a, b| a.total_cmp(b));
     obs_cb.sort_by(|a, b| a.total_cmp(b));
@@ -713,11 +756,19 @@ pub fn estimate_idp_reference_offsets(
 // ============================================================================
 
 /// Estimate 1D relative drift `delta` (`obs ≈ ref + delta`) between two unlabelled shift sets
-/// via smooth Gaussian kernel cross-correlation over `[-max_shift, +max_shift]`.
-fn fit_unlabelled_pairwise_drift(diffs_sorted: &[f64], max_shift: f64, bw: f64) -> f64 {
+/// via smooth Gaussian kernel cross-correlation, probing out to `±probe_max_in` so drifts exceeding
+/// `±max_shift` (`±0.70 ppm`) are explicitly detected and clamped rather than missed in the tail.
+/// Returns `(clamped_d, raw_d)`.
+fn fit_unlabelled_pairwise_drift(
+    diffs_sorted: &[f64],
+    max_shift: f64,
+    probe_max_in: f64,
+    bw: f64,
+) -> (f64, f64) {
     if diffs_sorted.len() < 4 {
-        return 0.0;
+        return (0.0, 0.0);
     }
+    let probe_max = probe_max_in.max(max_shift);
     let eval = |d: f64| -> f64 {
         let mut s = 0.0f64;
         for &df in diffs_sorted {
@@ -731,8 +782,8 @@ fn fit_unlabelled_pairwise_drift(diffs_sorted: &[f64], max_shift: f64, bw: f64) 
     let base = eval(0.0);
     let mut best_d = 0.0f64;
     let mut best_s = base;
-    for step in -100i32..=100 {
-        let d = (step as f64) * (max_shift / 100.0);
+    for step in -140i32..=140 {
+        let d = (step as f64) * (probe_max / 140.0);
         let sc = eval(d);
         if sc > best_s {
             best_s = sc;
@@ -741,7 +792,7 @@ fn fit_unlabelled_pairwise_drift(diffs_sorted: &[f64], max_shift: f64, bw: f64) 
     }
     let d0 = best_d;
     for step in -10i32..=10 {
-        let d = (d0 + (step as f64) * 0.002).clamp(-max_shift, max_shift);
+        let d = (d0 + (step as f64) * 0.002).clamp(-probe_max, probe_max);
         let sc = eval(d);
         if sc > best_s {
             best_s = sc;
@@ -749,9 +800,9 @@ fn fit_unlabelled_pairwise_drift(diffs_sorted: &[f64], max_shift: f64, bw: f64) 
         }
     }
     if best_s > base * 1.05 && best_d.abs() >= 0.01 {
-        best_d
+        (best_d.clamp(-max_shift, max_shift), best_d)
     } else {
-        0.0
+        (0.0, 0.0)
     }
 }
 
@@ -776,6 +827,16 @@ pub fn register_and_build_con_dipeptide_systems(
     if n_roots == 0 {
         return Vec::new();
     }
+
+    let mut reg_warnings: Vec<String> = Vec::new();
+    let mut record_drift_warn = |label: &str, clamped_d: f64, raw_d: f64| {
+        if raw_d.abs() >= SOLVER_WARN_INTER_EXP_DRIFT_PPM {
+            reg_warnings.push(format!(
+                "Solver inter-experiment drift hit/approached ±{:.2} ppm clamp ({label}: fitted {raw_d:+.3} ppm, applied {clamped_d:+.3} ppm); verify spectrum carrier calibration",
+                SOLVER_MAX_INTER_EXP_DRIFT_PPM
+            ));
+        }
+    };
 
     // Group 3D strip peaks by `(exp, anchor_root_idx)` and collect unanchored `NCACO` peaks
     let mut canco_by_root: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n_roots];
@@ -811,134 +872,73 @@ pub fn register_and_build_con_dipeptide_systems(
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct RawNcacoCand {
-        c_p: f64,
-        ca_p: f64,
-        height: f64,
-        dn_abs: f64,
-        is_unanch: bool,
-    }
-
-    // Unsupervised `15N` plane registration for `3D NCACO` peaks onto `picked.con_roots`,
-    // retaining `|n_corr - root.n_curr_ppm|` (`dn_abs`) so crowded Proline imino clusters
-    // (`~45` Prolines inside `135.5–138 ppm`) rank exact `15N` matches ahead of neighbors!
-    let mut ncaco_raw_by_root: Vec<Vec<RawNcacoCand>> = vec![Vec::new(); n_roots];
-    if !anchored_ncaco.is_empty() {
-        let mut diffs_anch_n = Vec::new();
-        for &(r_idx, _, n_p, _, _) in &anchored_ncaco {
-            let df = n_p - picked.con_roots[r_idx].n_curr_ppm;
-            if df.abs() <= 0.65 {
-                diffs_anch_n.push(df);
-            }
-        }
-        diffs_anch_n.sort_by(|a, b| a.total_cmp(b));
-        let d_ncaco_n_anch = fit_unlabelled_pairwise_drift(&diffs_anch_n, 0.50, 0.055);
-        for &(r_idx, c_p, n_p, ca_p, height) in &anchored_ncaco {
-            let dn_abs = ((n_p - d_ncaco_n_anch) - picked.con_roots[r_idx].n_curr_ppm).abs();
-            ncaco_raw_by_root[r_idx].push(RawNcacoCand {
-                c_p,
-                ca_p,
-                height,
-                dn_abs,
-                is_unanch: false,
-            });
-        }
-    }
-    if !unanchored_ncaco.is_empty() {
-        let mut diffs_nc_n = Vec::new();
-        for &(_, n_p, _, _) in &unanchored_ncaco {
-            for r in &picked.con_roots {
-                let df = n_p - r.n_curr_ppm;
-                if df.abs() <= 0.95 {
-                    diffs_nc_n.push(df);
-                }
-            }
-        }
-        diffs_nc_n.sort_by(|a, b| a.total_cmp(b));
-        let d_ncaco_n = fit_unlabelled_pairwise_drift(&diffs_nc_n, 0.75, 0.055);
-        for &(c_p, n_p, ca_p, height) in &unanchored_ncaco {
-            let n_corr = n_p - d_ncaco_n;
-            for (r_idx, r) in picked.con_roots.iter().enumerate() {
-                let dn_abs = (n_corr - r.n_curr_ppm).abs();
-                if dn_abs <= 0.15 {
-                    ncaco_raw_by_root[r_idx].push(RawNcacoCand {
-                        c_p,
-                        ca_p,
-                        height,
-                        dn_abs,
-                        is_unanch: true,
-                    });
-                }
-            }
-        }
-    }
-
-    // 1. Align `CBCACON`, `CCC(CO)N`, and `NCACO` indirect aliphatic axes onto `CANCO`'s `13CA` frame
+    // 1. Align `CBCACON` and `CCC(CO)N` indirect aliphatic axes onto `CANCO`'s `13CA` frame first
     let has_canco = canco_by_root.iter().any(|v| !v.is_empty());
     let mut diffs_cbca_vs_canco = Vec::new();
-    let mut diffs_cccon_vs_ref = Vec::new();
-    let mut diffs_ncaco_vs_canco = Vec::new();
-
     if has_canco {
         for r in 0..n_roots {
             for &(ca_cb, sgn, _) in &cbca_by_root[r] {
-                if sgn >= 0 && (40.0..=69.5).contains(&ca_cb) {
+                if sgn >= 0 && (39.0..=71.0).contains(&ca_cb) {
                     for &(ca_cn, _) in &canco_by_root[r] {
                         let df = ca_cb - ca_cn;
-                        if df.abs() <= 0.95 {
+                        if df.abs() <= 1.80 {
                             diffs_cbca_vs_canco.push(df);
                         }
-                    }
-                }
-            }
-            for nc_c in &ncaco_raw_by_root[r] {
-                for &(ca_cn, _) in &canco_by_root[r] {
-                    let df = nc_c.ca_p - ca_cn;
-                    if df.abs() <= 0.95 {
-                        diffs_ncaco_vs_canco.push(df);
                     }
                 }
             }
         }
     }
     diffs_cbca_vs_canco.sort_by(|a, b| a.total_cmp(b));
-    diffs_ncaco_vs_canco.sort_by(|a, b| a.total_cmp(b));
-    let d_cbca_aliph = fit_unlabelled_pairwise_drift(&diffs_cbca_vs_canco, 0.75, 0.045);
-    let d_ncaco_ca = fit_unlabelled_pairwise_drift(&diffs_ncaco_vs_canco, 0.75, 0.045);
+    let (d_cbca_aliph, raw_cbca_aliph) = fit_unlabelled_pairwise_drift(
+        &diffs_cbca_vs_canco,
+        SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+        1.60,
+        0.045,
+    );
+    record_drift_warn("CBCACON_aliph", d_cbca_aliph, raw_cbca_aliph);
 
+    let mut diffs_cccon_vs_ref = Vec::new();
     for r in 0..n_roots {
         for &(c_cc, _) in &cccon_by_root[r] {
             for &(ca_cn, _) in &canco_by_root[r] {
                 let df = c_cc - ca_cn;
-                if df.abs() <= 0.65 {
+                if df.abs() <= 1.80 {
                     diffs_cccon_vs_ref.push(df);
                 }
             }
             for &(c_cb, _, _) in &cbca_by_root[r] {
                 let df = c_cc - (c_cb - d_cbca_aliph);
-                if df.abs() <= 0.65 {
+                if df.abs() <= 1.80 {
                     diffs_cccon_vs_ref.push(df);
                 }
             }
         }
     }
     diffs_cccon_vs_ref.sort_by(|a, b| a.total_cmp(b));
-    let d_cccon_aliph = fit_unlabelled_pairwise_drift(&diffs_cccon_vs_ref, 0.45, 0.045);
+    let (d_cccon_aliph, raw_cccon_aliph) = fit_unlabelled_pairwise_drift(
+        &diffs_cccon_vs_ref,
+        SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+        1.60,
+        0.045,
+    );
+    record_drift_warn("CCCON_aliph", d_cccon_aliph, raw_cccon_aliph);
 
-    // 2. Align `2D CACO` `(C', CA)` onto `(CON C', CANCO/CBCACON CA)` frame
+    // 2. Align `2D CACO` `(C', CA)` onto `(CON C', CANCO/CBCACON CA)` frame BEFORE `NCACO` gating
     let (d_caco_c, d_caco_ca) = if picked.caco_peaks.len() >= 5 {
         let mut diffs_c = Vec::new();
         for cp in &picked.caco_peaks {
             for r in &picked.con_roots {
                 let df = cp.c_curr_ppm - r.c_prev_ppm;
-                if df.abs() <= 0.55 {
+                if df.abs() <= 0.90 {
                     diffs_c.push(df);
                 }
             }
         }
         diffs_c.sort_by(|a, b| a.total_cmp(b));
-        let dc = fit_unlabelled_pairwise_drift(&diffs_c, 0.45, 0.035);
+        let (dc, raw_dc) =
+            fit_unlabelled_pairwise_drift(&diffs_c, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.035);
+        record_drift_warn("CACO_C'", dc, raw_dc);
 
         let mut diffs_ca = Vec::new();
         for cp in &picked.caco_peaks {
@@ -947,14 +947,14 @@ pub fn register_and_build_con_dipeptide_systems(
                 if (c_corr - r.c_prev_ppm).abs() <= 0.06 {
                     for &(ca_cn, _) in &canco_by_root[r_idx] {
                         let df = cp.ca_curr_ppm - ca_cn;
-                        if df.abs() <= 0.65 {
+                        if df.abs() <= 1.80 {
                             diffs_ca.push(df);
                         }
                     }
                     for &(ca_cb, sgn, _) in &cbca_by_root[r_idx] {
                         if sgn >= 0 {
                             let df = cp.ca_curr_ppm - (ca_cb - d_cbca_aliph);
-                            if df.abs() <= 0.65 {
+                            if df.abs() <= 1.80 {
                                 diffs_ca.push(df);
                             }
                         }
@@ -963,19 +963,13 @@ pub fn register_and_build_con_dipeptide_systems(
             }
         }
         diffs_ca.sort_by(|a, b| a.total_cmp(b));
-        let dca = fit_unlabelled_pairwise_drift(&diffs_ca, 0.45, 0.045);
+        let (dca, raw_dca) =
+            fit_unlabelled_pairwise_drift(&diffs_ca, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 1.60, 0.045);
+        record_drift_warn("CACO_CA", dca, raw_dca);
         (dc, dca)
     } else {
         (0.0, 0.0)
     };
-
-    let any_cbcacon = cbca_by_root.iter().any(|v| !v.is_empty());
-    let any_cccon = cccon_by_root.iter().any(|v| !v.is_empty());
-    let any_con_3d = has_canco || any_cbcacon || any_cccon;
-    let has_both_signs_cbca = picked
-        .strip_peaks
-        .iter()
-        .any(|p| p.exp == C13DetectedExp::Cbcaco3D && p.sign < 0);
 
     let caco_corr: Vec<(f64, f64, CacoPeakKind, f64)> = picked
         .caco_peaks
@@ -990,11 +984,96 @@ pub fn register_and_build_con_dipeptide_systems(
         })
         .collect();
 
-    // Unsupervised `13C'` registration for `3D NCACO` (separately for unanchored vs pre-anchored peaks)
-    // using 2D `(C', CA)` agreement against `caco_corr` when available, or 1D `C'` vs `con_roots`.
-    let fit_ncaco_c_drift = |pks: &[(f64, f64)]| -> f64 {
+    // 3. Unsupervised `(15N, 13CA, 13C')` registration for `3D NCACO` followed by joint `(N, CA_i)`
+    // attachment and fanout-multiplicity downweighting so degenerate `15N` planes never broadcast
+    // spurious or neighboring `NCACO` peaks unpenalized across unrelated `CON` roots!
+    let d_ncaco_n_anch = if !anchored_ncaco.is_empty() {
+        let mut diffs_anch_n = Vec::new();
+        for &(r_idx, _, n_p, _, _) in &anchored_ncaco {
+            let df = n_p - picked.con_roots[r_idx].n_curr_ppm;
+            if df.abs() <= 1.80 {
+                diffs_anch_n.push(df);
+            }
+        }
+        diffs_anch_n.sort_by(|a, b| a.total_cmp(b));
+        let (d, raw_d) = fit_unlabelled_pairwise_drift(
+            &diffs_anch_n,
+            SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+            1.60,
+            0.055,
+        );
+        record_drift_warn("NCACO_anch_N", d, raw_d);
+        d
+    } else {
+        0.0
+    };
+
+    let d_ncaco_n_unanch = if !unanchored_ncaco.is_empty() {
+        let mut diffs_nc_n = Vec::new();
+        for &(_, n_p, _, _) in &unanchored_ncaco {
+            for r in &picked.con_roots {
+                let df = n_p - r.n_curr_ppm;
+                if df.abs() <= 0.92 {
+                    diffs_nc_n.push(df);
+                }
+            }
+        }
+        diffs_nc_n.sort_by(|a, b| a.total_cmp(b));
+        let (d, raw_d) =
+            fit_unlabelled_pairwise_drift(&diffs_nc_n, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.055);
+        record_drift_warn("NCACO_unanch_N", d, raw_d);
+        d
+    } else {
+        0.0
+    };
+
+    let mut diffs_ncaco_vs_canco = Vec::new();
+    if has_canco {
+        for &(r_idx, _, n_p, ca_p, _) in &anchored_ncaco {
+            if ((n_p - d_ncaco_n_anch) - picked.con_roots[r_idx].n_curr_ppm).abs() <= 0.16 {
+                for &(ca_cn, _) in &canco_by_root[r_idx] {
+                    let df = ca_p - ca_cn;
+                    if df.abs() <= 1.80 {
+                        diffs_ncaco_vs_canco.push(df);
+                    }
+                }
+            }
+        }
+        for &(_, n_p, ca_p, _) in &unanchored_ncaco {
+            let n_corr = n_p - d_ncaco_n_unanch;
+            for (r_idx, r) in picked.con_roots.iter().enumerate() {
+                if (n_corr - r.n_curr_ppm).abs() <= 0.14 {
+                    for &(ca_cn, _) in &canco_by_root[r_idx] {
+                        let df = ca_p - ca_cn;
+                        if df.abs() <= 1.80 {
+                            diffs_ncaco_vs_canco.push(df);
+                        }
+                    }
+                }
+            }
+        }
+    } else if !caco_corr.is_empty() {
+        for &(_, _, ca_p, _) in &unanchored_ncaco {
+            for &(_, ca_co, _, _) in &caco_corr {
+                let df = ca_p - ca_co;
+                if df.abs() <= 0.92 {
+                    diffs_ncaco_vs_canco.push(df);
+                }
+            }
+        }
+    }
+    diffs_ncaco_vs_canco.sort_by(|a, b| a.total_cmp(b));
+    let (d_ncaco_ca, raw_ncaco_ca) = fit_unlabelled_pairwise_drift(
+        &diffs_ncaco_vs_canco,
+        SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+        0.90,
+        0.045,
+    );
+    record_drift_warn("NCACO_CA", d_ncaco_ca, raw_ncaco_ca);
+
+    let fit_ncaco_c_drift = |pks: &[(f64, f64)]| -> (f64, f64) {
         if pks.len() < 4 {
-            return 0.0;
+            return (0.0, 0.0);
         }
         let mut diffs = Vec::new();
         if caco_corr.len() >= 5 {
@@ -1003,7 +1082,7 @@ pub fn register_and_build_con_dipeptide_systems(
                 for &(c_co, ca_co, _, _) in &caco_corr {
                     if (ca_corr - ca_co).abs() <= 0.16 {
                         let df = c_p - c_co;
-                        if df.abs() <= 0.80 {
+                        if df.abs() <= 0.90 {
                             diffs.push(df);
                         }
                     }
@@ -1014,21 +1093,22 @@ pub fn register_and_build_con_dipeptide_systems(
             for &(c_p, _) in pks {
                 for r in &picked.con_roots {
                     let df = c_p - r.c_prev_ppm;
-                    if df.abs() <= 0.80 {
+                    if df.abs() <= 0.90 {
                         diffs.push(df);
                     }
                 }
             }
         }
         diffs.sort_by(|a, b| a.total_cmp(b));
-        fit_unlabelled_pairwise_drift(&diffs, 0.65, 0.035)
+        fit_unlabelled_pairwise_drift(&diffs, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.035)
     };
 
     let unanch_pairs: Vec<(f64, f64)> = unanchored_ncaco
         .iter()
         .map(|&(c_p, _, ca_p, _)| (c_p, ca_p))
         .collect();
-    let d_ncaco_c_unanch = fit_ncaco_c_drift(&unanch_pairs);
+    let (d_ncaco_c_unanch, raw_ncaco_c_unanch) = fit_ncaco_c_drift(&unanch_pairs);
+    record_drift_warn("NCACO_unanch_C'", d_ncaco_c_unanch, raw_ncaco_c_unanch);
 
     let mut uniq_anch_pairs: Vec<(f64, f64)> = anchored_ncaco
         .iter()
@@ -1036,7 +1116,180 @@ pub fn register_and_build_con_dipeptide_systems(
         .collect();
     uniq_anch_pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
     uniq_anch_pairs.dedup_by(|a, b| (a.0 - b.0).abs() <= 0.005 && (a.1 - b.1).abs() <= 0.01);
-    let d_ncaco_c_anch = fit_ncaco_c_drift(&uniq_anch_pairs);
+    let (d_ncaco_c_anch, raw_ncaco_c_anch) = fit_ncaco_c_drift(&uniq_anch_pairs);
+    record_drift_warn("NCACO_anch_C'", d_ncaco_c_anch, raw_ncaco_c_anch);
+
+    #[derive(Clone, Copy)]
+    struct ValidatedNcacoCand {
+        c_corr: f64,
+        ca_corr: f64,
+        height_eff: f64,
+        dn_abs: f64,
+    }
+
+    let mut ncaco_by_root: Vec<Vec<ValidatedNcacoCand>> = vec![Vec::new(); n_roots];
+
+    // Helper: count distinct CANCO shifts at root `r_idx` (after 0.08 ppm dedup) so we know
+    // whether CANCO already observed both `CA(i)` and `CA(i-1)` (`>= 2`) vs had a dropout (`< 2`).
+    let canco_distinct_counts: Vec<usize> = (0..n_roots)
+        .map(|r| {
+            let mut v: Vec<f64> = canco_by_root[r].iter().map(|x| x.0).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            v.dedup_by(|a, b| (*a - *b).abs() <= 0.08);
+            v.len()
+        })
+        .collect();
+
+    // (a) Attach pre-anchored `NCACO` peaks with joint `(N, CA_i)` compatibility + fanout penalty
+    if !anchored_ncaco.is_empty() {
+        // Group identical underlying 3D NCACO peaks emitted across multiple roots sharing a `15N` slice
+        let mut grouped: Vec<(f64, f64, f64, f64, Vec<usize>)> = Vec::new();
+        for &(r_idx, c_p, n_p, ca_p, height) in &anchored_ncaco {
+            if let Some(g) = grouped.iter_mut().find(|g| {
+                (g.0 - c_p).abs() <= 0.004
+                    && (g.1 - n_p).abs() <= 0.008
+                    && (g.2 - ca_p).abs() <= 0.008
+            }) {
+                if !g.4.contains(&r_idx) {
+                    g.4.push(r_idx);
+                }
+            } else {
+                grouped.push((c_p, n_p, ca_p, height, vec![r_idx]));
+            }
+        }
+
+        for (c_p, n_p, ca_p, height, cand_roots) in grouped {
+            let c_corr = c_p - d_ncaco_c_anch;
+            let n_corr = n_p - d_ncaco_n_anch;
+            let ca_corr = ca_p - d_ncaco_ca;
+            let has_caco_corrob = caco_corr.is_empty()
+                || caco_corr.iter().any(|&(cc, cac, _, _)| {
+                    (cc - c_corr).abs() <= 0.065 && (cac - ca_corr).abs() <= 0.15
+                });
+
+            let mut root_hits: Vec<(usize, f64, bool)> = Vec::new();
+            for &r_idx in &cand_roots {
+                let dn_abs = (n_corr - picked.con_roots[r_idx].n_curr_ppm).abs();
+                let ca_match = canco_by_root[r_idx]
+                    .iter()
+                    .any(|&(ca_cn, _)| (ca_cn - ca_corr).abs() <= 0.22);
+                root_hits.push((r_idx, dn_abs, ca_match));
+            }
+            let any_ca_match = root_hits.iter().any(|h| h.2);
+            let kept: Vec<(usize, f64)> = root_hits
+                .into_iter()
+                .filter_map(|(r_idx, dn_abs, ca_match)| {
+                    if !has_canco {
+                        has_caco_corrob.then_some((r_idx, dn_abs))
+                    } else if any_ca_match {
+                        (ca_match || (canco_distinct_counts[r_idx] < 2 && dn_abs <= 0.045))
+                            .then_some((r_idx, dn_abs))
+                    } else if has_caco_corrob
+                        && (canco_distinct_counts[r_idx] < 2 || cand_roots.len() == 1)
+                    {
+                        Some((r_idx, dn_abs))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let fanout = kept.len().max(1) as f64;
+            let h_eff = height / fanout.powf(0.65);
+            for (r_idx, dn_abs) in kept {
+                ncaco_by_root[r_idx].push(ValidatedNcacoCand {
+                    c_corr,
+                    ca_corr,
+                    height_eff: h_eff,
+                    dn_abs,
+                });
+            }
+        }
+    }
+
+    // (b) Attach unanchored `3D NCACO` peaks strictly via joint `(N, CA_i)` gating + fanout penalty
+    for &(c_p, n_p, ca_p, height) in &unanchored_ncaco {
+        let c_corr = c_p - d_ncaco_c_unanch;
+        let n_corr = n_p - d_ncaco_n_unanch;
+        let ca_corr = ca_p - d_ncaco_ca;
+        let has_caco_corrob = caco_corr.is_empty()
+            || caco_corr.iter().any(|&(cc, cac, _, _)| {
+                (cc - c_corr).abs() <= 0.080 && (cac - ca_corr).abs() <= 0.18
+            });
+
+        let mut root_hits: Vec<(usize, f64, bool)> = Vec::new();
+        for (r_idx, r) in picked.con_roots.iter().enumerate() {
+            let dn_tol = if r.is_proline_imino_region {
+                0.16
+            } else {
+                0.145
+            };
+            let dn_abs = (n_corr - r.n_curr_ppm).abs();
+            if dn_abs <= dn_tol {
+                let ca_match = canco_by_root[r_idx]
+                    .iter()
+                    .any(|&(ca_cn, _)| (ca_cn - ca_corr).abs() <= 0.24);
+                root_hits.push((r_idx, dn_abs, ca_match));
+            }
+        }
+        if root_hits.is_empty() {
+            continue;
+        }
+
+        let any_ca_match = root_hits.iter().any(|h| h.2);
+        let mut kept: Vec<(usize, f64)> = if !has_canco {
+            if has_caco_corrob {
+                root_hits
+                    .into_iter()
+                    .filter(|&(_, dn_abs, _)| dn_abs <= 0.12)
+                    .map(|(r, dn, _)| (r, dn))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else if any_ca_match {
+            root_hits
+                .into_iter()
+                .filter(|&(r_idx, dn_abs, ca_match)| {
+                    ca_match || (canco_distinct_counts[r_idx] < 2 && dn_abs <= 0.065)
+                })
+                .map(|(r, dn, _)| (r, dn))
+                .collect()
+        } else {
+            // Rescue path when `CA(i)` dropped out in `CANCO` (or BMRB/experimental CACO also missed
+            // the residue): only attach to roots that lack a full 2-peak `CANCO` pair (`< 2`)!
+            let max_dn_rescue = if has_caco_corrob { 0.125 } else { 0.075 };
+            let mut rescue: Vec<(usize, f64)> = root_hits
+                .into_iter()
+                .filter(|&(r_idx, dn_abs, _)| {
+                    canco_distinct_counts[r_idx] < 2 && dn_abs <= max_dn_rescue
+                })
+                .map(|(r, dn, _)| (r, dn))
+                .collect();
+            rescue.sort_by(|a, b| a.1.total_cmp(&b.1));
+            rescue.truncate(if has_caco_corrob { 2 } else { 1 });
+            rescue
+        };
+
+        kept.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let fanout = kept.len().max(1) as f64;
+        let h_eff = height / fanout.powf(0.65);
+        for (r_idx, dn_abs) in kept {
+            ncaco_by_root[r_idx].push(ValidatedNcacoCand {
+                c_corr,
+                ca_corr,
+                height_eff: h_eff,
+                dn_abs,
+            });
+        }
+    }
+
+    let any_cbcacon = cbca_by_root.iter().any(|v| !v.is_empty());
+    let any_cccon = cccon_by_root.iter().any(|v| !v.is_empty());
+    let any_con_3d = has_canco || any_cbcacon || any_cccon;
+    let has_both_signs_cbca = picked
+        .strip_peaks
+        .iter()
+        .any(|p| p.exp == C13DetectedExp::Cbcaco3D && p.sign < 0);
 
     // Compute unlabelled median `2D CON` root height and median primary `CON`-anchored 3D peak
     // height to suppress spurious 2D thermal noise roots even when a single weak 3D noise spike lands nearby.
@@ -1062,16 +1315,12 @@ pub fn register_and_build_con_dipeptide_systems(
         .copied()
         .unwrap_or(0.0);
 
-    // 3. Assemble per-root `ConDipeptideSystem`
+    // 4. Assemble per-root `ConDipeptideSystem`
     let mut systems = Vec::with_capacity(n_roots);
     for (r_idx, root) in picked.con_roots.iter().enumerate() {
         let mut sys = ConDipeptideSystem::new(r_idx, root.c_prev_ppm, root.n_curr_ppm, root.height);
         sys.has_cbcacon_evidence = any_cbcacon;
 
-        // If `CON`-anchored 3D cubes (`CANCO`, `CBCACON`, `CCC(CO)N`) were acquired and this `2D CON`
-        // root has zero strip peaks (or only a single sub-threshold thermal spike on a weak 2D root),
-        // keep it as a 3D-unsupported root (`n_3d_ch == 0`) instead of fabricating chimera shifts
-        // from 1D `C'` (`CACO`) or 1D `N` (`NCACO`) coincidences.
         let n_con_3d_pks =
             canco_by_root[r_idx].len() + cbca_by_root[r_idx].len() + cccon_by_root[r_idx].len();
         let max_root_3d_h = canco_by_root[r_idx]
@@ -1106,21 +1355,9 @@ pub fn register_and_build_con_dipeptide_systems(
             .collect();
         cccon.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.total_cmp(&b.0)));
 
-        let mut ncaco: Vec<(f64, f64, f64, f64)> = ncaco_raw_by_root[r_idx]
+        let mut ncaco: Vec<(f64, f64, f64, f64)> = ncaco_by_root[r_idx]
             .iter()
-            .map(|nc_c| {
-                let dc_nc = if nc_c.is_unanch {
-                    d_ncaco_c_unanch
-                } else {
-                    d_ncaco_c_anch
-                };
-                (
-                    nc_c.c_p - dc_nc,
-                    nc_c.ca_p - d_ncaco_ca,
-                    nc_c.height,
-                    nc_c.dn_abs,
-                )
-            })
+            .map(|nc_c| (nc_c.c_corr, nc_c.ca_corr, nc_c.height_eff, nc_c.dn_abs))
             .collect();
         ncaco.sort_by(|a, b| {
             b.2.total_cmp(&a.2)
@@ -1128,8 +1365,7 @@ pub fn register_and_build_con_dipeptide_systems(
                 .then_with(|| a.0.total_cmp(&b.0))
         });
 
-        // (a) Extract `CA(i-1)` and `CB(i-1)` from `CBCACON`, suppressing <0.35x noise spikes
-        // when a strong primary peak is already present in that single-atom channel
+        // (a) Extract `CA(i-1)` and up to `MAX_IDP_CB_CANDS` (`4`) `CB(i-1)` candidates from `CBCACON`
         let max_pos_cbca = cbca
             .iter()
             .filter(|&&(_, s, _)| s >= 0)
@@ -1151,31 +1387,29 @@ pub fn register_and_build_con_dipeptide_systems(
                     && (13.0..=73.5).contains(&val)
                     && (sys.cb_prev.is_empty() || h >= 0.35 * max_neg_cbca)
                 {
-                    dedup_push(&mut sys.cb_prev, val, 0.11, MAX_IDP_CANDS);
+                    dedup_push(&mut sys.cb_prev, val, 0.11, MAX_IDP_CB_CANDS);
                 }
             } else if (41.5..=65.5).contains(&val) && sys.ca_prev.is_empty() {
                 dedup_push(&mut sys.ca_prev, val, 0.09, MAX_IDP_CANDS);
             } else if (13.0..=73.5).contains(&val) {
-                dedup_push(&mut sys.cb_prev, val, 0.11, MAX_IDP_CANDS);
+                dedup_push(&mut sys.cb_prev, val, 0.11, MAX_IDP_CB_CANDS);
             }
         }
 
-        // (b) Check `2D CACO` at `c_prev` (`|c_caco - c_prev| <= 0.045 ppm`) for `Gly` opposite-phase
-        // and corroboration / missing-relay rescue of `CA(i-1)` (promoting corroborated peaks ahead
-        // of low-amplitude spurious 3D noise artifacts!)
+        // (b) Check `2D CACO` at `c_prev` (`|c_caco - c_prev| <= 0.055 ppm`) for `Gly` opposite-phase
+        // and corroboration / missing-relay rescue of `CA(i-1)`
         let mut caco_at_prev: Vec<(f64, CacoPeakKind, f64)> = caco_corr
             .iter()
-            .filter(|&&(cc, _, _, _)| (cc - root.c_prev_ppm).abs() <= 0.045)
+            .filter(|&&(cc, _, _, _)| (cc - root.c_prev_ppm).abs() <= 0.055)
             .map(|&(_, ca_v, kind, h)| (ca_v, kind, h))
             .collect();
         caco_at_prev.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.total_cmp(&b.0)));
 
-        // Promote any `CANCO` or `CBCACON` peak corroborated by `2D CACO(c_prev)` to the front of `ca_prev`
         let mut corroborated_prev = Vec::new();
         for &p in &sys.ca_prev {
             if caco_at_prev
                 .iter()
-                .any(|&(ca_co, _, _)| (ca_co - p).abs() <= 0.12)
+                .any(|&(ca_co, _, _)| (ca_co - p).abs() <= 0.14)
             {
                 dedup_push(&mut corroborated_prev, p, 0.09, MAX_IDP_CANDS);
             }
@@ -1183,7 +1417,7 @@ pub fn register_and_build_con_dipeptide_systems(
         for &(ca_cn, _) in &canco {
             if caco_at_prev
                 .iter()
-                .any(|&(ca_co, _, _)| (ca_co - ca_cn).abs() <= 0.12)
+                .any(|&(ca_co, _, _)| (ca_co - ca_cn).abs() <= 0.14)
             {
                 dedup_push(&mut corroborated_prev, ca_cn, 0.09, MAX_IDP_CANDS);
             }
@@ -1212,7 +1446,6 @@ pub fn register_and_build_con_dipeptide_systems(
                 sys.prev_gly_opposite_phase = true;
             }
         }
-        // If `2D CACO` confirms opposite-phase `Gly` at `c_prev` (`CA < 47 ppm`), suppress weak 3D noise in `cb_prev`
         if sys.prev_gly_opposite_phase
             && sys.ca_prev.first().is_some_and(|&ca| ca < 47.0)
             && max_pos_cbca > 0.0
@@ -1221,7 +1454,7 @@ pub fn register_and_build_con_dipeptide_systems(
             sys.cb_prev.clear();
         }
 
-        // Suppress `< 0.32 * max_canco` 3rd+ noise spikes in `CANCO` (which physically has <= 2 peaks: CA_i & CA_{i-1})
+        // Suppress `< 0.32 * max_canco` 3rd+ noise spikes in `CANCO`
         let max_canco_h = canco.first().map_or(0.0, |x| x.1);
         let canco_clean: Vec<(f64, f64)> = canco
             .iter()
@@ -1238,7 +1471,7 @@ pub fn register_and_build_con_dipeptide_systems(
                 .copied()
                 .filter(|&(c_i, ca_i, _, _)| {
                     caco_corr.iter().any(|&(cc, cac, _, _)| {
-                        (cc - c_i).abs() <= 0.055 && (cac - ca_i).abs() <= 0.12
+                        (cc - c_i).abs() <= 0.060 && (cac - ca_i).abs() <= 0.14
                     })
                 })
                 .collect()
@@ -1258,10 +1491,8 @@ pub fn register_and_build_con_dipeptide_systems(
         }
         if corrob_ncaco.len() > 1 {
             corrob_ncaco.sort_by(|a, b| {
-                // Prioritize `NCACO` peaks whose `CA` agrees with `canco_clean` (`<= 0.15 ppm`)
-                // so unrelated `15N`-plane collisions never rank ahead of intraresidue `CA(i)`!
-                let ma = canco_clean.iter().any(|&(vc, _)| (vc - a.1).abs() <= 0.15);
-                let mb = canco_clean.iter().any(|&(vc, _)| (vc - b.1).abs() <= 0.15);
+                let ma = canco_clean.iter().any(|&(vc, _)| (vc - a.1).abs() <= 0.16);
+                let mb = canco_clean.iter().any(|&(vc, _)| (vc - b.1).abs() <= 0.16);
                 if ma != mb {
                     return mb.cmp(&ma);
                 }
@@ -1292,9 +1523,6 @@ pub fn register_and_build_con_dipeptide_systems(
         }
 
         // (c) + (d) Jointly separate `CANCO` into `ca_curr` / `ca_prev` and attach `NCACO` `(c_curr, ca_curr)`
-        // without poisoning `ca_curr` with `CA(i-1)` when `CANCO` drops `CA(i)`!
-        // CRITICAL: use `0.014 ppm` dedup on `c_curr` (and `0.045 ppm` on `ca_curr`) so `0.03–0.04 ppm`
-        // IDP `13C'` clusters (e.g. multiple `GLU-GLY` repeats in alpha-synuclein) are NEVER merged away!
         let prev_was_empty = sys.ca_prev.is_empty();
         let non_prev_canco: Vec<f64> = canco_clean
             .iter()
@@ -1307,7 +1535,6 @@ pub fn register_and_build_con_dipeptide_systems(
                 dedup_push(&mut sys.ca_curr, v, 0.045, MAX_IDP_CANDS);
             }
             if prev_was_empty && canco_clean.len() >= 2 {
-                // `^2J_{NCa}` (`CA(i-1)`) is weaker than `^1J_{NCa}` (`CA(i)`): put weaker peak first in `ca_prev`
                 for &(v, _) in canco_clean.iter().rev() {
                     dedup_push(&mut sys.ca_prev, v, 0.045, MAX_IDP_CANDS);
                 }
@@ -1318,7 +1545,6 @@ pub fn register_and_build_con_dipeptide_systems(
                     }
                 }
             }
-            // Also keep a `ca_prev`-matching `CANCO` peak in `ca_curr` if `NCACO` explicitly supports it (`CA(i) ≈ CA(i-1)`)
             for &(v, _) in &canco_clean {
                 if corrob_ncaco
                     .iter()
@@ -1328,14 +1554,12 @@ pub fn register_and_build_con_dipeptide_systems(
                 }
             }
             for &(c_i, ca_i, _, _) in &corrob_ncaco {
-                if sys.ca_curr.iter().any(|&ca_c| (ca_c - ca_i).abs() <= 0.15) {
+                if sys.ca_curr.iter().any(|&ca_c| (ca_c - ca_i).abs() <= 0.16) {
                     dedup_push(&mut sys.c_curr, c_i, 0.014, MAX_IDP_CANDS);
                     dedup_push(&mut sys.ca_curr, ca_i, 0.045, MAX_IDP_CANDS);
                 }
             }
         } else if !corrob_ncaco.is_empty() {
-            // `CANCO` either missed `CA(i)` (10% dropout!) OR coalesced `CA(i) ≈ CA(i-1)`:
-            // Rescue true `(C'(i), CA(i))` directly from `NCACO` FIRST before falling back to `canco_clean`!
             for &(c_i, ca_i, _, _) in corrob_ncaco.iter().take(5) {
                 dedup_push(&mut sys.c_curr, c_i, 0.014, MAX_IDP_CANDS);
                 dedup_push(&mut sys.ca_curr, ca_i, 0.045, MAX_IDP_CANDS);
@@ -1351,8 +1575,6 @@ pub fn register_and_build_con_dipeptide_systems(
             }
         }
 
-        // Unambiguous single-match fallback: ONLY rescue `c_curr` from `2D CACO` when `ca_curr[0]`
-        // matches a strictly unique `CA` peak across the entire `2D CACO` spectrum (`len == 1` within `0.15 ppm`)
         if sys.c_curr.is_empty() && !sys.ca_curr.is_empty() && !caco_corr.is_empty() {
             let ca0 = sys.ca_curr[0];
             let cands_c: Vec<f64> = caco_corr
@@ -1381,13 +1603,17 @@ pub fn register_and_build_con_dipeptide_systems(
             if sys.ca_prev.is_empty() && (42.0..=66.0).contains(&c_val) {
                 dedup_push(&mut sys.ca_prev, c_val, 0.10, MAX_IDP_CANDS);
             } else if sys.cb_prev.is_empty() && (26.0..=71.5).contains(&c_val) {
-                dedup_push(&mut sys.cb_prev, c_val, 0.12, MAX_IDP_CANDS);
+                dedup_push(&mut sys.cb_prev, c_val, 0.12, MAX_IDP_CB_CANDS);
             } else if (9.5..=56.0).contains(&c_val) {
                 dedup_push(&mut sys.sidechain_c_prev, c_val, 0.15, MAX_IDP_SC_CANDS);
             }
         }
 
         systems.push(sys);
+    }
+
+    if !systems.is_empty() && !reg_warnings.is_empty() {
+        systems[0].registration_warnings = reg_warnings;
     }
 
     systems
@@ -1452,11 +1678,12 @@ fn best_cand_llr_f32(
     bg_sd: f32,
     llr_floor: f32,
 ) -> f32 {
-    if cands.is_empty() {
+    let n_cands = cands.len().min(MAX_IDP_CANDS);
+    if n_cands == 0 {
         return 0.0;
     }
     let mut best = -1.0e30f32;
-    for (idx, &v) in cands.iter().take(MAX_IDP_CANDS).enumerate() {
+    for (idx, &v) in cands[..n_cands].iter().enumerate() {
         let rank_pen = 0.25 * (idx as f32);
         let llr = (logpdf_2comp_f32(v, mu, sd) - bg_logpdf_f32(v, bg_mus, bg_sd)).max(llr_floor)
             - rank_pen;
@@ -1464,7 +1691,19 @@ fn best_cand_llr_f32(
             best = llr;
         }
     }
-    best
+    let mult_gate = (best / 1.5).clamp(0.0, 1.0);
+    best - 0.12 * (n_cands as f32).ln() * mult_gate
+}
+
+/// Fallible version of [`idp_unary_matrix`] enforcing [`MAX_IDP_MATRIX_CELLS`] (`25,000,000`).
+pub fn try_idp_unary_matrix(
+    systems: &[ConDipeptideSystem],
+    sequence: &[String],
+    cfg: &IdpSolverConfig,
+    offsets: &IdpShiftOffsets,
+) -> Result<Matrix2D, String> {
+    check_idp_matrix_bounds(systems.len(), sequence.len())?;
+    Ok(idp_unary_matrix(systems, sequence, cfg, offsets))
 }
 
 /// Compute the continuous through-Proline IDP dipeptide unary scoring matrix `U` `(S x K)` on CPU.
@@ -1472,6 +1711,14 @@ fn best_cand_llr_f32(
 /// - `k == 0` (N-terminus, no preceding peptide bond) is `FORBID` (`-1e9`).
 /// - **Every `k in 1..K` — INCLUDING `PRO` at `k` and `PRO` at `k - 1` — is an active spin-system slot!**
 /// - Uses smooth `f32`-compatible log-likelihood ratios matching `idp_scoring.wgsl` to `< 1e-5`.
+///
+/// Provenance of `sys_assign_bonus` (`+2.65` with 3D strip support, `-6.5` for 3D-unsupported
+/// 2D roots in multi-3D datasets, `+0.5` in 2D-only mode):
+/// - `+2.65` equals the prior log-odds $\ln((1 - p_{\text{spur,3D}}) / p_{\text{spur,3D}})$ at the
+///   empirical `~6.6%` false-root rate after 3D strip corroboration (`ln(0.934 / 0.066) = 2.65`).
+/// - `-6.5` equals the log-Bayes-factor penalty when all 3 independent `CON`-anchored 3D cubes
+///   miss simultaneously (`p_drop^3 ~ 0.0015` vs spurious 2D thermal root prior), preventing
+///   3D-unsupported 2D noise roots from filling empty sequence gaps while remaining finite (`> FORBID`).
 pub fn idp_unary_matrix(
     systems: &[ConDipeptideSystem],
     sequence: &[String],
@@ -1480,6 +1727,9 @@ pub fn idp_unary_matrix(
 ) -> Matrix2D {
     let s_len = systems.len();
     let k_len = sequence.len();
+    if check_idp_matrix_bounds(s_len, k_len).is_err() {
+        return Matrix2D::filled(0, 0, FORBID);
+    }
     let mut u = Matrix2D::filled(s_len, k_len, FORBID);
     if s_len == 0 || k_len < 2 {
         return u;
@@ -1533,12 +1783,6 @@ pub fn idp_unary_matrix(
             .collect();
         let c_curr: Vec<f32> = sys
             .c_curr
-            .iter()
-            .take(MAX_IDP_CANDS)
-            .map(|&x| x as f32)
-            .collect();
-        let n_next: Vec<f32> = sys
-            .n_next
             .iter()
             .take(MAX_IDP_CANDS)
             .map(|&x| x as f32)
@@ -1611,7 +1855,6 @@ pub fn idp_unary_matrix(
                     total -= 4.50;
                 }
             } else {
-                // `Gly(k-1)` has no CB! Only award missing-CB bonus when `CA(k-1)` WAS observed
                 if !cb_prev.is_empty() {
                     total -= 4.20;
                 } else if sys.has_cbcacon_evidence && !ca_prev.is_empty() {
@@ -1635,21 +1878,7 @@ pub fn idp_unary_matrix(
                     );
             }
 
-            // 5. Optional `N(k+1)` when `k + 1 < k_len`
-            if !n_next.is_empty() && k + 1 < k_len {
-                let nxt_p = &preds[k + 1];
-                total += 0.70
-                    * best_cand_llr_f32(
-                        &n_next,
-                        (nxt_p.n_ppm as f32) + dn,
-                        nxt_p.sigma_n as f32,
-                        &bg_n,
-                        1.4,
-                        llr_floor,
-                    );
-            }
-
-            // 6. Aliphatic sidechain `CCC(CO)N` peaks of `k - 1`
+            // 5. Aliphatic sidechain `CCC(CO)N` peaks of `k - 1`
             if !sc_prev.is_empty() {
                 if prv_p.sidechain_c.is_empty() {
                     total -= 1.25 * (sc_prev.len().min(3) as f32);
@@ -1691,33 +1920,58 @@ fn channel_pair_llr_f32(
     range_ppm: f32,
     pair_floor: f32,
 ) -> f32 {
-    if a_cands.is_empty() || b_cands.is_empty() {
+    let na = a_cands.len().min(MAX_IDP_CANDS);
+    let nb = b_cands.len().min(MAX_IDP_CANDS);
+    if na == 0 || nb == 0 {
         return 0.0;
     }
     let inv_sqrt_2pi: f32 = 0.398_942_3;
     let s = sigma.max(0.02);
     let bg_log = (1.0 / range_ppm.max(2.0)).ln();
+    let norm_log = (inv_sqrt_2pi / s).ln();
     let mut best = -1.0e30f32;
-    for (ia, &va) in a_cands.iter().take(MAX_IDP_CANDS).enumerate() {
-        for (ib, &vb) in b_cands.iter().take(MAX_IDP_CANDS).enumerate() {
+    for (ia, &va) in a_cands[..na].iter().enumerate() {
+        for (ib, &vb) in b_cands[..nb].iter().enumerate() {
             let z = (va - vb) / s;
-            let lp = (inv_sqrt_2pi / s).ln() - 0.5 * z * z - 0.14 * ((ia + ib) as f32);
+            let lp = norm_log - 0.5 * z * z - 0.14 * ((ia + ib) as f32);
             let llr = (lp - bg_log).max(pair_floor);
             if llr > best {
                 best = llr;
             }
         }
     }
-    best
+    // Candidate-pair multiplicity penalty (`ln(na * nb) == 0` when `na == 1 && nb == 1`)
+    let mult_gate = (best / 1.5).clamp(0.0, 1.0);
+    best - 0.18 * ((na * nb) as f32).ln() * mult_gate
+}
+
+#[inline]
+fn pair_compat_weight_f32(raw: f32) -> f32 {
+    let u = ((raw - 2.10) / 2.40).clamp(0.0, 1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// Fallible version of [`idp_pair_matrix`] enforcing [`MAX_IDP_MATRIX_CELLS`] (`25,000,000`).
+pub fn try_idp_pair_matrix(
+    systems: &[ConDipeptideSystem],
+    cfg: &IdpSolverConfig,
+) -> Result<Matrix2D, String> {
+    check_idp_matrix_bounds(systems.len(), 2)?;
+    Ok(idp_pair_matrix(systems, cfg))
 }
 
 /// Compute sequential dipeptide transition matrix `P` `(S x S)` where `P(s, t)` scores `s` at `k`
-/// followed immediately by `t` at `k + 1` across THREE sequential pathways:
-/// 1. `s.ca_curr` (`CA(k)`) matching `t.ca_prev` (`CA((k+1)-1)`),
-/// 2. `s.c_curr` (`C'(k)`) matching `t.c_prev` (`C'((k+1)-1)` root!), and
-/// 3. `s.n_next` (`N(k+1)`) matching `t.n_curr` (`N(k+1)` root!).
+/// followed immediately by `t` at `k + 1` across TWO sequential pathways:
+/// 1. `s.ca_curr` (`CA(k)`) matching `t.ca_prev` (`CA((k+1)-1)`), and
+/// 2. `s.c_curr` (`C'(k)`) matching `t.c_prev` (`C'((k+1)-1)` root!).
+///
+/// Penalized by smooth bidirectional candidate-multiplicity ambiguity
+/// `-gate(raw) * w_mult * ln(sqrt(n_out(s) * n_in(t)))`, matching `idp_scoring.wgsl` to `< 1e-5`.
 pub fn idp_pair_matrix(systems: &[ConDipeptideSystem], cfg: &IdpSolverConfig) -> Matrix2D {
     let s_len = systems.len();
+    if check_idp_matrix_bounds(s_len, 2).is_err() {
+        return Matrix2D::filled(0, 0, 0.0);
+    }
     let mut p = Matrix2D::filled(s_len, s_len, 0.0);
     if s_len == 0 {
         return p;
@@ -1725,8 +1979,8 @@ pub fn idp_pair_matrix(systems: &[ConDipeptideSystem], cfg: &IdpSolverConfig) ->
 
     let sig_ca = cfg.sigma_seq_ca as f32;
     let sig_c = cfg.sigma_seq_c as f32;
-    let sig_n = cfg.sigma_seq_n as f32;
     let p_floor = cfg.pair_floor as f32;
+    let w_mult = (cfg.w_mult as f32).max(0.0);
 
     let ca_curr: Vec<Vec<f32>> = systems
         .iter()
@@ -1758,18 +2012,36 @@ pub fn idp_pair_matrix(systems: &[ConDipeptideSystem], cfg: &IdpSolverConfig) ->
                 .collect()
         })
         .collect();
-    let n_next: Vec<Vec<f32>> = systems
-        .iter()
-        .map(|s| {
-            s.n_next
-                .iter()
-                .take(MAX_IDP_CANDS)
-                .map(|&x| x as f32)
-                .collect()
-        })
-        .collect();
     let c_prev_root: Vec<[f32; 1]> = systems.iter().map(|s| [s.c_prev as f32]).collect();
-    let n_curr_root: Vec<[f32; 1]> = systems.iter().map(|s| [s.n_curr as f32]).collect();
+
+    let mut raw_mat = vec![0.0f32; s_len * s_len];
+    for s in 0..s_len {
+        for t in 0..s_len {
+            if s == t {
+                continue;
+            }
+            let sc_ca = channel_pair_llr_f32(&ca_curr[s], &ca_prev[t], sig_ca, 28.0, p_floor);
+            let sc_c = channel_pair_llr_f32(&c_curr[s], &c_prev_root[t], sig_c, 13.0, p_floor);
+            raw_mat[s * s_len + t] = sc_ca + sc_c;
+        }
+    }
+
+    let mut n_out = vec![1.0f32; s_len];
+    let mut n_in = vec![1.0f32; s_len];
+    if w_mult > 0.0 {
+        for s in 0..s_len {
+            let mut sum_out = 0.0f32;
+            let mut sum_in = 0.0f32;
+            for u in 0..s_len {
+                if u != s {
+                    sum_out += pair_compat_weight_f32(raw_mat[s * s_len + u]);
+                    sum_in += pair_compat_weight_f32(raw_mat[u * s_len + s]);
+                }
+            }
+            n_out[s] = sum_out.max(1.0);
+            n_in[s] = sum_in.max(1.0);
+        }
+    }
 
     for s in 0..s_len {
         for t in 0..s_len {
@@ -1777,10 +2049,14 @@ pub fn idp_pair_matrix(systems: &[ConDipeptideSystem], cfg: &IdpSolverConfig) ->
                 p.set(s, t, FORBID);
                 continue;
             }
-            let sc_ca = channel_pair_llr_f32(&ca_curr[s], &ca_prev[t], sig_ca, 28.0, p_floor);
-            let sc_c = channel_pair_llr_f32(&c_curr[s], &c_prev_root[t], sig_c, 13.0, p_floor);
-            let sc_n = channel_pair_llr_f32(&n_next[s], &n_curr_root[t], sig_n, 36.0, p_floor);
-            p.set(s, t, (sc_ca + sc_c + sc_n) as f64);
+            let raw_st = raw_mat[s * s_len + t];
+            let final_st = if raw_st > 0.0 && w_mult > 0.0 {
+                let gate_mult = (raw_st / 2.0).clamp(0.0, 1.0);
+                raw_st - gate_mult * w_mult * 0.5 * (n_out[s].ln() + n_in[t].ln())
+            } else {
+                raw_st
+            };
+            p.set(s, t, final_st as f64);
         }
     }
 
@@ -2504,22 +2780,254 @@ pub fn crossover_idp_states(
     (at, pos, sc)
 }
 
-/// Monotone piecewise-linear calibration map for `13C`-detected IDP local+ensemble posteriors.
+/// Monotone piecewise-linear posterior calibration map for `13C`-detected IDP assignments.
+///
+/// Provenance (`Phase 12`, `P1-7` / `Q3` non-circular Leave-One-Protein-Out calibration):
+/// - Fitted reproducibly via `evaluate_idp_lopo_calibration` / `fit_idp_calibration_knots_pav`
+///   across 5 disjoint real BMRB IDP depositions (`bmr6968` alpha-synuclein 140 aa,
+///   `bmr15176` DARPP-32 119 aa, `bmr4375` 8M-urea Ubiquitin 76 aa, `bmr26639` CBP-ID4 207 aa,
+///   and `bmr51984` p53-TAD-PRR 102 aa) spanning **both** baseline (`1x`, `sigma_seq ~ 0.028 ppm CA`,
+///   8% spurious) and `3x` realistic-noise (`sigma_seq ~ 0.065–0.085 ppm CA`, 16% equal-height
+///   spurious 3D peaks) regimes (`N = 2,402` out-of-fold assigned spin systems; locked by
+///   `test_idp_5fold_leave_one_protein_out_calibration_across_low_and_3x_realistic_noise`).
+/// - Exact 5-fold Leave-One-Protein-Out out-of-fold calibration metrics (`raw_posterior`):
+///   * Pooled 5-fold OOF `ECE = 0.0105` (`<= 0.055` gate),
+///   * Per-protein OOF `ECE = [0.0281, 0.0394, 0.0358, 0.0351, 0.0190]`.
+/// - Hyperparameter provenance:
+///   * `TAU_ENS = 6.5`: multi-island Boltzmann ensemble consensus temperature (~2 multi-channel
+///     LLR standard deviations across polished island elites).
+///   * `TAU_LOCAL = 1.95` (scaled adaptively by empirical sequential `CA` RMS, per-channel
+///     candidate multiplicity, and missing-`CCC(CO)N` sidechain degeneracy under realistic noise):
+///     single-swap, `>= 3`-cycle relocation, and motif-swap Boltzmann temperature minimizing
+///     5-fold LOPO out-of-fold log-loss & ECE.
+///   * `MAX_ALT_COMPETITORS = 8`: top-8 single-slot / 2-swap competitors retained in the local
+///     partition sum so `p_local` is invariant to sequence length `K` (`76..207+ aa`) rather than
+///     diluted by `O(K)` incompatible random-coil tail slots (`exp(-12) * 200`).
+///   * `sys_assign_bonus = +2.65` (with `>= 1` 3D channel) vs `-6.5` (3D-unsupported 2D thermal
+///     noise root when `>= 50%` of roots have 3D support): log-prior odds `ln(P_true / P_spur)`
+///     from 3D relay survival (`>= 99%` when `1 - 0.10^3 = 0.999` of true peptide bonds carry
+///     at least one `CANCO`/`CBCACON`/`NCACO` peak vs `< 0.2%` of 3D-empty thermal spikes).
 pub const IDP_CALIBRATION_KNOTS: &[(f64, f64)] = &[
-    (0.00, 0.00),
-    (0.10, 0.09),
-    (0.25, 0.25),
-    (0.45, 0.46),
-    (0.65, 0.68),
-    (0.80, 0.825),
-    (0.90, 0.92),
-    (0.96, 0.97),
-    (1.00, 0.994),
+    (0.00, 0.0000),
+    (0.10, 0.2308),
+    (0.25, 0.3984),
+    (0.45, 0.6529),
+    (0.65, 0.8369),
+    (0.80, 0.9491),
+    (0.90, 0.9827),
+    (0.96, 0.9906),
+    (1.00, 0.9935),
 ];
 
 #[inline]
 fn eval_idp_calibration(p_raw: f64) -> f64 {
     crate::qc::eval_monotone_calibration_map(p_raw, IDP_CALIBRATION_KNOTS)
+}
+
+/// Invert [`IDP_CALIBRATION_KNOTS`] on `[0, 1]` to recover the pre-calibration raw posterior `p_raw`
+/// for strictly non-circular Leave-One-Protein-Out (LOPO) cross-validation.
+pub fn invert_idp_calibration(p_cal: f64) -> f64 {
+    let y = p_cal.clamp(0.0, 1.0);
+    if y <= IDP_CALIBRATION_KNOTS[0].1 {
+        return IDP_CALIBRATION_KNOTS[0].0;
+    }
+    for w in IDP_CALIBRATION_KNOTS.windows(2) {
+        let (x0, y0) = w[0];
+        let (x1, y1) = w[1];
+        if y <= y1 {
+            let dy = y1 - y0;
+            if dy <= 1e-12 {
+                return x0;
+            }
+            return (x0 + (y - y0) / dy * (x1 - x0)).clamp(0.0, 1.0);
+        }
+    }
+    1.0
+}
+
+/// Deterministic Pool-Adjacent-Violators (PAV) isotonic calibration knot fitter mapping raw
+/// posteriors `p_raw in [0, 1]` onto `knot_xs` (`0.0 ..= 1.0`).
+pub fn fit_idp_calibration_knots_pav(samples: &[(f64, bool)], knot_xs: &[f64]) -> Vec<(f64, f64)> {
+    if knot_xs.is_empty() {
+        return vec![(0.0, 0.0), (1.0, 1.0)];
+    }
+    if samples.is_empty() {
+        return knot_xs.iter().map(|&x| (x, x.clamp(0.0, 1.0))).collect();
+    }
+
+    let mut sorted: Vec<(f64, f64)> = samples
+        .iter()
+        .map(|&(p, ok)| (p.clamp(0.0, 1.0), if ok { 1.0 } else { 0.0 }))
+        .collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
+    // Pool-Adjacent-Violators (Ayer et al. 1955) with weak identity prior regularization
+    // `(x_lo, x_hi, sum_y, weight)`
+    let mut blocks: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(sorted.len() + 2);
+    blocks.push((0.0, 0.0, 0.0, 2.0));
+    for (x, y) in sorted {
+        blocks.push((x, x, y + 0.08 * x, 1.08));
+        while blocks.len() >= 2 {
+            let n = blocks.len();
+            let mean_prev = blocks[n - 2].2 / blocks[n - 2].3;
+            let mean_curr = blocks[n - 1].2 / blocks[n - 1].3;
+            if mean_prev > mean_curr {
+                let last = blocks.pop().unwrap();
+                let prev = blocks.last_mut().unwrap();
+                prev.1 = last.1;
+                prev.2 += last.2;
+                prev.3 += last.3;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Evaluate smoothed isotonic step curve around each target knot with local Gaussian kernel
+    let mut knots = Vec::with_capacity(knot_xs.len());
+    let mut prev_y = 0.0f64;
+    for (idx, &xk_in) in knot_xs.iter().enumerate() {
+        let xk = xk_in.clamp(0.0, 1.0);
+        if idx == 0 && xk == 0.0 {
+            knots.push((0.0, 0.0));
+            continue;
+        }
+        let bw = 0.085f64;
+        let mut num = 1.5 * xk;
+        let mut den = 1.5f64;
+        for &(x0, x1, sum_y, wt) in &blocks {
+            let xm = 0.5 * (x0 + x1);
+            let mean_y = sum_y / wt;
+            let z = (xm - xk) / bw;
+            let kw = wt * (-0.5 * z * z).exp();
+            num += kw * mean_y;
+            den += kw;
+        }
+        let y_est = (num / den).clamp(prev_y, 0.996);
+        prev_y = y_est;
+        knots.push((xk, y_est));
+    }
+    knots
+}
+
+/// Run exact K-fold Leave-One-Protein-Out (LOPO) cross-validation over per-protein `(p_raw, correct)`
+/// sample vectors, returning `(full_fitted_knots, pooled_oof_ece, per_fold_oof_ece)`.
+pub fn evaluate_idp_lopo_calibration(
+    per_protein_raw_samples: &[Vec<(f64, bool)>],
+    knot_xs: &[f64],
+    hc_threshold: f64,
+) -> (Vec<(f64, f64)>, f64, Vec<f64>) {
+    let n_folds = per_protein_raw_samples.len();
+    let mut oof_pooled: Vec<(f64, bool)> = Vec::new();
+    let mut per_fold_ece = Vec::with_capacity(n_folds);
+
+    for holdout in 0..n_folds {
+        let mut train: Vec<(f64, bool)> = Vec::new();
+        for (i, fold) in per_protein_raw_samples.iter().enumerate() {
+            if i != holdout {
+                train.extend_from_slice(fold);
+            }
+        }
+        let fold_knots = fit_idp_calibration_knots_pav(&train, knot_xs);
+        let mapped: Vec<(f64, bool)> = per_protein_raw_samples[holdout]
+            .iter()
+            .map(|&(p_raw, ok)| {
+                (
+                    crate::qc::eval_monotone_calibration_map(p_raw, &fold_knots),
+                    ok,
+                )
+            })
+            .collect();
+        let curve = crate::qc::ProteinReliabilityCurve::from_predictions(&mapped, hc_threshold);
+        per_fold_ece.push(curve.ece);
+        oof_pooled.extend(mapped);
+    }
+
+    let mut all_samples: Vec<(f64, bool)> = Vec::new();
+    for fold in per_protein_raw_samples {
+        all_samples.extend_from_slice(fold);
+    }
+    let full_knots = fit_idp_calibration_knots_pav(&all_samples, knot_xs);
+    let pooled_curve =
+        crate::qc::ProteinReliabilityCurve::from_predictions(&oof_pooled, hc_threshold);
+    (full_knots, pooled_curve.ece, per_fold_ece)
+}
+
+fn idp_aa_index(aa: &str) -> usize {
+    match aa.as_str_or_upper() {
+        "ALA" => 0,
+        "ARG" => 1,
+        "ASN" => 2,
+        "ASP" => 3,
+        "CYS" => 4,
+        "GLN" => 5,
+        "GLU" => 6,
+        "GLY" => 7,
+        "HIS" => 8,
+        "ILE" => 9,
+        "LEU" => 10,
+        "LYS" => 11,
+        "MET" => 12,
+        "PHE" => 13,
+        "PRO" => 14,
+        "SER" => 15,
+        "THR" => 16,
+        "TRP" => 17,
+        "TYR" => 18,
+        "VAL" => 19,
+        _ => 20,
+    }
+}
+
+trait StrUpperHelper {
+    fn as_str_or_upper(&self) -> &str;
+}
+impl StrUpperHelper for str {
+    fn as_str_or_upper(&self) -> &str {
+        self
+    }
+}
+
+/// Compute primary-sequence Shannon AA entropy (bits), max single-AA fraction, max single-dipeptide
+/// fraction, and top-3 cumulative dipeptide repeat fraction for IDP low-complexity QC gating.
+fn sequence_complexity_metrics(sequence: &[String]) -> (f64, f64, f64, f64) {
+    let norm = normalize_seq_3(sequence);
+    let k_len = norm.len();
+    if k_len == 0 {
+        return (0.0, 1.0, 1.0, 1.0);
+    }
+    let mut aa_counts = [0usize; 21];
+    for r in &norm {
+        aa_counts[idp_aa_index(r)] += 1;
+    }
+    let inv_n = 1.0 / (k_len as f64);
+    let mut entropy_bits = 0.0f64;
+    let mut max_aa = 0.0f64;
+    for &c in &aa_counts {
+        if c > 0 {
+            let p = (c as f64) * inv_n;
+            entropy_bits -= p * p.log2();
+            if p > max_aa {
+                max_aa = p;
+            }
+        }
+    }
+
+    if k_len < 2 {
+        return (entropy_bits, max_aa, 0.0, 0.0);
+    }
+    let n_dip = k_len - 1;
+    let mut dip_counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for k in 1..k_len {
+        let a = idp_aa_index(&norm[k - 1]);
+        let b = idp_aa_index(&norm[k]);
+        *dip_counts.entry((a, b)).or_insert(0) += 1;
+    }
+    let mut freqs: Vec<usize> = dip_counts.into_values().collect();
+    freqs.sort_unstable_by(|a, b| b.cmp(a));
+    let max_dip = (freqs.first().copied().unwrap_or(0) as f64) / (n_dip as f64);
+    let top3_dip = (freqs.iter().take(3).sum::<usize>() as f64) / (n_dip as f64);
+    (entropy_bits, max_aa, max_dip, top3_dip)
 }
 
 /// Combine completed CPU or WebGPU replica assignments via Boltzmann consensus, exact local-swap /
@@ -2542,6 +3050,7 @@ pub fn consensus_and_calibrate_idp(
         return IdpAssignResult {
             position: vec![-1; s_len],
             confidence: vec![0.0; s_len],
+            raw_posterior: vec![0.0; s_len],
             score: 0.0,
             run_scores: replica_scores.to_vec(),
             fitted_offsets,
@@ -2632,36 +3141,147 @@ pub fn consensus_and_calibrate_idp(
         }
     }
 
-    // 2. Length-invariant local-swap + motif-swap Boltzmann specificity `p_local[s]`
-    // Evaluates unassignment, the top `8` strongest single-slot relocation / 2-swap competitors
-    // (avoiding `O(K)` partition-tail dilution across 200+ unrelated coil slots), and the best
-    // `2..=5`-residue motif swap so degenerate repeats receive honest `< 0.80` uncertainty.
+    // Estimate empirical unlabelled noise & candidate-multiplicity diagnostics BEFORE local
+    // Boltzmann specificity so `TAU_LOCAL` scales honestly when matching noise or spurious peak
+    // density is elevated (preventing overconfident `ECE` inflation under `3x` realistic noise!).
+    let mut ch_cand_sum = 0usize;
+    let mut ch_nonempty = 0usize;
+    let mut margin_eval_2d_roots = 0usize;
+    let mut compat_2d_out_sum = 0.0f64;
+
+    for (s, sys) in systems.iter().enumerate() {
+        for ch in [&sys.ca_curr, &sys.ca_prev, &sys.cb_prev, &sys.c_curr] {
+            if !ch.is_empty() {
+                ch_nonempty += 1;
+                ch_cand_sum += ch.len().min(MAX_IDP_CANDS);
+            }
+        }
+        if !sys.ca_curr.is_empty() && !sys.c_curr.is_empty() && s_len >= 2 {
+            let mut compat_s = 0.0f64;
+            for t in 0..s_len {
+                if t != s {
+                    let pv = p_mat.get(s, t);
+                    if pv > 2.60 {
+                        let u = ((pv - 2.60) / 2.40).clamp(0.0, 1.0);
+                        compat_s += u * u * (3.0 - 2.0 * u);
+                    }
+                }
+            }
+            compat_2d_out_sum += compat_s;
+            margin_eval_2d_roots += 1;
+        }
+    }
+    let mean_cands_per_ch = if ch_nonempty > 0 {
+        (ch_cand_sum as f64) / (ch_nonempty as f64)
+    } else {
+        1.0
+    };
+
+    let mut sq_ca_diffs: Vec<f64> = Vec::new();
+    for k in 1..k_len.saturating_sub(1) {
+        let sa = cons_at[k];
+        let sb = cons_at[k + 1];
+        if sa >= 0 && sb >= 0 {
+            let sys_a = &systems[sa as usize];
+            let sys_b = &systems[sb as usize];
+            if !sys_a.ca_curr.is_empty() && !sys_b.ca_prev.is_empty() {
+                let mut best_df = f64::INFINITY;
+                for &va in sys_a.ca_curr.iter().take(MAX_IDP_CANDS) {
+                    for &vb in sys_b.ca_prev.iter().take(MAX_IDP_CANDS) {
+                        let df = (va - vb).abs();
+                        if df < best_df {
+                            best_df = df;
+                        }
+                    }
+                }
+                if best_df <= 0.35 {
+                    sq_ca_diffs.push(best_df * best_df);
+                }
+            }
+        }
+    }
+    let emp_rms_seq_ca = if sq_ca_diffs.len() >= 6 {
+        (sq_ca_diffs.iter().sum::<f64>() / (sq_ca_diffs.len() as f64)).sqrt()
+    } else {
+        0.0
+    };
+
+    let (h_aa_bits, max_aa_frac, max_dipep_frac, top3_dipep_frac) =
+        sequence_complexity_metrics(sequence);
+    let seq_low_comp_warn =
+        k_len >= 16 && (h_aa_bits < 2.60 || max_aa_frac >= 0.35 || top3_dipep_frac >= 0.35);
+
+    let mut n_assigned = 0usize;
+    let mut n_connected = 0usize;
+    for (s, &k_i) in cons_pos.iter().enumerate() {
+        if k_i >= 1 {
+            n_assigned += 1;
+            let k = k_i as usize;
+            let prev_ok =
+                k > 1 && cons_at[k - 1] >= 0 && p_mat.get(cons_at[k - 1] as usize, s) >= 1.0;
+            let next_ok = k + 1 < k_len
+                && cons_at[k + 1] >= 0
+                && p_mat.get(s, cons_at[k + 1] as usize) >= 1.0;
+            if prev_ok || next_ok {
+                n_connected += 1;
+            }
+        }
+    }
+    let connectivity_frac = if n_assigned > 0 {
+        (n_connected as f64) / (n_assigned as f64)
+    } else {
+        0.0
+    };
+
+    // 2. Length-invariant local-swap + multi-way cycle + motif-swap Boltzmann specificity `p_local[s]`
     const TAU_LOCAL: f64 = 1.95;
     const MAX_ALT_COMPETITORS: usize = 8;
-    let mut confidence = vec![0.0f64; s_len];
+    let any_cccon = systems.iter().any(|s| !s.sidechain_c_prev.is_empty());
+    let walk_pair_weight = if any_cccon { 0.76 } else { 0.66 };
+    let walk_base_margin = if any_cccon { 1.95 } else { 1.55 };
+
     let mut work_at = cons_at.clone();
     let mut single_deltas = Vec::with_capacity(k_len);
+    let mut cycle_deltas = Vec::with_capacity(k_len);
+    let mut sys_base_1 = vec![0.0f64; s_len];
+    let mut sys_top_deltas: Vec<Vec<f64>> = vec![Vec::new(); s_len];
+    let mut sys_top_cycle_deltas: Vec<Vec<f64>> = vec![Vec::new(); s_len];
+    let mut sys_best_blk = vec![f64::NEG_INFINITY; s_len];
+    let mut n_ambig_placements = 0usize;
 
     for s in 0..s_len {
         let k_i = cons_pos[s];
         if k_i < 0 {
-            confidence[s] = 0.0;
             continue;
         }
         let k_star = k_i as usize;
-        let mut alt_sum = 0.0f64;
+        sys_base_1[s] = eval_1_slot(&work_at, u_mat, p_mat, k_star);
 
-        // (a) Unassigning `s -> -1`
-        let base_1 = eval_1_slot(&work_at, u_mat, p_mat, k_star);
-        alt_sum += ((-base_1 - 2.0) / TAU_LOCAL).clamp(-35.0, 20.0).exp();
+        let pair_prev = if k_star > 1 && cons_at[k_star - 1] >= 0 {
+            p_mat.get(cons_at[k_star - 1] as usize, s).max(0.0)
+        } else {
+            0.0
+        };
+        let pair_next = if k_star + 1 < k_len && cons_at[k_star + 1] >= 0 {
+            p_mat.get(s, cons_at[k_star + 1] as usize).max(0.0)
+        } else {
+            0.0
+        };
+        let u_star = u_mat.get(s, k_star);
+        // Multi-way (`>= 3`-cycle) relocation bound: a 2-swap `k_star <-> k_alt` freezes the
+        // occupant `t = work_at[k_alt]` into `k_star` even when the true error is a `>= 3`-cycle
+        // `s -> k_alt -> k_2 -> k_star`; `cycle_deltas` measures unary preference for `k_alt`
+        // minus the sequential walk support anchoring `s` at `k_star`.
+        let walk_anchor = walk_pair_weight * (pair_prev + pair_next) + walk_base_margin;
 
-        // (b) Top-K single-slot relocations / 2-swaps `k_star <-> k_alt`
         single_deltas.clear();
+        cycle_deltas.clear();
         for &k_alt_u in &slots[s] {
             let k_alt = k_alt_u as usize;
             if k_alt == k_star {
                 continue;
             }
+            cycle_deltas.push((u_mat.get(s, k_alt) - u_star) - walk_anchor);
             let t = work_at[k_alt];
             if t >= 0 && u_mat.get(t as usize, k_star) <= (IDP_FORBID_HALF as f64) {
                 continue;
@@ -2675,13 +3295,10 @@ pub fn consensus_and_calibrate_idp(
             single_deltas.push(delta);
         }
         single_deltas.sort_by(|a, b| b.total_cmp(a));
-        for &delta in single_deltas.iter().take(MAX_ALT_COMPETITORS) {
-            alt_sum += (delta / TAU_LOCAL).clamp(-35.0, 20.0).exp();
-        }
+        sys_top_deltas[s].extend(single_deltas.iter().copied().take(MAX_ALT_COMPETITORS));
+        cycle_deltas.sort_by(|a, b| b.total_cmp(a));
+        sys_top_cycle_deltas[s].extend(cycle_deltas.iter().copied().take(3));
 
-        // (c) Best contiguous `2..=5`-residue motif swap containing `k_star` so degenerate
-        // dipeptide..pentapeptide repeats receive honest `< 0.80` uncertainty without penalizing
-        // uniquely flanked motifs (e.g. `-Pro-Pro-` with distinct flanking residues).
         let mut best_blk_delta = f64::NEG_INFINITY;
         for blen in 2..=5usize.min(k_len.saturating_sub(1)) {
             let win_lo = k_star.saturating_sub(blen - 1).max(1);
@@ -2724,16 +3341,83 @@ pub fn consensus_and_calibrate_idp(
                 }
             }
         }
+        sys_best_blk[s] = best_blk_delta;
+        let best_single_delta = sys_top_deltas[s]
+            .first()
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
+        if best_single_delta.max(best_blk_delta) >= -1.75 {
+            n_ambig_placements += 1;
+        }
+    }
+
+    let ambig_placement_frac = if n_assigned > 0 {
+        (n_ambig_placements as f64) / (n_assigned as f64)
+    } else {
+        1.0
+    };
+
+    let rms_scale = if emp_rms_seq_ca > 0.042 {
+        (emp_rms_seq_ca / 0.038).clamp(1.0, 2.50)
+    } else {
+        1.0
+    };
+    let cand_scale = if mean_cands_per_ch > 1.54 {
+        (mean_cands_per_ch / 1.48).clamp(1.0, 1.60)
+    } else {
+        1.0
+    };
+    let no_cccon_scale = if !any_cccon
+        && emp_rms_seq_ca >= 0.034
+        && (ambig_placement_frac >= 0.12 || connectivity_frac < 0.92)
+        && (mean_cands_per_ch > 1.52 || ambig_placement_frac >= 0.22 || connectivity_frac < 0.90)
+    {
+        // Without 3D CCC(CO)N TOCSY sidechain carbons, amino acids sharing overlapping `(CA, CB)`
+        // random-coil basins (`Glu/Gln/Lys/Arg/Met`, `Leu/Phe/Tyr/Asp/Asn`) lack CG/CD/CE
+        // disambiguation; under elevated matching noise + low-margin swap ambiguity + spurious
+        // candidate multiplicity, widen `tau_local_eff` proportionally.
+        let ambig_excess = (ambig_placement_frac - 0.20).max(0.0);
+        let mult_excess = (mean_cands_per_ch - 1.54).max(0.0);
+        let conn_deficit = (0.90 - connectivity_frac).max(0.0);
+        let rms_excess = (emp_rms_seq_ca - 0.055).max(0.0);
+        (1.0 + 1.85 * ambig_excess + 0.95 * mult_excess + 4.40 * conn_deficit + 12.5 * rms_excess)
+            .clamp(1.0, 2.05)
+    } else {
+        1.0
+    };
+    let repeat_scale = if seq_low_comp_warn { 1.85 } else { 1.0 };
+    let tau_local_base = TAU_LOCAL * rms_scale * cand_scale * no_cccon_scale * repeat_scale;
+    let w_ens = if !any_cccon && emp_rms_seq_ca >= 0.038 {
+        0.28
+    } else {
+        0.34
+    };
+
+    let mut raw_posterior = vec![0.0f64; s_len];
+    let mut confidence = vec![0.0f64; s_len];
+
+    for s in 0..s_len {
+        if cons_pos[s] < 0 {
+            raw_posterior[s] = 0.0;
+            confidence[s] = 0.0;
+            continue;
+        }
+        let tau_s = tau_local_base;
+        let mut alt_sum = ((-sys_base_1[s] - 2.0) / tau_s).clamp(-35.0, 20.0).exp();
+        for &delta in &sys_top_deltas[s] {
+            alt_sum += (delta / tau_s).clamp(-35.0, 20.0).exp();
+        }
+        for &cdelta in &sys_top_cycle_deltas[s] {
+            alt_sum += (cdelta / (1.15 * tau_s)).clamp(-35.0, 20.0).exp();
+        }
+        let best_blk_delta = sys_best_blk[s];
         if best_blk_delta > -4.0 {
-            alt_sum += (best_blk_delta / (1.15 * TAU_LOCAL))
-                .clamp(-35.0, 20.0)
-                .exp();
+            alt_sum += (best_blk_delta / (1.15 * tau_s)).clamp(-35.0, 20.0).exp();
         }
 
         let p_local = 1.0 / (1.0 + alt_sum);
-        // Require both local Boltzmann specificity and multi-island ensemble agreement for HC (>=0.80)
-        // while preserving >=0.55 posterior on uniquely polished sequential placements.
-        let p_combined = 0.64 * p_local + 0.36 * (p_local * p_ens[s]).sqrt();
+        let p_combined = (1.0 - w_ens) * p_local + w_ens * (p_local * p_ens[s]).sqrt();
+        raw_posterior[s] = p_combined;
         confidence[s] = eval_idp_calibration(p_combined);
     }
 
@@ -2741,47 +3425,128 @@ pub fn consensus_and_calibrate_idp(
     let n_3d_sup = systems.iter().filter(|s| s.has_3d_support()).count();
     let support_3d_frac = (n_3d_sup as f64) / (s_len as f64);
 
-    let mut n_assigned = 0usize;
-    let mut n_connected = 0usize;
-    for (s, &k_i) in cons_pos.iter().enumerate() {
-        if k_i >= 1 {
-            n_assigned += 1;
-            let k = k_i as usize;
-            let prev_ok =
-                k > 1 && cons_at[k - 1] >= 0 && p_mat.get(cons_at[k - 1] as usize, s) >= 1.0;
-            let next_ok = k + 1 < k_len
-                && cons_at[k + 1] >= 0
-                && p_mat.get(s, cons_at[k + 1] as usize) >= 1.0;
-            if prev_ok || next_ok {
-                n_connected += 1;
-            }
-        }
-    }
-    let connectivity_frac = if n_assigned > 0 {
-        (n_connected as f64) / (n_assigned as f64)
+    let n_expected_con = k_len.saturating_sub(1).max(1);
+    let root_ratio = (s_len as f64) / (n_expected_con as f64);
+    let mean_compat_2d_out = if margin_eval_2d_roots > 0 {
+        compat_2d_out_sum / (margin_eval_2d_roots as f64)
     } else {
         0.0
     };
 
-    let mut qc_reasons = Vec::new();
-    let qc_verdict = if support_3d_frac < 0.25 {
+    let mut qc_reasons: Vec<String> = Vec::new();
+    let mut severe_abstain = false;
+    let mut severe_degeneracy_warn = false;
+    let mut drift_or_sparse_warn = false;
+    let mut any_warn = false;
+
+    // (a) 3D strip support & sequential connectivity gates
+    if support_3d_frac < 0.25 {
         qc_reasons.push(format!(
             "Catastrophic 3D strip support loss ({:.1}% < 25.0% of CON roots supported)",
             support_3d_frac * 100.0
         ));
-        DatasetQcVerdict::Abstain
+        severe_abstain = true;
     } else if s_len >= 6 && connectivity_frac < 0.15 {
         qc_reasons.push(format!(
             "Sequential dipeptide connectivity collapsed ({:.1}% < 15.0% linked)",
             connectivity_frac * 100.0
         ));
-        DatasetQcVerdict::Abstain
+        severe_abstain = true;
     } else if support_3d_frac < 0.55 || (s_len >= 6 && connectivity_frac < 0.40) {
         qc_reasons.push(format!(
             "Partial 3D support ({:.1}%) or sparse sequential connectivity ({:.1}%)",
             support_3d_frac * 100.0,
             connectivity_frac * 100.0
         ));
+        drift_or_sparse_warn = true;
+        any_warn = true;
+    }
+
+    // (b) 2D CON root-deficit gate (`n_roots < 0.70 * n_expected_con`, catching Q80 root collapse!)
+    if k_len >= 20 && root_ratio < 0.35 {
+        qc_reasons.push(format!(
+            "Severe 2D CON root collapse ({s_len}/{n_expected_con} = {:.1}% < 35.0% expected peptide bonds; severe peak overlap or sensitivity loss)",
+            root_ratio * 100.0
+        ));
+        severe_abstain = true;
+    } else if k_len >= 20 && root_ratio < 0.70 {
+        qc_reasons.push(format!(
+            "2D CON root deficit ({s_len}/{n_expected_con} = {:.1}% < 70.0% expected peptide bonds)",
+            root_ratio * 100.0
+        ));
+        severe_degeneracy_warn = true;
+        any_warn = true;
+    }
+
+    // (c) Primary-sequence low-complexity / repeat gate (catching poly-Q & FG-repeat!)
+    if k_len >= 16 && (h_aa_bits < 1.65 || max_aa_frac >= 0.55 || max_dipep_frac >= 0.35) {
+        qc_reasons.push(format!(
+            "Extreme low-complexity / homopolymeric repeat sequence (Shannon H={h_aa_bits:.2} bits, dominant AA={:.1}%, dominant dipeptide={:.1}%)",
+            max_aa_frac * 100.0,
+            max_dipep_frac * 100.0
+        ));
+        severe_abstain = true;
+    } else if seq_low_comp_warn {
+        qc_reasons.push(format!(
+            "Low-complexity / repetitive IDP sequence (Shannon H={h_aa_bits:.2} bits < 2.60 or repeat fraction max_AA={:.1}%, top3_dipeptide={:.1}% >= 35.0%)",
+            max_aa_frac * 100.0,
+            top3_dipep_frac * 100.0
+        ));
+        severe_degeneracy_warn = true;
+        any_warn = true;
+    }
+
+    // (d) Candidate sequential multiplicity / elevated realistic-noise gate (all metrics length-invariant!)
+    let compat_2d_density = if s_len > 0 {
+        mean_compat_2d_out / (s_len as f64)
+    } else {
+        0.0
+    };
+    if n_3d_sup >= 8
+        && (emp_rms_seq_ca >= 0.034
+            || mean_cands_per_ch >= 1.47
+            || ambig_placement_frac >= 0.22
+            || compat_2d_density >= 0.14)
+    {
+        qc_reasons.push(format!(
+            "Elevated sequential ambiguity or matching noise (empirical CA RMS={emp_rms_seq_ca:.3} ppm, mean cands/ch={mean_cands_per_ch:.2}, 2D compat density={:.1}%, low-margin placements={:.1}%)",
+            compat_2d_density * 100.0,
+            ambig_placement_frac * 100.0
+        ));
+        any_warn = true;
+    }
+
+    // (e) Picker (`|drift| >= 0.38 ppm`) & solver (`|drift| >= 0.65 ppm` / global `>= 3.80 ppm`) carrier-drift clamp warnings
+    for w in &cfg.picker_warnings {
+        qc_reasons.push(w.clone());
+        drift_or_sparse_warn = true;
+        any_warn = true;
+    }
+    for sys in systems {
+        for w in &sys.registration_warnings {
+            qc_reasons.push(w.clone());
+            drift_or_sparse_warn = true;
+            any_warn = true;
+        }
+    }
+    for (ax_lbl, dv) in [
+        ("15N", fitted_offsets.d_n),
+        ("13C'", fitted_offsets.d_c),
+        ("13CA", fitted_offsets.d_ca),
+        ("13CB", fitted_offsets.d_cb),
+    ] {
+        if dv.abs() >= 3.80 {
+            qc_reasons.push(format!(
+                "Global {ax_lbl} reference offset ({dv:+.3} ppm) hit ±4.00 ppm estimator boundary; verify referencing"
+            ));
+            drift_or_sparse_warn = true;
+            any_warn = true;
+        }
+    }
+
+    let qc_verdict = if severe_abstain {
+        DatasetQcVerdict::Abstain
+    } else if any_warn {
         DatasetQcVerdict::Warn
     } else {
         DatasetQcVerdict::Pass
@@ -2795,9 +3560,19 @@ pub fn consensus_and_calibrate_idp(
             }
         }
         DatasetQcVerdict::Warn => {
-            for c in &mut confidence {
-                *c = (*c * 0.88).clamp(0.0, 0.96);
+            if severe_degeneracy_warn {
+                for c in &mut confidence {
+                    *c = (*c * 0.76).clamp(0.0, 0.84);
+                }
+            } else if drift_or_sparse_warn {
+                for c in &mut confidence {
+                    *c = (*c * 0.94).clamp(0.0, 0.97);
+                }
             }
+            // Note: for elevated noise / candidate-multiplicity `Warn`, `tau_local_eff` has
+            // already widened the Boltzmann specificity denominator before monotone LOPO knot
+            // calibration so ambiguous placements drop below `0.80` while uniquely resolved
+            // links stay calibrated without post-hoc underconfidence bias.
         }
         DatasetQcVerdict::Pass => {}
     }
@@ -2805,6 +3580,7 @@ pub fn consensus_and_calibrate_idp(
     IdpAssignResult {
         position: cons_pos,
         confidence,
+        raw_posterior,
         score: final_sc,
         run_scores,
         fitted_offsets,
@@ -2815,15 +3591,17 @@ pub fn consensus_and_calibrate_idp(
     }
 }
 
-/// Multi-island evolutionary + detailed-balance simulated annealing CPU solver for continuous
-/// through-Proline `13C`-detected IDP assignment (`T11.2`).
-pub fn assign_idp_13c_cpu(
+/// Fallible multi-island evolutionary + detailed-balance simulated annealing CPU solver enforcing
+/// [`MAX_IDP_MATRIX_CELLS`] (`S * K <= 25,000,000` and `S * S <= 25,000,000`, returning `Err` on overflow).
+pub fn try_assign_idp_13c_cpu(
     systems: &[ConDipeptideSystem],
     sequence: &[String],
     cfg: &IdpSolverConfig,
-) -> IdpAssignResult {
+) -> Result<IdpAssignResult, String> {
     let s_len = systems.len();
     let k_len = sequence.len();
+    check_idp_matrix_bounds(s_len, k_len)?;
+
     let fitted_offsets = if cfg.auto_reference_offset {
         estimate_idp_reference_offsets(systems, sequence, cfg)
     } else {
@@ -2831,7 +3609,7 @@ pub fn assign_idp_13c_cpu(
     };
 
     if s_len == 0 || k_len < 2 {
-        return consensus_and_calibrate_idp(
+        return Ok(consensus_and_calibrate_idp(
             systems,
             sequence,
             &Matrix2D::filled(0, 0, 0.0),
@@ -2841,11 +3619,11 @@ pub fn assign_idp_13c_cpu(
             &[],
             fitted_offsets,
             cfg,
-        );
+        ));
     }
 
-    let u_mat = idp_unary_matrix(systems, sequence, cfg, &fitted_offsets);
-    let p_mat = idp_pair_matrix(systems, cfg);
+    let u_mat = try_idp_unary_matrix(systems, sequence, cfg, &fitted_offsets)?;
+    let p_mat = try_idp_pair_matrix(systems, cfg)?;
     let slots = build_idp_valid_slots(&u_mat);
 
     let n_islands = cfg.islands.max(1);
@@ -2954,14 +3732,12 @@ pub fn assign_idp_13c_cpu(
                     continue;
                 }
                 population[lo..hi].sort_by(|a, b| b.2.total_cmp(&a.2));
-                // Polish top two island elites before segment crossover
                 for elite in &mut population[lo..(lo + 2).min(hi)] {
                     elite.2 = polish_idp_state(&mut elite.0, &mut elite.1, &u_mat, &p_mat, &slots);
                 }
                 population[lo..hi].sort_by(|a, b| b.2.total_cmp(&a.2));
                 let elite_clone = population[lo].clone();
                 let second_clone = population[lo + 1].clone();
-                // Replace bottom half of island with segment crossovers of elites
                 let mid = lo + (hi - lo) / 2;
                 for idx in mid..hi {
                     let donor = if idx % 2 == 0 {
@@ -2979,7 +3755,6 @@ pub fn assign_idp_13c_cpu(
                     );
                 }
             }
-            // Ring migration of best elite across adjacent islands
             if n_islands >= 2 && per_island >= 3 {
                 let elites: Vec<IdpReplicaState> = (0..n_islands)
                     .map(|isl| population[isl * per_island].clone())
@@ -2997,7 +3772,7 @@ pub fn assign_idp_13c_cpu(
     let rep_positions: Vec<Vec<i32>> = population.iter().map(|st| st.1.clone()).collect();
     let rep_scores: Vec<f64> = population.iter().map(|st| st.2).collect();
 
-    consensus_and_calibrate_idp(
+    Ok(consensus_and_calibrate_idp(
         systems,
         sequence,
         &u_mat,
@@ -3007,7 +3782,46 @@ pub fn assign_idp_13c_cpu(
         &rep_scores,
         fitted_offsets,
         cfg,
-    )
+    ))
+}
+
+/// Multi-island evolutionary + detailed-balance simulated annealing CPU solver for continuous
+/// through-Proline `13C`-detected IDP assignment (`T11.2`).
+///
+/// Delegates to [`try_assign_idp_13c_cpu`], returning an explicit `Abstain` result without
+/// allocating `U`/`P` if `S * K > 25,000,000`.
+pub fn assign_idp_13c_cpu(
+    systems: &[ConDipeptideSystem],
+    sequence: &[String],
+    cfg: &IdpSolverConfig,
+) -> IdpAssignResult {
+    match try_assign_idp_13c_cpu(systems, sequence, cfg) {
+        Ok(res) => res,
+        Err(msg) => IdpAssignResult {
+            position: vec![-1; systems.len()],
+            confidence: vec![0.0; systems.len()],
+            raw_posterior: vec![0.0; systems.len()],
+            score: 0.0,
+            run_scores: Vec::new(),
+            fitted_offsets: cfg.manual_offsets,
+            qc_verdict: DatasetQcVerdict::Abstain,
+            support_3d_frac: 0.0,
+            connectivity_frac: 0.0,
+            qc_reasons: vec![msg],
+        },
+    }
+}
+
+/// Fallible end-to-end convenience pipeline enforcing [`MAX_IDP_MATRIX_CELLS`] (`Err` on overflow).
+pub fn try_assign_idp_13c_from_picked(
+    picked: &C13PickedDataset,
+    sequence: &[String],
+    cfg: &IdpSolverConfig,
+) -> Result<(Vec<ConDipeptideSystem>, IdpAssignResult), String> {
+    check_idp_matrix_bounds(picked.con_roots.len(), sequence.len())?;
+    let systems = register_and_build_con_dipeptide_systems(picked);
+    let result = try_assign_idp_13c_cpu(&systems, sequence, cfg)?;
+    Ok((systems, result))
 }
 
 /// End-to-end convenience pipeline: register inter-experiment drift across `picked`, build
@@ -3039,6 +3853,7 @@ pub fn idp_to_reference(
     } else {
         IdpShiftOffsets::default()
     };
+    let preds = predict_ncidp_shifts(sequence, &IdpSolverConfig::default());
 
     let mut at: BTreeMap<usize, usize> = BTreeMap::new();
     for (s, &k_i) in result.position.iter().enumerate() {
@@ -3091,8 +3906,22 @@ pub fn idp_to_reference(
                 .insert((k - 1, "CA".to_string()), sys.ca_prev[0] - off.d_ca);
         }
         if !sys.cb_prev.is_empty() && !sequence[k - 1].eq_ignore_ascii_case("GLY") {
+            let cb_val = if sys.cb_prev.len() > 1 {
+                if let Some(mu_cb) = preds.get(k - 1).and_then(|p| p.cb_ppm) {
+                    let target = mu_cb + result.fitted_offsets.d_cb;
+                    sys.cb_prev
+                        .iter()
+                        .copied()
+                        .min_by(|&a, &b| (a - target).abs().total_cmp(&(b - target).abs()))
+                        .unwrap_or(sys.cb_prev[0])
+                } else {
+                    sys.cb_prev[0]
+                }
+            } else {
+                sys.cb_prev[0]
+            };
             out.shifts
-                .insert((k - 1, "CB".to_string()), sys.cb_prev[0] - off.d_cb);
+                .insert((k - 1, "CB".to_string()), cb_val - off.d_cb);
         }
         if !sys.c_curr.is_empty() && !out.shifts.contains_key(&(k, "C".to_string())) {
             out.shifts
