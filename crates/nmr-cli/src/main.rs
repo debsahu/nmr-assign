@@ -171,7 +171,7 @@ fn usage() -> String {
        nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
        nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard] [--engine auto|gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
-       nmrassign propensity      --shifts <assigned.str> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
+       nmrassign propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
@@ -181,7 +181,7 @@ fn usage() -> String {
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
-       nmrassign report          --star <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
+       nmrassign report          --star|--shifts <shifts.str> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
        nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
@@ -1509,38 +1509,64 @@ fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
         "SM", "EU", "GD", "TB", "DY", "HO", "ER", "TM", "YB",
     ];
 
+    #[inline]
+    fn pdb_ascii_col(bytes: &[u8], start: usize, end: usize) -> Option<&str> {
+        let slice = bytes.get(start..end)?;
+        if !slice.is_ascii() {
+            return None;
+        }
+        std::str::from_utf8(slice).ok()
+    }
+
     for line in pdb_text.lines() {
         if line.starts_with("ENDMDL") {
             break;
         }
+        let bytes = line.as_bytes();
         let is_atom = line.starts_with("ATOM  ");
         let is_het = line.starts_with("HETATM");
-        if (!is_atom && !is_het) || line.len() < 54 {
+        if (!is_atom && !is_het) || bytes.len() < 54 {
             continue;
         }
-        let alt = line.as_bytes().get(16).copied().unwrap_or(b' ') as char;
-        if alt != ' ' && alt != 'A' && alt != '1' {
+        let alt = bytes[16];
+        if alt != b' ' && alt != b'A' && alt != b'1' {
             continue;
         }
-        let Ok(x) = line[30..38].trim().parse::<f64>() else {
+        let (Some(atom_col), Some(res_col), Some(x_col), Some(y_col), Some(z_col)) = (
+            pdb_ascii_col(bytes, 12, 16),
+            pdb_ascii_col(bytes, 17, 20),
+            pdb_ascii_col(bytes, 30, 38),
+            pdb_ascii_col(bytes, 38, 46),
+            pdb_ascii_col(bytes, 46, 54),
+        ) else {
             continue;
         };
-        let Ok(y) = line[38..46].trim().parse::<f64>() else {
+        let Ok(x) = x_col.trim().parse::<f64>() else {
             continue;
         };
-        let Ok(z) = line[46..54].trim().parse::<f64>() else {
+        let Ok(y) = y_col.trim().parse::<f64>() else {
             continue;
         };
+        let Ok(z) = z_col.trim().parse::<f64>() else {
+            continue;
+        };
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
         let pos = [x, y, z];
 
         if is_het {
-            let res_name = line[17..20].trim().to_ascii_uppercase();
-            let atom_name = line[12..16].trim().to_ascii_uppercase();
-            let elem_col: String = if line.len() >= 78 {
-                line[76..78]
-                    .chars()
-                    .filter(|c| c.is_ascii_alphabetic())
-                    .map(|c| c.to_ascii_uppercase())
+            let res_name = res_col.trim().to_ascii_uppercase();
+            let atom_name = atom_col.trim().to_ascii_uppercase();
+            let elem_col: String = if bytes.len() > 76 {
+                let end = bytes.len().min(78);
+                let Some(elem_raw) = pdb_ascii_col(bytes, 76, end) else {
+                    continue;
+                };
+                elem_raw
+                    .bytes()
+                    .filter(|b| b.is_ascii_alphabetic())
+                    .map(|b| (b as char).to_ascii_uppercase())
                     .collect()
             } else {
                 String::new()
@@ -1565,7 +1591,11 @@ fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
             continue;
         }
 
-        let ch = line.as_bytes()[21] as char;
+        let chain_byte = bytes[21];
+        if !chain_byte.is_ascii() {
+            continue;
+        }
+        let ch = chain_byte as char;
         if let Some(c0) = active_chain {
             if ch != c0 {
                 continue;
@@ -1573,10 +1603,13 @@ fn parse_pdb_atom_coords_first_model(pdb_text: &str) -> PdbAtomCoordsBundle {
         } else {
             active_chain = Some(ch);
         }
-        let Ok(seq_id) = line[22..26].trim().parse::<i32>() else {
+        let Some(seq_col) = pdb_ascii_col(bytes, 22, 26) else {
             continue;
         };
-        let mut atom_name = line[12..16].trim().to_ascii_uppercase();
+        let Ok(seq_id) = seq_col.trim().parse::<i32>() else {
+            continue;
+        };
+        let mut atom_name = atom_col.trim().to_ascii_uppercase();
         if atom_name == "HN" {
             atom_name = "H".to_string();
         }
@@ -1657,39 +1690,56 @@ fn fit_and_report_pcs_tensor_cli(
             )
         })?;
 
-        let (atom_name, pcs_ppm, sigma_ppm) = if let Ok(v) = cols[1].parse::<f64>() {
-            let sig = cols
-                .get(2)
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.05);
+        let parse_pcs_val = |raw: &str| -> Result<f64, String> {
+            let v: f64 = raw
+                .parse()
+                .map_err(|e| format!("PCS line {}: invalid pcs_ppm {raw:?}: {e}", line_no + 1))?;
+            if !v.is_finite() {
+                return Err(format!(
+                    "PCS line {}: non-finite pcs_ppm {raw:?}",
+                    line_no + 1
+                ));
+            }
+            Ok(v)
+        };
+        let parse_sigma_opt = |opt_raw: Option<&&str>| -> Result<f64, String> {
+            let Some(&raw) = opt_raw else {
+                return Ok(0.05);
+            };
+            if raw.is_empty() {
+                return Ok(0.05);
+            }
+            let s: f64 = raw
+                .parse()
+                .map_err(|e| format!("PCS line {}: invalid sigma_ppm {raw:?}: {e}", line_no + 1))?;
+            if !s.is_finite() || s <= 0.0 {
+                return Err(format!(
+                    "PCS line {}: sigma_ppm {raw:?} must be finite and > 0",
+                    line_no + 1
+                ));
+            }
+            Ok(s)
+        };
+
+        let (atom_name, pcs_ppm, sigma_ppm) = if cols[1].parse::<f64>().is_ok() {
+            let v = parse_pcs_val(cols[1])?;
+            let sig = parse_sigma_opt(cols.get(2))?;
             ("H".to_string(), v, sig)
         } else if cols.len() >= 3 && cols[2].parse::<f64>().is_ok() {
             let mut at = cols[1].to_ascii_uppercase();
             if at == "HN" {
                 at = "H".to_string();
             }
-            let v: f64 = cols[2].parse().unwrap();
-            let sig = cols
-                .get(3)
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.05);
+            let v = parse_pcs_val(cols[2])?;
+            let sig = parse_sigma_opt(cols.get(3))?;
             (at, v, sig)
         } else if cols.len() >= 4 {
             let mut at = cols[2].to_ascii_uppercase();
             if at == "HN" {
                 at = "H".to_string();
             }
-            let v: f64 = cols[3].parse().map_err(|e| {
-                format!(
-                    "PCS line {}: invalid pcs_ppm {:?}: {e}",
-                    line_no + 1,
-                    cols[3]
-                )
-            })?;
-            let sig = cols
-                .get(4)
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.05);
+            let v = parse_pcs_val(cols[3])?;
+            let sig = parse_sigma_opt(cols.get(4))?;
             (at, v, sig)
         } else {
             return Err(format!(
@@ -1715,9 +1765,9 @@ fn fit_and_report_pcs_tensor_cli(
         }
     }
 
-    if observations.len() < 5 {
+    if observations.len() < 6 {
         return Err(format!(
-            "PCS 5-parameter SVD fit requires at least 5 matched PDB nuclear coordinates, found {}",
+            "PCS 5-parameter SVD fit requires at least 6 matched PDB nuclear coordinates (>= 1 DoF), found {}",
             observations.len()
         ));
     }
@@ -1738,7 +1788,9 @@ fn fit_and_report_pcs_tensor_cli(
         for mpos in candidate_metals {
             match fit_pcs_tensor_svd(&observations, mpos) {
                 Ok(t) => {
-                    if best_tensor.as_ref().is_none_or(|b| t.q_factor < b.q_factor) {
+                    if best_tensor.as_ref().is_none_or(|b| {
+                        nmr_core::paramagnetic::pcs_q_is_better(t.q_factor, b.q_factor)
+                    }) {
                         best_tensor = Some(t);
                     }
                 }
@@ -1937,6 +1989,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut pdb_path: Option<PathBuf> = None;
     let mut pcs_path: Option<PathBuf> = None;
     let mut temp_k = 298.15f64;
+    let mut temp_k_explicit = false;
     let mut ph_opt: Option<f64> = None;
     let mut con_path: Option<PathBuf> = None;
     let mut caco_path: Option<PathBuf> = None;
@@ -1947,10 +2000,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut c13_triples: Vec<(String, PathBuf)> = Vec::new();
     let mut snr = 5.0f32;
     let mut solver = SolverKind::EvoGraph;
+    let mut solver_explicit = false;
     let mut engine_req_opt: Option<EngineRequest> = None;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
+    let mut assign_cost_explicit = false;
     let mut seed = 0u64;
     let mut verbose = false;
 
@@ -2005,6 +2060,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --temp-k")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                temp_k_explicit = true;
             }
             "--ph" => {
                 i += 1;
@@ -2061,6 +2117,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "--solver" => {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
+                solver_explicit = true;
             }
             "--first-seq-id" => {
                 i += 1;
@@ -2101,6 +2158,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --assign-cost")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                assign_cost_explicit = true;
             }
             "--seed" => {
                 i += 1;
@@ -2128,6 +2186,48 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         }
         if metal_ligands_spec.is_some() {
             return Err("--metal-ligands is only supported with --regime paramagnetic".to_string());
+        }
+    }
+    if regime != RegimeKind::Idp13C {
+        let has_c13_spectra = con_path.is_some()
+            || caco_path.is_some()
+            || canco_path.is_some()
+            || cbcacon_path.is_some()
+            || cccon_path.is_some()
+            || ncaco_path.is_some()
+            || !c13_triples.is_empty();
+        if has_c13_spectra {
+            return Err(
+                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco, --triple) are only supported with --regime idp-13c"
+                    .to_string(),
+            );
+        }
+        if temp_k_explicit {
+            return Err(
+                "--temp-k is only supported with --regime idp-13c in `nmrassign assign`"
+                    .to_string(),
+            );
+        }
+        if ph_opt.is_some() {
+            return Err(
+                "--ph is only supported with --regime idp-13c in `nmrassign assign`".to_string(),
+            );
+        }
+    } else {
+        if solver_explicit {
+            return Err(
+                "--solver is not supported with --regime idp-13c (idp-13c uses its dedicated CON-dipeptide multi-replica annealer)"
+                    .to_string(),
+            );
+        }
+        if priors_path.is_some() {
+            return Err(
+                "--priors is not supported with --regime idp-13c (idp-13c uses sequence-specific ncIDP random-coil priors)"
+                    .to_string(),
+            );
+        }
+        if assign_cost_explicit {
+            return Err("--assign-cost is not supported with --regime idp-13c".to_string());
         }
     }
 
@@ -4505,6 +4605,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     let mut out_path: Option<PathBuf> = None;
     let mut title: Option<String> = None;
     let mut report_opts = ReportOptions::default();
+    let mut temp_k_explicit = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -4539,6 +4640,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --temp-k")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                temp_k_explicit = true;
             }
             "--ph" => {
                 i += 1;
@@ -4552,6 +4654,21 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown report flag {other:?}")),
         }
         i += 1;
+    }
+
+    if !report_opts.include_idp_propensity_track {
+        if temp_k_explicit {
+            return Err(
+                "--temp-k requires --idp-propensity (or --propensity) in `nmrassign report`"
+                    .to_string(),
+            );
+        }
+        if report_opts.ph.is_some() {
+            return Err(
+                "--ph requires --idp-propensity (or --propensity) in `nmrassign report`"
+                    .to_string(),
+            );
+        }
     }
 
     let star_p = star_path.ok_or("report requires --star <shifts.str>")?;
@@ -4629,14 +4746,19 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut pdb_para_path: Option<PathBuf> = None;
     let mut pcs_path: Option<PathBuf> = None;
     let mut report_opts = ReportOptions::default();
+    let mut temp_k_explicit = false;
     let mut method = "classical".to_string();
+    let mut method_explicit = false;
     let mut snr = 5.0f32;
     let mut prob = 0.45f32;
+    let mut prob_explicit = false;
     let mut priors_path: Option<String> = None;
     let mut solver = SolverKind::EvoGraph;
+    let mut solver_explicit = false;
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
+    let mut assign_cost_explicit = false;
     let mut seed = 0u64;
     let mut name_arg: Option<String> = None;
     let mut out_dir: Option<PathBuf> = None;
@@ -4692,6 +4814,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --temp-k")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                temp_k_explicit = true;
             }
             "--ph" => {
                 i += 1;
@@ -4788,6 +4911,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--method" => {
                 i += 1;
                 method = args.get(i).ok_or("missing --method")?.to_ascii_lowercase();
+                method_explicit = true;
             }
             "--snr" => {
                 i += 1;
@@ -4804,6 +4928,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --prob")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                prob_explicit = true;
             }
             "--priors" => {
                 i += 1;
@@ -4812,6 +4937,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--solver" => {
                 i += 1;
                 solver = parse_solver(args.get(i).ok_or("missing --solver")?)?;
+                solver_explicit = true;
             }
             "--runs" => {
                 i += 1;
@@ -4838,6 +4964,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .ok_or("missing --assign-cost")?
                     .parse()
                     .map_err(|e| format!("{e}"))?;
+                assign_cost_explicit = true;
             }
             "--seed" => {
                 i += 1;
@@ -4888,6 +5015,75 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         }
         if metal_ligands_spec.is_some() {
             return Err("--metal-ligands is only supported with --regime paramagnetic".to_string());
+        }
+    }
+    if regime != RegimeKind::Idp13C {
+        let has_c13_flag = con_path.is_some()
+            || caco_path.is_some()
+            || canco_path.is_some()
+            || cbcacon_path.is_some()
+            || cccon_path.is_some()
+            || ncaco_path.is_some()
+            || triples
+                .iter()
+                .any(|(exp, _)| C13DetectedExp::from_name(exp).is_some());
+        if has_c13_flag {
+            return Err(
+                "13C-detected spectrum flags (--con, --caco, --canco, --cbcacon, --cccon, --ncaco) are only supported with --regime idp-13c"
+                    .to_string(),
+            );
+        }
+        if !report_opts.include_idp_propensity_track {
+            if temp_k_explicit {
+                return Err(
+                    "--temp-k in `nmrassign pipeline` requires --regime idp-13c or --idp-propensity"
+                        .to_string(),
+                );
+            }
+            if report_opts.ph.is_some() {
+                return Err(
+                    "--ph in `nmrassign pipeline` requires --regime idp-13c or --idp-propensity"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        if solver_explicit {
+            return Err("--solver is not supported with --regime idp-13c".to_string());
+        }
+        if priors_path.is_some() {
+            return Err("--priors is not supported with --regime idp-13c".to_string());
+        }
+        if assign_cost_explicit {
+            return Err("--assign-cost is not supported with --regime idp-13c".to_string());
+        }
+        if hsqc_path.is_some()
+            || fid_bundle_path.is_some()
+            || fid_hsqc_path.is_some()
+            || !fid_triples.is_empty()
+        {
+            return Err(
+                "1H-detected --hsqc / --fid / --fid-hsqc / --fid-triple flags are not supported with --regime idp-13c"
+                    .to_string(),
+            );
+        }
+        if fold || pdb_ref_path.is_some() || noesy_peaks_path.is_some() {
+            return Err(
+                "--fold / --pdb-ref / --noesy-peaks globular NOESY folding flags are not supported with --regime idp-13c"
+                    .to_string(),
+            );
+        }
+        if nef_path.is_some() {
+            return Err(
+                "--nef input is not supported with --regime idp-13c in `nmrassign pipeline` (use --seq or --star)"
+                    .to_string(),
+            );
+        }
+        if method_explicit || prob_explicit {
+            return Err(
+                "--method / --prob 1H neural-picker flags are not supported with --regime idp-13c"
+                    .to_string(),
+            );
         }
     }
 

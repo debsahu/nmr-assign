@@ -279,9 +279,10 @@ pub struct C13PickerConfig {
     pub min_sep_n15_hz: f64,
     /// Minimum resolved separation in `Hz` along `13CA`/`13CB` (`default = 4.2 Hz`).
     pub min_sep_c_aliph_hz: f64,
-    /// Nominal IPAP virtual-decoupling `^1J_{C'CA} / 2` residual satellite window `(lo_hz, hi_hz)` (`default = (22.0, 31.0) Hz`).
-    pub ipap_half_j_window_hz: (f64, f64),
-    /// Maximum relative height of symmetric IPAP `± ^1J_{C'CA} / 2` residual decoupling satellites (`default = 0.075`).
+    /// Nominal IPAP virtual-decoupling full `^1J_{C'CA}` residual satellite window `(lo_hz, hi_hz)`
+    /// (`default = (45.0, 62.0) Hz`, centered on `^1J_{C'CA} ≈ 53.5 Hz`).
+    pub ipap_j_window_hz: (f64, f64),
+    /// Maximum relative height of symmetric IPAP `± ^1J_{C'CA}` residual decoupling satellites (`default = 0.105`).
     pub ipap_max_residual_frac: f64,
     /// Allow opposite-sign peaks in `2D CACO` (for constant-time `^1J_{CACB}` `Gly` inversion, `default = true`).
     pub caco_allow_negative: bool,
@@ -307,7 +308,7 @@ impl Default for C13PickerConfig {
             min_sep_c_prime_hz: 3.0,
             min_sep_n15_hz: 3.5,
             min_sep_c_aliph_hz: 4.2,
-            ipap_half_j_window_hz: (22.0, 31.0),
+            ipap_j_window_hz: (45.0, 62.0),
             ipap_max_residual_frac: 0.105,
             caco_allow_negative: true,
             snr_3d: 4.5,
@@ -790,45 +791,54 @@ fn pick_narrow_2d_core(
     out
 }
 
-/// Suppress residual IPAP / S3E virtual-decoupling satellites at `± ^1J_{C'CA} / 2` along `13C'`
-/// using field-strength-invariant `Hz -> ppm` conversion via `c_obs_mhz`.
+/// Suppress residual IPAP / S3E virtual-decoupling satellites at full `± ^1J_{C'CA}` (`~53–55 Hz`)
+/// along `13C'` using field-strength-invariant `Hz -> ppm` conversion via `c_obs_mhz`.
+///
+/// In IPAP virtual homodecoupling (`IP ± AP`), shifting the selected doublet line by `∓J/2` places
+/// any uncancelled opposite doublet component at full `± ^1J_{C'CA}` from the decoupled parent peak.
 fn suppress_ipap_c_prime_satellites<T>(
     mut peaks: Vec<T>,
     c_obs_mhz: f64,
     other_tol_ppm: f64,
+    noise_sigma: f64,
     cfg: &C13PickerConfig,
     get_coords: impl Fn(&T) -> (f64, f64, f64, i32),
 ) -> Vec<T> {
     if peaks.len() < 2 || cfg.ipap_max_residual_frac <= 0.0 {
         return peaks;
     }
-    let lo_ppm = hz_to_ppm(cfg.ipap_half_j_window_hz.0, c_obs_mhz, 150.0);
-    let hi_ppm = hz_to_ppm(cfg.ipap_half_j_window_hz.1, c_obs_mhz, 150.0);
+    let lo_ppm = hz_to_ppm(cfg.ipap_j_window_hz.0, c_obs_mhz, 150.0);
+    let hi_ppm = hz_to_ppm(cfg.ipap_j_window_hz.1, c_obs_mhz, 150.0);
     peaks.sort_by(|a, b| get_coords(b).2.abs().total_cmp(&get_coords(a).2.abs()));
 
     let n = peaks.len();
     let mut keep = vec![true; n];
-    for i in 0..n {
-        if !keep[i] {
-            continue;
-        }
-        let (ci, oi, hi, _) = get_coords(&peaks[i]);
-        let parent_amp = hi.abs();
-        if parent_amp <= 0.0 {
-            continue;
-        }
-        for j in (i + 1)..n {
-            if !keep[j] {
+    for j in 1..n {
+        let (cj, oj, hj, sj) = get_coords(&peaks[j]);
+        let cand_amp = hj.abs();
+        let mut sum_parent_amp = 0.0_f64;
+        let mut max_parent_amp = 0.0_f64;
+        for i in 0..j {
+            if !keep[i] {
                 continue;
             }
-            let (cj, oj, hj, _) = get_coords(&peaks[j]);
+            let (ci, oi, hi, si) = get_coords(&peaks[i]);
+            let parent_amp = hi.abs();
+            if parent_amp <= 0.0 || si != sj {
+                continue;
+            }
             let dc = (cj - ci).abs();
             let do_ppm = (oj - oi).abs();
-            if do_ppm <= other_tol_ppm
-                && dc >= lo_ppm
-                && dc <= hi_ppm
-                && hj.abs() <= cfg.ipap_max_residual_frac * parent_amp
-            {
+            if do_ppm <= other_tol_ppm && dc >= lo_ppm && dc <= hi_ppm {
+                sum_parent_amp += parent_amp;
+                max_parent_amp = max_parent_amp.max(parent_amp);
+            }
+        }
+        if max_parent_amp > 0.0 {
+            let max_allowed = (cfg.ipap_max_residual_frac * sum_parent_amp
+                + 2.5 * noise_sigma.max(0.0))
+            .min(0.24 * max_parent_amp);
+            if cand_amp <= max_allowed {
                 keep[j] = false;
             }
         }
@@ -942,8 +952,8 @@ pub fn pick_con_2d(spec: &Spectrum2D, cfg: &C13PickerConfig) -> Vec<Con2DPeak> {
         })
         .collect();
 
-    let n_tol_ipap = hz_to_ppm(3.0, n_axis.obs_mhz, 60.8);
-    peaks = suppress_ipap_c_prime_satellites(peaks, c_axis.obs_mhz, n_tol_ipap, cfg, |p| {
+    let n_tol_ipap = hz_to_ppm(4.0, n_axis.obs_mhz, 60.8);
+    peaks = suppress_ipap_c_prime_satellites(peaks, c_axis.obs_mhz, n_tol_ipap, noise, cfg, |p| {
         (p.c_prev_ppm, p.n_curr_ppm, p.height, 1)
     });
 
@@ -1084,8 +1094,8 @@ pub fn pick_caco_2d(spec: &Spectrum2D, cfg: &C13PickerConfig) -> Vec<Caco2DPeak>
         })
         .collect();
 
-    let ca_tol_ipap = hz_to_ppm(4.0, ca_axis.obs_mhz, 150.9);
-    peaks = suppress_ipap_c_prime_satellites(peaks, c_axis.obs_mhz, ca_tol_ipap, cfg, |p| {
+    let ca_tol_ipap = hz_to_ppm(4.5, ca_axis.obs_mhz, 150.9);
+    peaks = suppress_ipap_c_prime_satellites(peaks, c_axis.obs_mhz, ca_tol_ipap, noise, cfg, |p| {
         (p.c_curr_ppm, p.ca_curr_ppm, p.height, p.sign)
     });
 
@@ -1893,7 +1903,9 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
     let sig_n = hz_to_ppm(cfg.lw_n15_hz.max(2.0), n_mhz, 60.8) * fwhm_to_sigma;
     let sig_ca = hz_to_ppm(cfg.lw_ca_hz.max(2.5), c_mhz, 150.9) * fwhm_to_sigma;
     let sig_cb = hz_to_ppm(cfg.lw_cb_hz.max(2.5), c_mhz, 150.9) * fwhm_to_sigma;
-    let ipap_half_j_ppm = hz_to_ppm(26.5, c_mhz, 150.9);
+    // IPAP virtual homodecoupling (`IP ± AP`) shifts the retained doublet line by `∓J/2`,
+    // leaving any uncancelled opposite doublet component at full `±^1J_{C'CA} ≈ 53.5 Hz`.
+    let ipap_j_ppm = hz_to_ppm(53.5, c_mhz, 150.9);
 
     let seq_len = ref_data.sequence.len();
     // Optional per-residue empirical model-mismatch shift perturbation
@@ -1958,22 +1970,8 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
         splat_2d_gaussian(&mut con_2d, cp, nc, sig_cp, sig_n, amp);
         if cfg.ipap_residual_frac > 0.0 {
             let sat_amp = amp * cfg.ipap_residual_frac;
-            splat_2d_gaussian(
-                &mut con_2d,
-                cp + ipap_half_j_ppm,
-                nc,
-                sig_cp,
-                sig_n,
-                sat_amp,
-            );
-            splat_2d_gaussian(
-                &mut con_2d,
-                cp - ipap_half_j_ppm,
-                nc,
-                sig_cp,
-                sig_n,
-                sat_amp,
-            );
+            splat_2d_gaussian(&mut con_2d, cp + ipap_j_ppm, nc, sig_cp, sig_n, sat_amp);
+            splat_2d_gaussian(&mut con_2d, cp - ipap_j_ppm, nc, sig_cp, sig_n, sat_amp);
         }
     }
     let noise_2d = i0_2d / cfg.snr_2d.max(5.0);
@@ -2010,8 +2008,8 @@ pub fn simulate_idp_13c_cubes(ref_data: &Reference, cfg: &IdpCubeSimConfig) -> S
             splat_2d_gaussian(&mut spec, cp, cap, sig_cp, sig_ca, amp);
             if cfg.ipap_residual_frac > 0.0 {
                 let sat = amp * cfg.ipap_residual_frac;
-                splat_2d_gaussian(&mut spec, cp + ipap_half_j_ppm, cap, sig_cp, sig_ca, sat);
-                splat_2d_gaussian(&mut spec, cp - ipap_half_j_ppm, cap, sig_cp, sig_ca, sat);
+                splat_2d_gaussian(&mut spec, cp + ipap_j_ppm, cap, sig_cp, sig_ca, sat);
+                splat_2d_gaussian(&mut spec, cp - ipap_j_ppm, cap, sig_cp, sig_ca, sat);
             }
         }
         for v in &mut spec.data {

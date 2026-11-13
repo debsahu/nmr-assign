@@ -1362,6 +1362,12 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                     let Ok(val) = r[c_val].parse::<f64>() else {
                         continue;
                     };
+                    if !val.is_finite() {
+                        return Err(format!(
+                            "non-finite chemical shift value {:?} in NEF shift list",
+                            r[c_val]
+                        ));
+                    }
                     shifts.push(NefAssignedShift {
                         chain_code: c_chain
                             .map(|c| r[c].clone())

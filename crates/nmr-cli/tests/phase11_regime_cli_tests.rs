@@ -504,11 +504,11 @@ fn test_cli_assign_regime_paramagnetic_metal_ligands_and_pcs_svd() {
         assert!(
             stdout.contains("PCS 5-param Δχ SVD fit")
                 && stdout.contains("Δχ_ax=+24.500")
-                && (stdout.contains("Δχ_rh=+6.200") || stdout.contains("Δχ_rh=-6.200"))
+                && stdout.contains("Δχ_rh=+6.200")
                 && stdout.contains("rhombicity=0.253")
                 && stdout.contains("PCS Q-factor=0.0000")
                 && stdout.contains("Euler ZYZ="),
-            "expected exact 5-param Δχ SVD tensor summary in stdout for {solver}, got:\n{stdout}"
+            "expected exact Schmitz/Otting UTS 5-param Δχ SVD tensor summary in stdout for {solver}, got:\n{stdout}"
         );
 
         let pred = read_star_all_atoms(&out_star, None).expect("read paramagnetic output .str");
@@ -993,6 +993,251 @@ fn test_cli_sidechain_aromatic_preserves_unassigned_user_ring_shifts_p1_12() {
         assert_eq!(amb_map.get(&(45, "HD1".to_string())).copied(), Some(2));
         assert_eq!(amb_map.get(&(68, "CE1".to_string())).copied(), Some(1));
         assert_eq!(amb_map.get(&(68, "HE1".to_string())).copied(), Some(1));
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_phase11_pretag_cli_security_pcs_and_flag_validation_regressions() {
+    let dir = make_temp_dir("pretag_cli_regressions");
+    let root = repo_root();
+    let star_ubq = root.join("data/fixtures/synthetic_ubiquitin.str");
+    let ref_ubq = read_star_all_atoms(&star_ubq, None).expect("read ubiquitin");
+    let (peaks, _) = simulate(
+        &ref_ubq,
+        &SimConfig {
+            seed: 5,
+            ..SimConfig::default()
+        },
+    );
+    let peaks_tsv = dir.join("ubq_peaks.tsv");
+    write_peaks(&peaks_tsv, &peaks).expect("write peaks");
+
+    // 1. P0-1 CLI: multibyte UTF-8 in PDB columns 37 and 76..78 must NOT panic in `assign` or `report`
+    let bad_pdb = dir.join("multibyte.pdb");
+    let mut pdb_body = String::from(
+        "ATOM      1  N   ALA A   1      10.000  11.000  12.000  1.00 20.00           N  \n\
+         ATOM      2  CA  ALA A   1      11.20é  11.500  12.300  1.00 20.00           C  \n\
+         HETATM   99 FE   HEM A 101      25.000  25.000  25.000  1.00 15.00          Fé\n",
+    );
+    let clean_pdb = fs::read_to_string(root.join("data/pdb_refs/1d3z.pdb")).expect("read 1d3z");
+    pdb_body.push_str(&clean_pdb);
+    fs::write(&bad_pdb, &pdb_body).expect("write multibyte.pdb");
+
+    let out_para = dir.join("para_utf8");
+    let res_para = Command::new(nmrassign_bin())
+        .args([
+            "assign",
+            "--regime",
+            "paramagnetic",
+            "--star",
+            star_ubq.to_str().unwrap(),
+            "--peaks",
+            peaks_tsv.to_str().unwrap(),
+            "--metal-ligands",
+            "HIS68",
+            "--pdb",
+            bad_pdb.to_str().unwrap(),
+            "--runs",
+            "8",
+            "--steps",
+            "200",
+            "--out",
+            out_para.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run assign utf8 pdb");
+    assert!(
+        res_para.status.success(),
+        "assign --regime paramagnetic panicked or failed on UTF-8 PDB:\n{}",
+        String::from_utf8_lossy(&res_para.stderr)
+    );
+
+    let out_rep_utf8 = dir.join("rep_utf8.html");
+    let res_rep_utf8 = Command::new(nmrassign_bin())
+        .args([
+            "report",
+            "--shifts",
+            star_ubq.to_str().unwrap(),
+            "--pdb",
+            bad_pdb.to_str().unwrap(),
+            "--out",
+            out_rep_utf8.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run report --shifts --pdb utf8");
+    assert!(
+        res_rep_utf8.status.success(),
+        "report --shifts --pdb panicked or failed on UTF-8 PDB:\n{}",
+        String::from_utf8_lossy(&res_rep_utf8.stderr)
+    );
+
+    // 2. P0-2 CLI: malicious Comp_ID in STAR must be XML-escaped in `report --idp-propensity`
+    let xss_star = dir.join("xss.str");
+    fs::write(
+        &xss_star,
+        "data_xss\nsave_shifts\n_Assigned_chem_shift_list.Sf_category assigned_chemical_shifts\n\
+         loop_\n_Atom_chem_shift.ID\n_Atom_chem_shift.Seq_ID\n_Atom_chem_shift.Comp_ID\n\
+         _Atom_chem_shift.Atom_ID\n_Atom_chem_shift.Val\n\
+         1 1 '<svg/onload=alert(1)>' H 8.20\n\
+         2 1 '<svg/onload=alert(1)>' N 120.4\n\
+         3 1 '<svg/onload=alert(1)>' CA 54.1\n\
+         4 2 ALA H 8.35\n\
+         5 2 ALA N 122.1\n\
+         6 2 ALA CA 52.8\nstop_\nsave_\n",
+    )
+    .unwrap();
+    let xss_html = dir.join("xss.html");
+    let res_xss = Command::new(nmrassign_bin())
+        .args([
+            "report",
+            "--star",
+            xss_star.to_str().unwrap(),
+            "--idp-propensity",
+            "--title",
+            "<img src=x onerror=alert(9)>",
+            "--out",
+            xss_html.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run report xss");
+    assert!(res_xss.status.success());
+    let html_body = fs::read_to_string(&xss_html).unwrap();
+    let html_lower = html_body.to_ascii_lowercase();
+    assert!(!html_lower.contains("<svg/onload=alert(1)>"));
+    assert!(!html_lower.contains("<img src=x onerror=alert(9)>"));
+    assert!(html_lower.contains("&lt;svg/onload=alert(1)&gt;"));
+    assert!(html_body.contains("&lt;img src=x onerror=alert(9)&gt;"));
+
+    // 3. P0-3 CLI: `propensity` with Seq_ID = 2147483647 or Val = NaN must exit non-zero cleanly
+    for (name, bad_row) in [
+        ("oom_seq", "2 2147483647 ALA CA 52.4"),
+        ("nan_val", "2 2 ALA CA NaN"),
+    ] {
+        let bad_star = dir.join(format!("{name}.str"));
+        fs::write(
+            &bad_star,
+            format!(
+                "data_bad\nsave_s\n_Assigned_chem_shift_list.Sf_category assigned_chemical_shifts\n\
+                 loop_\n_Atom_chem_shift.ID\n_Atom_chem_shift.Seq_ID\n_Atom_chem_shift.Comp_ID\n\
+                 _Atom_chem_shift.Atom_ID\n_Atom_chem_shift.Val\n1 1 ALA CA 52.4\n{bad_row}\nstop_\nsave_\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(nmrassign_bin())
+            .args(["propensity", "--shifts", bad_star.to_str().unwrap()])
+            .output()
+            .expect("run propensity bad star");
+        assert!(
+            !out.status.success(),
+            "expected propensity to fail on {name}, but succeeded"
+        );
+    }
+
+    // 4. P1-1 CLI: `assign --regime paramagnetic --pcs` must reject NaN PCS, sigma <= 0, 5 rows, and collinear rows
+    let pcs_nan = dir.join("pcs_nan.tsv");
+    fs::write(
+        &pcs_nan,
+        "1 H 0.42 0.03\n2 H NaN 0.03\n3 H -0.21 0.03\n4 H 0.15 0.03\n5 H -0.33 0.03\n6 H 0.28 0.03\n",
+    )
+    .unwrap();
+    let pcs_zero_sig = dir.join("pcs_zero_sig.tsv");
+    fs::write(
+        &pcs_zero_sig,
+        "1 H 0.42 0.0\n2 H 0.11 0.03\n3 H -0.21 0.03\n4 H 0.15 0.03\n5 H -0.33 0.03\n6 H 0.28 0.03\n",
+    )
+    .unwrap();
+    let pcs_five = dir.join("pcs_five.tsv");
+    fs::write(
+        &pcs_five,
+        "1 H 0.42 0.03\n2 H 0.11 0.03\n3 H -0.21 0.03\n4 H 0.15 0.03\n5 H -0.33 0.03\n",
+    )
+    .unwrap();
+    for bad_pcs in [&pcs_nan, &pcs_zero_sig, &pcs_five] {
+        let out = Command::new(nmrassign_bin())
+            .args([
+                "assign",
+                "--regime",
+                "paramagnetic",
+                "--star",
+                star_ubq.to_str().unwrap(),
+                "--peaks",
+                peaks_tsv.to_str().unwrap(),
+                "--metal-ligands",
+                "HIS68",
+                "--pdb",
+                root.join("data/pdb_refs/1d3z.pdb").to_str().unwrap(),
+                "--pcs",
+                bad_pcs.to_str().unwrap(),
+                "--out",
+                dir.join("bad_pcs_out").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "expected bad PCS file {} to exit non-zero",
+            bad_pcs.display()
+        );
+    }
+
+    // 5. P1-4 CLI: cross-regime flags must fail loudly with non-zero exit (never silently ignored)
+    let ig_out = dir.join("ig_out").to_string_lossy().into_owned();
+    let ig_html = dir.join("ig.html").to_string_lossy().into_owned();
+    let star_s = star_ubq.to_str().unwrap();
+    let peaks_s = peaks_tsv.to_str().unwrap();
+    let cross_regime_cases: Vec<Vec<&str>> = vec![
+        vec![
+            "assign",
+            "--star",
+            star_s,
+            "--peaks",
+            peaks_s,
+            "--con",
+            "bogus.ft2",
+            "--out",
+            &ig_out,
+        ],
+        vec![
+            "assign", "--star", star_s, "--peaks", peaks_s, "--temp-k", "999", "--ph", "40",
+            "--out", &ig_out,
+        ],
+        vec![
+            "assign", "--regime", "idp-13c", "--star", star_s, "--peaks", peaks_s, "--solver",
+            "standard", "--out", &ig_out,
+        ],
+        vec!["report", "--star", star_s, "--ph", "99", "--out", &ig_html],
+        vec![
+            "pipeline",
+            "--star",
+            star_s,
+            "--con",
+            "bogus.ft2",
+            "--out-dir",
+            &ig_out,
+        ],
+        vec![
+            "pipeline",
+            "--regime",
+            "idp-13c",
+            "--star",
+            star_s,
+            "--solver",
+            "standard",
+            "--out-dir",
+            &ig_out,
+        ],
+    ];
+    for cmd_args in cross_regime_cases {
+        let out = Command::new(nmrassign_bin())
+            .args(&cmd_args)
+            .output()
+            .expect("run cross-regime validation check");
+        assert!(
+            !out.status.success(),
+            "expected cross-regime invocation {cmd_args:?} to fail with non-zero status"
+        );
     }
 
     let _ = fs::remove_dir_all(&dir);

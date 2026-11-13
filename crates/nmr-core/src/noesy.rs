@@ -222,19 +222,32 @@ pub fn parse_pdb_str_first_model(pdb_text: &str) -> Result<PdbChain, String> {
     let mut index_by_seq: BTreeMap<(char, i32), usize> = BTreeMap::new();
     let mut selected_chain: Option<char> = None;
 
+    #[inline]
+    fn pdb_ascii_col(bytes: &[u8], start: usize, end: usize) -> Option<&str> {
+        let slice = bytes.get(start..end)?;
+        if !slice.is_ascii() {
+            return None;
+        }
+        std::str::from_utf8(slice).ok()
+    }
+
     for line in pdb_text.lines() {
         if line.starts_with("ENDMDL") {
             break;
         }
-        if !line.starts_with("ATOM  ") || line.len() < 54 {
-            continue;
-        }
         let bytes = line.as_bytes();
-        let alt_loc = bytes[16] as char;
-        if alt_loc != ' ' && alt_loc != 'A' && alt_loc != '1' {
+        if !line.starts_with("ATOM  ") || bytes.len() < 54 {
             continue;
         }
-        let chain_id = bytes[21] as char;
+        let alt_loc = bytes[16];
+        if alt_loc != b' ' && alt_loc != b'A' && alt_loc != b'1' {
+            continue;
+        }
+        let chain_byte = bytes[21];
+        if !chain_byte.is_ascii() {
+            continue;
+        }
+        let chain_id = chain_byte as char;
         if let Some(ch) = selected_chain {
             if chain_id != ch {
                 continue;
@@ -244,25 +257,37 @@ pub fn parse_pdb_str_first_model(pdb_text: &str) -> Result<PdbChain, String> {
         }
 
         // Ignore insertion codes other than space so residue numbering stays clean
-        let i_code = bytes[26] as char;
-        if i_code != ' ' {
+        if bytes[26] != b' ' {
             continue;
         }
 
-        let atom_name = line[12..16].trim();
-        let res_name = line[17..20].trim().to_ascii_uppercase();
-        let Ok(seq_id) = line[22..26].trim().parse::<i32>() else {
+        let (Some(atom_col), Some(res_col), Some(seq_col), Some(x_col), Some(y_col), Some(z_col)) = (
+            pdb_ascii_col(bytes, 12, 16),
+            pdb_ascii_col(bytes, 17, 20),
+            pdb_ascii_col(bytes, 22, 26),
+            pdb_ascii_col(bytes, 30, 38),
+            pdb_ascii_col(bytes, 38, 46),
+            pdb_ascii_col(bytes, 46, 54),
+        ) else {
             continue;
         };
-        let Ok(x) = line[30..38].trim().parse::<f64>() else {
+        let atom_name = atom_col.trim();
+        let res_name = res_col.trim().to_ascii_uppercase();
+        let Ok(seq_id) = seq_col.trim().parse::<i32>() else {
             continue;
         };
-        let Ok(y) = line[38..46].trim().parse::<f64>() else {
+        let Ok(x) = x_col.trim().parse::<f64>() else {
             continue;
         };
-        let Ok(z) = line[46..54].trim().parse::<f64>() else {
+        let Ok(y) = y_col.trim().parse::<f64>() else {
             continue;
         };
+        let Ok(z) = z_col.trim().parse::<f64>() else {
+            continue;
+        };
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
         let xyz = [x, y, z];
 
         let idx = *index_by_seq.entry((chain_id, seq_id)).or_insert_with(|| {

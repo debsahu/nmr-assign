@@ -42,7 +42,7 @@ Feature parity target, mapped to modules:
 
 ## Principles
 
-1. `nmr-core` (`f64`) is the clean mathematical reference; `nmr-gpu` (`wgpu`/WGSL) accelerates hot paths (`U`/`P` scoring, `16 KiB` workgroup-SRAM multi-replica annealing for globular, `13C`-IDP & methyl-TROSY solvers, and 3D CNN inference; non-blocking `std::future::Future` `GpuEngine::read_buffer_vec_async` on `wasm32`) with leakage-free 10-fold LOPO per-engine confidence calibration (`STANDARD_CPU_CALIBRATION_KNOTS`, `STANDARD_GPU_CALIBRATION_KNOTS`, `EVO_GRAPH_CALIBRATION_KNOTS` in `nmr-core::qc`) parity-tested against `nmr-core` (06, 10, 13, 14).
+1. `nmr-core` (`f64`) is the clean mathematical reference; `nmr-gpu` (`wgpu`/WGSL) accelerates hot paths (`U`/`P` scoring, `16 KiB` workgroup-SRAM multi-replica annealing for globular, `13C`-IDP & methyl-TROSY solvers, and 3D CNN inference; synchronous GPU entry points return an explicit `Err` on `wasm32`, with low-level `Future` helper `GpuEngine::read_buffer_vec_async` prepared for async browser callers) with 10-fold OOF LOPO per-engine calibrators (`STANDARD_CALIBRATION_KNOTS`, `STANDARD_GPU_CALIBRATION_KNOTS`, `EVO_GRAPH_CALIBRATION_KNOTS` in `nmr-core::qc`) parity-tested against `nmr-core` (06, 10, 13, 14).
 2. Every module is benchmarked against ground truth before it is trusted (05).
 3. Ambiguity is carried forward as scored candidates (`SpinSystem` clusters, `r^-6` ambiguous NOE restraints), never silently discarded.
 4. Clean-room: implement from peer-reviewed papers, open BMRB/PDB data, and permissive Apache-2.0/MIT sources only (see `AGENTS.md` and `THIRD_PARTY.md`).

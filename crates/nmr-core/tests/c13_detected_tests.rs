@@ -83,7 +83,7 @@ fn test_crowded_con_cluster_deconvolution_and_ipap_suppression_500_to_950_mhz() 
             lw_c_prime_hz: 4.4,
             lw_n15_hz: 4.0,
             snr_2d: 65.0,
-            ipap_residual_frac: 0.055, // 5.5% residual IPAP ±J/2 decoupling satellites
+            ipap_residual_frac: 0.055, // 5.5% residual IPAP ±1J(C',CA) (~53.5 Hz) decoupling satellites
             con_grid: (1024, 1024),
             experiments: vec![C13DetectedExp::Con2D],
             seed: 101 + (mhz as u64),
@@ -190,6 +190,12 @@ fn test_proline_rich_bmrb_con_root_recovery_gate_above_97_percent() {
         let rec_all = (matched_all as f64) / (cubes.ground_truth_con.len() as f64);
         let rec_x_pro = (matched_x_pro as f64) / (total_x_pro.max(1) as f64);
         let rec_pro_pro = (matched_pro_pro as f64) / (total_pro_pro.max(1) as f64);
+        println!(
+            "{label}: matched={matched_all}/{} ({:.2}%), total_picked={}, x_pro={matched_x_pro}/{total_x_pro}, pro_pro={matched_pro_pro}/{total_pro_pro}",
+            cubes.ground_truth_con.len(),
+            rec_all * 100.0,
+            con_peaks.len()
+        );
 
         assert!(
             rec_all >= 0.97,
@@ -332,4 +338,69 @@ fn test_h1_exchange_broadening_vs_c13_con_advantage_at_physiological_ph() {
     );
     assert!(cmp.proline_peptide_bonds >= 44);
     assert!(cmp.amide_bonds_broadened_below_snr > 40);
+}
+
+#[test]
+fn test_p1_2_ipap_full_j_53_5_hz_satellites_suppressed_at_5_and_8_percent_on_p53() {
+    let root = workspace_root();
+    let p53 = read_star(
+        root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+        None,
+    )
+    .expect("p53 STAR");
+
+    // Verify default IPAP window targets full ±1J(C',CA) in [45, 62] Hz (Bermel et al. 2006)
+    let pcfg = C13PickerConfig::default();
+    assert_eq!(pcfg.ipap_j_window_hz, (45.0, 62.0));
+
+    for &res_frac in &[0.05, 0.08] {
+        let sim_cfg = IdpCubeSimConfig {
+            proton_mhz: 800.0,
+            temperature_k: 303.15,
+            ph: 6.5,
+            lw_c_prime_hz: 4.5,
+            lw_n15_hz: 4.0,
+            snr_2d: 55.0,
+            ipap_residual_frac: res_frac,
+            con_grid: (1536, 1536),
+            experiments: vec![C13DetectedExp::Con2D],
+            seed: 2026,
+            ..IdpCubeSimConfig::default()
+        };
+        let cubes = simulate_idp_13c_cubes(&p53, &sim_cfg);
+        let picked = pick_con_2d(&cubes.con_2d, &pcfg);
+
+        let n_truth = cubes.ground_truth_con.len();
+        let matched_truth = cubes
+            .ground_truth_con
+            .iter()
+            .filter(|&&(_, cp, np, _, _)| {
+                picked.iter().any(|p| {
+                    (p.c_prev_ppm - cp).abs() <= 0.038 && (p.n_curr_ppm - np).abs() <= 0.15
+                })
+            })
+            .count();
+        let spurious = picked
+            .iter()
+            .filter(|p| {
+                !cubes.ground_truth_con.iter().any(|&(_, cp, np, _, _)| {
+                    (p.c_prev_ppm - cp).abs() <= 0.045 && (p.n_curr_ppm - np).abs() <= 0.18
+                })
+            })
+            .count();
+
+        let rec = (matched_truth as f64) / (n_truth as f64);
+        assert!(
+            rec >= 0.97,
+            "p53 CON recovery at {:.0}% full-1J IPAP satellites dropped to {:.2}% ({matched_truth}/{n_truth})",
+            res_frac * 100.0,
+            rec * 100.0
+        );
+        assert!(
+            spurious <= 2,
+            "full ±1J(C',CA) IPAP satellites leaked into picked CON roots at {:.0}% residual: got {spurious} spurious picks (total picked={}, truth={n_truth})",
+            res_frac * 100.0,
+            picked.len()
+        );
+    }
 }

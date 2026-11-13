@@ -259,7 +259,8 @@ fn test_synthetic_lanthanide_pcs_svd_robust_irls_and_metal_refinement() {
         if line.starts_with("ENDMDL") {
             break;
         }
-        if line.starts_with("ATOM  ") && line.len() >= 54 {
+        let bytes = line.as_bytes();
+        if line.starts_with("ATOM  ") && bytes.len() >= 54 && bytes[..54].is_ascii() {
             let sid: i32 = line[22..26].trim().parse().unwrap_or(1);
             let x: f64 = line[30..38].trim().parse().expect("pdb x");
             let y: f64 = line[38..46].trim().parse().expect("pdb y");
@@ -277,11 +278,13 @@ fn test_synthetic_lanthanide_pcs_svd_robust_irls_and_metal_refinement() {
         amides.len()
     );
 
-    // Canonical lanthanide susceptibility anisotropy tensors in 10^-32 m^3 (UTS ordering |zz| >= |xx| >= |yy|)
+    // Canonical lanthanide susceptibility anisotropy tensors in 10^-32 m^3
+    // (Schmitz & Otting 2008 UTS ordering |zz'| >= |yy'| >= |xx'| => 0 <= dchi_rh / dchi_ax <= 2/3)
+    let pi_2 = std::f64::consts::FRAC_PI_2;
     let lanthanides = [
-        ("Tm3+", 22.4_f64, -5.8_f64, [0.65_f64, 1.05, 2.15]),
-        ("Tb3+", -34.2_f64, 8.6_f64, [1.20_f64, 0.82, 0.45]),
-        ("Dy3+", -38.5_f64, 11.2_f64, [2.35_f64, 1.38, 1.70]),
+        ("Tm3+", 22.4_f64, 5.8_f64, [0.65_f64, 1.05, 2.15 + pi_2]),
+        ("Tb3+", -34.2_f64, -8.6_f64, [1.20_f64, 0.82, 0.45 + pi_2]),
+        ("Dy3+", -38.5_f64, -11.2_f64, [2.35_f64, 1.38, 1.70 + pi_2]),
     ];
 
     for (ion_name, true_ax, true_rh, true_euler) in lanthanides {
@@ -307,13 +310,18 @@ fn test_synthetic_lanthanide_pcs_svd_robust_irls_and_metal_refinement() {
             );
         }
 
-        // Verify UTS eigenvalue ordering, tracelessness, right-handedness, and rhombicity <= 2/3
+        // Verify Schmitz/Otting UTS eigenvalue ordering |zz'| >= |yy'| >= |xx'|,
+        // tracelessness, right-handedness, and 0 <= dchi_rh / dchi_ax <= 2/3
         let [xx_p, yy_p, zz_p] = fit_clean.eigenvalues_paf;
         assert!((xx_p + yy_p + zz_p).abs() < 1e-11, "PAF trace must vanish");
         assert!(
-            zz_p.abs() >= xx_p.abs() - 1e-12 && xx_p.abs() >= yy_p.abs() - 1e-12,
-            "{ion_name}: UTS ordering violated: {:?}",
-            fit_clean.eigenvalues_paf
+            zz_p.abs() >= yy_p.abs() - 1e-12
+                && yy_p.abs() >= xx_p.abs() - 1e-12
+                && fit_clean.dchi_rh * fit_clean.dchi_ax >= -1e-12,
+            "{ion_name}: Schmitz/Otting UTS ordering violated: eig={:?}, ax={}, rh={}",
+            fit_clean.eigenvalues_paf,
+            fit_clean.dchi_ax,
+            fit_clean.dchi_rh
         );
         assert!(fit_clean.rhombicity <= 2.0 / 3.0 + 1e-12);
         let r_recon = rotation_matrix_from_zyz(
@@ -377,7 +385,7 @@ fn test_synthetic_lanthanide_pcs_svd_robust_irls_and_metal_refinement() {
     }
 
     // 3. Robust Huber IRLS test against contact-shift / misassignment outliers
-    let (true_ax, true_rh, true_euler) = (-34.2_f64, 8.6_f64, [1.20_f64, 0.82, 0.45]);
+    let (true_ax, true_rh, true_euler) = (-34.2_f64, -8.6_f64, [1.20_f64, 0.82, 0.45 + pi_2]);
     let mut outlier_obs: Vec<PcsObservation> = amides
         .iter()
         .map(|&(seq_id, pos)| {
@@ -1043,4 +1051,92 @@ fn test_tandem_two_cluster_explicit_ligands_with_3d_pdb_preserves_bimodal_bleach
     assert!(
         rep_two.p_bleach[1] > 0.80 && rep_two.p_bleach[17] > 0.80 && rep_two.p_bleach[12] < 0.20
     );
+}
+
+#[test]
+fn test_p1_1_pcs_uts_sign_input_validation_rank_check_and_nan_q_factor() {
+    use nmr_core::paramagnetic::pcs_q_is_better;
+
+    let metal: Vec3 = [0.0, 0.0, 0.0];
+    let sites: [Vec3; 8] = [
+        [12.0, 3.0, -2.0],
+        [-11.0, 5.5, 4.0],
+        [4.0, -13.0, 3.5],
+        [-3.5, 6.0, 14.0],
+        [8.5, 9.0, -10.5],
+        [-9.5, -8.0, -9.0],
+        [14.5, -4.0, 7.5],
+        [-6.0, 12.5, -8.5],
+    ];
+
+    // (a) Canonical Schmitz/Otting UTS (+30.0, +8.0) recovers dchi_rh = +8.0 (not -8.0)
+    let euler = [0.55_f64, 1.15, 2.05];
+    let valid_obs: Vec<PcsObservation> = sites
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| {
+            let pcs = predict_pcs_spherical_ppm(pos, metal, 30.0, 8.0, euler);
+            PcsObservation::new((i + 1) as i32, pos, pcs).with_uncertainty(0.03)
+        })
+        .collect();
+    let t = fit_pcs_tensor_svd(&valid_obs, metal).expect("valid 8-site UTS fit");
+    assert!(
+        (t.dchi_ax - 30.0).abs() < 1e-9 && (t.dchi_rh - 8.0).abs() < 1e-9,
+        "expected exact (+30.0, +8.0) UTS recovery, got ax={}, rh={}",
+        t.dchi_ax,
+        t.dchi_rh
+    );
+
+    // (b) NaN / Inf PCS or coordinates must fail cleanly
+    let mut nan_obs = valid_obs.clone();
+    nan_obs[2].pcs_ppm = f64::NAN;
+    assert!(fit_pcs_tensor_svd(&nan_obs, metal).is_err());
+    assert!(fit_pcs_tensor_robust(&nan_obs, metal, 0.08, 10).is_err());
+    assert!(refine_metal_position_and_tensor(&nan_obs, metal, 2.0, 1.0).is_err());
+
+    // (c) Non-positive or non-finite uncertainty_ppm / negative coord_uncertainty must fail cleanly
+    let mut zero_sig = valid_obs.clone();
+    zero_sig[0] = zero_sig[0].with_uncertainty(0.0);
+    assert!(fit_pcs_tensor_svd(&zero_sig, metal).is_err());
+    let mut neg_sig = valid_obs.clone();
+    neg_sig[1] = neg_sig[1].with_uncertainty(-0.02);
+    assert!(fit_pcs_tensor_svd(&neg_sig, metal).is_err());
+    let mut neg_coord_sig = valid_obs.clone();
+    neg_coord_sig[0] = neg_coord_sig[0].with_coord_uncertainty(-0.1);
+    assert!(fit_pcs_tensor_svd(&neg_coord_sig, metal).is_err());
+
+    // (d) Underdetermined n = 5 (0 residual DoF) must fail cleanly
+    assert!(fit_pcs_tensor_svd(&valid_obs[..5], metal).is_err());
+    assert!(refine_metal_position_and_tensor(&valid_obs[..7], metal, 2.0, 1.0).is_err());
+
+    // (e) Rank-deficient collinear nuclear coordinates (cond > 1e8) must fail cleanly
+    let collinear_obs: Vec<PcsObservation> = (0..7)
+        .map(|i| {
+            let r = 12.0 + f64::from(i) * 2.0;
+            PcsObservation::new(i + 1, [r, 0.0, 0.0], 0.4 - 0.03 * f64::from(i))
+                .with_uncertainty(0.03)
+        })
+        .collect();
+    assert!(
+        fit_pcs_tensor_svd(&collinear_obs, metal).is_err(),
+        "collinear nuclear coordinates have rank-1 dipolar design matrix and must return Err"
+    );
+
+    // (f) Diamagnetic / all-zero PCS vector has undefined Q = 0/0 => q_factor.is_nan(),
+    //     and pcs_q_is_better ranks any finite Q strictly ahead of NaN!
+    let zero_pcs_obs: Vec<PcsObservation> = sites
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| PcsObservation::new((i + 1) as i32, pos, 0.0).with_uncertainty(0.03))
+        .collect();
+    let zero_fit = fit_pcs_tensor_svd(&zero_pcs_obs, metal).expect("all-zero PCS SVD fit");
+    assert!(
+        zero_fit.q_factor.is_nan(),
+        "expected NaN Q-factor when sum(pcs_obs^2) == 0, got {}",
+        zero_fit.q_factor
+    );
+    assert!(zero_fit.rmsd_ppm.abs() < 1e-12);
+    assert!(!pcs_q_is_better(f64::NAN, 0.25));
+    assert!(pcs_q_is_better(0.25, f64::NAN));
+    assert!(!pcs_q_is_better(f64::NAN, f64::NAN));
 }

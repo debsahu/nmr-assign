@@ -235,6 +235,12 @@ fn read_star_str_inner(
                 let Ok(val) = r[val_col].parse::<f64>() else {
                     continue;
                 };
+                if !val.is_finite() {
+                    return Err(format!(
+                        "non-finite chemical shift value {:?} at Seq_ID {sid} in NMR-STAR",
+                        r[val_col]
+                    ));
+                }
                 let ent = ent_col
                     .map(|c| r[c].clone())
                     .unwrap_or_else(|| "1".to_string());
@@ -305,6 +311,7 @@ fn read_star_str_inner(
         }
     }
 
+    const MAX_STAR_SEQ_SPAN: i64 = 100_000;
     let (&lo, &hi) = (
         comps.keys().next().ok_or("empty sequence in NMR-STAR")?,
         comps
@@ -312,6 +319,13 @@ fn read_star_str_inner(
             .next_back()
             .ok_or("empty sequence in NMR-STAR")?,
     );
+    let span = i64::from(hi) - i64::from(lo);
+    if !(0..=MAX_STAR_SEQ_SPAN).contains(&span) {
+        return Err(format!(
+            "NMR-STAR Seq_ID span {lo}..={hi} ({} residues) exceeds safety limit ({MAX_STAR_SEQ_SPAN})",
+            span.saturating_add(1)
+        ));
+    }
     let seq_ids: Vec<i32> = (lo..=hi).collect();
     let sequence: Vec<String> = seq_ids
         .iter()

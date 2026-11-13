@@ -1290,9 +1290,9 @@ pub struct PcsObservation {
     pub seq_id: i32,
     pub coord_angstrom: Vec3,
     pub pcs_ppm: f64,
-    /// Measurement uncertainty $\sigma_i$ in ppm (defaults to `0.05` ppm; `<= 0` uses `1.0`).
+    /// Measurement uncertainty $\sigma_i > 0$ in ppm (defaults to `0.05` ppm).
     pub uncertainty_ppm: f64,
-    /// Optional 3D RMS nuclear coordinate uncertainty $\sigma_{\text{coord}}$ in Å (`0.0` when exact),
+    /// Optional 3D RMS nuclear coordinate uncertainty $\sigma_{\text{coord}} \ge 0$ in Å (`0.0` when exact),
     /// propagated analytically via $\nabla_{\mathbf{r}} \Delta\delta^{\text{PCS}}$ (`Schmitz et al. 2008`).
     pub coord_uncertainty_angstrom: f64,
 }
@@ -1314,7 +1314,7 @@ impl PcsObservation {
     }
 
     pub fn with_coord_uncertainty(mut self, sigma_3d_angstrom: f64) -> Self {
-        self.coord_uncertainty_angstrom = sigma_3d_angstrom.max(0.0);
+        self.coord_uncertainty_angstrom = sigma_3d_angstrom;
         self
     }
 }
@@ -1331,14 +1331,15 @@ pub struct DeltaChiTensor {
     /// Full $3 \times 3$ traceless symmetric tensor $\Delta\boldsymbol{\chi}_{\text{mol}}$ ($10^{-32}\text{ m}^3$).
     pub matrix_mol: [[f64; 3]; 3],
     /// Principal-axis eigenvalues $[\Delta\chi'_{xx}, \Delta\chi'_{yy}, \Delta\chi'_{zz}]$ ordered by the
-    /// UTS convention $|\Delta\chi'_{zz}| \ge |\Delta\chi'_{xx}| \ge |\Delta\chi'_{yy}|$.
+    /// Schmitz/Otting UTS convention $|\Delta\chi'_{zz}| \ge |\Delta\chi'_{yy}| \ge |\Delta\chi'_{xx}|$
+    /// (`0 <= Δχ_rh / Δχ_ax <= 2/3`).
     pub eigenvalues_paf: [f64; 3],
     /// Proper right-handed rotation matrix $R \in SO(3)$ mapping molecular vectors to the PAF ($\mathbf{r}' = R(\mathbf{r} - \mathbf{m})$).
     pub rotation_mol_to_paf: [[f64; 3]; 3],
     /// Axial anisotropy $\Delta\chi_{\text{ax}} = \Delta\chi'_{zz} - \frac{1}{2}(\Delta\chi'_{xx} + \Delta\chi'_{yy})$ ($10^{-32}\text{ m}^3$).
     pub dchi_ax: f64,
     /// Rhombic anisotropy $\Delta\chi_{\text{rh}} = \Delta\chi'_{xx} - \Delta\chi'_{yy}$ ($10^{-32}\text{ m}^3$),
-    /// satisfying $|\Delta\chi_{\text{rh}} / \Delta\chi_{\text{ax}}| \le \frac{2}{3}$.
+    /// satisfying $0 \le \Delta\chi_{\text{rh}} / \Delta\chi_{\text{ax}} \le \frac{2}{3}$.
     pub dchi_rh: f64,
     /// Non-negative rhombicity ratio $|\Delta\chi_{\text{rh}} / \Delta\chi_{\text{ax}}| \in [0, 2/3]$.
     pub rhombicity: f64,
@@ -1454,14 +1455,67 @@ pub fn pcs_design_row(coord: Vec3, metal_pos: Vec3) -> [f64; 5] {
     ]
 }
 
+/// Maximum acceptable singular-value condition number $\kappa(A) = \sigma_{\max}/\sigma_{\min}$
+/// for 5-parameter PCS linear least squares before declaring the nuclear geometry rank-deficient.
+pub const MAX_PCS_DESIGN_COND: f64 = 1.0e8;
+
+/// Compare two Cornilescu PCS $Q$-factors, treating `NaN` / non-finite $Q$ strictly as worst.
+#[inline]
+pub fn pcs_q_is_better(candidate_q: f64, incumbent_q: f64) -> bool {
+    match (candidate_q.is_finite(), incumbent_q.is_finite()) {
+        (true, true) => candidate_q < incumbent_q,
+        (true, false) => true,
+        (false, _) => false,
+    }
+}
+
+fn validate_pcs_observation_slice(obs: &[PcsObservation], min_count: usize) -> Result<(), String> {
+    if obs.len() < min_count {
+        return Err(format!(
+            "PCS DeltaChi tensor fit requires at least {min_count} observations (>= 1 DoF), got {}",
+            obs.len()
+        ));
+    }
+    for o in obs {
+        if !o.pcs_ppm.is_finite() {
+            return Err(format!(
+                "non-finite PCS shift ({}) at seq_id {}",
+                o.pcs_ppm, o.seq_id
+            ));
+        }
+        if !o.coord_angstrom.iter().all(|v| v.is_finite()) {
+            return Err(format!(
+                "non-finite nuclear coordinate {:?} at seq_id {}",
+                o.coord_angstrom, o.seq_id
+            ));
+        }
+        if !o.uncertainty_ppm.is_finite() || o.uncertainty_ppm <= 0.0 {
+            return Err(format!(
+                "invalid PCS uncertainty_ppm ({}) at seq_id {}: must be finite and > 0",
+                o.uncertainty_ppm, o.seq_id
+            ));
+        }
+        if !o.coord_uncertainty_angstrom.is_finite() || o.coord_uncertainty_angstrom < 0.0 {
+            return Err(format!(
+                "invalid PCS coord_uncertainty_angstrom ({}) at seq_id {}: must be finite and >= 0",
+                o.coord_uncertainty_angstrom, o.seq_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Self-contained thin Hestenes one-sided Jacobi Singular Value Decomposition of an $N \times 5$
-/// matrix $A = U \Sigma V^T$ ($N \ge 5$), solving $A x \approx b$ in least squares without squaring $\kappa(A)$.
+/// matrix $A = U \Sigma V^T$ ($N \ge 6$), solving $A x \approx b$ in least squares without squaring $\kappa(A)$.
 fn solve_nx5_svd(a_rows: &[[f64; 5]], b: &[f64]) -> Result<([f64; 5], f64), String> {
     let n = a_rows.len();
-    if n < 5 || b.len() != n {
+    if n < 6 || b.len() != n {
         return Err(format!(
-            "5-parameter PCS tensor SVD requires at least 5 observations (got {n})"
+            "5-parameter PCS tensor SVD requires at least 6 observations (>= 1 DoF, got {n})"
         ));
+    }
+    if a_rows.iter().any(|r| r.iter().any(|v| !v.is_finite())) || b.iter().any(|v| !v.is_finite()) {
+        return Err("non-finite entry in PCS design matrix or observation vector".to_string());
     }
 
     // Store columns w_0..w_4 of length n; initialize V = I_5
@@ -1527,29 +1581,33 @@ fn solve_nx5_svd(a_rows: &[[f64; 5]], b: &[f64]) -> Result<([f64; 5], f64), Stri
         sigmas[j] = norm_sq.sqrt();
     }
     let s_max = sigmas.iter().copied().fold(0.0_f64, f64::max);
-    if s_max <= 1e-15 || !s_max.is_finite() {
-        return Err("degenerate PCS geometry: singular design matrix".to_string());
-    }
     let s_min = sigmas.iter().copied().fold(f64::INFINITY, f64::min);
-    let cond = if s_min > 1e-15 * s_max {
-        s_max / s_min
-    } else {
-        1e15
-    };
+    if s_max <= 1e-15 || !s_max.is_finite() || !s_min.is_finite() || s_min <= 0.0 {
+        return Err(
+            "degenerate PCS geometry: singular or rank-deficient design matrix".to_string(),
+        );
+    }
+    let cond = s_max / s_min;
+    if !cond.is_finite() || cond > MAX_PCS_DESIGN_COND {
+        return Err(format!(
+            "ill-conditioned PCS geometry: design-matrix condition number {cond:.3e} exceeds {:.1e}",
+            MAX_PCS_DESIGN_COND
+        ));
+    }
 
-    let tol = 1e-12 * s_max;
     let mut x = [0.0_f64; 5];
     for j in 0..5 {
-        if sigmas[j] > tol {
-            let mut ut_b = 0.0_f64;
-            for i in 0..n {
-                ut_b += (cols[j][i] / sigmas[j]) * b[i];
-            }
-            let coeff = ut_b / sigmas[j];
-            for k in 0..5 {
-                x[k] += coeff * v[k][j];
-            }
+        let mut ut_b = 0.0_f64;
+        for i in 0..n {
+            ut_b += (cols[j][i] / sigmas[j]) * b[i];
         }
+        let coeff = ut_b / sigmas[j];
+        for k in 0..5 {
+            x[k] += coeff * v[k][j];
+        }
+    }
+    if !x.iter().all(|v| v.is_finite()) {
+        return Err("PCS SVD produced non-finite tensor components".to_string());
     }
     Ok((x, cond))
 }
@@ -1606,9 +1664,9 @@ fn jacobi_sym_3x3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
     ([a[0][0], a[1][1], a[2][2]], q)
 }
 
-/// Diagonalize the 5-component traceless symmetric tensor into the UTS principal-axis convention
-/// $|\Delta\chi'_{zz}| \ge |\Delta\chi'_{xx}| \ge |\Delta\chi'_{yy}|$ (`|Δχ_rh / Δχ_ax| <= 2/3`)
-/// and right-handed ZYZ Euler angles $(\alpha, \beta, \gamma)$.
+/// Diagonalize the 5-component traceless symmetric tensor into the Schmitz/Otting UTS
+/// principal-axis convention $|\Delta\chi'_{zz}| \ge |\Delta\chi'_{yy}| \ge |\Delta\chi'_{xx}|$
+/// (`0 <= Δχ_rh / Δχ_ax <= 2/3`) and right-handed ZYZ Euler angles $(\alpha, \beta, \gamma)$.
 fn build_delta_chi_tensor(
     metal_pos: Vec3,
     x: [f64; 5],
@@ -1620,12 +1678,13 @@ fn build_delta_chi_tensor(
     let mat = [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]];
 
     let (evals, q_cols) = jacobi_sym_3x3(mat);
-    // Order indices so |lambda_z| >= |lambda_x| >= |lambda_y|
+    // Schmitz et al. (J. Biomol. NMR 2008) / Otting UTS ordering:
+    // |lambda_z| >= |lambda_y| >= |lambda_x| so 0 <= dchi_rh / dchi_ax <= 2/3.
     let mut order = [0usize, 1, 2];
     order.sort_by(|&a, &b| evals[b].abs().total_cmp(&evals[a].abs()));
     let idx_z = order[0];
-    let idx_x = order[1];
-    let idx_y = order[2];
+    let idx_y = order[1];
+    let idx_x = order[2];
 
     let dchi_zz_p = evals[idx_z];
     let dchi_xx_p = evals[idx_x];
@@ -1658,7 +1717,7 @@ fn build_delta_chi_tensor(
     let dchi_ax = dchi_zz_p - 0.5 * (dchi_xx_p + dchi_yy_p);
     let dchi_rh = dchi_xx_p - dchi_yy_p;
     let rhombicity = if dchi_ax.abs() > 1e-15 {
-        (dchi_rh / dchi_ax).abs().min(2.0 / 3.0)
+        (dchi_rh / dchi_ax).clamp(0.0, 2.0 / 3.0)
     } else {
         0.0
     };
@@ -1675,12 +1734,12 @@ fn build_delta_chi_tensor(
     let rmsd_ppm = if !obs.is_empty() {
         (sum_sq_err / (obs.len() as f64)).sqrt()
     } else {
-        0.0
+        f64::NAN
     };
-    let q_factor = if sum_sq_obs > 1e-15 {
+    let q_factor = if sum_sq_obs > 1e-15 && sum_sq_err.is_finite() {
         (sum_sq_err / sum_sq_obs).sqrt()
     } else {
-        0.0
+        f64::NAN
     };
 
     DeltaChiTensor {
@@ -1704,11 +1763,7 @@ fn build_delta_chi_tensor(
 /// `o.coord_uncertainty_angstrom` propagated analytically via $\nabla_{\mathbf{r}}\Delta\delta^{\text{PCS}}$
 /// (`Schmitz et al. 2008`).
 fn effective_pcs_sigma_ppm(o: &PcsObservation, metal_pos: Vec3, x: &[f64; 5]) -> f64 {
-    let sig_ppm = if o.uncertainty_ppm > 1e-9 {
-        o.uncertainty_ppm
-    } else {
-        0.05
-    };
+    let sig_ppm = o.uncertainty_ppm.max(1e-12);
     if o.coord_uncertainty_angstrom <= 1e-9 {
         return sig_ppm;
     }
@@ -1741,7 +1796,7 @@ fn effective_pcs_sigma_ppm(o: &PcsObservation, metal_pos: Vec3, x: &[f64; 5]) ->
     // Isotropic 3D RMS sigma_coord has per-axis variance sigma_coord^2 / 3
     let var_coord =
         (o.coord_uncertainty_angstrom * o.coord_uncertainty_angstrom / 3.0) * grad_norm_sq;
-    (sig_ppm * sig_ppm + var_coord).sqrt().max(1e-9)
+    (sig_ppm * sig_ppm + var_coord).sqrt().max(1e-12)
 }
 
 /// Fit the 5-parameter traceless symmetric $\Delta\boldsymbol{\chi}$ tensor at fixed metal position
@@ -1751,12 +1806,13 @@ pub fn fit_pcs_tensor_svd(
     obs: &[PcsObservation],
     metal_pos_angstrom: Vec3,
 ) -> Result<DeltaChiTensor, String> {
-    if obs.len() < 5 {
+    if !metal_pos_angstrom.iter().all(|v| v.is_finite()) {
         return Err(format!(
-            "need at least 5 PCS observations to fit 5-parameter DeltaChi tensor, got {}",
-            obs.len()
+            "non-finite metal coordinate {metal_pos_angstrom:?} in PCS tensor SVD fit"
         ));
     }
+    validate_pcs_observation_slice(obs, 6)?;
+
     let mut a_rows = Vec::with_capacity(obs.len());
     let mut b_vec = Vec::with_capacity(obs.len());
     let mut has_coord_unc = false;
@@ -1772,11 +1828,7 @@ pub fn fit_pcs_tensor_svd(
         if o.coord_uncertainty_angstrom > 1e-9 {
             has_coord_unc = true;
         }
-        let w = if o.uncertainty_ppm > 1e-9 {
-            1.0 / o.uncertainty_ppm
-        } else {
-            1.0
-        };
+        let w = 1.0 / o.uncertainty_ppm.max(1e-12);
         let mut row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
         for v in &mut row {
             *v *= w;
@@ -1819,6 +1871,11 @@ pub fn fit_pcs_tensor_robust(
     huber_delta_ppm: f64,
     max_iters: usize,
 ) -> Result<DeltaChiTensor, String> {
+    if !huber_delta_ppm.is_finite() || huber_delta_ppm <= 0.0 {
+        return Err(format!(
+            "invalid huber_delta_ppm ({huber_delta_ppm}): must be finite and > 0"
+        ));
+    }
     let init = fit_pcs_tensor_svd(obs, metal_pos_angstrom)?;
     let delta = huber_delta_ppm.max(0.01);
     let mut x = init.components_5;
@@ -1831,13 +1888,7 @@ pub fn fit_pcs_tensor_robust(
             let base_row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
             let pred: f64 = base_row.iter().zip(&x).map(|(&r, &c)| r * c).sum();
             let resid = (o.pcs_ppm - pred).abs();
-            let base_w = if o.coord_uncertainty_angstrom > 1e-9 {
-                1.0 / effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x)
-            } else if o.uncertainty_ppm > 1e-9 {
-                1.0 / o.uncertainty_ppm
-            } else {
-                1.0
-            };
+            let base_w = 1.0 / effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
             let huber_w = if resid <= delta {
                 1.0
             } else {
@@ -1877,6 +1928,15 @@ pub fn refine_metal_position_and_tensor(
     search_radius_angstrom: f64,
     grid_step_angstrom: f64,
 ) -> Result<DeltaChiTensor, String> {
+    if !initial_metal_pos.iter().all(|v| v.is_finite())
+        || !search_radius_angstrom.is_finite()
+        || !grid_step_angstrom.is_finite()
+    {
+        return Err(
+            "non-finite initial_metal_pos or grid parameter in VarPro PCS refinement".to_string(),
+        );
+    }
+    validate_pcs_observation_slice(obs, 8)?;
     if obs.len() < 8 {
         return Err(format!(
             "joint 8-parameter metal-position + DeltaChi refinement requires >= 8 PCS observations, got {}",

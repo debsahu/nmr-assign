@@ -316,31 +316,58 @@ pub fn extract_dihedrals_from_pdb(pdb_text: &str) -> Vec<DihedralPoint> {
         c: Option<[f64; 3]>,
     }
 
+    #[inline]
+    fn pdb_ascii_col(bytes: &[u8], start: usize, end: usize) -> Option<&str> {
+        let slice = bytes.get(start..end)?;
+        if !slice.is_ascii() {
+            return None;
+        }
+        std::str::from_utf8(slice).ok()
+    }
+
     let mut map: BTreeMap<i32, ResBackbone> = BTreeMap::new();
     for line in pdb_text.lines() {
         if line.starts_with("ENDMDL") && !map.is_empty() {
             break;
         }
-        if !line.starts_with("ATOM  ") || line.len() < 54 {
+        let bytes = line.as_bytes();
+        if !line.starts_with("ATOM  ") || bytes.len() < 54 {
             continue;
         }
-        let atom_name = line[12..16].trim();
+        let alt = bytes[16];
+        if alt != b' ' && alt != b'A' && alt != b'1' {
+            continue;
+        }
+        let (Some(atom_col), Some(res_col), Some(seq_col), Some(x_col), Some(y_col), Some(z_col)) = (
+            pdb_ascii_col(bytes, 12, 16),
+            pdb_ascii_col(bytes, 17, 20),
+            pdb_ascii_col(bytes, 22, 26),
+            pdb_ascii_col(bytes, 30, 38),
+            pdb_ascii_col(bytes, 38, 46),
+            pdb_ascii_col(bytes, 46, 54),
+        ) else {
+            continue;
+        };
+        let atom_name = atom_col.trim();
         if !matches!(atom_name, "N" | "CA" | "C") {
             continue;
         }
-        let res_name = line[17..20].trim().to_ascii_uppercase();
-        let Ok(seq_id) = line[22..26].trim().parse::<i32>() else {
+        let res_name = res_col.trim().to_ascii_uppercase();
+        let Ok(seq_id) = seq_col.trim().parse::<i32>() else {
             continue;
         };
-        let Ok(x) = line[30..38].trim().parse::<f64>() else {
+        let Ok(x) = x_col.trim().parse::<f64>() else {
             continue;
         };
-        let Ok(y) = line[38..46].trim().parse::<f64>() else {
+        let Ok(y) = y_col.trim().parse::<f64>() else {
             continue;
         };
-        let Ok(z) = line[46..54].trim().parse::<f64>() else {
+        let Ok(z) = z_col.trim().parse::<f64>() else {
             continue;
         };
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            continue;
+        }
         let entry = map.entry(seq_id).or_insert_with(|| ResBackbone {
             seq_id,
             res_name: res_name.clone(),
@@ -1118,8 +1145,9 @@ fn render_secondary_shifts_svg(
                 }
             }
         };
+        let res_esc = escape_xml(res);
         svg.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{y:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{fill}\"><title>{res}{sid}: dCA-dCB = {v:+.2} ppm ({})</title></rect>\n",
+            "<rect x=\"{:.1}\" y=\"{y:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{fill}\"><title>{res_esc}{sid}: dCA-dCB = {v:+.2} ppm ({})</title></rect>\n",
             x + 0.8,
             (bar_step - 1.6).max(2.0),
             h.max(1.0),
@@ -1492,18 +1520,19 @@ fn render_strip_connectivity_svg(
                 }
             }
 
+            let res_esc = escape_xml(res);
             // Draw i-1 hollow markers slightly left of strip center
             if let Some(v) = ca_im1 {
                 let py = map_y(v, y0);
                 svg.push_str(&format!(
-                    "<circle cx=\"{:.1}\" cy=\"{py:.1}\" r=\"2.8\" fill=\"#ffffff\" stroke=\"#2563eb\" stroke-width=\"1.4\"><title>{res}{sid} CA(i-1) = {v:.2} ppm</title></circle>\n",
+                    "<circle cx=\"{:.1}\" cy=\"{py:.1}\" r=\"2.8\" fill=\"#ffffff\" stroke=\"#2563eb\" stroke-width=\"1.4\"><title>{res_esc}{sid} CA(i-1) = {v:.2} ppm</title></circle>\n",
                     cx - 3.0
                 ));
             }
             if let Some(v) = cb_im1 {
                 let py = map_y(v, y0);
                 svg.push_str(&format!(
-                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"5.4\" height=\"5.4\" fill=\"#ffffff\" stroke=\"#059669\" stroke-width=\"1.4\"><title>{res}{sid} CB(i-1) = {v:.2} ppm</title></rect>\n",
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"5.4\" height=\"5.4\" fill=\"#ffffff\" stroke=\"#059669\" stroke-width=\"1.4\"><title>{res_esc}{sid} CB(i-1) = {v:.2} ppm</title></rect>\n",
                     cx - 5.7,
                     py - 2.7
                 ));
@@ -1513,14 +1542,14 @@ fn render_strip_connectivity_svg(
             if let Some(v) = ca_i {
                 let py = map_y(v, y0);
                 svg.push_str(&format!(
-                    "<circle cx=\"{:.1}\" cy=\"{py:.1}\" r=\"3.2\" fill=\"#2563eb\"><title>{res}{sid} CA(i) = {v:.2} ppm</title></circle>\n",
+                    "<circle cx=\"{:.1}\" cy=\"{py:.1}\" r=\"3.2\" fill=\"#2563eb\"><title>{res_esc}{sid} CA(i) = {v:.2} ppm</title></circle>\n",
                     cx + 2.5
                 ));
             }
             if let Some(v) = cb_i {
                 let py = map_y(v, y0);
                 svg.push_str(&format!(
-                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"6.0\" height=\"6.0\" fill=\"#059669\"><title>{res}{sid} CB(i) = {v:.2} ppm</title></rect>\n",
+                    "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"6.0\" height=\"6.0\" fill=\"#059669\"><title>{res_esc}{sid} CB(i) = {v:.2} ppm</title></rect>\n",
                     cx - 0.5,
                     py - 3.0
                 ));
