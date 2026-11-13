@@ -5,6 +5,8 @@
 # Phase 9 -> Phase 10 update (external review Q4 / P1-3): `15476`, `16385`, and `53280` were promoted from `heldout` to `dev` (10 `dev` entries),
 # `5845,17030,18145,51351,16099,18489` are tagged `cohort=seen_p8_p9`, and 3 fresh pre-screened disjoint monomeric cold entries (`16072`, `16782`, `17092`)
 # were added with `cohort=cold_p10` (10 `dev` + 9 `heldout` = 19 total).
+# Phase 11 -> Phase 12 update (external review Q1): `16072`, `16782`, and `17092` (`cold_p10`) were promoted to `split=dev` (`cohort=dev_from_p10`, 13 `dev` entries total),
+# and fresh pre-screened disjoint monomeric cold entries are added under `split=heldout`, `cohort=cold_p12` with pre-registered manifest SHA-256 in `data/benchmark/PROVENANCE.md`.
 bmrb_id	protein	residues	field_mhz	vendor	experiments	split	cohort
 ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 51439	CISD3	93	900	Bruker	HSQC,HNCO,HNCA,HNCOCA,CBCACONH	dev	dev
@@ -16,12 +18,19 @@ ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 15476	SR384	54	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 16385	PfR193A	114	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	dev	dev
 53280	Ap3	60	850	Bruker	HSQC,HNCO,HNCACB,CBCACONH	dev	dev
+16072	SSP0047	120	850	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH	dev	dev_from_p10
+16782	SgR171	120	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	dev	dev_from_p10
+17092	HR4435B	83	600	Bruker	HSQC,HNCO,HNCACB,CBCACONH	dev	dev_from_p10
 5845	ZR31	102	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p8_p9
 17030	HR4694F	95	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	seen_p8_p9
 18145	OR126	83	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p8_p9
 51351	TSR3	75	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p8_p9
 16099	Kazal-1	74	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p8_p9
 18489	NFU1	107	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p8_p9
-16072	SSP0047	120	850	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH	heldout	cold_p10
-16782	SgR171	120	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p10
-17092	HR4435B	83	600	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p10
+5691	RS28_PYRHO	82	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p12
+6585	At1g24000.1	122	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH	heldout	cold_p12
+15491	VfR117	88	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	heldout	cold_p12
+16096	DvR115G	94	600	Varian	HSQC,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	cold_p12
+16376	OR8w187r	140	800	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	cold_p12
+18337	OR136	134	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p12
+18561	OR250	112	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p12

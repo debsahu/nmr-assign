@@ -4026,6 +4026,13 @@ pub fn assign_evo_graph_with_report(
         Some(&evo_det),
     );
     if cfg.apply_qc_calibration {
+        if cfg.population_size != crate::qc::EVO_GRAPH_CALIBRATED_RUNS {
+            qc.mark_uncalibrated_runs(
+                "evo-graph",
+                cfg.population_size,
+                crate::qc::EVO_GRAPH_CALIBRATED_RUNS,
+            );
+        }
         apply_dataset_qc_to_assignments(&mut result, &qc);
         qc.already_applied = true;
     }
@@ -4089,8 +4096,13 @@ fn assign_evo_graph_core(
     let (pos1, scores1) = run_parallel_islands(&u1, &p, &u1, cfg, locks, None, &mut master_rng);
     let mut res1 = consensus_from_runs(&pos1, scores1);
     // Parameter-free unit-temperature (`T = 1.0` nat) single-spin Pass-1 Boltzmann margin with
-    // zero empirical knot tables upstream of Pass 2 (`P1-7(a)`): guarantees zero cross-fold LOPO
-    // leakage and aligns directly with the physical `0.70..0.85` Pass-2 anchor gates.
+    // zero empirical knot tables upstream of Pass 2 (`P1-7(a)`): guarantees zero cross-fold
+    // post-solver isotonic LOPO leakage and feeds the physical `0.70` Pass-2 anchor threshold
+    // (`cfg.anchor_consensus_threshold = 0.70`) and `0.80` / `0.91` graph self-consistency gates.
+    // Scope note (`P1-8`): those upstream structural solver thresholds were fixed during earlier
+    // phases with the initial `dev` entries visible; 13-fold LOPO certifies the post-Pass-2
+    // isotonic PAV map (`EVO_GRAPH_CALIBRATION_KNOTS`), while end-to-end generalization is
+    // evaluated single-shot on pre-registered cold held-out cohorts (`cold_p12`).
     calibrate_boltzmann_confidence(&mut res1, &u1, &p);
     apply_locked_result_overrides(&mut res1, norm_seq.len(), locks);
     report.pass1_best_score = res1.score;
@@ -4238,6 +4250,13 @@ pub fn assign_evo_graph_from_peaks_with_minor_damping(
         Some(&evo_det),
     );
     if cfg.apply_qc_calibration {
+        if cfg.population_size != crate::qc::EVO_GRAPH_CALIBRATED_RUNS {
+            qc.mark_uncalibrated_runs(
+                "evo-graph",
+                cfg.population_size,
+                crate::qc::EVO_GRAPH_CALIBRATED_RUNS,
+            );
+        }
         apply_dataset_qc_to_assignments(&mut result, &qc);
         qc.already_applied = true;
     }

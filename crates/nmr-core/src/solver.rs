@@ -89,6 +89,9 @@ pub struct AnnealConfig {
 }
 
 impl Default for AnnealConfig {
+    /// Default CPU simulated annealing configuration (`runs = 16` replicas, matching
+    /// [`crate::qc::STANDARD_CPU_CALIBRATED_RUNS`] / [`crate::qc::STANDARD_CALIBRATION_KNOTS`];
+    /// WebGPU `standard` uses `runs = 64` matching [`crate::qc::STANDARD_GPU_CALIBRATED_RUNS`], `P1-8`).
     fn default() -> Self {
         Self {
             runs: 16,

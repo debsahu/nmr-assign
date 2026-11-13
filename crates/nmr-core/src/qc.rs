@@ -99,8 +99,44 @@ pub struct DatasetQcReport {
     pub connectivity_frac: f64,
     /// Fraction of assigned spin systems with strong consensus/marginal belief (`>= 0.65`).
     pub solution_margin: f64,
+    /// True when the solver replica/population count matched the canonical isotonic calibration fit
+    /// ([`STANDARD_CPU_CALIBRATED_RUNS`] `= 16` for CPU `standard`,
+    /// [`STANDARD_GPU_CALIBRATED_RUNS`] `= 64` for WebGPU `standard`,
+    /// [`EVO_GRAPH_CALIBRATED_RUNS`] `= 64` for `evo-graph`); `false` when a caller overrides
+    /// `runs != fit_runs` (`P1-8`).
+    pub confidence_calibrated: bool,
+    /// Explicit warning when `confidence_calibrated == false` (`runs != fit_runs`, `P1-8`).
+    pub calibration_warning: Option<String>,
     /// Human-readable QC warnings or abstention triggers.
     pub reasons: Vec<String>,
+}
+
+/// Canonical CPU `standard` replica count (`runs = 16`) at which [`STANDARD_CALIBRATION_KNOTS`] is fitted (`P1-8`).
+pub const STANDARD_CPU_CALIBRATED_RUNS: usize = 16;
+
+/// Canonical WebGPU `standard` replica count (`runs = 64`) at which [`STANDARD_GPU_CALIBRATION_KNOTS`] is fitted (`P1-8`).
+pub const STANDARD_GPU_CALIBRATED_RUNS: usize = 64;
+
+/// Canonical `evo-graph` island population size (`population_size = 64`, `num_islands = 16`) at which
+/// [`EVO_GRAPH_CALIBRATION_KNOTS`] is fitted (`P1-8`).
+pub const EVO_GRAPH_CALIBRATED_RUNS: usize = 64;
+
+impl DatasetQcReport {
+    /// Record an explicit `P1-8` replica-count mismatch (`actual_runs != fit_runs`), marking
+    /// `confidence_calibrated = false` and populating `calibration_warning`.
+    pub fn mark_uncalibrated_runs(
+        &mut self,
+        solver_label: &str,
+        actual_runs: usize,
+        fit_runs: usize,
+    ) {
+        if actual_runs != fit_runs {
+            self.confidence_calibrated = false;
+            self.calibration_warning = Some(format!(
+                "uncalibrated replica count for {solver_label} (runs={actual_runs} != fit_runs={fit_runs}); isotonic confidence knots were fitted at runs={fit_runs} (confidence_calibrated=false)"
+            ));
+        }
+    }
 }
 
 impl Default for DatasetQcReport {
@@ -123,6 +159,8 @@ impl Default for DatasetQcReport {
             detailed_offsets: DetailedReferenceOffsets::default(),
             connectivity_frac: 1.0,
             solution_margin: 1.0,
+            confidence_calibrated: true,
+            calibration_warning: None,
             reasons: Vec::new(),
         }
     }
@@ -630,6 +668,18 @@ pub fn evaluate_dataset_qc(
             hsqc_3d_rms_dh_ppm, hsqc_3d_rms_dn_ppm
         ));
     }
+    if n_amide_hsqc_roots > 0
+        && hsqc_3d_support_frac < 0.45
+        && supported_roots_per_assignable < 0.35
+        && solution_margin < 0.20
+    {
+        abstain_reasons.push(format!(
+            "severe 3D strip starvation with weak convergence (3D support {:.1}%, supported/assignable {:.1}%, margin {:.1}%)",
+            hsqc_3d_support_frac * 100.0,
+            supported_roots_per_assignable * 100.0,
+            solution_margin * 100.0,
+        ));
+    }
 
     if !abstain_reasons.is_empty() {
         return DatasetQcReport {
@@ -650,6 +700,8 @@ pub fn evaluate_dataset_qc(
             detailed_offsets,
             connectivity_frac,
             solution_margin,
+            confidence_calibrated: true,
+            calibration_warning: None,
             reasons: abstain_reasons,
         };
     }
@@ -711,6 +763,8 @@ pub fn evaluate_dataset_qc(
             detailed_offsets,
             connectivity_frac,
             solution_margin,
+            confidence_calibrated: true,
+            calibration_warning: None,
             reasons: Vec::new(),
         }
     } else {
@@ -732,6 +786,8 @@ pub fn evaluate_dataset_qc(
             detailed_offsets,
             connectivity_frac,
             solution_margin,
+            confidence_calibrated: true,
+            calibration_warning: None,
             reasons: warn_reasons,
         }
     }
@@ -773,13 +829,63 @@ pub struct ReliabilityBin {
     pub empirical_acc: f64,
 }
 
+/// Standard 10-bin equal-width probability partition (`[0.0, 0.1, ..., 1.0]`, Guo et al. 2017)
+/// used to report `ECE_10` alongside 4-bin `ECE_4` and 12-bin `ECE_12` (`P2`).
+pub const UNIFORM_CALIBRATION_GRID_10: &[f64] =
+    &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
+/// Compute binned Expected Calibration Error (ECE) of `(confidence, is_correct)` pairs over an
+/// arbitrary strictly increasing partition `grid` (`g_0 < g_1 < ... < g_M`, with `[g_b, g_{b+1})`
+/// for `b < M - 1` and `[g_{M - 1}, g_M]` inclusive on the top bin).
+pub fn compute_grid_ece(predictions: &[(f64, bool)], grid: &[f64]) -> f64 {
+    if predictions.is_empty() || grid.len() < 2 {
+        return 0.0;
+    }
+    let n_bins = grid.len() - 1;
+    let mut counts = vec![0usize; n_bins];
+    let mut corrects = vec![0usize; n_bins];
+    let mut conf_sums = vec![0.0_f64; n_bins];
+    for &(raw_conf, is_ok) in predictions {
+        let c = raw_conf.clamp(0.0, 1.0);
+        let mut idx = n_bins - 1;
+        for b in 0..n_bins {
+            if c < grid[b + 1] || b + 1 == n_bins {
+                idx = b;
+                break;
+            }
+        }
+        counts[idx] += 1;
+        conf_sums[idx] += c;
+        if is_ok {
+            corrects[idx] += 1;
+        }
+    }
+    let total = predictions.len() as f64;
+    let mut ece = 0.0_f64;
+    for b in 0..n_bins {
+        let cnt = counts[b];
+        if cnt > 0 {
+            let mc = conf_sums[b] / (cnt as f64);
+            let ea = (corrects[b] as f64) / (cnt as f64);
+            ece += ((cnt as f64) / total) * (mc - ea).abs();
+        }
+    }
+    ece
+}
+
 /// Per-protein confidence reliability diagram (`[0.0..0.5, 0.5..0.8, 0.8..0.9, 0.9..1.0]`),
-/// Expected Calibration Error (`ece`), and explicit high-confidence abstention status.
+/// 4-bin (`ece`), 10-bin (`ece_10`), and 12-bin (`ece_12`) Expected Calibration Error, and
+/// explicit high-confidence abstention status.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProteinReliabilityCurve {
     pub bins: [ReliabilityBin; 4],
     pub total_predictions: usize,
+    /// 4-bin Expected Calibration Error (`[0.0, 0.5), [0.5, 0.8), [0.8, 0.9), [0.9, 1.0]`).
     pub ece: f64,
+    /// Uniform 10-bin Expected Calibration Error (`[0.0, 0.1, ..., 1.0]`, Guo et al. 2017; `P2`).
+    pub ece_10: f64,
+    /// Canonical 12-bin (`g12`, [`CANONICAL_CALIBRATION_GRID_12`]) Expected Calibration Error (`P2`).
+    pub ece_12: f64,
     pub hc_threshold: f64,
     pub hc_assigned: usize,
     pub hc_correct: usize,
@@ -792,7 +898,7 @@ pub struct ProteinReliabilityCurve {
 impl ProteinReliabilityCurve {
     pub const BIN_EDGES: [(f64, f64); 4] = [(0.0, 0.5), (0.5, 0.8), (0.8, 0.9), (0.9, 1.0)];
 
-    /// Construct a 4-bin `ProteinReliabilityCurve` from `(confidence, is_correct)` pairs.
+    /// Construct a `ProteinReliabilityCurve` (`ECE_4`, `ECE_10`, `ECE_12`) from `(confidence, is_correct)` pairs.
     pub fn from_predictions(predictions: &[(f64, bool)], hc_threshold: f64) -> Self {
         let mut counts = [0usize; 4];
         let mut corrects = [0usize; 4];
@@ -849,6 +955,8 @@ impl ProteinReliabilityCurve {
                 empirical_acc,
             }
         });
+        let ece_10 = compute_grid_ece(predictions, UNIFORM_CALIBRATION_GRID_10);
+        let ece_12 = compute_grid_ece(predictions, CANONICAL_CALIBRATION_GRID_12);
 
         let (hc_precision, hc_status) = if hc_assigned == 0 {
             (None, "Abstained (0 HC calls)".to_string())
@@ -864,6 +972,8 @@ impl ProteinReliabilityCurve {
             bins,
             total_predictions: total,
             ece,
+            ece_10,
+            ece_12,
             hc_threshold,
             hc_assigned,
             hc_correct,
@@ -1014,12 +1124,12 @@ pub fn fit_isotonic_monotone_knots(
     }
 
     // Anchor `f(0.0) = 0.0` strictly for zero-belief / unplaced entries, place a positive-belief
-    // left-boundary midpoint shoulder `(x_left, 0.5 * bin_vals[0])` so positive sub-centroid
-    // beliefs in `(0, x_knots[0])` neither collapse toward `0.0` nor over-extrapolate `bin_vals[0]`,
-    // and extrapolate flat `(1.0, y_end)` above the top bin centroid.
+    // left-boundary midpoint shoulder `(x_left, 0.5 * bin_vals[0])` at `x_left = 0.5 * x_knots[0]`
+    // (`P2`) so positive sub-centroid beliefs in `(0, x_knots[0])` interpolate smoothly without
+    // collapsing to `1e-4`, and extrapolate flat `(1.0, y_end)` above the top bin centroid.
     let mut knots = Vec::with_capacity(n_bins + 3);
     knots.push((0.0, 0.0));
-    let x_left = (0.5 * x_knots[0]).min(1e-4);
+    let x_left = 0.5 * x_knots[0];
     if x_left > 0.0 {
         knots.push((x_left, 0.5 * bin_vals[0]));
     }
@@ -1031,73 +1141,206 @@ pub fn fit_isotonic_monotone_knots(
     knots
 }
 
-/// Monotone calibration knot table for `evo-graph` (`P1-2` / `P1-7`), fitted via isotonic PAV on
+/// Hierarchical empirical-Bayes isotonic PAV fitter (`Q2`): pools primary `samples` (weight `1.0`
+/// per observation) with `anchor_samples` from the matched CPU Hamiltonian (`weight = anchor_weight`
+/// per observation, e.g., `0.50`) plus symmetric `Beta(laplace_prior / 2, laplace_prior / 2)`
+/// smoothing on `grid`. When `anchor_weight <= 0.0` or `anchor_samples` is empty, reduces
+/// identically to [`fit_isotonic_monotone_knots`].
+///
+/// In Leave-One-Protein-Out (LOPO) cross-validation, the held-out protein MUST be excluded from
+/// both `samples` AND `anchor_samples` simultaneously so zero target-protein information leaks
+/// across engines.
+pub fn fit_isotonic_monotone_knots_shrunk_toward(
+    samples: &[(f64, bool)],
+    anchor_samples: &[(f64, bool)],
+    anchor_weight: f64,
+    grid: &[f64],
+    laplace_prior: f64,
+) -> Vec<(f64, f64)> {
+    if anchor_weight <= 0.0 || anchor_samples.is_empty() {
+        return fit_isotonic_monotone_knots(samples, grid, laplace_prior);
+    }
+    if grid.len() < 2 {
+        return vec![(0.0, 0.0), (1.0, 1.0)];
+    }
+    let n_bins = grid.len() - 1;
+    let mut weights = vec![0.0_f64; n_bins];
+    let mut pos_sums = vec![0.0_f64; n_bins];
+    let mut x_sums = vec![0.0_f64; n_bins];
+    for b in 0..n_bins {
+        let mid = 0.5 * (grid[b] + grid[b + 1]);
+        let prior_w = laplace_prior.max(1e-6);
+        weights[b] = prior_w;
+        pos_sums[b] = 0.5 * prior_w;
+        x_sums[b] = prior_w * mid;
+    }
+
+    let mut accum = |raw_p: f64, is_ok: bool, w: f64| {
+        let p = raw_p.clamp(0.0, 1.0);
+        let mut idx = n_bins - 1;
+        for b in 0..n_bins {
+            if p < grid[b + 1] || b + 1 == n_bins {
+                idx = b;
+                break;
+            }
+        }
+        weights[idx] += w;
+        x_sums[idx] += w * p;
+        if is_ok {
+            pos_sums[idx] += w;
+        }
+    };
+
+    for &(raw_p, is_ok) in anchor_samples {
+        accum(raw_p, is_ok, anchor_weight);
+    }
+    for &(raw_p, is_ok) in samples {
+        accum(raw_p, is_ok, 1.0);
+    }
+
+    let mut x_knots = vec![0.0_f64; n_bins];
+    for b in 0..n_bins {
+        x_knots[b] = (x_sums[b] / weights[b]).clamp(grid[b], grid[b + 1]);
+    }
+
+    let mut blocks: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(n_bins);
+    for b in 0..n_bins {
+        blocks.push((b, b, pos_sums[b], weights[b]));
+        while blocks.len() >= 2 {
+            let n = blocks.len();
+            let mean_prev = blocks[n - 2].2 / blocks[n - 2].3;
+            let mean_curr = blocks[n - 1].2 / blocks[n - 1].3;
+            if mean_prev > mean_curr {
+                let last = blocks.pop().unwrap();
+                let prev = blocks.last_mut().unwrap();
+                prev.1 = last.1;
+                prev.2 += last.2;
+                prev.3 += last.3;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut bin_vals = vec![0.0_f64; n_bins];
+    for (lo, hi, sp, sw) in blocks {
+        let v = (sp / sw).clamp(0.0, 1.0);
+        for slot in &mut bin_vals[lo..=hi] {
+            *slot = v;
+        }
+    }
+
+    let mut knots = Vec::with_capacity(n_bins + 3);
+    knots.push((0.0, 0.0));
+    let x_left = 0.5 * x_knots[0];
+    if x_left > 0.0 {
+        knots.push((x_left, 0.5 * bin_vals[0]));
+    }
+    for b in 0..n_bins {
+        knots.push((x_knots[b], bin_vals[b]));
+    }
+    let y_end = bin_vals[n_bins - 1].max(0.0);
+    knots.push((1.0, y_end));
+    knots
+}
+
+/// Canonical empirical-Bayes shrinkage weight (`w = 0.50`, `Q2`) pooling CPU `standard` (`f64`)
+/// bin counts with WebGPU `standard` (`f32`) bin counts before isotonic PAV projection.
+///
+/// Selected strictly via 13-fold OOF LOPO on the 13-entry `dev` split (holding out each protein
+/// simultaneously from both GPU and CPU folds): `w = 0.50` improves OOF `mean_ECE_4`
+/// (`0.0631 -> 0.0613`), OOF `macro_HCP` (`94.70% -> 95.39%`), and OOF `micro_HCP`
+/// (`93.15% -> 94.05%`) relative to unshrunk GPU PAV (`w = 0.00`) while keeping OOF `pooled_ECE_4`
+/// (`0.0319`) and `pooled_ECE_12` (`0.0477`) strictly below `0.050`.
+pub const CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT: f64 = 0.50;
+
+/// Monotone calibration knot table for `evo-graph` (`population_size = 64, num_islands = 16`,
+/// [`EVO_GRAPH_CALIBRATED_RUNS`]; `P1-2` / `P1-7` / `P1-8`), fitted via isotonic PAV on
 /// [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with symmetric `Beta(0.25, 0.25)` smoothing
 /// (`laplace_prior = 0.5` total pseudocount: `0.25` positive + `0.25` negative) across the
-/// 10-entry `dev` split (zero hyperparameter search; validated via strict 10-fold
-/// Leave-One-Protein-Out cross-validation with zero empirical knot tables upstream of Pass 2).
+/// 13-entry `dev` split (`10` prior `dev` + `3` promoted `dev_from_p10`).
+///
+/// Scope & provenance disclosure (`P1-8`): 13-fold Leave-One-Protein-Out (LOPO) cross-validation
+/// strictly certifies this post-solver isotonic PAV calibrator (zero empirical knot tables exist
+/// upstream of Pass 2). Upstream structural solver and dataset-QC constants (`0.70` Pass-2 anchor
+/// gate, `0.80` graph clash gates, `0.91` boundary-anchor threshold, and `(0.65, 0.07, 1.60, 0.16)`
+/// convergence filter) were fixed during earlier phases with the initial `dev` entries visible;
+/// true out-of-sample generalization of the full pipeline is measured on the pre-registered
+/// single-shot `cold_p12` cohort.
 pub const EVO_GRAPH_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.0000, 0.0000),
-    (0.0001, 0.0895),
-    (0.0449, 0.1790),
-    (0.2256, 0.2729),
-    (0.3782, 0.3612),
-    (0.5075, 0.6415),
-    (0.6258, 0.6415),
-    (0.7254, 0.6415),
-    (0.7993, 0.7053),
-    (0.8676, 0.7121),
-    (0.9301, 0.7694),
-    (0.9577, 0.7694),
-    (0.9869, 0.8514),
-    (0.9998, 0.9763),
-    (1.0000, 0.9763),
+    (0.0204, 0.0705),
+    (0.0407, 0.1409),
+    (0.2201, 0.3322),
+    (0.3739, 0.3754),
+    (0.5083, 0.6623),
+    (0.6299, 0.6623),
+    (0.7269, 0.6623),
+    (0.7992, 0.7473),
+    (0.8650, 0.7473),
+    (0.9309, 0.8250),
+    (0.9586, 0.8250),
+    (0.9868, 0.8445),
+    (0.9997, 0.9793),
+    (1.0000, 0.9793),
 ];
 
-/// Monotone calibration knot table for CPU `standard` (`runs = 16`, `P1-6` / `P1-8`), fitted via
-/// isotonic PAV on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with symmetric `Beta(0.25, 0.25)`
-/// smoothing (`laplace_prior = 0.5` total pseudocount: `0.25` positive + `0.25` negative) across
-/// the 10-entry `dev` split (zero hyperparameter search; validated via strict 10-fold
-/// Leave-One-Protein-Out cross-validation over physical `T = 1.0` marginal posteriors).
+/// Monotone calibration knot table for CPU `standard` (`runs = 16`, [`STANDARD_CPU_CALIBRATED_RUNS`];
+/// `P1-6` / `P1-8`), fitted via isotonic PAV on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with
+/// symmetric `Beta(0.25, 0.25)` smoothing (`laplace_prior = 0.5` total pseudocount: `0.25`
+/// positive + `0.25` negative) across the 13-entry `dev` split.
+///
+/// Scope & provenance disclosure (`P1-8`): 13-fold OOF LOPO certifies this post-solver isotonic
+/// calibrator over `T = 1.0` marginal posteriors at `runs = 16`; callers passing `--runs != 16`
+/// trigger an explicit stderr warning and `DatasetQcReport.confidence_calibrated = false`.
 pub const STANDARD_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.0000, 0.0000),
-    (0.0001, 0.1205),
-    (0.0543, 0.2411),
-    (0.2159, 0.5080),
-    (0.3791, 0.5080),
-    (0.5077, 0.5745),
-    (0.6237, 0.5925),
-    (0.7230, 0.7721),
-    (0.8024, 0.7721),
-    (0.8687, 0.8966),
-    (0.9326, 0.9348),
-    (0.9596, 0.9444),
-    (0.9832, 0.9462),
-    (0.9994, 0.9462),
-    (1.0000, 0.9462),
+    (0.0272, 0.1015),
+    (0.0544, 0.2030),
+    (0.2179, 0.4646),
+    (0.3772, 0.5144),
+    (0.5082, 0.5836),
+    (0.6250, 0.5836),
+    (0.7216, 0.7598),
+    (0.8024, 0.7598),
+    (0.8699, 0.9011),
+    (0.9335, 0.9524),
+    (0.9587, 0.9528),
+    (0.9835, 0.9576),
+    (0.9995, 0.9576),
+    (1.0000, 0.9576),
 ];
 
 /// Monotone calibration knot table for WebGPU `standard` (`runs = 64` `f32` multi-replica elite
-/// consensus, `P1-8`), fitted via isotonic PAV on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with
-/// symmetric `Beta(0.25, 0.25)` smoothing (`laplace_prior = 0.5` total pseudocount: `0.25`
-/// positive + `0.25` negative) across the 10-entry `dev` split (zero hyperparameter search;
-/// validated via strict 10-fold Leave-One-Protein-Out cross-validation).
+/// consensus, [`STANDARD_GPU_CALIBRATED_RUNS`]; `P1-8` / `Q2`), fitted via CPU-anchored isotonic
+/// PAV ([`fit_isotonic_monotone_knots_shrunk_toward`] with [`CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT`]
+/// `= 0.50`) on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) across the 13-entry `dev` split.
+///
+/// Hardware & scope provenance (`P1-8` / `Q2`): Fitted deterministically on **`Apple M5 Pro`
+/// (`Metal` backend via `wgpu`, `f32` WGSL compute)** across seeds `0..4`. Cross-driver IEEE-754
+/// `f32` transcendental/FMA rounding on non-Apple adapters (Vulkan / DX12) can slightly shift raw
+/// replica consensus bin counts without affecting monotonicity; empirical-Bayes shrinkage toward
+/// CPU `f64` counts (`w = 0.50`) reduces sparse upper-bin variance on OOF LOPO (`macro_HCP`
+/// `94.70% -> 95.39%`, `mean_ECE_4` `0.0631 -> 0.0613`). Callers overriding `--runs != 64`
+/// trigger an explicit stderr warning and `DatasetQcReport.confidence_calibrated = false`.
+/// 13-fold OOF LOPO certifies this post-solver isotonic map while upstream solver/QC constants
+/// were fixed on prior `dev` entries.
 pub const STANDARD_GPU_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.0000, 0.0000),
-    (0.0001, 0.1050),
-    (0.0491, 0.2100),
-    (0.2222, 0.3977),
-    (0.3808, 0.4860),
-    (0.5143, 0.6881),
-    (0.6289, 0.6881),
-    (0.7194, 0.8492),
-    (0.7951, 0.8822),
-    (0.8611, 0.9327),
-    (0.9175, 0.9497),
-    (0.9587, 0.9497),
-    (0.9844, 0.9497),
-    (0.9995, 0.9497),
-    (1.0000, 0.9497),
+    (0.0264, 0.0961),
+    (0.0529, 0.1922),
+    (0.2199, 0.4211),
+    (0.3801, 0.5339),
+    (0.5116, 0.6633),
+    (0.6273, 0.6896),
+    (0.7200, 0.8427),
+    (0.7975, 0.8596),
+    (0.8630, 0.9351),
+    (0.9227, 0.9574),
+    (0.9585, 0.9574),
+    (0.9840, 0.9574),
+    (0.9995, 0.9574),
+    (1.0000, 0.9574),
 ];
 
 /// Map raw physical (`T = 1.0`) `evo-graph` marginal belief into calibrated probability.

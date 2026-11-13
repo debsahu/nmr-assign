@@ -77,7 +77,8 @@ use nmr_core::process::{
 };
 use nmr_core::qc::{
     apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport, DatasetQcVerdict,
-    ProteinReliabilityCurve,
+    ProteinReliabilityCurve, EVO_GRAPH_CALIBRATED_RUNS, STANDARD_CPU_CALIBRATED_RUNS,
+    STANDARD_GPU_CALIBRATED_RUNS,
 };
 use nmr_core::report::{
     predict_csi_dihedrals, write_quality_report_html, ReportInput, StructureReportSummary,
@@ -164,13 +165,13 @@ fn usage() -> String {
      Usage:\n\
        nmrassign --version | -V | version\n\
        nmrassign inspect         <path> [--json]\n\
-       nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
-       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 32] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
+       nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
+       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
        nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--solver evo-graph|standard] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
        nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard] [--engine auto|gpu|cpu] [--runs 64] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
+       nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
        nmrassign propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
@@ -279,6 +280,70 @@ pub(crate) struct SolverWorkflowOutput {
     pub(crate) steps_per_system: usize,
 }
 
+/// Minimum allowed `--runs` replica / population count across CLI subcommands (`P2`).
+pub(crate) const CLI_MIN_RUNS: usize = 1;
+/// Maximum allowed `--runs` replica / population count across CLI subcommands (`P2`).
+pub(crate) const CLI_MAX_RUNS: usize = 4096;
+/// Minimum allowed `--steps` annealing step count across CLI subcommands (`P2`).
+pub(crate) const CLI_MIN_STEPS: usize = 100;
+/// Maximum allowed `--steps` annealing step count across CLI subcommands (`P2`).
+pub(crate) const CLI_MAX_STEPS: usize = 50_000_000;
+
+pub(crate) fn parse_bounded_runs(raw: &str) -> Result<usize, String> {
+    let val: usize = raw
+        .parse()
+        .map_err(|e| format!("invalid --runs value {raw:?}: {e} (expected integer in {CLI_MIN_RUNS}..={CLI_MAX_RUNS})"))?;
+    if !(CLI_MIN_RUNS..=CLI_MAX_RUNS).contains(&val) {
+        return Err(format!(
+            "--runs {val} out of allowed bounds ({CLI_MIN_RUNS}..={CLI_MAX_RUNS})"
+        ));
+    }
+    Ok(val)
+}
+
+pub(crate) fn parse_bounded_steps(raw: &str) -> Result<usize, String> {
+    let val: usize = raw
+        .parse()
+        .map_err(|e| format!("invalid --steps value {raw:?}: {e} (expected integer in {CLI_MIN_STEPS}..={CLI_MAX_STEPS})"))?;
+    if !(CLI_MIN_STEPS..=CLI_MAX_STEPS).contains(&val) {
+        return Err(format!(
+            "--steps {val} out of allowed bounds ({CLI_MIN_STEPS}..={CLI_MAX_STEPS})"
+        ));
+    }
+    Ok(val)
+}
+
+pub(crate) fn parse_bounded_r_bleach(raw: &str) -> Result<f64, String> {
+    let val: f64 = raw.parse().map_err(|e| {
+        format!("invalid --r-bleach value {raw:?}: {e} (expected finite radius in 1.0..=50.0 Å)")
+    })?;
+    if !val.is_finite() || !(1.0..=50.0).contains(&val) {
+        return Err(format!(
+            "--r-bleach {val} out of allowed bounds (expected finite radius in 1.0..=50.0 Å)"
+        ));
+    }
+    Ok(val)
+}
+
+/// Two-stage rigid `(dH, dN)` alignment of a 3D `(1H, 15N, 13C)` spectrum to a 2D `15N`-HSQC:
+/// - Stage 1 runs conservative `(±0.08 ppm H, ±0.60 ppm N)` alignment so well-calibrated
+///   single-spectrometer suites remain bit-for-bit unchanged.
+/// - Stage 2 triggers strictly when Stage 1 rails against its search boundary (`|dH| >= 0.0795`
+///   or `|dN| >= 0.595`), allowing cross-spectrometer / cross-temperature `O1` water shifts
+///   (e.g. `5..45 °C` H2O carrier differences up to `±0.24 ppm H`, `±1.20 ppm N`) to converge.
+pub(crate) fn register_3d_hn_to_hsqc_adaptive(
+    spec_3d: &mut Spectrum3D,
+    hsqc_2d: &Spectrum2D,
+) -> (f64, f64) {
+    let (dh1, dn1) = register_3d_hn_to_hsqc_2d(spec_3d, hsqc_2d, 0.08, 0.60);
+    if dh1.abs() >= 0.0795 || dn1.abs() >= 0.595 {
+        let (dh2, dn2) = register_3d_hn_to_hsqc_2d(spec_3d, hsqc_2d, 0.16, 0.60);
+        (dh1 + dh2, dn1 + dn2)
+    } else {
+        (dh1, dn1)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_assignment_workflow(
     solver: SolverKind,
@@ -301,8 +366,13 @@ pub(crate) fn execute_assignment_workflow(
             let (effective_priors, offsets) =
                 prepare_scoring_priors(&systems, sequence, priors, score_cfg);
             let detailed_offsets = sync_detailed_reference_offsets(&offsets, &base_detailed);
+            let fit_runs = if engine == EngineKind::Gpu {
+                STANDARD_GPU_CALIBRATED_RUNS
+            } else {
+                STANDARD_CPU_CALIBRATED_RUNS
+            };
             let default_runs = if engine == EngineKind::Gpu {
-                64
+                STANDARD_GPU_CALIBRATED_RUNS
             } else {
                 default_cpu_runs
             };
@@ -323,6 +393,12 @@ pub(crate) fn execute_assignment_workflow(
                 &result,
                 Some(&detailed_offsets),
             );
+            if anneal_cfg.runs != fit_runs {
+                qc_report.mark_uncalibrated_runs(&engine_label, anneal_cfg.runs, fit_runs);
+                if let Some(ref w) = qc_report.calibration_warning {
+                    eprintln!("Warning: [{engine_label}] confidence_calibrated=false — {w}");
+                }
+            }
             apply_dataset_qc_to_assignments(&mut result, &qc_report);
             qc_report.already_applied = true;
             Ok(SolverWorkflowOutput {
@@ -353,8 +429,21 @@ pub(crate) fn execute_assignment_workflow(
             if let Some(st) = steps_opt {
                 evo_cfg.steps_per_system_per_gen = st.max(1);
             }
-            let (systems, result, rep) =
+            let (systems, result, mut rep) =
                 assign_evo_graph_from_peaks(peaks, sequence, priors, &evo_cfg);
+            let engine_label = "CPU (f64, evo-graph)".to_string();
+            // Also guard callers passing `--runs 1..=3` (clamped to 4 != 64) or any `r != 64`
+            let requested_runs = runs_opt.unwrap_or(evo_cfg.population_size);
+            if requested_runs != EVO_GRAPH_CALIBRATED_RUNS {
+                rep.qc_report.mark_uncalibrated_runs(
+                    &engine_label,
+                    requested_runs,
+                    EVO_GRAPH_CALIBRATED_RUNS,
+                );
+            }
+            if let Some(ref w) = rep.qc_report.calibration_warning {
+                eprintln!("Warning: [{engine_label}] confidence_calibrated=false — {w}");
+            }
             let detailed_offsets = rep.qc_report.detailed_offsets;
             let offsets = ShiftOffsets {
                 h: rep.final_offsets.d_h,
@@ -364,7 +453,6 @@ pub(crate) fn execute_assignment_workflow(
                 c: rep.final_offsets.d_c,
             };
             let effective_priors = rep.shifted_priors(priors);
-            let engine_label = "CPU (f64, evo-graph)".to_string();
             Ok(SolverWorkflowOutput {
                 systems,
                 kept_hsqc_indices: Some(rep.kept_hsqc_indices),
@@ -387,14 +475,21 @@ fn format_star_offset_header(
     detailed_offsets: &DetailedReferenceOffsets,
     qc_report: &DatasetQcReport,
 ) -> Option<String> {
-    if offsets.is_zero() && qc_report.verdict == DatasetQcVerdict::Pass {
+    if offsets.is_zero()
+        && qc_report.verdict == DatasetQcVerdict::Pass
+        && qc_report.confidence_calibrated
+    {
         return None;
     }
     let mut parts = vec![
         version_string(),
         format!("solver={solver_label}"),
         format!("qc_verdict={}", qc_report.verdict),
+        format!("confidence_calibrated={}", qc_report.confidence_calibrated),
     ];
+    if let Some(ref cw) = qc_report.calibration_warning {
+        parts.push(format!("calibration_warning={cw}"));
+    }
     if !qc_report.reasons.is_empty() {
         parts.push(format!("qc_notes={}", qc_report.reasons.join("; ")));
     }
@@ -514,21 +609,15 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
             }
             "--runs" => {
                 i += 1;
-                runs = Some(
-                    args.get(i)
-                        .ok_or("missing value for --runs")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                runs = Some(parse_bounded_runs(
+                    args.get(i).ok_or("missing value for --runs")?,
+                )?);
             }
             "--steps" => {
                 i += 1;
-                steps = Some(
-                    args.get(i)
-                        .ok_or("missing value for --steps")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                steps = Some(parse_bounded_steps(
+                    args.get(i).ok_or("missing value for --steps")?,
+                )?);
             }
             "--assign-cost" => {
                 i += 1;
@@ -616,7 +705,7 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
             &score_cfg,
             runs,
             steps,
-            12,
+            STANDARD_CPU_CALIBRATED_RUNS,
             cur_seed,
         )?;
         let elapsed = t0.elapsed().as_secs_f64();
@@ -1856,6 +1945,7 @@ pub(crate) fn execute_paramagnetic_workflow(
     priors: &Priors,
     score_cfg: &ScoreConfig,
     metal_ligands_spec: Option<&str>,
+    r_bleach_opt: Option<f64>,
     pdb_path: Option<&Path>,
     pcs_path: Option<&Path>,
     runs: Option<usize>,
@@ -1911,7 +2001,7 @@ pub(crate) fn execute_paramagnetic_workflow(
         anneal_cfg.steps_per_system = st.max(200);
     }
 
-    let para_cfg = ParamagneticAssignConfig {
+    let mut para_cfg = ParamagneticAssignConfig {
         mode,
         explicit_ligand_indices: explicit_ligand_indices.clone(),
         auto_detect_motifs: explicit_ligand_indices.is_empty(),
@@ -1922,6 +2012,9 @@ pub(crate) fn execute_paramagnetic_workflow(
         seed,
         ..ParamagneticAssignConfig::default()
     };
+    if let Some(rb) = r_bleach_opt {
+        para_cfg.r_bleach_angstrom = rb;
+    }
 
     let (systems, result, para_report, eff_priors, engine_label) = match solver {
         SolverKind::Standard => {
@@ -1986,6 +2079,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut first_seq_id = 1i32;
     let mut regime = RegimeKind::Globular;
     let mut metal_ligands_spec: Option<String> = None;
+    let mut r_bleach_opt: Option<f64> = None;
     let mut pdb_path: Option<PathBuf> = None;
     let mut pcs_path: Option<PathBuf> = None;
     let mut temp_k = 298.15f64;
@@ -2044,6 +2138,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "--metal-ligands" => {
                 i += 1;
                 metal_ligands_spec = Some(args.get(i).ok_or("missing --metal-ligands")?.clone());
+            }
+            "--r-bleach" => {
+                i += 1;
+                r_bleach_opt = Some(parse_bounded_r_bleach(
+                    args.get(i).ok_or("missing --r-bleach")?,
+                )?);
             }
             "--pdb" => {
                 i += 1;
@@ -2135,21 +2235,11 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             }
             "--runs" => {
                 i += 1;
-                runs = Some(
-                    args.get(i)
-                        .ok_or("missing --runs")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                runs = Some(parse_bounded_runs(args.get(i).ok_or("missing --runs")?)?);
             }
             "--steps" => {
                 i += 1;
-                steps = Some(
-                    args.get(i)
-                        .ok_or("missing --steps")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                steps = Some(parse_bounded_steps(args.get(i).ok_or("missing --steps")?)?);
             }
             "--assign-cost" => {
                 i += 1;
@@ -2186,6 +2276,9 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         }
         if metal_ligands_spec.is_some() {
             return Err("--metal-ligands is only supported with --regime paramagnetic".to_string());
+        }
+        if r_bleach_opt.is_some() {
+            return Err("--r-bleach is only supported with --regime paramagnetic".to_string());
         }
     }
     if regime != RegimeKind::Idp13C {
@@ -2309,6 +2402,7 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     &pri,
                     &score_cfg,
                     metal_ligands_spec.as_deref(),
+                    r_bleach_opt,
                     pdb_path.as_deref(),
                     pcs_path.as_deref(),
                     runs,
@@ -2372,7 +2466,16 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 Some(EngineRequest::Cpu) => Some(EngineKind::Cpu),
             };
             let wf = execute_assignment_workflow(
-                solver, engine_opt, &peaks, &sequence, &pri, &score_cfg, runs, steps, 12, seed,
+                solver,
+                engine_opt,
+                &peaks,
+                &sequence,
+                &pri,
+                &score_cfg,
+                runs,
+                steps,
+                STANDARD_CPU_CALIBRATED_RUNS,
+                seed,
             )?;
             log_workflow_diagnostics(
                 &wf.engine_label,
@@ -2854,7 +2957,7 @@ fn pick_in_memory_spectra(
     // against false shifts on well-calibrated single-spectrometer datasets.
     if let Some(s2) = hsqc_spec {
         for (_exp, s3) in triples.iter_mut() {
-            let (dh, dn) = register_3d_hn_to_hsqc_2d(s3, s2, 0.08, 0.60);
+            let (dh, dn) = register_3d_hn_to_hsqc_adaptive(s3, s2);
             if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
                 eprintln!("[register] aligned 3D {_exp} to HSQC: dH={dh:+.4} ppm, dN={dn:+.3} ppm");
             }
@@ -3360,21 +3463,11 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
             }
             "--runs" => {
                 i += 1;
-                runs = Some(
-                    args.get(i)
-                        .ok_or("missing --runs")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                runs = Some(parse_bounded_runs(args.get(i).ok_or("missing --runs")?)?);
             }
             "--steps" => {
                 i += 1;
-                steps = Some(
-                    args.get(i)
-                        .ok_or("missing --steps")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                steps = Some(parse_bounded_steps(args.get(i).ok_or("missing --steps")?)?);
             }
             "--missing" => {
                 i += 1;
@@ -3489,7 +3582,7 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
                     &scfg,
                     runs,
                     steps,
-                    32,
+                    STANDARD_CPU_CALIBRATED_RUNS,
                     seed,
                 )?;
                 let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
@@ -3758,19 +3851,11 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             }
             "--runs" => {
                 i += 1;
-                runs = args
-                    .get(i)
-                    .ok_or("missing --runs")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                runs = parse_bounded_runs(args.get(i).ok_or("missing --runs")?)?;
             }
             "--steps" => {
                 i += 1;
-                steps = args
-                    .get(i)
-                    .ok_or("missing --steps")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?;
+                steps = parse_bounded_steps(args.get(i).ok_or("missing --steps")?)?;
             }
             "--seed" => {
                 i += 1;
@@ -4743,6 +4828,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut ncaco_path: Option<PathBuf> = None;
     let mut regime = RegimeKind::Globular;
     let mut metal_ligands_spec: Option<String> = None;
+    let mut r_bleach_opt: Option<f64> = None;
     let mut pdb_para_path: Option<PathBuf> = None;
     let mut pcs_path: Option<PathBuf> = None;
     let mut report_opts = ReportOptions::default();
@@ -4798,6 +4884,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--metal-ligands" => {
                 i += 1;
                 metal_ligands_spec = Some(args.get(i).ok_or("missing --metal-ligands")?.clone());
+            }
+            "--r-bleach" => {
+                i += 1;
+                r_bleach_opt = Some(parse_bounded_r_bleach(
+                    args.get(i).ok_or("missing --r-bleach")?,
+                )?);
             }
             "--pdb" => {
                 i += 1;
@@ -4941,21 +5033,11 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             }
             "--runs" => {
                 i += 1;
-                runs = Some(
-                    args.get(i)
-                        .ok_or("missing --runs")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                runs = Some(parse_bounded_runs(args.get(i).ok_or("missing --runs")?)?);
             }
             "--steps" => {
                 i += 1;
-                steps = Some(
-                    args.get(i)
-                        .ok_or("missing --steps")?
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                );
+                steps = Some(parse_bounded_steps(args.get(i).ok_or("missing --steps")?)?);
             }
             "--assign-cost" => {
                 i += 1;
@@ -5015,6 +5097,9 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         }
         if metal_ligands_spec.is_some() {
             return Err("--metal-ligands is only supported with --regime paramagnetic".to_string());
+        }
+        if r_bleach_opt.is_some() {
+            return Err("--r-bleach is only supported with --regime paramagnetic".to_string());
         }
     }
     if regime != RegimeKind::Idp13C {
@@ -5455,6 +5540,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             &pri,
             &scfg,
             metal_ligands_spec.as_deref(),
+            r_bleach_opt,
             pdb_para_path.as_deref(),
             pcs_path.as_deref(),
             runs,
@@ -5493,7 +5579,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             &scfg,
             runs,
             steps,
-            32,
+            STANDARD_CPU_CALIBRATED_RUNS,
             seed,
         )?;
         let dt = t_solve.elapsed().as_secs_f64();
