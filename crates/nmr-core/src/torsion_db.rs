@@ -649,73 +649,112 @@ impl SeqAlignmentStats {
     }
 }
 
-/// Semi-global Gotoh Needleman-Wunsch alignment (`BLOSUM62`, affine `gap_open = -11, gap_extend = -1`,
-/// free terminal overhangs so homologous domains inside longer proteins are never diluted by end-tails).
-pub fn needleman_wunsch_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
+/// Gotoh affine-gap alignment spanning the shorter sequence end-to-end (`alignment_cols >= min(len_a, len_b)`).
+///
+/// When `seq_a.len() == seq_b.len()`, performs true end-to-end global alignment `(0, 0) -> (n, m)` with
+/// penalized terminal gaps on both sequences (preventing 1-2 residue corner-overhang escapes).
+/// When lengths differ, allows free N/C overhangs ONLY on the longer sequence so an embedded homologous
+/// domain is aligned end-to-end without dilution from unrelated flanking domains.
+fn gotoh_shorter_global_stats<F>(
+    seq_a: &[u8],
+    seq_b: &[u8],
+    gap_open: i32,
+    gap_ext: i32,
+    mut score_fn: F,
+) -> SeqAlignmentStats
+where
+    F: FnMut(u8, u8) -> i32,
+{
     const NEG_INF: i32 = -1_000_000_000;
-    const GAP_OPEN: i32 = -11;
-    const GAP_EXT: i32 = -1;
 
-    let n = seq_a.len();
-    let m = seq_b.len();
-    if n == 0 || m == 0 {
+    if seq_a.is_empty() || seq_b.is_empty() {
         return SeqAlignmentStats {
             identities: 0,
             aligned_pairs: 0,
             alignment_cols: 0,
         };
     }
+
+    let (s_short, s_long) = if seq_a.len() <= seq_b.len() {
+        (seq_a, seq_b)
+    } else {
+        (seq_b, seq_a)
+    };
+    let n = s_short.len();
+    let m = s_long.len();
+    let equal_len = n == m;
+
     let stride = m + 1;
     let total = (n + 1) * stride;
     let mut mat = vec![NEG_INF; total];
-    let mut ix = vec![NEG_INF; total]; // gap in seq_b (up move)
-    let mut iy = vec![NEG_INF; total]; // gap in seq_a (left move)
-                                       // Packed traceback bits per cell: bits 0..2 = prev state for M (0=M,1=Ix,2=Iy,3=start),
-                                       // bit 3 = prev state for Ix (0=M, 1=Ix), bit 4 = prev state for Iy (0=M, 1=Iy).
-    let mut tb = vec![3u8; total];
+    let mut ix = vec![NEG_INF; total]; // gap in s_long (up move, consumes s_short)
+    let mut iy = vec![NEG_INF; total]; // gap in s_short (left move, consumes s_long)
+                                       // 6-bit packed traceback per cell:
+                                       // bits 0..2: prev state for M  (0=M, 1=Ix, 2=Iy)
+                                       // bits 2..4: prev state for Ix (0=M, 1=Ix, 2=Iy)
+                                       // bits 4..6: prev state for Iy (0=M, 1=Ix, 2=Iy)
+    let mut tb = vec![0u8; total];
 
-    for i in 0..=n {
-        mat[i * stride] = 0;
+    mat[0] = 0;
+    // Leading gaps consuming s_short (col 0) are ALWAYS penalized
+    for i in 1..=n {
+        ix[i * stride] = gap_open + ((i - 1) as i32) * gap_ext;
+        let ix_prev = if i == 1 { 0u8 } else { 1u8 };
+        tb[i * stride] = ix_prev << 2;
     }
-    mat[..=m].fill(0);
+    if equal_len {
+        // Equal lengths: true global (0,0) -> (n,m), leading gaps on s_long also penalized
+        for j in 1..=m {
+            iy[j] = gap_open + ((j - 1) as i32) * gap_ext;
+            let iy_prev = if j == 1 { 0u8 } else { 2u8 };
+            tb[j] = iy_prev << 4;
+        }
+    } else {
+        // Strictly shorter query/template: free N-terminal overhang ONLY on s_long
+        mat[..=m].fill(0);
+    }
 
     for i in 1..=n {
-        let ca = seq_a[i - 1].to_ascii_uppercase();
+        let ca = s_short[i - 1].to_ascii_uppercase();
         for j in 1..=m {
-            let cb = seq_b[j - 1].to_ascii_uppercase();
+            let cb = s_long[j - 1].to_ascii_uppercase();
             let idx = i * stride + j;
 
-            // Ix[i, j]: gap in B (move from i-1, j)
+            // Ix[i, j]: gap in s_long (from i-1, j)
             let up_idx = (i - 1) * stride + j;
-            let open_x = mat[up_idx] + GAP_OPEN;
-            let ext_x = ix[up_idx] + GAP_EXT;
-            let ix_from_ix = if ext_x > open_x {
-                ix[idx] = ext_x;
-                1u8
+            let cx_m = mat[up_idx] + gap_open;
+            let cx_x = ix[up_idx] + gap_ext;
+            let cx_y = iy[up_idx] + gap_open;
+            let (best_ix, ix_prev) = if cx_x >= cx_m && cx_x >= cx_y {
+                (cx_x, 1u8)
+            } else if cx_m >= cx_y {
+                (cx_m, 0u8)
             } else {
-                ix[idx] = open_x;
-                0u8
+                (cx_y, 2u8)
             };
+            ix[idx] = best_ix;
 
-            // Iy[i, j]: gap in A (move from i, j-1)
+            // Iy[i, j]: gap in s_short (from i, j-1)
             let left_idx = i * stride + (j - 1);
-            let open_y = mat[left_idx] + GAP_OPEN;
-            let ext_y = iy[left_idx] + GAP_EXT;
-            let iy_from_iy = if ext_y > open_y {
-                iy[idx] = ext_y;
-                1u8
+            let cy_m = mat[left_idx] + gap_open;
+            let cy_y = iy[left_idx] + gap_ext;
+            let cy_x = ix[left_idx] + gap_open;
+            let (best_iy, iy_prev) = if cy_y >= cy_m && cy_y >= cy_x {
+                (cy_y, 2u8)
+            } else if cy_m >= cy_x {
+                (cy_m, 0u8)
             } else {
-                iy[idx] = open_y;
-                0u8
+                (cy_x, 1u8)
             };
+            iy[idx] = best_iy;
 
-            // M[i, j]: align seq_a[i-1] with seq_b[j-1]
-            let sub = blosum62_score(ca, cb);
+            // M[i, j]: align s_short[i-1] with s_long[j-1]
+            let sub = score_fn(ca, cb);
             let diag_idx = (i - 1) * stride + (j - 1);
             let s_m = mat[diag_idx];
             let s_x = ix[diag_idx];
             let s_y = iy[diag_idx];
-            let (best_prev, m_prev_state) = if s_m >= s_x && s_m >= s_y {
+            let (best_prev, m_prev) = if s_m >= s_x && s_m >= s_y {
                 (s_m, 0u8)
             } else if s_x >= s_y {
                 (s_x, 1u8)
@@ -723,59 +762,66 @@ pub fn needleman_wunsch_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
                 (s_y, 2u8)
             };
             mat[idx] = best_prev + sub;
-            tb[idx] = m_prev_state | (ix_from_ix << 3) | (iy_from_iy << 4);
+            tb[idx] = m_prev | (ix_prev << 2) | (iy_prev << 4);
         }
     }
 
-    // Optimal semi-global end along bottom row (i = n) or right column (j = m)
-    let mut best_score = NEG_INF;
-    let mut best_ij = (n, m);
-    for j in 1..=m {
-        let s = mat[n * stride + j];
-        if s > best_score {
-            best_score = s;
-            best_ij = (n, j);
+    let (mut i, mut j, mut state) = if equal_len {
+        let end_idx = n * stride + m;
+        let sm = mat[end_idx];
+        let sx = ix[end_idx];
+        let sy = iy[end_idx];
+        let st = if sm >= sx && sm >= sy {
+            0u8
+        } else if sx >= sy {
+            1u8
+        } else {
+            2u8
+        };
+        (n, m, st)
+    } else {
+        // Free C-terminal overhang ONLY on s_long (must finish at i == n)
+        let mut best_score = ix[n * stride];
+        let mut best_j = 0usize;
+        let mut best_st = 1u8;
+        for j_cand in 1..=m {
+            let cell = n * stride + j_cand;
+            for (sc, st) in [(mat[cell], 0u8), (ix[cell], 1u8), (iy[cell], 2u8)] {
+                if sc > best_score {
+                    best_score = sc;
+                    best_j = j_cand;
+                    best_st = st;
+                }
+            }
         }
-    }
-    for i in 1..=n {
-        let s = mat[i * stride + m];
-        if s > best_score {
-            best_score = s;
-            best_ij = (i, m);
-        }
-    }
+        (n, best_j, best_st)
+    };
 
-    let (mut i, mut j) = best_ij;
-    let mut state = 0u8; // start in M at last aligned pair
     let mut identities = 0usize;
     let mut aligned_pairs = 0usize;
     let mut cols = 0usize;
 
-    while i > 0 && j > 0 {
-        let idx = i * stride + j;
-        let code = tb[idx];
+    while i > 0 || (equal_len && j > 0) {
+        let code = tb[i * stride + j];
         match state {
             0 => {
                 cols += 1;
                 aligned_pairs += 1;
-                if seq_a[i - 1].eq_ignore_ascii_case(&seq_b[j - 1]) {
+                if s_short[i - 1].eq_ignore_ascii_case(&s_long[j - 1]) {
                     identities += 1;
                 }
-                state = code & 0x07;
+                state = code & 0x03;
                 i -= 1;
                 j -= 1;
-                if state == 3 {
-                    break;
-                }
             }
             1 => {
                 cols += 1;
-                state = if ((code >> 3) & 1) == 1 { 1 } else { 0 };
+                state = (code >> 2) & 0x03;
                 i -= 1;
             }
             _ => {
                 cols += 1;
-                state = if ((code >> 4) & 1) == 1 { 2 } else { 0 };
+                state = (code >> 4) & 0x03;
                 j -= 1;
             }
         }
@@ -788,11 +834,29 @@ pub fn needleman_wunsch_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
     }
 }
 
-/// Local Gotoh Smith-Waterman alignment (`BLOSUM62`, affine `gap_open = -11, gap_extend = -1`).
-pub fn smith_waterman_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
+/// Global/shorter-spanning Gotoh Needleman-Wunsch alignment (`BLOSUM62`, affine `gap_open = -11, gap_extend = -1`).
+pub fn needleman_wunsch_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
+    gotoh_shorter_global_stats(seq_a, seq_b, -11, -1, blosum62_score)
+}
+
+/// Global/shorter-spanning Gotoh Needleman-Wunsch exact-identity alignment (`match = +3, mismatch = -1, gap_open = -11, gap_extend = -2`),
+/// guaranteeing positive alignment score for every `> 25%` sequence-identity homolog regardless of non-conservative substitutions
+/// while preventing spurious gap-hopping onto random single-residue coincidences.
+pub fn needleman_wunsch_identity_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
+    gotoh_shorter_global_stats(seq_a, seq_b, -11, -2, |a, b| if a == b { 3 } else { -1 })
+}
+
+fn gotoh_local_stats<F>(
+    seq_a: &[u8],
+    seq_b: &[u8],
+    gap_open: i32,
+    gap_ext: i32,
+    mut score_fn: F,
+) -> SeqAlignmentStats
+where
+    F: FnMut(u8, u8) -> i32,
+{
     const NEG_INF: i32 = -1_000_000_000;
-    const GAP_OPEN: i32 = -11;
-    const GAP_EXT: i32 = -1;
 
     let n = seq_a.len();
     let m = seq_b.len();
@@ -820,8 +884,8 @@ pub fn smith_waterman_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
             let idx = i * stride + j;
 
             let up_idx = (i - 1) * stride + j;
-            let open_x = mat[up_idx] + GAP_OPEN;
-            let ext_x = ix[up_idx] + GAP_EXT;
+            let open_x = mat[up_idx] + gap_open;
+            let ext_x = ix[up_idx] + gap_ext;
             let ix_from_ix = if ext_x > open_x {
                 ix[idx] = ext_x;
                 1u8
@@ -831,8 +895,8 @@ pub fn smith_waterman_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
             };
 
             let left_idx = i * stride + (j - 1);
-            let open_y = mat[left_idx] + GAP_OPEN;
-            let ext_y = iy[left_idx] + GAP_EXT;
+            let open_y = mat[left_idx] + gap_open;
+            let ext_y = iy[left_idx] + gap_ext;
             let iy_from_iy = if ext_y > open_y {
                 iy[idx] = ext_y;
                 1u8
@@ -841,7 +905,7 @@ pub fn smith_waterman_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
                 0u8
             };
 
-            let sub = blosum62_score(ca, cb);
+            let sub = score_fn(ca, cb);
             let diag_idx = (i - 1) * stride + (j - 1);
             let s_m = mat[diag_idx];
             let s_x = ix[diag_idx];
@@ -918,6 +982,40 @@ pub fn smith_waterman_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
     }
 }
 
+/// Local Gotoh Smith-Waterman alignment (`BLOSUM62`, affine `gap_open = -11, gap_extend = -1`).
+pub fn smith_waterman_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
+    gotoh_local_stats(seq_a, seq_b, -11, -1, blosum62_score)
+}
+
+/// Local Gotoh Smith-Waterman exact-identity alignment (`match = +3, mismatch = -1, gap_open = -11, gap_extend = -2`).
+pub fn smith_waterman_identity_stats(seq_a: &[u8], seq_b: &[u8]) -> SeqAlignmentStats {
+    gotoh_local_stats(seq_a, seq_b, -11, -2, |a, b| if a == b { 3 } else { -1 })
+}
+
+/// Maximum sequence identity over `>= 50%` query OR template coverage across all four
+/// `BLOSUM62` + exact-identity global/local alignments.
+fn effective_seq_identity_50cov(seq_a: &[u8], seq_b: &[u8]) -> f64 {
+    if seq_a.is_empty() || seq_b.is_empty() {
+        return 0.0;
+    }
+    let qlen = seq_a.len() as f64;
+    let tlen = seq_b.len() as f64;
+    let mut best = 0.0f64;
+    for st in [
+        needleman_wunsch_stats(seq_a, seq_b),
+        smith_waterman_stats(seq_a, seq_b),
+        needleman_wunsch_identity_stats(seq_a, seq_b),
+        smith_waterman_identity_stats(seq_a, seq_b),
+    ] {
+        let q_cov = (st.aligned_pairs as f64) / qlen;
+        let t_cov = (st.aligned_pairs as f64) / tlen;
+        if q_cov >= 0.50 || t_cov >= 0.50 {
+            best = best.max(st.identity_over_pairs());
+        }
+    }
+    best
+}
+
 /// Returns `true` if `seq_a` and `seq_b` share any 7-mer with `<= 1` mismatch (`>= 6/7` identical).
 pub fn shares_7mer_within_1_mismatch(seq_a: &[u8], seq_b: &[u8]) -> bool {
     if seq_a.len() < 7 || seq_b.len() < 7 {
@@ -940,7 +1038,8 @@ pub fn shares_7mer_within_1_mismatch(seq_a: &[u8], seq_b: &[u8]) -> bool {
 }
 
 /// Clean-room Zhang & Skolnick (*Proteins* 2004, 57, 702-710) `TM-score` on `C_alpha` coordinates,
-/// normalized by `query_ca.len()`, with iterative Kabsch + dynamic-programming equivalence search.
+/// normalized by `min(query_ca.len(), template_ca.len())`, with dense `shift_step = 1` diagonal +
+/// sliding-window Kabsch seeding and iterative dynamic-programming equivalence refinement.
 pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
     let lq = query_ca.len();
     let lt = template_ca.len();
@@ -948,13 +1047,14 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
         return 0.0;
     }
 
-    let d0 = if lq > 15 {
-        (1.24 * ((lq as f64) - 15.0).cbrt() - 1.8).max(0.5)
+    let l_norm = lq.min(lt);
+    let d0 = if l_norm > 15 {
+        (1.24 * ((l_norm as f64) - 15.0).cbrt() - 1.8).max(0.5)
     } else {
         0.5
     };
     let d0_sq = d0 * d0;
-    let inv_lq = 1.0 / (lq as f64);
+    let inv_lnorm = 1.0 / (l_norm as f64);
 
     let apply_xform = |p: Vec3, rot: &[[f64; 3]; 3], c_mov: Vec3, c_ref: Vec3| -> Vec3 {
         let u = v_sub(p, c_mov);
@@ -1016,7 +1116,7 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
                             ref_buf.push(query_ca[qi]);
                         }
                     }
-                    let tm = sum_tm * inv_lq;
+                    let tm = sum_tm * inv_lnorm;
                     if tm > best_tm {
                         best_tm = tm;
                         best_rot = rot;
@@ -1039,7 +1139,7 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
                         1.0 / (1.0 + v_dist_sq(query_ca[qi], xt) / d0_sq)
                     })
                     .sum();
-                let tm_final = sum_final * inv_lq;
+                let tm_final = sum_final * inv_lnorm;
                 if tm_final > best_tm {
                     best_tm = tm_final;
                     best_rot = rot;
@@ -1055,26 +1155,19 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
         (best_tm, best_rot, best_cm, best_cr)
     };
 
-    // DP equivalence search given current superposition `(rot, cm, cr)`
+    // Semi-global DP equivalence search given current superposition `(rot, cm, cr)`,
+    // allowing free N/C terminal overhangs so embedded domains & cloning tags are never forced onto random tails.
     let dp_structural_pairs = |rot: &[[f64; 3]; 3], cm: Vec3, cr: Vec3| -> Vec<(usize, usize)> {
         let stride = lt + 1;
         let mut dp = vec![0.0f64; (lq + 1) * stride];
-        let mut tb = vec![0u8; (lq + 1) * stride];
-        let gap_pen = -0.6f64;
+        let mut tb = vec![3u8; (lq + 1) * stride];
+        let gap_pen = -0.20f64;
 
         let xformed_t: Vec<Vec3> = template_ca
             .iter()
             .map(|&p| apply_xform(p, rot, cm, cr))
             .collect();
 
-        for i in 1..=lq {
-            dp[i * stride] = gap_pen * (i as f64);
-            tb[i * stride] = 1;
-        }
-        for j in 1..=lt {
-            dp[j] = gap_pen * (j as f64);
-            tb[j] = 2;
-        }
         for i in 1..=lq {
             let pq = query_ca[i - 1];
             for j in 1..=lt {
@@ -1095,18 +1188,35 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
                 }
             }
         }
-        let mut pairs = Vec::with_capacity(lq.min(lt));
-        let (mut i, mut j) = (lq, lt);
-        while i > 0 || j > 0 {
-            let step = tb[i * stride + j];
-            if i > 0 && j > 0 && step == 0 {
-                pairs.push((i - 1, j - 1));
-                i -= 1;
-                j -= 1;
-            } else if i > 0 && (j == 0 || step == 1) {
-                i -= 1;
-            } else {
-                j -= 1;
+        let mut best_end_score = f64::NEG_INFINITY;
+        let mut best_end = (lq, lt);
+        for j in 1..=lt {
+            let sc = dp[lq * stride + j];
+            if sc > best_end_score {
+                best_end_score = sc;
+                best_end = (lq, j);
+            }
+        }
+        for i in 1..=lq {
+            let sc = dp[i * stride + lt];
+            if sc > best_end_score {
+                best_end_score = sc;
+                best_end = (i, lt);
+            }
+        }
+
+        let mut pairs = Vec::with_capacity(l_norm);
+        let (mut i, mut j) = best_end;
+        while i > 0 && j > 0 {
+            match tb[i * stride + j] {
+                0 => {
+                    pairs.push((i - 1, j - 1));
+                    i -= 1;
+                    j -= 1;
+                }
+                1 => i -= 1,
+                2 => j -= 1,
+                _ => break,
             }
         }
         pairs.reverse();
@@ -1115,50 +1225,62 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
 
     let mut best_overall_tm = 0.0f64;
 
-    // Generate candidate gapless diagonal seeds
-    let min_ov = (lq.min(lt) / 2).max(4);
-    let mut seeds: Vec<(f64, Vec<(usize, usize)>)> = Vec::new();
+    // Dense `shift_step = 1` gapless diagonal + sliding-window seed scan (zero skipped offsets)
+    let min_ov = (l_norm / 2).max(4);
     let shift_min = -((lt as isize) - (min_ov as isize));
     let shift_max = (lq as isize) - (min_ov as isize);
-    let shift_step = (((shift_max - shift_min) as usize) / 14).max(1) as isize;
+    let mut seeds: Vec<(f64, Vec<(usize, usize)>)> =
+        Vec::with_capacity((shift_max - shift_min + 1).max(0) as usize);
 
-    let mut candidate_shifts: Vec<isize> = (shift_min..=shift_max)
-        .step_by(shift_step as usize)
-        .collect();
-    if lq == lt && !candidate_shifts.contains(&0) {
-        candidate_shifts.push(0);
-    }
-
-    let mut mov_tmp = Vec::new();
-    let mut ref_tmp = Vec::new();
-    for sh in candidate_shifts {
+    let mut mov_tmp = Vec::with_capacity(l_norm);
+    let mut ref_tmp = Vec::with_capacity(l_norm);
+    for sh in shift_min..=shift_max {
         let q_start = sh.max(0) as usize;
         let t_start = (-sh).max(0) as usize;
         let len = (lq - q_start).min(lt - t_start);
         if len < 4 {
             continue;
         }
-        mov_tmp.clear();
-        ref_tmp.clear();
         let mut pairs = Vec::with_capacity(len);
         for k in 0..len {
             pairs.push((q_start + k, t_start + k));
-            mov_tmp.push(template_ca[t_start + k]);
-            ref_tmp.push(query_ca[q_start + k]);
         }
-        let (rot, cm, cr, _) = kabsch_transform(&mov_tmp, &ref_tmp);
-        let init_tm: f64 = pairs
-            .iter()
-            .map(|&(qi, ti)| {
-                let xt = apply_xform(template_ca[ti], &rot, cm, cr);
-                1.0 / (1.0 + v_dist_sq(query_ca[qi], xt) / d0_sq)
-            })
-            .sum::<f64>()
-            * inv_lq;
-        seeds.push((init_tm, pairs));
+
+        let mut win_specs: Vec<(usize, usize)> = vec![(0, len)];
+        let w_len = (l_norm / 2).clamp(8, len);
+        if w_len < len {
+            win_specs.push((0, w_len));
+            win_specs.push(((len - w_len) / 2, w_len));
+            win_specs.push((len - w_len, w_len));
+            win_specs.sort_unstable();
+            win_specs.dedup();
+        }
+
+        let mut best_sh_tm = 0.0f64;
+        for (ws, wl) in win_specs {
+            mov_tmp.clear();
+            ref_tmp.clear();
+            for &(qi, ti) in &pairs[ws..(ws + wl)] {
+                mov_tmp.push(template_ca[ti]);
+                ref_tmp.push(query_ca[qi]);
+            }
+            let (rot, cm, cr, _) = kabsch_transform(&mov_tmp, &ref_tmp);
+            let tm_cand: f64 = pairs
+                .iter()
+                .map(|&(qi, ti)| {
+                    let xt = apply_xform(template_ca[ti], &rot, cm, cr);
+                    1.0 / (1.0 + v_dist_sq(query_ca[qi], xt) / d0_sq)
+                })
+                .sum::<f64>()
+                * inv_lnorm;
+            if tm_cand > best_sh_tm {
+                best_sh_tm = tm_cand;
+            }
+        }
+        seeds.push((best_sh_tm, pairs));
     }
     seeds.sort_by(|a, b| b.0.total_cmp(&a.0));
-    seeds.truncate(3);
+    seeds.truncate(8);
 
     for (_, mut pairs) in seeds {
         for _iter in 0..2 {
@@ -1257,15 +1379,32 @@ pub fn apply_homolog_firewall<'a>(
             }
         }
 
-        // Layer 3: Global NW + Local SW (> 25% seq identity over >= 50% query OR template coverage) + 7-mer <= 1 mismatch
+        // Layer 3: Global/shorter-spanning NW + Local SW (BLOSUM62 AND exact-identity scoring,
+        // > 25% seq identity over >= 50% query OR template coverage) + 7-mer <= 1 mismatch
+        let qlen = query_seq1.len();
+        let tlen = ch.seq1.len();
         let nw = needleman_wunsch_stats(query_seq1, &ch.seq1);
-        if nw.exceeds_firewall(query_seq1.len(), ch.seq1.len()) {
-            reasons.push(format!("L3:nw_seq_id({:.3})", nw.identity_over_pairs()));
+        let nw_id = needleman_wunsch_identity_stats(query_seq1, &ch.seq1);
+        let best_nw_sid = [nw, nw_id]
+            .into_iter()
+            .filter(|st| st.exceeds_firewall(qlen, tlen))
+            .map(|st| st.identity_over_pairs())
+            .fold(0.0f64, f64::max);
+        if best_nw_sid > 0.25 {
+            reasons.push(format!("L3:nw_seq_id({best_nw_sid:.3})"));
         }
+
         let sw = smith_waterman_stats(query_seq1, &ch.seq1);
-        if sw.exceeds_firewall(query_seq1.len(), ch.seq1.len()) {
-            reasons.push(format!("L3:sw_seq_id({:.3})", sw.identity_over_pairs()));
+        let sw_id = smith_waterman_identity_stats(query_seq1, &ch.seq1);
+        let best_sw_sid = [sw, sw_id]
+            .into_iter()
+            .filter(|st| st.exceeds_firewall(qlen, tlen))
+            .map(|st| st.identity_over_pairs())
+            .fold(0.0f64, f64::max);
+        if best_sw_sid > 0.25 {
+            reasons.push(format!("L3:sw_seq_id({best_sw_sid:.3})"));
         }
+
         if shares_7mer_within_1_mismatch(query_seq1, &ch.seq1) {
             reasons.push("L3:7mer_6of7".to_string());
         }
@@ -1282,12 +1421,12 @@ pub fn apply_homolog_firewall<'a>(
         }
 
         if reasons.is_empty() {
-            // Track max retained sequence identity (over >= 50% coverage)
-            let qlen = query_seq1.len().max(1) as f64;
-            let tlen = ch.seq1.len().max(1) as f64;
-            for st in [nw, sw] {
-                if (st.aligned_pairs as f64) / qlen >= 0.50
-                    || (st.aligned_pairs as f64) / tlen >= 0.50
+            // Track max retained sequence identity (strictly gated on >= 50% query/template coverage)
+            let qlen_f = qlen.max(1) as f64;
+            let tlen_f = tlen.max(1) as f64;
+            for st in [nw, sw, nw_id, sw_id] {
+                if (st.aligned_pairs as f64) / qlen_f >= 0.50
+                    || (st.aligned_pairs as f64) / tlen_f >= 0.50
                 {
                     max_retained_seq_id = max_retained_seq_id.max(st.identity_over_pairs());
                 }
@@ -1617,18 +1756,7 @@ pub fn predict_torsions_with_db(
     let (rci_vec, s2_vec) = compute_rci_and_s2(&sec);
     let kept_seq_ids: Vec<f64> = kept_chains
         .iter()
-        .map(|ch| {
-            let nw = needleman_wunsch_stats(&q_seq1, &ch.seq1);
-            let sw = smith_waterman_stats(&q_seq1, &ch.seq1);
-            let qlen = q_seq1.len().max(1) as f64;
-            let tlen = ch.seq1.len().max(1) as f64;
-            let mut sid = nw.identity_over_pairs();
-            if (sw.aligned_pairs as f64) / qlen >= 0.50 || (sw.aligned_pairs as f64) / tlen >= 0.50
-            {
-                sid = sid.max(sw.identity_over_pairs());
-            }
-            sid
-        })
+        .map(|ch| effective_seq_identity_50cov(&q_seq1, &ch.seq1))
         .collect();
     let mut predictions = Vec::with_capacity(n);
     let mut nearest_template_seq_identities = vec![0.0f64; n];

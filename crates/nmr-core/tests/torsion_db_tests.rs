@@ -251,6 +251,57 @@ fn test_homolog_firewall_all_five_layers_independently() {
         .iter()
         .any(|e| e.pdb_id == "1UBQ" && e.reasons.iter().any(|r| r.starts_with("L3:sw_seq_id"))));
 
+    // Layer 3a-adversarial: 34.2% sequence identity (26/76 identical, 0 shared 6/7-mers) with harsh
+    // non-conservative W/R/D substitutions so full-diagonal BLOSUM62 score is strictly negative (< 0)!
+    let harsh = *b"WRD";
+    let mut seq_34pct_wrd = Vec::with_capacity(ubq_chain.seq1.len());
+    for (idx, &aa) in ubq_chain.seq1.iter().enumerate() {
+        if idx % 3 == 0 {
+            seq_34pct_wrd.push(aa);
+        } else {
+            let mut sub = harsh[idx % harsh.len()];
+            if sub == aa {
+                sub = b'W';
+            }
+            if sub == aa {
+                sub = b'D';
+            }
+            seq_34pct_wrd.push(sub);
+        }
+    }
+    assert!(!shares_7mer_within_1_mismatch(
+        &seq_34pct_wrd,
+        &ubq_chain.seq1
+    ));
+    let (_, ex_wrd, _, max_ret_wrd) =
+        apply_homolog_firewall(db, &seq_34pct_wrd, &HomologFirewallQuery::default());
+    assert!(
+        ex_wrd.iter().any(|e| e.pdb_id == "1UBQ"
+            && e.reasons
+                .iter()
+                .any(|r| r.starts_with("L3:nw_seq_id") || r.starts_with("L3:sw_seq_id"))),
+        "Layer 3 must exclude 34.2%-id 1UBQ homolog even under harsh W/R/D substitutions with negative BLOSUM62!"
+    );
+    assert!(
+        max_ret_wrd <= 0.25 + 1e-12,
+        "max_retained_seq_id {max_ret_wrd} exceeded 0.25"
+    );
+
+    // Also verify embedded harsh W/R/D 34.2%-id 1UBQ domain inside a 210-aa query is caught by Layer 3
+    let mut long_wrd = vec![b'P'; 65];
+    long_wrd.extend_from_slice(&seq_34pct_wrd);
+    long_wrd.extend(vec![b'P'; 69]);
+    let (_, ex_long_wrd, _, max_ret_long_wrd) =
+        apply_homolog_firewall(db, &long_wrd, &HomologFirewallQuery::default());
+    assert!(
+        ex_long_wrd.iter().any(|e| e.pdb_id == "1UBQ"
+            && e.reasons
+                .iter()
+                .any(|r| r.starts_with("L3:nw_seq_id") || r.starts_with("L3:sw_seq_id"))),
+        "Layer 3 must exclude embedded 34.2%-id W/R/D domain inside 210-aa query!"
+    );
+    assert!(max_ret_long_wrd <= 0.25 + 1e-12);
+
     // Layer 3b: 7-mer <= 1 mismatch (>= 6/7) filter on an otherwise 0%-identity sequence
     let mut seq_7mer = vec![b'W'; 60];
     // Copy residues 10..17 of 1UBQ with 1 mismatch at offset 3
@@ -292,7 +343,7 @@ fn test_homolog_firewall_all_five_layers_independently() {
 
     let poly_w = vec![b'W'; ubq_ca.len()];
     let fw_tm = HomologFirewallQuery {
-        query_ca_coords: Some(rot_pert_ca),
+        query_ca_coords: Some(rot_pert_ca.clone()),
         ..Default::default()
     };
     let (_, ex_tm, sha_tm1, _) = apply_homolog_firewall(db, &poly_w, &fw_tm);
@@ -306,6 +357,78 @@ fn test_homolog_firewall_all_five_layers_independently() {
             .iter()
             .any(|e| e.pdb_id == "1UBQ" && e.reasons.iter().any(|r| r.starts_with("L4:tm_score"))),
         "Layer 4 must exclude structural analog with TM-score >= 0.50 even at 0% sequence identity"
+    );
+
+    // Layer 4b: Perturbed 76-aa 1UBQ embedded at offset 62 inside a 200-aa multi-domain query
+    let mut embedded_200_ca = Vec::with_capacity(200);
+    for k in 0..62 {
+        let s = k as f64;
+        embedded_200_ca.push([
+            -80.0 + 1.5 * s,
+            50.0 + 2.3 * (0.9 * s).cos(),
+            -40.0 + 2.3 * (0.9 * s).sin(),
+        ]);
+    }
+    embedded_200_ca.extend_from_slice(&rot_pert_ca);
+    for k in 0..62 {
+        let s = k as f64;
+        embedded_200_ca.push([
+            160.0 + 1.5 * s,
+            -70.0 + 2.3 * (1.1 * s).cos(),
+            120.0 + 2.3 * (1.1 * s).sin(),
+        ]);
+    }
+    assert_eq!(embedded_200_ca.len(), 200);
+    let tm_emb_200 = tm_score_ca(&embedded_200_ca, &ubq_ca);
+    assert!(
+        tm_emb_200 >= 0.80,
+        "expected embedded 76-aa 1UBQ in 200-aa query to achieve TM >= 0.80 (min(Lq,Lt) norm), got {tm_emb_200}"
+    );
+    let (_, ex_tm_emb, _, _) = apply_homolog_firewall(
+        db,
+        &[b'W'; 200],
+        &HomologFirewallQuery {
+            query_ca_coords: Some(embedded_200_ca),
+            ..Default::default()
+        },
+    );
+    assert!(
+        ex_tm_emb
+            .iter()
+            .any(|e| e.pdb_id == "1UBQ" && e.reasons.iter().any(|r| r.starts_with("L4:tm_score"))),
+        "Layer 4 must exclude 76-aa 1UBQ domain embedded inside a 200-aa query!"
+    );
+
+    // Layer 4c: Perturbed 76-aa 1UBQ preceded by a 5-aa N-terminal cloning tag (`sh = 5`)
+    let mut tagged_81_ca = Vec::with_capacity(81);
+    for k in 0..5 {
+        let s = (5 - k) as f64;
+        tagged_81_ca.push([
+            rot_pert_ca[0][0] - 3.8 * s,
+            rot_pert_ca[0][1] + 0.9 * s,
+            rot_pert_ca[0][2] - 0.7 * s,
+        ]);
+    }
+    tagged_81_ca.extend_from_slice(&rot_pert_ca);
+    assert_eq!(tagged_81_ca.len(), 81);
+    let tm_tag_81 = tm_score_ca(&tagged_81_ca, &ubq_ca);
+    assert!(
+        tm_tag_81 >= 0.80,
+        "expected 1UBQ with 5-aa N-terminal tag to achieve TM >= 0.80, got {tm_tag_81}"
+    );
+    let (_, ex_tm_tag, _, _) = apply_homolog_firewall(
+        db,
+        &[b'W'; 81],
+        &HomologFirewallQuery {
+            query_ca_coords: Some(tagged_81_ca),
+            ..Default::default()
+        },
+    );
+    assert!(
+        ex_tm_tag
+            .iter()
+            .any(|e| e.pdb_id == "1UBQ" && e.reasons.iter().any(|r| r.starts_with("L4:tm_score"))),
+        "Layer 4 must exclude 1UBQ with a 5-aa N-terminal cloning tag!"
     );
 }
 
@@ -334,6 +457,51 @@ fn test_unlabelled_global_shift_offset_recovery() {
         assert!(
             (est.dn - (-1.85)).abs() < 1.10,
             "{bmrb_id}: failed to recover -1.85 ppm 15N offset: {est:?}"
+        );
+
+        // Verify sequence-order / residue-label permutation invariance of `estimate_global_shift_offsets`
+        // across all non-Proline and non-pre-Proline positions!
+        let n_seq = shifted.sequence.len();
+        let free_idxs: Vec<usize> = (0..n_seq)
+            .filter(|&i| {
+                let is_pro = shifted.sequence[i].trim().eq_ignore_ascii_case("PRO");
+                let pre_pro =
+                    i + 1 < n_seq && shifted.sequence[i + 1].trim().eq_ignore_ascii_case("PRO");
+                !is_pro && !pre_pro
+            })
+            .collect();
+        let mut perm_map: Vec<usize> = (0..n_seq).collect();
+        for (k, &old_i) in free_idxs.iter().enumerate() {
+            // Deterministic non-trivial reversal + stride permutation
+            let new_i = free_idxs[free_idxs.len() - 1 - k];
+            perm_map[new_i] = old_i;
+        }
+        let mut permuted = Reference {
+            sequence: (0..n_seq)
+                .map(|new_i| shifted.sequence[perm_map[new_i]].clone())
+                .collect(),
+            seq_ids: (0..n_seq).map(|new_i| (new_i + 1) as i32).collect(),
+            shifts: std::collections::BTreeMap::new(),
+            ambiguity_codes: std::collections::BTreeMap::new(),
+        };
+        let mut inv_perm = vec![0usize; n_seq];
+        for (new_i, &old_i) in perm_map.iter().enumerate() {
+            inv_perm[old_i] = new_i;
+        }
+        for ((old_i, atom), &val) in &shifted.shifts {
+            permuted
+                .shifts
+                .insert((inv_perm[*old_i], atom.clone()), val);
+        }
+        let est_perm = estimate_global_shift_offsets(&permuted);
+        assert!(
+            (est_perm.dh - est.dh).abs() < 1e-12
+                && (est_perm.dn - est.dn).abs() < 1e-12
+                && (est_perm.dca - est.dca).abs() < 1e-12
+                && (est_perm.dcb - est.dcb).abs() < 1e-12
+                && (est_perm.dc - est.dc).abs() < 1e-12
+                && (est_perm.dha - est.dha).abs() < 1e-12,
+            "{bmrb_id}: estimate_global_shift_offsets is not permutation-invariant: {est:?} vs {est_perm:?}"
         );
 
         let bref = &bench_refs[bmrb_id];
@@ -448,6 +616,13 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
             rep.max_retained_seq_identity <= 0.25 + 1e-12,
             "{bmrb_id}: retained homolog with sequence identity {:.3} > 0.25!",
             rep.max_retained_seq_identity
+        );
+        assert!(
+            rep.nearest_template_seq_identities
+                .iter()
+                .all(|&sid| sid <= 0.25 + 1e-12),
+            "{bmrb_id}: nearest_template_seq_identities exceeded 0.25: {:?}",
+            rep.nearest_template_seq_identities
         );
         assert_eq!(rep.exclusion_list_sha256.len(), 64);
 
