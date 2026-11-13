@@ -8,8 +8,10 @@
 >   - Bax, Clore & Gronenborn, *J. Magn. Reson.* **88**, 425–431 (1990); Kay, Ikura & Bax, *J. Am. Chem. Soc.* **112**, 888–889 (1990) — `3D HCCH-TOCSY` & `HCCH-COSY` intra-residue `1H-13C-13C-1H` coherence transfer.
 > - **Aromatic `13CB`-to-ring correlation experiments (`2D (HB)CB(CGCD)HD` & `2D (HB)CB(CGCDCE)HE`)**:
 >   - Yamazaki, Forman-Kay & Kay, *J. Am. Chem. Soc.* **115**, 11054–11055 (1993) — two-dimensional scalar `1J_CC` relay correlating aliphatic `13CB` with aromatic `1HD*` and `1HE*` ring protons across quaternary `13CG`/`13CD2`.
-> - **Histidine imidazole `15ND1` / `15NE2` tautomeric & protonation state determination (`2D long-range 1H-15N HMQC`)**:
->   - Pelton, Torchia, Meadow & Roseman, *Protein Sci.* **2**, 543–558 (1993) — tautomeric (`Nε2-H` $\tau$ vs `Nδ1-H` $\pi$) and imidazolium (`+1` doubly protonated) classification from long-range `2J_NH` / `3J_NH` `1H-15N` HMQC chemical shifts and cross-peak intensity patterns.
+> - **Histidine imidazole `15ND1` / `15NE2` / `13CG` tautomeric, exchange & metal-ligation states (`2D long-range 1H-15N HMQC`)**:
+>   - Pelton, Torchia, Meadow & Roseman, *Protein Sci.* **2**, 543–558 (1993) — tautomeric (`Nε2-H` $\tau$ vs `Nδ1-H` $\pi$) and imidazolium (`+1` doubly protonated) classification from long-range `2J_NH` / `3J_NH` `1H-15N` HMQC chemical shifts and Table 1 heteronuclear coupling constants.
+>   - Reynolds, Peat, Freedman & Lyerla, *J. Am. Chem. Soc.* **95**, 328–331 (1973); Sudmeier, Bradshaw & Bachovchin, *J. Magn. Reson.* **163**, 194–198 (2003) — quaternary `13CG` chemical-shift discrimination of $\tau$ (`~135.5 ppm`) vs $\pi$ (`~127.2 ppm`) histidine tautomers.
+>   - Barraud, Schubert, Allain & Nietlispach, *J. Biomol. NMR* **53**, 95–108 (2012) — `Zn(II)`/metal-coordinated histidine `15ND1`/`15NE2` shifts (`~20–48 ppm` upfield of `249.5 ppm`) in metalloproteins and zinc fingers.
 > - **Aromatic `1H-13C` HSQC / constant-time HSQC (`CT-HSQC`) & intra-ring `HCCH-TOCSY`**:
 >   - Bax, Clore & Gronenborn, *J. Magn. Reson.* **88**, 425–431 (1990); Torizawa, Ono, Terauchi & Kainosho, *J. Am. Chem. Soc.* **127**, 12620–12626 (2005).
 > - **IUPAC nomenclature & empirical BMRB chemical-shift priors**:
@@ -32,7 +34,7 @@ Extending sequential backbone assignment (`H`, `N`, `CA`, `CB`, `C`; see `03-ass
 3. **Companion Sidechain & Methyl Specifications**:
    - **Bayesian Stereospecific Prochiral Assignment (`docs/specs/07b-stereospecific.md`, `crates/nmr-core/src/stereospec.rs`)**: resolves diastereotopic `CH2` methylenes (`HB2/HB3`, `HA2/HA3`, `HG*`, `HD*`, `HE*`), prochiral `Val CG1/CG2` & `Leu CD1/CD2` isopropyl methyls, and `Asn`/`Gln` primary carboxamides from `3J` scalar couplings, intraresidue/sequential NOE ratios, and Lovell backbone-dependent rotamer priors (plus bounded shift-anisotropy priors strictly on `Asn`/`Gln`), gating NMR-STAR `_Atom_chem_shift.Ambiguity_code` (`1` vs `2`) and NEF v1.1 `x`/`y` wildcards at posterior `>= 0.90`.
    - **Supramolecular `13C`-Methyl TROSY (`docs/specs/13-methyl-trosy.md`, `crates/nmr-core/src/{methyl_trosy,methyl_solver}.rs`, `crates/nmr-gpu/src/methyl_gpu.rs`)**: assigns selectively protonated `ILVMAT` methyl probes in high-molecular-weight (`20–500 kDa`) perdeuterated systems from `2D 1H-13C HMQC`, `3D/4D` methyl-NOESY, and 3D structure contact graphs via WebGPU/CPU independent multi-replica simulated annealing (`56` replicas by default in `MethylAnnealConfig`, `64 × seeds` in CLI, with automatic CPU fallback when no WebGPU adapter is available; `nmrassign methyl`).
-   - **Interactive 2D IUPAC Covalent Sidechain Z-Score Inspector (`crates/nmr-core/src/topology.rs`, `crates/nmr-gui/src/sidechain_widget.rs`)**: planar non-overlapping 2D covalent atom-bond layouts (`Cys` redox & `His` protonation state-aware), BMRB empirical Z-score coloring (`|z| <= 1.5`, `1.5..3.0`, `> 3.0`), and 1-click `SyncCrosshair` frequency navigation in `nmr-gui`.
+   - **Interactive 2D IUPAC Covalent Sidechain Z-Score Inspector (`crates/nmr-core/src/topology.rs`, `crates/nmr-gui/src/sidechain_widget.rs`)**: planar non-overlapping 2D covalent atom-bond layouts (`Cys` redox & `His` protonation state-aware; canonical uncommitted `HIS` omits tautomeric `HD1`/`HE2` protons until an explicit `Ne2H`, `Nd1H`, or `DoublyProtonated` variant is inferred or selected), empirical BMRB Z-score coloring (`|z| <= 1.5`, `1.5..3.0`, `> 3.0`, while atoms without BMRB priors such as `C'`/`N`/`O`/ring `15N` return `None` $\to$ `NoPriorNeutral` slate rather than a misleading `0.00σ` green), separate `auto_inferred_variants` vs manual `user_variant_overrides` state (`sync_inferred_variants_from_reference`), and 1-click `SyncCrosshair` frequency navigation in `nmr-gui`.
 
 ---
 
@@ -102,7 +104,7 @@ Quaternary `13CG` carbons in `Phe`, `Tyr`, `Trp`, and `His` (plus `13CD2`/`13CE2
 | `HBCBCGCDHD` | 2D `x = 1HD (5.8..8.8 ppm)`, `y = 13CB (24..46 ppm)` | $(^{1}\text{HB}) \to {}^{13}\text{CB}(t_1) \xrightarrow{^{1}J_{\text{CB,CG}}} {}^{13}\text{CG} \xrightarrow{^{1}J_{\text{CG,CD}}} {}^{13}\text{CD} \xrightarrow{^{1}J_{\text{CH}}} {}^{1}\text{HD}(t_2)$: correlates `Phe`/`Tyr` `HD*`, `Trp` `HD1`, and `His` `HD2` directly with backbone `CB(i)`. | Yamazaki, Forman-Kay & Kay (1993) |
 | `HBCBCGCDCEHE` | 2D `x = 1HE (5.8..9.0 ppm)`, `y = 13CB (24..46 ppm)` | $(^{1}\text{HB}) \to {}^{13}\text{CB}(t_1) \to {}^{13}\text{CG} \to {}^{13}\text{CD} \to {}^{13}\text{CE} \to {}^{1}\text{HE}(t_2)$: correlates `Phe`/`Tyr` `HE*`, `Trp` `HE3` (via `CB-CG-CD2-CE3-HE3`), and weak/optional `His` `HE1` with `CB(i)`. | Yamazaki, Forman-Kay & Kay (1993) |
 | `AROM_HCCH_TOCSY` | 3D `x = 1H`, `y = 13C`, `z = 1H_tocsy` | Intra-ring $^{1}\text{H}\text{-}{}^{13}\text{C}\text{-}{}^{13}\text{C}\text{-}{}^{1}\text{H}$ isotropic mixing: links `(CD*,HD*) <-> (CE*,HE*) <-> (CZ,HZ)` in `Phe`, `(CD*,HD*) <-> (CE*,HE*)` in `Tyr`, and the 4-spin benzenoid sub-ring `HE3 <-> HZ3 <-> HH2 <-> HZ2` in `Trp` (`1-step` attenuation `~0.68`, `2-step` `~0.42`, `3-step` `~0.24`). | Bax et al. (1990); Torizawa et al. (2005) |
-| `HIS_LR_N15HMQC` | 2D `x = 1H (6.4..9.2 ppm)`, `y = 15N (155..265 ppm)` | Long-range $^{2}J_{\text{NH}}$ / $^{3}J_{\text{NH}}$ ($\Delta \approx 22\text{ ms}$) HMQC correlating `His` `HE1` (`~7.5–8.8 ppm`) strongly to both `ND1` (`2J`) and `NE2` (`2J`), and `HD2` (`~6.8–7.6 ppm`) strongly to `NE2` (`2J`) and weakly to `ND1` (`3J`). | Pelton et al. (1993) |
+| `HIS_LR_N15HMQC` | 2D `x = 1H (6.0..9.35 ppm)`, `y = 15N (155..265 ppm)` | Long-range $^{2}J_{\text{NH}}$ / $^{3}J_{\text{NH}}$ ($\Delta \approx 22\text{ ms}$) HMQC governed by Pelton et al. (1993) Table 1 couplings: `HE1` couples strongly to **both** `ND1` and `NE2` (`8.8–10.6 Hz` to unprotonated `=N-` at `~249.5 ppm` vs `5.2–5.9 Hz` to protonated `>NH` at `~168–178 ppm`), whereas `HD2` couples strongly to unprotonated `=N-` (`8.2–9.4 Hz`) and more weakly to protonated `>NH` (`1.4–5.4 Hz`). | Pelton et al. (1993) |
 | `TRP_IND_N15HSQC` | 2D `x = 1HE1 (9.2..11.5 ppm)`, `y = 15NE1 (122..137 ppm)` | One-bond $^{1}J_{\text{NH}}$ indole `15NE1-1HE1` correlation, paired with intra-ring `HE1 -> HD1` (`~2.5 Å`) and `HE1 -> HZ2` (`~2.8 Å`) NOE/relay cross-peaks bridging the pyrrole and benzenoid halves of `Trp`. | Markley et al. (1998) |
 
 ### 4.2 Volumetric Simulation & Artifact-Suppressing Peak Picking
@@ -115,17 +117,19 @@ Quaternary `13CG` carbons in `Phe`, `Tyr`, `Trp`, and `His` (plus `13CD2`/`13CE2
 
 ---
 
-## 5. Histidine Tautomeric & Protonation State Classification (`Pelton et al. 1993`)
+## 5. Histidine Tautomeric, Fast-Exchange & Metal-Ligation State Classification (`Pelton et al. 1993`; `Barraud et al. 2012`)
 
-Histidine's imidazole sidechain exists in three distinct chemical/protonation states near physiological pH, distinguished unambiguously by unprotonated pyridine-like nitrogen (`~249 ppm`, $\beta$-type) versus protonated pyrrole-like nitrogen (`~168–178 ppm`, $\alpha/\alpha^+$-type) chemical shifts and `2J_NH` vs `3J_NH` cross-peak topologies in `HIS_LR_N15HMQC`:
+Histidine's imidazole priors are defined once in a single authoritative table `HisVariantPriors` (`HIS_NE2H_PRIORS`, `HIS_ND1H_PRIORS`, `HIS_DOUBLY_PROTONATED_PRIORS` in `crates/nmr-core/src/topology.rs`) shared identically by `topology.rs` and `aromatic.rs`. Near physiological pH, static histidine rings occupy one of three canonical protonation/tautomeric states, while dynamic solvent-exposed rings and metal-coordinating rings (`Zn(II)`, `Cu(I)`, `[2Fe-2S]`) occupy distinct non-Pelton regimes captured by `HisStateClassification`:
 
-| `HisTautomer` Variant | Chemical State | `15ND1` (ppm) | `15NE2` (ppm) | `13CD2` (ppm) | `1HE1` (ppm) | `13CB` (ppm) | `HIS_LR_N15HMQC` Pattern (`HE1`, `HD2`) |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| `Ne2H` | Neutral $N^{\varepsilon 2}\text{-H}$ ($\tau$ tautomer) | `249.5 ± 4.2` | `169.5 ± 4.0` | `117.8 ± 2.1` | `7.82 ± 0.25` | `30.2 ± 1.6` | `HE1` strong to `ND1 (249)` & `NE2 (170)`; `HD2` strong `2J` to `NE2 (170)`, weak `3J` to `ND1 (249)` |
-| `Nd1H` | Neutral $N^{\delta 1}\text{-H}$ ($\pi$ tautomer) | `171.0 ± 4.2` | `249.0 ± 4.2` | `125.4 ± 2.2` | `7.76 ± 0.25` | `28.1 ± 1.6` | `HE1` strong to `ND1 (171)` & `NE2 (249)`; `HD2` strong `2J` to `NE2 (249)`, weak `3J` to `ND1 (171)` |
-| `DoublyProtonated` | Imidazolium `+1` cation | `177.0 ± 4.0` | `174.5 ± 4.0` | `118.2 ± 2.0` (`< 122`) | `8.58 ± 0.30` | `29.0 ± 1.6` | Both `ND1` & `NE2` in `170–182 ppm`; `HD2` stronger `2J` peak identifies `NE2` |
+| `HisTautomer` Variant | Chemical State | `15ND1` (ppm) | `15NE2` (ppm) | `13CG` (ppm) | `13CD2` (ppm) | `1HE1` (ppm) | `13CB` (ppm) | Pelton Table 1 `HIS_LR_N15HMQC` Coupling Pattern |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| `Ne2H` | Neutral $N^{\varepsilon 2}\text{-H}$ ($\tau$ tautomer) | `249.5 ± 4.2` (`=N-`) | `169.5 ± 4.0` (`>NH`) | `135.5 ± 2.2` | `117.8 ± 2.1` | `7.82 ± 0.25` | `30.2 ± 1.6` | `HE1`: `10.6 Hz` to `ND1 (249.5)`, `5.9 Hz` to `NE2 (169.5)`; `HD2`: stronger **`9.1 Hz` to `ND1 (249.5)`**, weaker `5.4 Hz` to `NE2 (169.5)` |
+| `Nd1H` | Neutral $N^{\delta 1}\text{-H}$ ($\pi$ tautomer) | `171.0 ± 4.2` (`>NH`) | `249.0 ± 4.2` (`=N-`) | `127.2 ± 2.2` | `125.4 ± 2.2` | `7.76 ± 0.25` | `28.1 ± 1.6` | `HE1`: `5.2 Hz` to `ND1 (171.0)`, `8.8 Hz` to `NE2 (249.0)`; `HD2`: stronger **`8.2 Hz` to `NE2 (249.0)`**, weak `1.4 Hz` to `ND1 (171.0)` |
+| `DoublyProtonated` | Imidazolium `+1` cation | `177.0 ± 4.0` (`>NH+`) | `174.5 ± 4.0` (`>NH+`) | `129.8 ± 2.2` | `118.2 ± 2.0` (`< 122`) | `8.58 ± 0.30` | `29.0 ± 1.6` | Both `ND1` & `NE2` in `170–182 ppm`; `HD2` stronger `2J` (`~5.4 Hz` vs `~1.4 Hz` `3J`) identifies `NE2` |
 
-`classify_his_tautomer` evaluates the joint log-likelihood across `(ND1, NE2, CD2, HD2, CE1, HE1, CB)` plus Pelton's $|\delta_{\text{ND1}} - \delta_{\text{NE2}}|$ separation diagnostic (`~80 ppm` in neutral tautomers vs `< 15 ppm` in `+1` imidazolium) and normalizes via softmax to yield a calibrated tautomer posterior $P(\text{tautomer} \mid \text{data}) \in [0, 1]$. Even when one `15N` cross-peak drops out, `CD2 < 122 ppm` + downfield `HE1 ~ 8.6 ppm` (`DoublyProtonated`) versus `CD2 ~ 125.4 ppm` (`Nd1H`) preserves accurate state recovery.
+`classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, f64)` combines the 3-state Pelton log-posterior across `(ND1, NE2, CG, CD2, HD2, CE1, HE1, CB)` (with optional `sample_ph` Henderson–Hasselbalch prior modulation around `pKa ~ 6.3`) with two explicit physical abstention gates that prevent false `>= 0.80` static-tautomer commitments:
+1. **`HisStateClassification::FastExchangeUncommitted` (`conf <= 0.52 < 0.80`)**: Triggered when rapid neutral $\tau \leftrightarrow \pi$ tautomer exchange coalesces both `ND1` and `NE2` into the intermediate `195.0..=225.0 ppm` averaging zone (or a single observed `15N` in `198.0..=222.0 ppm` with intermediate `CD2 ~ 119.5..124.2 ppm` and neutral `HE1 < 8.25 ppm`).
+2. **`HisStateClassification::MetalCoordinatedCandidate` (`conf <= 0.60 < 0.80`)**: Triggered when `metal_coordinated_hint` is set (e.g., from `nmr-core::paramagnetic::coordinating_histidine_indices`), when an asymmetric pair exhibits one pyrrole-like `>NH` (`160..=183.5 ppm`) paired with a metal-ligated `=N–M` shifted `20–48 ppm` upfield from `249.5 ppm` into `185..=230 ppm` alongside non-cationic `HE1 < 8.30 ppm` (Barraud et al., 2012 — preventing `Zn(II)`/`[2Fe-2S]` histidines from being misclassified as `DoublyProtonated`), or when upfield-only `15N <= 192 ppm` conflicts with basic `sample_ph >= 7.4` and neutral `HE1 < 8.15 ppm`.
 
 ---
 
@@ -133,9 +137,9 @@ Histidine's imidazole sidechain exists in three distinct chemical/protonation st
 
 ### 6.1 Intra-Ring Spin-System Assembly (`cluster_aromatic_rings`)
 
-1. **Node Construction**: `AROM_C13HSQC` cross-peaks form `(1H, 13C)` nodes (rescuing any dropped HSQC roots corroborated by $\ge 2$ cross-peaks in a 3D `AROM_HCCH_TOCSY` strip) and attach candidate `CB` shifts from `HBCBCGCDHD` and `HBCBCGCDCEHE` within $\Delta \delta_{\text{H}} \le \text{tol\_h}$.
+1. **Node Construction & Unlabelled `CB` Registration**: `AROM_C13HSQC` cross-peaks form `(1H, 13C)` nodes (rescuing any dropped HSQC roots corroborated by $\ge 2$ cross-peaks in a 3D `AROM_HCCH_TOCSY` strip) and attach candidate `CB` shifts from `HBCBCGCDHD` and `HBCBCGCDCEHE` within $\Delta \delta_{\text{H}} \le \text{tol\_h}$. Before matching against backbone `CB(r_k)`, `estimate_unlabelled_yamazaki_cb_offset` estimates and removes any systematic carrier/referencing offset between the unordered multiset of Yamazaki `CB` relays and unordered aromatic backbone `CB` shifts (`0.0` permutation sensitivity; `max |δCB_err| <= 0.04 ppm`).
 2. **Topology-Specific Assembly**:
-   - **`HIS`**: pairs `(HE1, CE1)` and `(HD2, CD2)` sharing `HIS_LR_N15HMQC` `(ND1, NE2)` columns (disambiguating `NE2` vs `ND1` via the stronger `2J(HD2, NE2)` vs weaker `3J(HD2, ND1)` cross-peak intensity ratio), backed up by `HBCBCGCDHD`/`HBCBCGCDCEHE` shared-`CB` pairing if `HMQC` is absent.
+   - **`HIS`**: pairs `(HE1, CE1)` and `(HD2, CD2)` sharing `HIS_LR_N15HMQC` `(ND1, NE2)` columns (assigning unprotonated `=N-` vs protonated `>NH` via chemical shift and Pelton Table 1 `HD2` coupling ratios), backed up by `HBCBCGCDHD`/`HBCBCGCDCEHE` shared-`CB` pairing if `HMQC` is absent.
    - **`TRP`**: assembles the 4-spin benzenoid walk `CE3/HE3 - CZ3/HZ3 - CH2/HH2 - CZ2/HZ2` via `AROM_HCCH_TOCSY` relay edges + BMRB priors (`CZ2 ~ 114.4 ppm`), and links it to pyrrole `CD1/HD1` via shared Yamazaki `CB` (`HBCBCGCDHD` on `HD1` $\leftrightarrow$ `HBCBCGCDCEHE` on `HE3`) and/or `TRP_IND_N15HSQC` `HE1` NOE bridges (`HE1 <-> HD1` and `HE1 <-> HZ2`).
    - **`PHE` vs `TYR`**: greedily extracts mutually consistent 3-node `(CD*, CE*, CZ)` (`PHE`) and 2-node `(CD*, CE*)` (`TYR`) spin systems using intra-ring `AROM_HCCH_TOCSY` connectivity, shared `(cb_hd, cb_he)` Yamazaki agreement, and the `~13 ppm` `13CE` chemical-shift separation between `TYR` (`~117.9 ppm`) and `PHE` (`~130.7 ppm`), with partial-ring rescue when a single peak drops out.
 
@@ -147,20 +151,16 @@ $$W_{k, c} = \begin{cases} -\infty & \text{if } \text{kind}(C_c) \ne \text{aa}(r
 
 where:
 - $\text{LLR}_{\text{prior}}(\delta_a \mid r_k, a)$ uses the Gaussian / bounded-tail (`>= -8.0` floor) empirical BMRB chemical-shift likelihood ratio of Section 2 (note: `aromatic.rs` is purely sequence-based and does **not** model structure-derived aromatic ring-current shifts);
-- $\text{LLR}_{\text{CB}}(C_c, r_k)$ scores Gaussian agreement between observed Yamazaki `CB` shifts (`cb_hd`, `cb_he`) and assigned backbone `CB(r_k)` ($\sigma_{\text{CB}} = 0.055\text{ ppm}$, gated at $|\Delta\text{CB}| \le \text{tol\_cb}$), falling back to the residue-type BMRB `CB` prior if backbone `CB(r_k)` was unassigned;
+- $\text{LLR}_{\text{CB}}(C_c, r_k)$ scores Gaussian agreement between offset-registered Yamazaki `CB` shifts (`cb_hd`, `cb_he`) and assigned backbone `CB(r_k)` ($\sigma_{\text{CB}} = 0.055\text{ ppm}$, gated at $|\Delta\text{CB}| \le \text{tol\_cb}$), falling back to the residue-type BMRB `CB` prior if backbone `CB(r_k)` was unassigned;
 - $\text{LLR}_{\text{tie}}(C_c, r_k)$ incorporates optional `HB2`/`HB3` $\leftrightarrow$ `HD*` NOE cross-peaks (`NOESY13C` / `AROM_HB_NOE`) and pre-assigned `TRP` `NE1/HE1` shifts to break ties between sequence positions with identical or near-degenerate `CB` shifts.
 
-### 6.3 Exact Leave-One-Out Marginal Confidence Calibration
+### 6.3 Multi-Candidate Block-Boltzmann Marginal Confidence Calibration
 
-We solve $\pi^* = \arg\max_{\pi} \sum_{k=1}^K W_{k, \pi(k)}$ exactly in $\mathcal{O}(K (M + K)^2)$ time via the primal–dual Kuhn–Munkres algorithm (`hungarian_max_weight`). For every assigned residue $r_k$ ($\pi^*(k) = c^* < M$), we forbid edge $(k, c^*)$ and re-solve global bipartite matching to obtain the exact leave-one-out global score margin:
+We solve $\pi^* = \arg\max_{\pi} \sum_{k=1}^K W_{k, \pi(k)}$ exactly in $\mathcal{O}(K (M + K)^2)$ time via the primal–dual Kuhn–Munkres algorithm (`hungarian_max_weight`). For every assigned residue $r_k$ ($\pi^*(k) = c^* < M$), `compute_calibrated_ring_confidences` evaluates exact constrained global matchings $\Delta S_{k, c'} = S(\pi^*) - \max_{\pi : \pi(k) = c'} S(\pi) \ge 0$ across **all** competing clusters and the null slot $c' \ne c^*$, forming the multi-candidate softmax marginal:
 
-$$\Delta S_k = S(\pi^*) - \max_{\pi : \pi(k) \ne c^*} S(\pi) \ge 0$$
+$$P_{\text{ring}}(k) = \frac{P_{\text{backbone}}(k)}{1 + \sum_{c' \ne c^*} \exp(-\Delta S_{k, c'} / T_{\text{cal}})}, \qquad P_{\text{atom}}(k, a) = P_{\text{ring}}(k) \cdot P_{\text{intra}}(c^*, a) \in [0, 1]$$
 
-The ring-to-residue marginal confidence and per-atom confidence are calibrated via:
-
-$$P_{\text{ring}}(k) = \frac{P_{\text{backbone}}(k)}{1 + \exp(-\Delta S_k / T_{\text{cal}})}, \qquad P_{\text{atom}}(k, a) = P_{\text{ring}}(k) \cdot P_{\text{intra}}(c^*, a) \in [0, 1]$$
-
-Crucially, whenever two homologous aromatic residues in unfolded or repetitive regions share identical `CB` shifts and lack tie-breaking `HB` NOEs, $\Delta S_k = 0 \implies P_{\text{ring}}(k) = 0.50 < 0.80$, preventing uncalibrated high-confidence swap errors while still committing unambiguous rings at $P \ge 0.95$.
+Crucially, under any exact $K$-way degenerate tie ($\Delta S_{k, c_2} = \dots = \Delta S_{k, c_K} = 0$, e.g. $K = 2$ or $K = 3$ homologous aromatic residues with missing or identical `CB` relays), the multi-candidate denominator sums $K - 1$ unit terms so $P_{\text{ring}}(k) \le 1 / K$ (`<= 0.50` for 2-way ties, `<= 0.333` for 3-way ties — strictly `< 0.80`), preventing uncalibrated high-confidence swap errors while committing well-resolved rings cleanly. When merging into a partially assigned `Reference` (`merge_aromatic_assignments_preserving_existing`), pre-existing assigned ring shifts are preserved verbatim unless the new assignment achieves confidence `>= 0.55`.
 
 ---
 
@@ -168,13 +168,20 @@ Crucially, whenever two homologous aromatic residues in unfolded or repetitive r
 
 1. **Aliphatic Sidechain Benchmark (`crates/nmr-core/tests/sidechain_tests.rs`)**:
    - Verified across all 20 standard amino-acid covalent topologies, volumetric 2D/3D pickers (`C13HSQC`, `CCCONH`, `HCCCONH`, `HCCH-TOCSY`), `Pro` assignment without amide `HN`, and joint `(U, P)` backbone rescue.
-2. **12-Protein BMRB Aromatic Synthetic Self-Consistency Benchmark (`crates/nmr-core/tests/aromatic_tests.rs`)**:
-   - Evaluated end-to-end (`synthesize_aromatic_reference` + `simulate_aromatic_spectra` with thermal Gaussian noise, chemical-shift jitter, FT sinc sidelobes, and `2.5%` peak dropout $\to$ `pick_all_aromatic_spectra` $\to$ `assign_aromatic_rings`) across all 12 BMRB backbones in `data/benchmark/manifest.tsv` (`82` aromatic residues: `36 PHE`, `23 TYR`, `5 TRP`, `18 HIS` cycling all 3 `HisTautomer` states).
-   - **Synthetic self-consistency scope disclosure**: Because `synthesize_aromatic_reference` and `simulate_aromatic_spectra` sample missing ring/imidazole shifts and Yamazaki `CB` relays (`0.02–0.035 ppm` jitter vs $\sigma_{\text{CB}} = 0.055\text{ ppm}$) from the same BMRB/Pelton prior models inverted by `assign_aromatic_rings`, these metrics measure **synthetic self-consistency**, not accuracy on experimental aromatic `13C-HSQC` and `(HB)CB(CGCD)HD` datasets (real-spectrum aromatic validation is tracked for Phase 11):
-     - **Aromatic `(1H, 13C/15N)` assignment accuracy**: **`95.07%` (`405/426`)** (`>= 92.0%` synthetic self-consistency gate; symmetric `Phe`/`Tyr` ring-flip pairs counted once per pair with `Ambiguity_code = 3`).
-     - **Aromatic volumetric recall**: **`85.1%` (`405/476`, `85.08%`)** across all assignable aromatic spin pairs.
-     - **High-confidence (`>= 0.80`) precision**: **`98.48%` (`323/328`)** (`>= 96.0%` synthetic self-consistency gate).
-     - **Histidine tautomeric state (`Ne2H`, `Nd1H`, `DoublyProtonated`) accuracy**: **`100.0%` (`18/18`)** on synthetic Pelton shift regimes across the 12-protein suite.
+2. **12-Protein BMRB Aromatic Synthetic Self-Consistency Suite (`crates/nmr-core/tests/aromatic_tests.rs`)**:
+   - Evaluated end-to-end (`synthesize_aromatic_reference` + `simulate_aromatic_spectra` with thermal Gaussian noise, chemical-shift jitter, FT sinc sidelobes, and `2.5%` peak dropout $\to$ `pick_all_aromatic_spectra` $\to$ `assign_aromatic_rings`) across all 12 BMRB backbones in `data/benchmark/manifest.tsv` (`82` aromatic residues: `36 PHE`, `23 TYR`, `5 TRP`, `18 HIS` cycling all 3 resolved `HisTautomer` states).
+   - **Synthetic self-consistency scope disclosure**: Because `synthesize_aromatic_reference` and `simulate_aromatic_spectra` sample missing ring/imidazole shifts and Yamazaki `CB` relays from the same BMRB/Pelton prior models inverted by `assign_aromatic_rings`, these metrics measure **synthetic self-consistency**:
+     - **Aromatic `(1H, 13C/15N)` assignment accuracy**: **`95.67%` (`442/462`)** (`>= 92.0%` synthetic gate; symmetric `Phe`/`Tyr` ring-flip pairs counted once per pair with `Ambiguity_code = 3`).
+     - **Aromatic volumetric recall**: **`92.86%` (`442/476`)**.
+     - **High-confidence (`>= 0.80`) precision**: **`98.94%` (`374/378`)** (`>= 96.0%` synthetic gate).
+     - **Resolved Histidine tautomeric state (`Ne2H`, `Nd1H`, `DoublyProtonated`) accuracy**: **`100.00%` (`18/18`)** on static Pelton regimes.
+3. **Non-Circular Real-BMRB Experimental Aromatic Benchmark (`P0-2`, `crates/nmr-core/tests/aromatic_tests.rs`)**:
+   - Evaluated strictly **non-circularly** across 5 seeds per protein on experimental deposited BMRB aromatic `(1H, 13C, 15N)` shifts (zero synthetic ring-shift fabrication) with uncalibrated Yamazaki `CB` carrier offsets `|ΔCB| = 0.16..0.28 ppm` (`[+0.16, -0.21, +0.24, -0.27, +0.28] ppm`), `10%` peak dropout, `9%` overlapping clutter noise, and real `Zn(II)`-coordinated `His`:
+     - **`bmr17769` (`1D3Z` Human Ubiquitin)**: **`100.00%` (`68/68`)** accuracy, **`85.00%`** recall, **`100.00%` (`66/66`)** HC precision, **`mean |δCB_err| = 0.0176 ppm`**.
+     - **`bmr4562` (`1E8L` Hen Egg-White Lysozyme, `3 Phe, 3 Tyr, 6 Trp, 1 His`)**: **`85.82%` (`357/416`)** accuracy, **`77.61%`** recall, **`93.59%` (`219/234`)** HC precision, **`mean |δCB_err| = 0.0194 ppm`**.
+     - **`bmr16649` (`2KRU`, *Chlorobium tepidum* `PCP_red` domain `NESG CtR69A`)**: **`95.32%` (`163/171`)** accuracy, **`90.56%`** recall, **`95.21%` (`139/146`)** HC precision, **`mean |δCB_err| = 0.0134 ppm`**, and **`4/4` `Zn(II)`-`His52` (`ND1 = 200.88 ppm, NE2 = 178.27 ppm`) `MetalCoordinatedCandidate` abstentions** (`conf <= 0.60 < 0.80`).
+     - **`mbp_bmr7114` (`370 aa` `MBP` negative control lacking deposited aromatic shifts)**: **`0` false positives** across all **`41` aromatic sequence positions**.
+     - **Pooled 4-Entry Real-BMRB Aggregate**: **`89.77%` (`588/655`) accuracy**, **`81.67%` (`588/720`) recall**, **`95.07%` (`424/446`) HC precision**, **`ECE = 0.0783`**, and unlabelled Yamazaki offset recovery **`max |δCB_err| = 0.0374 ppm`**.
 
 ---
 
