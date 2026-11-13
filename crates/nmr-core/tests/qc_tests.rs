@@ -434,7 +434,8 @@ fn tms_shifted_all_helix_and_all_sheet_proteins_pass_joint_offset_qc() {
         let mut synth = base_truth.clone();
         for k in 0..synth.sequence.len() {
             let rname = &synth.sequence[k];
-            let jitter = ((k as f64) * 1.6180339).sin() * 0.35;
+            let phi_conj = 0.5 * (1.0 + 5.0_f64.sqrt());
+            let jitter = ((k as f64) * phi_conj).sin() * 0.35;
             if let Some((mu_ca, _)) = priors.get(rname, "CA") {
                 synth
                     .shifts
