@@ -218,8 +218,17 @@ fn test_all_20_canonical_and_5_variant_layouts_planar_connected_and_non_overlapp
         let layout = topo.layout_2d(ResidueVariant::Canonical);
         verify_layout_invariants(&layout);
 
-        // Exact 1-to-1 IUPAC atom and bond parity with canonical `ResidueTopology`
-        let expected_atoms: BTreeSet<&str> = topo.atoms.iter().map(|a| a.name).collect();
+        // Exact IUPAC atom and bond parity with canonical `ResidueTopology`, except `HIS`
+        // `Canonical` intentionally omits exchangeable `HD1` and `HE2` so neutral uncommitted
+        // histidine never falsely depicts cationic imidazolium `HisH+`.
+        let mut expected_atoms: BTreeSet<&str> = topo.atoms.iter().map(|a| a.name).collect();
+        let expected_bond_len = if topo.three_letter == "HIS" {
+            expected_atoms.remove("HD1");
+            expected_atoms.remove("HE2");
+            topo.bonds.len() - 2
+        } else {
+            topo.bonds.len()
+        };
         let actual_atoms: BTreeSet<&str> = layout.atoms.iter().map(|a| a.name).collect();
         assert_eq!(
             actual_atoms, expected_atoms,
@@ -228,7 +237,7 @@ fn test_all_20_canonical_and_5_variant_layouts_planar_connected_and_non_overlapp
         );
         assert_eq!(
             layout.bonds.len(),
-            topo.bonds.len(),
+            expected_bond_len,
             "{}: covalent bond count mismatch",
             topo.three_letter
         );
@@ -908,7 +917,190 @@ fn test_headless_egui_ribbon_selection_atom_jump_and_variant_toggle() {
                 });
             },
         );
-        let expected_len = residue_topology(res_name).unwrap().atoms.len();
+        let raw_len = residue_topology(res_name).unwrap().atoms.len();
+        let expected_len = if res_name == "HIS" {
+            raw_len - 2
+        } else {
+            raw_len
+        };
         assert_eq!(state.last_atom_hit_rects.len(), expected_len);
     }
+}
+
+#[test]
+fn test_his_canonical_omits_exchangeable_hd1_and_he2() {
+    let his_canon = residue_layout_2d("HIS", ResidueVariant::Canonical).unwrap();
+    assert!(
+        his_canon.atom("HD1").is_none() && his_canon.atom("HE2").is_none(),
+        "HIS Canonical must omit both exchangeable HD1 and HE2"
+    );
+    assert!(his_canon.bond_order("ND1", "HD1").is_none());
+    assert!(his_canon.bond_order("NE2", "HE2").is_none());
+    assert!(his_canon.atom("HD2").is_some() && his_canon.atom("HE1").is_some());
+
+    let his_nd1h = residue_layout_2d("HIS", ResidueVariant::HisNd1H).unwrap();
+    assert!(his_nd1h.atom("HD1").is_some() && his_nd1h.atom("HE2").is_none());
+
+    let his_ne2h = residue_layout_2d("HIS", ResidueVariant::HisNe2H).unwrap();
+    assert!(his_ne2h.atom("HD1").is_none() && his_ne2h.atom("HE2").is_some());
+
+    let his_prot = residue_layout_2d("HIS", ResidueVariant::HisDoublyProtonated).unwrap();
+    assert!(his_prot.atom("HD1").is_some() && his_prot.atom("HE2").is_some());
+}
+
+#[test]
+fn test_zero_or_nan_prior_sigma_returns_none_and_renders_no_bmrb_prior() {
+    let mut priors = Priors::default();
+    let sc_priors = SidechainPriors::empirical_bmrb();
+
+    // Inject degenerate sd = 0.0, negative sd, and NaN into backbone priors for ALA CA / N / H
+    let ala_map = priors.table.entry("ALA".to_string()).or_default();
+    ala_map.insert("CA".to_string(), (53.35, 0.0));
+    ala_map.insert("N".to_string(), (123.5, -1.0));
+    ala_map.insert("H".to_string(), (f64::NAN, 0.45));
+
+    assert_eq!(
+        compute_atom_bmrb_zscore(
+            "ALA",
+            ResidueVariant::Canonical,
+            "CA",
+            55.0,
+            &priors,
+            &sc_priors
+        ),
+        None
+    );
+    assert_eq!(
+        compute_atom_bmrb_zscore(
+            "ALA",
+            ResidueVariant::Canonical,
+            "N",
+            124.0,
+            &priors,
+            &sc_priors
+        ),
+        None
+    );
+    assert_eq!(
+        compute_atom_bmrb_zscore(
+            "ALA",
+            ResidueVariant::Canonical,
+            "H",
+            8.2,
+            &priors,
+            &sc_priors
+        ),
+        None
+    );
+
+    let ala_layout = residue_layout_2d("ALA", ResidueVariant::Canonical).unwrap();
+    let ca_node = ala_layout.atom("CA").unwrap();
+    assert!(ca_node.is_nmr_observable);
+
+    let eval = evaluate_atom_node(
+        "ALA",
+        ResidueVariant::Canonical,
+        ca_node,
+        Some(&AssignedAtomInfo::new(55.0)),
+        None,
+        &priors,
+        &sc_priors,
+    );
+    assert_eq!(eval.class, AtomZScoreClass::NoPriorNeutral);
+    assert_ne!(eval.class, AtomZScoreClass::OutlierCrimson);
+    assert!(eval.z_score.is_none());
+    assert!(eval.bmrb_mu_sd.is_none());
+
+    let tip = eval.build_tooltip("ALA", 1, ResidueVariant::Canonical);
+    assert_eq!(tip.bmrb_prior, "No BMRB prior");
+    assert_eq!(tip.z_score, "No BMRB prior");
+
+    // Also verify observable atom node on a non-standard residue lacking BMRB priors (e.g. MSE CA)
+    let eval_mse = evaluate_atom_node(
+        "MSE",
+        ResidueVariant::Canonical,
+        ca_node,
+        Some(&AssignedAtomInfo::new(55.4)),
+        None,
+        &Priors::default(),
+        &sc_priors,
+    );
+    assert_eq!(eval_mse.class, AtomZScoreClass::NoPriorNeutral);
+    assert_ne!(eval_mse.class, AtomZScoreClass::OutlierCrimson);
+    assert_eq!(
+        eval_mse
+            .build_tooltip("MSE", 7, ResidueVariant::Canonical)
+            .z_score,
+        "No BMRB prior"
+    );
+}
+
+#[test]
+fn test_sidechain_inspector_state_sync_inferred_variants_preserves_user_overrides() {
+    use nmr_core::nmrstar::Reference;
+    use nmr_gui::sidechain_widget::SidechainInspectorState;
+
+    let mut state = SidechainInspectorState::new();
+    let mut ref_data = Reference {
+        sequence: vec![
+            "CYS".to_string(),
+            "CYS".to_string(),
+            "HIS".to_string(),
+            "HIS".to_string(),
+        ],
+        seq_ids: vec![1, 2, 3, 4],
+        ..Default::default()
+    };
+    // CYS 0: reduced CB = 27.9 ppm; CYS 1: oxidized disulfide CB = 41.4 ppm
+    ref_data.shifts.insert((0, "CB".to_string()), 27.9);
+    ref_data.shifts.insert((1, "CB".to_string()), 41.4);
+    // HIS 2: canonical Pelton Ne2H (ND1=250.1, NE2=168.8, CD2=118.0, HE1=7.80)
+    ref_data.shifts.insert((2, "ND1".to_string()), 250.1);
+    ref_data.shifts.insert((2, "NE2".to_string()), 168.8);
+    ref_data.shifts.insert((2, "CD2".to_string()), 118.0);
+    ref_data.shifts.insert((2, "HE1".to_string()), 7.80);
+    // HIS 3: Pelton Nd1H (ND1=170.2, NE2=249.4, CD2=125.2, HE1=7.84)
+    ref_data.shifts.insert((3, "ND1".to_string()), 170.2);
+    ref_data.shifts.insert((3, "NE2".to_string()), 249.4);
+    ref_data.shifts.insert((3, "CD2".to_string()), 125.2);
+    ref_data.shifts.insert((3, "HE1".to_string()), 7.84);
+
+    // User manually overrides CYS 1 to CysReduced before auto-sync
+    state.set_variant(1, ResidueVariant::CysReduced);
+    assert_eq!(
+        state.user_variant_overrides.get(&1),
+        Some(&ResidueVariant::CysReduced)
+    );
+
+    state.sync_inferred_variants_from_reference(&ref_data);
+    assert_eq!(state.variant_for(0), ResidueVariant::CysReduced);
+    // User override on CYS 1 MUST win over auto-inferred CysOxidized!
+    assert_eq!(
+        state.auto_inferred_variants.get(&1),
+        Some(&ResidueVariant::CysOxidized)
+    );
+    assert_eq!(state.variant_for(1), ResidueVariant::CysReduced);
+    assert_eq!(state.variant_for(2), ResidueVariant::HisNe2H);
+    assert_eq!(state.variant_for(3), ResidueVariant::HisNd1H);
+
+    // Now mutate shifts: HIS 2 enters fast tautomer exchange (ND1=208, NE2=211) and CYS 0 loses CB:
+    // stale auto-inferred states MUST be cleared while user override on CYS 1 stays intact!
+    ref_data.shifts.remove(&(0, "CB".to_string()));
+    ref_data.shifts.insert((2, "ND1".to_string()), 208.0);
+    ref_data.shifts.insert((2, "NE2".to_string()), 211.0);
+    // HIS 3 shifts to Zn(II)-coordinated mimicry (ND1=200.88, NE2=178.27, HE1=7.72) -> must abstain!
+    ref_data.shifts.insert((3, "ND1".to_string()), 200.88);
+    ref_data.shifts.insert((3, "NE2".to_string()), 178.27);
+    ref_data.shifts.insert((3, "CD2".to_string()), 117.70);
+    ref_data.shifts.insert((3, "HE1".to_string()), 7.72);
+
+    state.sync_inferred_variants_from_reference(&ref_data);
+    assert_eq!(state.variant_for(0), ResidueVariant::Canonical);
+    assert_eq!(state.variant_for(1), ResidueVariant::CysReduced);
+    assert_eq!(state.variant_for(2), ResidueVariant::Canonical);
+    assert_eq!(state.variant_for(3), ResidueVariant::Canonical);
+
+    // Clearing user override on CYS 1 falls back to auto-inferred CysOxidized
+    state.clear_user_variant_override(1);
+    assert_eq!(state.variant_for(1), ResidueVariant::CysOxidized);
 }

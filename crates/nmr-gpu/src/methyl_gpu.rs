@@ -15,18 +15,38 @@
 //!   & Kay, L. E. (*J. Am. Chem. Soc.* 2017, 139, 9523–9533 — probabilistic methyl NOE contact-graph
 //!   matching).
 
+#[cfg(not(target_arch = "wasm32"))]
 use bytemuck::{Pod, Zeroable};
+#[cfg(not(target_arch = "wasm32"))]
 use nmr_core::methyl_solver::{
-    build_initial_replica_states, consensus_and_calibrate_methyl, evaluate_methyl_raw_score,
-    MethylAnnealConfig, MethylAssignResult, MethylContactProblem,
+    build_geminal_move_table, build_initial_replica_states, consensus_and_calibrate_methyl,
+    evaluate_methyl_raw_score,
 };
+use nmr_core::methyl_solver::{MethylAnnealConfig, MethylAssignResult, MethylContactProblem};
+#[cfg(not(target_arch = "wasm32"))]
 use nmr_core::rng::Rng;
+#[cfg(not(target_arch = "wasm32"))]
 use wgpu::util::DeviceExt;
 
 use crate::GpuEngine;
 
-const CHUNK_STEPS: u32 = 32_768;
+/// Maximum MCMC steps per single WebGPU command-buffer submission (`<= 4,096` to prevent WDDM TDR).
+pub const MAX_CHUNK_STEPS: u32 = 4_096;
 
+/// Adaptive per-submit step chunk size (`<= 4,096`) scaled inversely with problem dimension so
+/// single dispatches stay well below OS GPU watchdog timeouts (`2 s` Windows TDR) even above 1,024 sites.
+#[inline]
+pub const fn chunk_steps_for_dim(max_dim: usize) -> u32 {
+    if max_dim <= 255 {
+        4_096
+    } else if max_dim <= 1024 {
+        2_048
+    } else {
+        1_024
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct MethylParamsGpu {
@@ -48,7 +68,7 @@ struct MethylParamsGpu {
     off_obs_adj_floats: u32,
     off_short_edge_lam: u32,
     off_short_adj_lam: u32,
-    _pad_u0: u32,
+    n_gem_pairs: u32,
 
     off_slots_offs: u32,
     off_slots_vals: u32,
@@ -65,6 +85,11 @@ struct MethylParamsGpu {
     off_cut_adj_offs: u32,
     off_cut_adj_peers: u32,
 
+    off_gem_pairs: u32,
+    off_gem_nbr_offs: u32,
+    off_gem_nbr_vals: u32,
+    _pad_u1: u32,
+
     d_cutoff: f32,
     sigma_d: f32,
     flat_bottom_d: f32,
@@ -76,12 +101,14 @@ struct MethylParamsGpu {
     _pad_f1: f32,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct PackedMethylProblemGpu {
     base_params: MethylParamsGpu,
     ro_floats: Vec<f32>,
     ro_ints: Vec<u32>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn pack_methyl_problem(prob: &MethylContactProblem) -> PackedMethylProblemGpu {
     let mut ro_floats = Vec::new();
     let mut ro_ints = Vec::new();
@@ -190,6 +217,18 @@ fn pack_methyl_problem(prob: &MethylContactProblem) -> PackedMethylProblemGpu {
     let off_cut_adj_peers = ro_ints.len() as u32;
     ro_ints.extend_from_slice(&prob.struct_cut_peers);
 
+    let gem_tbl = build_geminal_move_table(prob);
+    let n_gem_pairs = gem_tbl.pairs.len() as u32;
+    let off_gem_pairs = ro_ints.len() as u32;
+    for &[m1, m2] in &gem_tbl.pairs {
+        ro_ints.push(m1);
+        ro_ints.push(m2);
+    }
+    let off_gem_nbr_offs = ro_ints.len() as u32;
+    ro_ints.extend_from_slice(&gem_tbl.nbr_offsets);
+    let off_gem_nbr_vals = ro_ints.len() as u32;
+    ro_ints.extend_from_slice(&gem_tbl.nbr_indices);
+
     while ro_ints.len() < 4 {
         ro_ints.push(0);
     }
@@ -210,7 +249,7 @@ fn pack_methyl_problem(prob: &MethylContactProblem) -> PackedMethylProblemGpu {
         off_obs_adj_floats,
         off_short_edge_lam,
         off_short_adj_lam,
-        _pad_u0: 0,
+        n_gem_pairs,
         off_slots_offs,
         off_slots_vals,
         off_gem_site,
@@ -223,6 +262,10 @@ fn pack_methyl_problem(prob: &MethylContactProblem) -> PackedMethylProblemGpu {
         off_short_adj_peers,
         off_cut_adj_offs,
         off_cut_adj_peers,
+        off_gem_pairs,
+        off_gem_nbr_offs,
+        off_gem_nbr_vals,
+        _pad_u1: 0,
         d_cutoff: prob.d_cutoff,
         sigma_d: prob.sigma_d,
         flat_bottom_d: prob.flat_bottom_d,
@@ -348,207 +391,221 @@ impl<'a> MethylGpuSolver<'a> {
         prob: &MethylContactProblem,
         positions: &[Vec<i32>],
     ) -> Result<Vec<f64>, String> {
-        if positions.is_empty() {
-            return Ok(Vec::new());
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (
+                &self.engine,
+                &self.bgl,
+                &self.eval_pipeline,
+                &self.anneal_256_pipeline,
+                &self.anneal_1024_pipeline,
+                &self.anneal_global_pipeline,
+                prob,
+                positions,
+            );
+            Err(
+                "synchronous WebGPU methyl objective readback is unsupported on wasm32; use async readback or CPU solver"
+                    .to_string(),
+            )
         }
-        for p in positions {
-            if p.len() != prob.s_len {
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if positions.is_empty() {
+                return Ok(Vec::new());
+            }
+            for p in positions {
+                if p.len() != prob.s_len {
+                    return Err(format!(
+                        "methyl assignment vector length {} != problem s_len {}",
+                        p.len(),
+                        prob.s_len
+                    ));
+                }
+            }
+            if prob.s_len == 0 || prob.m_len == 0 {
+                return Ok(vec![0.0; positions.len()]);
+            }
+
+            let packed = pack_methyl_problem(prob);
+            let max_bind = self.engine.max_storage_binding_bytes();
+            let ro_f_bytes = (packed.ro_floats.len() * 4) as u64;
+            let ro_i_bytes = (packed.ro_ints.len() * 4) as u64;
+            if ro_f_bytes > max_bind || ro_i_bytes > max_bind {
                 return Err(format!(
-                    "methyl assignment vector length {} != problem s_len {}",
-                    p.len(),
-                    prob.s_len
+                    "methyl problem read-only buffer ({} B) exceeds adapter limit ({} B)",
+                    ro_f_bytes.max(ro_i_bytes),
+                    max_bind
                 ));
             }
-        }
-        if prob.s_len == 0 || prob.m_len == 0 {
-            return Ok(vec![0.0; positions.len()]);
-        }
 
-        let packed = pack_methyl_problem(prob);
-        let max_bind = self.engine.max_storage_binding_bytes();
-        let ro_f_bytes = (packed.ro_floats.len() * 4) as u64;
-        let ro_i_bytes = (packed.ro_ints.len() * 4) as u64;
-        if ro_f_bytes > max_bind || ro_i_bytes > max_bind {
-            return Err(format!(
-                "methyl problem read-only buffer ({} B) exceeds adapter limit ({} B)",
-                ro_f_bytes.max(ro_i_bytes),
-                max_bind
-            ));
-        }
-
-        let b_floats = self
-            .engine
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("methyl-eval-ro-floats"),
-                contents: bytemuck::cast_slice(&packed.ro_floats),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let b_ints = self
-            .engine
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("methyl-eval-ro-ints"),
-                contents: bytemuck::cast_slice(&packed.ro_ints),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        let per_rep_bytes = ((prob.m_len.max(prob.s_len) * 4) as u64).max(16);
-        let max_wg = self
-            .engine
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension as usize;
-        let max_batch = ((max_bind / per_rep_bytes) as usize)
-            .min(max_wg.saturating_mul(64))
-            .max(1);
-
-        let mut out = Vec::with_capacity(positions.len());
-        let mut offset = 0usize;
-        while offset < positions.len() {
-            let batch_n = (positions.len() - offset).min(max_batch);
-            let mut p_val = packed.base_params;
-            p_val.replicas = batch_n as u32;
-
-            let mut pos_flat = Vec::with_capacity(batch_n * prob.s_len);
-            for p in &positions[offset..offset + batch_n] {
-                pos_flat.extend_from_slice(p);
-            }
-            if pos_flat.is_empty() {
-                pos_flat.push(-1);
-            }
-
-            let at_dummy = vec![-1i32; (batch_n * prob.m_len).max(1)];
-            let scores_init = vec![[0.0f32; 2]; batch_n.max(1)];
-            let rng_dummy = vec![[1u32; 4]; batch_n.max(1)];
-
-            let u_params =
+            let b_floats =
                 self.engine
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("methyl-eval-params"),
-                        contents: bytemuck::bytes_of(&p_val),
-                        usage: wgpu::BufferUsages::UNIFORM,
+                        label: Some("methyl-eval-ro-floats"),
+                        contents: bytemuck::cast_slice(&packed.ro_floats),
+                        usage: wgpu::BufferUsages::STORAGE,
                     });
-            let b_at = self
+            let b_ints = self
                 .engine
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("methyl-eval-at"),
-                    contents: bytemuck::cast_slice(&at_dummy),
+                    label: Some("methyl-eval-ro-ints"),
+                    contents: bytemuck::cast_slice(&packed.ro_ints),
                     usage: wgpu::BufferUsages::STORAGE,
                 });
-            let b_pos = self
+
+            let per_rep_bytes = ((prob.m_len.max(prob.s_len) * 4) as u64).max(16);
+            let max_wg = self
                 .engine
                 .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("methyl-eval-pos"),
-                    contents: bytemuck::cast_slice(&pos_flat),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-            let b_scores =
-                self.engine
+                .limits()
+                .max_compute_workgroups_per_dimension as usize;
+            let max_batch = ((max_bind / per_rep_bytes) as usize)
+                .min(max_wg.saturating_mul(64))
+                .max(1);
+
+            let mut out = Vec::with_capacity(positions.len());
+            let mut offset = 0usize;
+            while offset < positions.len() {
+                let batch_n = (positions.len() - offset).min(max_batch);
+                let mut p_val = packed.base_params;
+                p_val.replicas = batch_n as u32;
+
+                let mut pos_flat = Vec::with_capacity(batch_n * prob.s_len);
+                for p in &positions[offset..offset + batch_n] {
+                    pos_flat.extend_from_slice(p);
+                }
+                if pos_flat.is_empty() {
+                    pos_flat.push(-1);
+                }
+
+                let at_dummy = vec![-1i32; (batch_n * prob.m_len).max(1)];
+                let scores_init = vec![[0.0f32; 2]; batch_n.max(1)];
+                let rng_dummy = vec![[1u32; 4]; batch_n.max(1)];
+
+                let u_params =
+                    self.engine
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("methyl-eval-params"),
+                            contents: bytemuck::bytes_of(&p_val),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                let b_at =
+                    self.engine
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("methyl-eval-at"),
+                            contents: bytemuck::cast_slice(&at_dummy),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        });
+                let b_pos =
+                    self.engine
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("methyl-eval-pos"),
+                            contents: bytemuck::cast_slice(&pos_flat),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        });
+                let b_scores =
+                    self.engine
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("methyl-eval-scores"),
+                            contents: bytemuck::cast_slice(&scores_init),
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                        });
+                let b_rng =
+                    self.engine
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("methyl-eval-rng"),
+                            contents: bytemuck::cast_slice(&rng_dummy),
+                            usage: wgpu::BufferUsages::STORAGE,
+                        });
+
+                let bg = self
+                    .engine
                     .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("methyl-eval-scores"),
-                        contents: bytemuck::cast_slice(&scores_init),
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("methyl-eval-bg"),
+                        layout: &self.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: u_params.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: b_floats.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: b_ints.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: b_at.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: b_pos.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: b_scores.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: b_rng.as_entire_binding(),
+                            },
+                        ],
                     });
-            let b_rng = self
-                .engine
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("methyl-eval-rng"),
-                    contents: bytemuck::cast_slice(&rng_dummy),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
 
-            let bg = self
-                .engine
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("methyl-eval-bg"),
-                    layout: &self.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: u_params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: b_floats.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: b_ints.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: b_at.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: b_pos.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: b_scores.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: b_rng.as_entire_binding(),
-                        },
-                    ],
-                });
-
-            let mut enc =
-                self.engine
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("methyl-eval-enc"),
+                let mut enc =
+                    self.engine
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("methyl-eval-enc"),
+                        });
+                {
+                    let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("methyl-eval-pass"),
+                        timestamp_writes: None,
                     });
-            {
-                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("methyl-eval-pass"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.eval_pipeline);
-                cpass.set_bind_group(0, &bg, &[]);
-                cpass.dispatch_workgroups((batch_n as u32).div_ceil(64), 1, 1);
-            }
-            self.engine.queue.submit(Some(enc.finish()));
+                    cpass.set_pipeline(&self.eval_pipeline);
+                    cpass.set_bind_group(0, &bg, &[]);
+                    cpass.dispatch_workgroups((batch_n as u32).div_ceil(64), 1, 1);
+                }
+                self.engine.queue.submit(Some(enc.finish()));
 
-            let scores_gpu: Vec<[f32; 2]> = self
-                .engine
-                .read_buffer_vec(&b_scores, (batch_n * 8) as u64)?;
-            for sc in scores_gpu {
-                out.push(sc[0] as f64);
+                let scores_gpu: Vec<[f32; 2]> = self
+                    .engine
+                    .read_buffer_vec(&b_scores, (batch_n * 8) as u64)?;
+                for sc in scores_gpu {
+                    out.push(sc[0] as f64);
+                }
+                offset += batch_n;
             }
-            offset += batch_n;
+
+            Ok(out)
         }
-
-        Ok(out)
     }
 
-    /// Run massively parallel WebGPU multi-replica simulated annealing + Boltzmann consensus
-    /// and local-swap confidence calibration on `prob`.
-    pub fn assign(
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_replica_batches(
         &self,
         prob: &MethylContactProblem,
-        cfg: &MethylAnnealConfig,
-    ) -> Result<MethylAssignResult, String> {
-        let replicas = cfg.replicas.max(1);
-        if prob.s_len == 0 || prob.m_len == 0 {
-            return Ok(MethylAssignResult {
-                position: vec![-1; prob.s_len],
-                confidence: vec![0.0; prob.s_len],
-                class_posteriors: prob.class_posteriors.clone(),
-                score: 0.0,
-                raw_score: 0.0,
-                run_scores: vec![0.0; replicas],
-            });
-        }
-
+        replicas: usize,
+        total_steps: u32,
+        t_start: f64,
+        t_end: f64,
+        seed: u64,
+        return_terminal_cur: bool,
+    ) -> Result<Vec<Vec<i32>>, String> {
         let packed = pack_methyl_problem(prob);
         let max_bind = self.engine.max_storage_binding_bytes();
         let ro_f_bytes = (packed.ro_floats.len() * 4) as u64;
@@ -579,6 +636,9 @@ impl<'a> MethylGpuSolver<'a> {
             });
 
         let max_dim = prob.s_len.max(prob.m_len);
+        let chunk_steps = chunk_steps_for_dim(max_dim);
+        debug_assert!(chunk_steps <= MAX_CHUNK_STEPS);
+
         let (pipeline, wg_threads) = if max_dim <= 255 {
             (&self.anneal_256_pipeline, 8u32)
         } else if max_dim <= 1024 {
@@ -587,8 +647,8 @@ impl<'a> MethylGpuSolver<'a> {
             (&self.anneal_global_pipeline, 8u32)
         };
 
-        let init_states = build_initial_replica_states(prob, replicas, cfg.seed);
-        let mut seeder = Rng::new(cfg.seed ^ 0x4750_555F_4D45_5448);
+        let init_states = build_initial_replica_states(prob, replicas, seed);
+        let mut seeder = Rng::new(seed ^ 0x4750_555F_4D45_5448);
         let mut all_rng_seeds: Vec<[u32; 4]> = Vec::with_capacity(replicas);
         for _ in 0..replicas {
             let a = seeder.next_u64();
@@ -600,12 +660,6 @@ impl<'a> MethylGpuSolver<'a> {
             all_rng_seeds.push(st);
         }
 
-        let min_floor = cfg.steps_per_root.saturating_mul(85);
-        let total_steps = cfg
-            .steps_per_root
-            .saturating_mul(prob.s_len)
-            .max(min_floor)
-            .clamp(1, u32::MAX as usize) as u32;
         let per_rep_state_bytes = ((2 * max_dim * 4) as u64).max(16);
         let max_wg = self
             .engine
@@ -617,8 +671,6 @@ impl<'a> MethylGpuSolver<'a> {
             .max(1);
 
         let mut all_positions: Vec<Vec<i32>> = Vec::with_capacity(replicas);
-        let mut all_raw_scores: Vec<f64> = Vec::with_capacity(replicas);
-
         let mut rep_offset = 0usize;
         while rep_offset < replicas {
             let batch_reps = (replicas - rep_offset).min(max_batch_reps);
@@ -626,14 +678,12 @@ impl<'a> MethylGpuSolver<'a> {
             let mut pos_both_init = Vec::with_capacity(2 * batch_reps * prob.s_len);
             let mut scores_init = Vec::with_capacity(batch_reps);
 
-            // Current [0..batch_reps]
             for st in &init_states[rep_offset..rep_offset + batch_reps] {
                 at_both_init.extend_from_slice(&st.0);
                 pos_both_init.extend_from_slice(&st.1);
                 let sc_f32 = st.2 as f32;
                 scores_init.push([sc_f32, sc_f32]);
             }
-            // Best [batch_reps..2*batch_reps] initialized identically to starting state
             for st in &init_states[rep_offset..rep_offset + batch_reps] {
                 at_both_init.extend_from_slice(&st.0);
                 pos_both_init.extend_from_slice(&st.1);
@@ -644,9 +694,9 @@ impl<'a> MethylGpuSolver<'a> {
             let mut p_init = packed.base_params;
             p_init.replicas = batch_reps as u32;
             p_init.total_steps = total_steps;
-            p_init.chunk_steps = CHUNK_STEPS;
-            p_init.t_start = cfg.t_start as f32;
-            p_init.t_end = cfg.t_end as f32;
+            p_init.chunk_steps = chunk_steps;
+            p_init.t_start = t_start as f32;
+            p_init.t_end = t_end as f32;
 
             let u_params =
                 self.engine
@@ -752,28 +802,121 @@ impl<'a> MethylGpuSolver<'a> {
                     cpass.dispatch_workgroups(workgroups, 1, 1);
                 }
                 self.engine.queue.submit(Some(enc.finish()));
-                step_offset = step_offset.saturating_add(CHUNK_STEPS);
+                step_offset = step_offset.saturating_add(chunk_steps);
             }
 
             let pos_bytes = (2 * batch_reps * prob.s_len * 4) as u64;
             let pos_both_out: Vec<i32> = self.engine.read_buffer_vec(&b_pos, pos_bytes)?;
-            let best_pos_all = &pos_both_out[batch_reps * prob.s_len..2 * batch_reps * prob.s_len];
+            let slice_out = if return_terminal_cur {
+                &pos_both_out[0..batch_reps * prob.s_len]
+            } else {
+                &pos_both_out[batch_reps * prob.s_len..2 * batch_reps * prob.s_len]
+            };
 
             for r in 0..batch_reps {
-                let p_vec = best_pos_all[r * prob.s_len..(r + 1) * prob.s_len].to_vec();
-                let exact_raw = evaluate_methyl_raw_score(prob, &p_vec);
-                all_positions.push(p_vec);
-                all_raw_scores.push(exact_raw);
+                all_positions.push(slice_out[r * prob.s_len..(r + 1) * prob.s_len].to_vec());
             }
 
             rep_offset += batch_reps;
         }
 
-        Ok(consensus_and_calibrate_methyl(
-            prob,
-            &all_positions,
-            &all_raw_scores,
-        ))
+        Ok(all_positions)
+    }
+
+    /// Run fixed-temperature WebGPU Metropolis–Hastings MCMC and return terminal chain states
+    /// `pos_cur` (for stationary Boltzmann detailed-balance verification).
+    pub fn sample_mcmc_terminal_states(
+        &self,
+        prob: &MethylContactProblem,
+        temperature: f64,
+        steps: u32,
+        replicas: usize,
+        seed: u64,
+    ) -> Result<Vec<Vec<i32>>, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (prob, temperature, steps, replicas, seed);
+            Err(
+                "synchronous WebGPU methyl MCMC readback is unsupported on wasm32; use async readback or CPU solver"
+                    .to_string(),
+            )
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let reps = replicas.max(1);
+            if prob.s_len == 0 || prob.m_len == 0 {
+                return Ok(vec![vec![-1; prob.s_len]; reps]);
+            }
+            self.run_replica_batches(
+                prob,
+                reps,
+                steps.max(1),
+                temperature,
+                temperature,
+                seed,
+                true,
+            )
+        }
+    }
+
+    /// Run massively parallel WebGPU multi-replica simulated annealing + Boltzmann consensus
+    /// and local-swap confidence calibration on `prob`.
+    pub fn assign(
+        &self,
+        prob: &MethylContactProblem,
+        cfg: &MethylAnnealConfig,
+    ) -> Result<MethylAssignResult, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (prob, cfg);
+            Err(
+                "synchronous WebGPU methyl assignment readback is unsupported on wasm32; use async readback or CPU solver"
+                    .to_string(),
+            )
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let replicas = cfg.replicas.max(1);
+            if prob.s_len == 0 || prob.m_len == 0 {
+                return Ok(MethylAssignResult {
+                    position: vec![-1; prob.s_len],
+                    confidence: vec![0.0; prob.s_len],
+                    class_posteriors: prob.class_posteriors.clone(),
+                    score: 0.0,
+                    raw_score: 0.0,
+                    run_scores: vec![0.0; replicas],
+                });
+            }
+
+            let min_floor = cfg.steps_per_root.saturating_mul(85);
+            let total_steps = cfg
+                .steps_per_root
+                .saturating_mul(prob.s_len)
+                .max(min_floor)
+                .clamp(1, u32::MAX as usize) as u32;
+
+            let all_positions = self.run_replica_batches(
+                prob,
+                replicas,
+                total_steps,
+                cfg.t_start,
+                cfg.t_end,
+                cfg.seed,
+                false,
+            )?;
+            let all_raw_scores: Vec<f64> = all_positions
+                .iter()
+                .map(|p_vec| evaluate_methyl_raw_score(prob, p_vec))
+                .collect();
+
+            Ok(consensus_and_calibrate_methyl(
+                prob,
+                &all_positions,
+                &all_raw_scores,
+            ))
+        }
     }
 }
 

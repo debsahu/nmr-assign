@@ -2654,6 +2654,9 @@ fn is_atom_nmr_observable(topo: &ResidueTopology, spec: &AtomSpec) -> bool {
 fn atom_included_in_variant(three_letter: &str, variant: ResidueVariant, atom_name: &str) -> bool {
     match (three_letter, variant) {
         ("CYS", ResidueVariant::CysOxidized) => atom_name != "HG",
+        // Under uncommitted Canonical HIS, omit exchangeable HD1 and HE2 simultaneously so neutral
+        // uncommitted histidines never depict cationic HisH+ imidazolium.
+        ("HIS", ResidueVariant::Canonical) => !matches!(atom_name, "HD1" | "HE2"),
         ("HIS", ResidueVariant::HisNd1H) => atom_name != "HE2",
         ("HIS", ResidueVariant::HisNe2H) => atom_name != "HD1",
         _ => true,
@@ -3197,6 +3200,104 @@ fn exchangeable_proton_fallback_prior(three_letter: &str, atom: &str) -> Option<
     }
 }
 
+/// Authoritative histidine tautomeric and protonation chemical-shift priors `(mean_ppm, sd_ppm)`
+/// shared identically between the 2D covalent GUI Z-score inspector (`topology.rs`) and the
+/// Pelton histidine state classifier (`aromatic.rs`).
+///
+/// Provenance:
+/// - Pelton, Torchia, Meadow & Roseman, *Protein Sci.* 2, 543–558 (1993) — `15ND1`, `15NE2`,
+///   `13CD2`, `13CE1`, `13CG` imidazole tautomeric & protonation shift distributions.
+/// - Reynolds, Peat, Freedman & Lyerla, *J. Am. Chem. Soc.* 95, 328–331 (1973);
+///   Sudmeier, Bradshaw & Bachovchin, *J. Magn. Reson.* 162, 366–370 (2003) — `13CG`/`13CD2`
+///   neutral tautomer (`~135.5` vs `~127.2 ppm`) & imidazolium (`~129.8 ppm`) diagnostics.
+/// - Ulrich et al., *Nucleic Acids Res.* 36, D402–D408 (2008) — empirical BMRB statistics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HisVariantPriors {
+    pub nd1: (f64, f64),
+    pub ne2: (f64, f64),
+    pub cg: (f64, f64),
+    pub cd2: (f64, f64),
+    pub hd2: (f64, f64),
+    pub ce1: (f64, f64),
+    pub he1: (f64, f64),
+    pub cb: (f64, f64),
+    pub hd1: Option<(f64, f64)>,
+    pub he2: Option<(f64, f64)>,
+}
+
+/// Neutral $\tau$ tautomer (`Nε2-H` protonated, `Nδ1` unprotonated pyridine-like `~249.5 ppm`).
+pub const HIS_NE2H_PRIORS: HisVariantPriors = HisVariantPriors {
+    nd1: (249.5, 3.8),
+    ne2: (168.5, 3.6),
+    cg: (135.5, 2.0),
+    cd2: (118.2, 1.9),
+    hd2: (7.02, 0.26),
+    ce1: (138.0, 1.6),
+    he1: (7.80, 0.28),
+    cb: (30.8, 2.1),
+    hd1: None,
+    he2: Some((12.10, 1.20)),
+};
+
+/// Neutral $\pi$ tautomer (`Nδ1-H` protonated, `Nε2` unprotonated pyridine-like `~249.5 ppm`).
+pub const HIS_ND1H_PRIORS: HisVariantPriors = HisVariantPriors {
+    nd1: (169.5, 3.8),
+    ne2: (249.5, 3.8),
+    cg: (127.2, 2.0),
+    cd2: (125.2, 2.0),
+    hd2: (7.14, 0.26),
+    ce1: (137.8, 1.6),
+    he1: (7.84, 0.28),
+    cb: (28.6, 2.1),
+    hd1: Some((12.30, 1.20)),
+    he2: None,
+};
+
+/// Cationic imidazolium `+1` state (both `Nδ1-H` and `Nε2-H` protonated).
+pub const HIS_DOUBLY_PROTONATED_PRIORS: HisVariantPriors = HisVariantPriors {
+    nd1: (177.0, 3.2),
+    ne2: (173.5, 3.2),
+    cg: (129.8, 2.0),
+    cd2: (119.0, 1.9),
+    hd2: (7.34, 0.26),
+    ce1: (135.8, 1.6),
+    he1: (8.58, 0.28),
+    cb: (29.0, 2.0),
+    hd1: Some((13.20, 1.30)),
+    he2: Some((13.00, 1.30)),
+};
+
+impl HisVariantPriors {
+    /// Look up the unified Pelton + BMRB histidine prior table for a [`ResidueVariant`].
+    #[inline]
+    pub const fn for_variant(variant: ResidueVariant) -> Option<Self> {
+        match variant {
+            ResidueVariant::HisNe2H => Some(HIS_NE2H_PRIORS),
+            ResidueVariant::HisNd1H => Some(HIS_ND1H_PRIORS),
+            ResidueVariant::HisDoublyProtonated => Some(HIS_DOUBLY_PROTONATED_PRIORS),
+            _ => None,
+        }
+    }
+
+    /// Look up `(mean_ppm, sd_ppm)` for a specific IUPAC atom name in this histidine state.
+    #[inline]
+    pub fn atom_prior(&self, atom: &str) -> Option<(f64, f64)> {
+        match atom {
+            "ND1" => Some(self.nd1),
+            "NE2" => Some(self.ne2),
+            "CG" => Some(self.cg),
+            "CD2" => Some(self.cd2),
+            "HD2" => Some(self.hd2),
+            "CE1" => Some(self.ce1),
+            "HE1" => Some(self.he1),
+            "CB" => Some(self.cb),
+            "HD1" => self.hd1,
+            "HE2" => self.he2,
+            _ => None,
+        }
+    }
+}
+
 fn variant_specific_prior_override(
     three_letter: &str,
     variant: ResidueVariant,
@@ -3234,35 +3335,8 @@ fn variant_specific_prior_override(
                 .and_then(|m| m.get(atom))
                 .copied(),
         },
-        // Pelton et al. (Protein Sci. 1993, 2, 543-558) imidazole 15N/13C tautomeric distributions
-        ("HIS", ResidueVariant::HisNd1H) => match atom {
-            "ND1" => Some((167.5, 5.0)),
-            "NE2" => Some((249.5, 6.0)),
-            "HD1" => Some((12.30, 1.20)),
-            "CG" => Some((129.0, 2.2)),
-            "CD2" => Some((125.5, 2.2)),
-            "CE1" => Some((138.0, 1.8)),
-            _ => None,
-        },
-        ("HIS", ResidueVariant::HisNe2H) => match atom {
-            "ND1" => Some((249.5, 6.0)),
-            "NE2" => Some((167.5, 5.0)),
-            "HE2" => Some((12.10, 1.20)),
-            "CG" => Some((135.5, 2.2)),
-            "CD2" => Some((118.2, 2.0)),
-            "CE1" => Some((138.0, 1.8)),
-            _ => None,
-        },
-        ("HIS", ResidueVariant::HisDoublyProtonated) => match atom {
-            "ND1" => Some((176.0, 4.5)),
-            "NE2" => Some((173.5, 4.5)),
-            "HD1" => Some((13.20, 1.30)),
-            "HE2" => Some((13.00, 1.30)),
-            "CG" => Some((130.5, 2.2)),
-            "CD2" => Some((119.5, 2.0)),
-            "CE1" => Some((135.8, 1.8)),
-            _ => None,
-        },
+        // Unified Pelton et al. (Protein Sci. 1993) + BMRB histidine tautomer/protonation table
+        ("HIS", var) => HisVariantPriors::for_variant(var).and_then(|hp| hp.atom_prior(atom)),
         _ => None,
     }
 }
@@ -3271,7 +3345,8 @@ fn variant_specific_prior_override(
 /// `(res_name, variant, atom)`.
 ///
 /// Returns `None` for unknown residues/atoms, atoms absent in the specified `ResidueVariant`
-/// (such as `HG` in `CysOxidized` or `HD1` in `HisNe2H`), and non-spin-1/2 heteroatoms (`O`, `S`).
+/// (such as `HG` in `CysOxidized` or `HD1`/`HE2` in `HIS` `Canonical`), non-spin-1/2 heteroatoms
+/// (`O`, `S`), and any atom lacking a finite positive-variance BMRB prior (`!mu.is_finite() || !sd.is_finite() || sd <= 0.0`).
 pub fn compute_atom_bmrb_zscore(
     res_name: &str,
     variant: ResidueVariant,
@@ -3325,7 +3400,12 @@ pub fn compute_atom_bmrb_zscore(
         .or_else(|| aa_all_atom_prior(three, norm_atom))
         .or_else(|| exchangeable_proton_fallback_prior(three, norm_atom))?;
 
-    let safe_sd = sd.max(1e-6);
-    let z_score = (ppm - mu) / safe_sd;
-    Some((mu, safe_sd, z_score))
+    if !mu.is_finite() || !sd.is_finite() || sd <= 0.0 {
+        return None;
+    }
+    let z_score = (ppm - mu) / sd;
+    if !z_score.is_finite() {
+        return None;
+    }
+    Some((mu, sd, z_score))
 }

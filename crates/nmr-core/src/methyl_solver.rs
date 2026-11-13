@@ -23,9 +23,10 @@ use std::thread;
 use crate::methyl_trosy::{
     classify_methyl_peak, hmcmcbca_log_likelihood, link_hmcmcbca_geminal_pairs,
     lookup_site_methyl_shifts, MethylClassPosterior, MethylGroupKind, MethylNoePeak,
-    MethylRootPeak, MethylStructureModel,
+    MethylResidueClass, MethylRootPeak, MethylStructureModel,
 };
 use crate::nmrstar::Reference;
+use crate::qc::ProteinReliabilityCurve;
 use crate::rng::Rng;
 
 pub const METHYL_FORBID: f32 = -1.0e9;
@@ -443,26 +444,130 @@ pub fn build_methyl_contact_problem(
         obs_adj_offsets.push(obs_adj_entries.len() as u32);
     }
 
-    // 2. Geminal coupling matrix G_gem(s1, s2)
+    // 2. Geminal coupling matrix G_gem(s1, s2) with noise-tolerant HMCM(CG)CBCA + intra-residue NOE corroboration
+    let tol_hmcm_robust = cfg.hmcm_tol_aliph_ppm.max(0.32);
+    let mut hmcm_cands: Vec<(f64, f64, usize, usize)> = Vec::new();
+    for s1 in 0..s_len {
+        let Some(ref h1) = roots[s1].hmcm else {
+            continue;
+        };
+        let Some(cb1) = h1.cb_ppm else {
+            continue;
+        };
+        if !(26.0..=50.0).contains(&cb1) {
+            continue;
+        }
+        for s2 in (s1 + 1)..s_len {
+            let Some(ref h2) = roots[s2].hmcm else {
+                continue;
+            };
+            let Some(cb2) = h2.cb_ppm else {
+                continue;
+            };
+            let d_cb = (cb1 - cb2).abs();
+            if d_cb > tol_hmcm_robust {
+                continue;
+            }
+            let d_ca = match (h1.ca_ppm, h2.ca_ppm) {
+                (Some(a), Some(b)) => {
+                    let d = (a - b).abs();
+                    if d > tol_hmcm_robust * 1.25 {
+                        continue;
+                    }
+                    d
+                }
+                _ => 0.05,
+            };
+            let d_cg = match (h1.cg_ppm, h2.cg_ppm) {
+                (Some(a), Some(b)) => {
+                    let d = (a - b).abs();
+                    if d > tol_hmcm_robust {
+                        continue;
+                    }
+                    d
+                }
+                (None, None) => 0.0,
+                _ => continue,
+            };
+            let dist_aliph = (d_cb * d_cb + d_ca * d_ca + d_cg * d_cg).sqrt();
+            let has_short_noe = obs_dhat_lookup.get(&(s1, s2)).is_some_and(|&dh| dh <= 4.85)
+                || (roots[s1].c_ppm - roots[s2].c_ppm).abs() < cfg.diag_mask_c_ppm;
+            let eff_cost = dist_aliph - if has_short_noe { 0.10 } else { 0.0 };
+            hmcm_cands.push((eff_cost, dist_aliph, s1, s2));
+        }
+    }
+    hmcm_cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut robust_partner = vec![None::<usize>; s_len];
+    let mut robust_dist = vec![f64::INFINITY; s_len];
+    for (_, dist_aliph, s1, s2) in hmcm_cands {
+        if robust_partner[s1].is_none() && robust_partner[s2].is_none() {
+            robust_partner[s1] = Some(s2);
+            robust_partner[s2] = Some(s1);
+            robust_dist[s1] = dist_aliph;
+            robust_dist[s2] = dist_aliph;
+        }
+    }
+
+    let noe_gem_fallback = |s1: usize, s2: usize| -> f32 {
+        if let Some(&dh) = obs_dhat_lookup.get(&(s1, s2)) {
+            if dh <= 4.85 {
+                2.2
+            } else {
+                -0.8
+            }
+        } else if (roots[s1].c_ppm - roots[s2].c_ppm).abs() < cfg.diag_mask_c_ppm {
+            1.0
+        } else {
+            -1.5
+        }
+    };
 
     let mut gem_obs_mat = vec![0.0f32; s_len * s_len];
     for s1 in 0..s_len {
         for s2 in (s1 + 1)..s_len {
-            let val: f32 = match (hmcm_partner[s1], hmcm_partner[s2]) {
-                (Some(p1), _) if p1 == s2 => 8.0,
-                (Some(_), _) | (_, Some(_)) => -8.0,
-                (None, None) => {
-                    if let Some(&dh) = obs_dhat_lookup.get(&(s1, s2)) {
-                        if dh <= 4.85 {
-                            2.2
+            let val: f32 = if robust_partner[s1] == Some(s2) {
+                let d = robust_dist[s1];
+                if d <= 0.12 {
+                    8.0
+                } else {
+                    (4.8 + 3.2 * (-(d / 0.24).powi(2)).exp()) as f32
+                }
+            } else {
+                match (&roots[s1].hmcm, &roots[s2].hmcm) {
+                    (Some(h1), Some(h2)) => {
+                        let d_cb = match (h1.cb_ppm, h2.cb_ppm) {
+                            (Some(a), Some(b)) => (a - b).abs(),
+                            _ => 0.0,
+                        };
+                        let d_ca = match (h1.ca_ppm, h2.ca_ppm) {
+                            (Some(a), Some(b)) => (a - b).abs() * 0.85,
+                            _ => 0.0,
+                        };
+                        let d_cg = match (h1.cg_ppm, h2.cg_ppm) {
+                            (Some(a), Some(b)) => (a - b).abs(),
+                            (None, None) => 0.0,
+                            _ => 1.0,
+                        };
+                        let max_d = d_cb.max(d_ca).max(d_cg);
+                        if max_d > 0.44 {
+                            -8.0
+                        } else if robust_dist[s1] <= 0.16 || robust_dist[s2] <= 0.16 {
+                            -7.5
+                        } else if robust_partner[s1].is_some() || robust_partner[s2].is_some() {
+                            -4.5
                         } else {
-                            -0.8
+                            noe_gem_fallback(s1, s2)
                         }
-                    } else if (roots[s1].c_ppm - roots[s2].c_ppm).abs() < cfg.diag_mask_c_ppm {
-                        1.0
-                    } else {
-                        -1.5
                     }
+                    (Some(_), None) | (None, Some(_)) => {
+                        let tight_taken = robust_dist[s1] <= 0.14 || robust_dist[s2] <= 0.14;
+                        if tight_taken {
+                            -7.5
+                        } else {
+                            noe_gem_fallback(s1, s2)
+                        }
+                    }
+                    (None, None) => noe_gem_fallback(s1, s2),
                 }
             };
             gem_obs_mat[s1 * s_len + s2] = val;
@@ -564,10 +669,11 @@ pub fn build_methyl_contact_problem(
     let mut struct_short_lists: Vec<Vec<StructShortAdjEntry>> = vec![Vec::new(); m_len];
     let mut struct_cut_lists: Vec<Vec<u32>> = vec![Vec::new(); m_len];
 
+    let d_cutoff_f32 = cfg.d_cutoff_angstrom as f32;
     for m1 in 0..m_len {
         for m2 in (m1 + 1)..m_len {
             let d = model.dist_cc(m1, m2);
-            if d <= cfg.d_cutoff_angstrom {
+            if d_mat[m1 * m_len + m2] <= d_cutoff_f32 {
                 struct_cut_lists[m1].push(m2 as u32);
                 struct_cut_lists[m2].push(m1 as u32);
             }
@@ -656,16 +762,25 @@ fn find_closest_root_2d(
 }
 
 /// Evaluate exact unnormalized objective $E_{\text{raw}}(\pi)$ in `f64` from `pos[0..S]`.
+/// Returns `-1.0e12` immediately if `pos` has wrong length, any out-of-bounds index
+/// (`m < -1` or `m >= prob.m_len as i32`), or a duplicate non-injective site assignment.
 pub fn evaluate_methyl_raw_score(prob: &MethylContactProblem, pos: &[i32]) -> f64 {
-    assert_eq!(pos.len(), prob.s_len);
+    if pos.len() != prob.s_len {
+        return -1.0e12;
+    }
+    let m_bound = prob.m_len as i32;
     let mut at = vec![-1i32; prob.m_len];
     for (s, &m) in pos.iter().enumerate() {
-        if m >= 0 && (m as usize) < prob.m_len {
-            if at[m as usize] >= 0 {
+        if m < -1 || m >= m_bound {
+            return -1.0e12;
+        }
+        if m >= 0 {
+            let mu = m as usize;
+            if at[mu] >= 0 {
                 // Invalid non-injective mapping
                 return -1.0e12;
             }
-            at[m as usize] = s as i32;
+            at[mu] = s as i32;
         }
     }
     evaluate_methyl_raw_from_both(prob, &at, pos)
@@ -979,6 +1094,448 @@ fn eval_subset_contrib(
     val
 }
 
+/// Precomputed static structural geminal-pair tables (`Leu CD1<->CD2`, `Val CG1<->CG2`) shared
+/// identically by CPU and WebGPU reversible involution MCMC kernels (Moves 3 and 4).
+#[derive(Clone, Debug)]
+pub struct GeminalMoveTable {
+    /// Canonical structural geminal pairs `[m_lo, m_hi]` with `m_lo < m_hi = gem_site[m_lo]`.
+    pub pairs: Vec<[u32; 2]>,
+    /// CSR offsets (`len = pairs.len() + 1`) into `nbr_indices` for nearby geminal residues.
+    pub nbr_offsets: Vec<u32>,
+    /// Indices `g_b != g_a` into `pairs` within `<= 13.5 A` minimum inter-pair `C-C` distance.
+    pub nbr_indices: Vec<u32>,
+}
+
+/// Build static state-independent geminal move tables from `prob`.
+pub fn build_geminal_move_table(prob: &MethylContactProblem) -> GeminalMoveTable {
+    let m_len = prob.m_len;
+    let mut pairs: Vec<[u32; 2]> = Vec::new();
+    for m1 in 0..m_len {
+        let m2 = prob.gem_site[m1];
+        if m2 > m1 as i32 && (m2 as usize) < m_len {
+            pairs.push([m1 as u32, m2 as u32]);
+        }
+    }
+    let ng = pairs.len();
+    let mut nbr_offsets = Vec::with_capacity(ng + 1);
+    let mut nbr_indices = Vec::new();
+    nbr_offsets.push(0);
+    for (ga, &[a0, a1]) in pairs.iter().enumerate() {
+        for (gb, &[b0, b1]) in pairs.iter().enumerate() {
+            if ga == gb {
+                continue;
+            }
+            let d00 = prob.d_mat[(a0 as usize) * m_len + (b0 as usize)];
+            let d01 = prob.d_mat[(a0 as usize) * m_len + (b1 as usize)];
+            let d10 = prob.d_mat[(a1 as usize) * m_len + (b0 as usize)];
+            let d11 = prob.d_mat[(a1 as usize) * m_len + (b1 as usize)];
+            let d_min = d00.min(d01).min(d10).min(d11);
+            if d_min <= 13.5 {
+                nbr_indices.push(gb as u32);
+            }
+        }
+        nbr_offsets.push(nbr_indices.len() as u32);
+    }
+    GeminalMoveTable {
+        pairs,
+        nbr_offsets,
+        nbr_indices,
+    }
+}
+
+/// Exact single-root proposal probability $P_{\text{prop}}(u \to x)$ in Move 2 (`0.125` uniform
+/// slot + `0.875` NOE-anchor contact extension), excluding moving roots `(excl_s, excl_t)`.
+/// Because `struct_cut_peers[ma]` excludes `ma` and `obs_adj[u]` excludes `u`, neither `s` nor `t`
+/// can ever serve as an anchor for proposing the partner's site in either $\sigma \to \sigma'$ or
+/// $\sigma' \to \sigma$, making all anchor positions strictly invariant across the transition.
+#[inline]
+fn move2_prop_prob_cpu(
+    prob: &MethylContactProblem,
+    pos: &[i32],
+    u: usize,
+    target_m: usize,
+    excl_s: usize,
+    excl_t: i32,
+) -> f64 {
+    const EPS_M2: f64 = 0.125;
+    let sl_len = prob.slots[u].len();
+    if sl_len == 0 {
+        return 0.0;
+    }
+    let mut p = EPS_M2 / (sl_len as f64);
+    let o0 = prob.obs_adj_offsets[u] as usize;
+    let o1 = prob.obs_adj_offsets[u + 1] as usize;
+    if o0 < o1 {
+        let inv_odeg = (1.0 - EPS_M2) / ((o1 - o0) as f64);
+        let mut sum_anc = 0.0f64;
+        for entry in &prob.obs_adj_entries[o0..o1] {
+            let a = entry.peer_s as usize;
+            if a == excl_s || (excl_t >= 0 && a == excl_t as usize) {
+                continue;
+            }
+            let ma_i = pos[a];
+            if ma_i < 0 {
+                continue;
+            }
+            let ma = ma_i as usize;
+            if ma == target_m {
+                continue;
+            }
+            if prob.d_mat[ma * prob.m_len + target_m] <= prob.d_cutoff {
+                let cdeg = prob.struct_cut_offsets[ma + 1] - prob.struct_cut_offsets[ma];
+                if cdeg > 0 {
+                    sum_anc += 1.0 / (cdeg as f64);
+                }
+            }
+        }
+        p += inv_odeg * sum_anc;
+    }
+    p
+}
+
+#[inline]
+fn mh_accept_cpu(rng: &mut Rng, delta: f64, temp: f64, log_hastings: f64) -> bool {
+    let log_acc = (delta / temp) + log_hastings;
+    if log_acc >= 0.0 {
+        true
+    } else if log_acc > -36.0 {
+        rng.f64() < log_acc.exp()
+    } else {
+        false
+    }
+}
+
+/// Execute one exact Metropolis–Hastings transition step at temperature `temp` across the
+/// 4 reversible move kernels (`7/16` Move 1, `6/16` Move 2, `2/16` Move 3, `1/16` Move 4).
+fn step_methyl_mcmc_cpu(
+    prob: &MethylContactProblem,
+    gem_tbl: &GeminalMoveTable,
+    at: &mut [i32],
+    pos: &mut [i32],
+    cur: &mut f64,
+    temp: f64,
+    rng: &mut Rng,
+) -> bool {
+    let s_len = prob.s_len;
+    let m_len = prob.m_len;
+    let mut m_buf = [0usize; 4];
+    let mut s_buf = [0usize; 4];
+    let phase = rng.next_u64() & 15;
+
+    if phase < 7 {
+        // Move 1: slot-guided swap / move-to-vacant / reversible unassign-assign / displace-occupied
+        let s = rng.usize(s_len);
+        let sl = &prob.slots[s];
+        if sl.is_empty() {
+            return false;
+        }
+        let m = sl[rng.usize(sl.len())] as usize;
+        let ms = pos[s];
+        if ms == m as i32 {
+            return false;
+        }
+
+        let t = at[m];
+        if ms < 0 && t < 0 {
+            return false;
+        }
+        if ms >= 0
+            && t >= 0
+            && prob.u_mat[(t as usize) * m_len + (ms as usize)] <= METHYL_FORBID_HALF
+        {
+            return false;
+        }
+        // Cardinality-preserving Move 1 on Omega_k (k = min(S, M)):
+        // Cases 1B (ms>=0, t<0) and 1C (ms>=0, t>=0) have q_rev == q_fwd;
+        // Case 1E (ms<0, t>=0, displace occupied) has q_rev / q_fwd = |slots[s]| / |slots[t]|.
+        let log_hastings = if ms < 0 && t >= 0 {
+            let sl_t = prob.slots[t as usize].len().max(1);
+            ((sl.len() as f64) / (sl_t as f64)).ln()
+        } else {
+            0.0
+        };
+
+        let nm = if ms < 0 {
+            m_buf[0] = m;
+            1
+        } else {
+            m_buf[0] = m;
+            m_buf[1] = ms as usize;
+            2
+        };
+        let ns = if t < 0 {
+            s_buf[0] = s;
+            1
+        } else {
+            s_buf[0] = s;
+            s_buf[1] = t as usize;
+            2
+        };
+        let before = eval_subset_contrib(prob, at, pos, &m_buf[..nm], &s_buf[..ns]);
+        if ms >= 0 {
+            at[ms as usize] = t;
+        }
+        at[m] = s as i32;
+        pos[s] = m as i32;
+        if t >= 0 {
+            pos[t as usize] = ms;
+        }
+        let delta = eval_subset_contrib(prob, at, pos, &m_buf[..nm], &s_buf[..ns]) - before;
+        if mh_accept_cpu(rng, delta, temp, log_hastings) {
+            *cur += delta;
+            true
+        } else {
+            at[m] = t;
+            if ms >= 0 {
+                at[ms as usize] = s as i32;
+            }
+            pos[s] = ms;
+            if t >= 0 {
+                pos[t as usize] = m as i32;
+            }
+            false
+        }
+    } else if phase < 13 {
+        // Move 2: 3D contact-guided + 1/8 slot-ergodic swap/move with exact Hastings correction
+        let s = rng.usize(s_len);
+        let ms_i = pos[s];
+        if ms_i < 0 {
+            return false;
+        }
+        let ms = ms_i as usize;
+        let sl = &prob.slots[s];
+        if sl.is_empty() {
+            return false;
+        }
+        let m = if (rng.next_u64() & 7) == 0 {
+            sl[rng.usize(sl.len())] as usize
+        } else {
+            let o0 = prob.obs_adj_offsets[s] as usize;
+            let o1 = prob.obs_adj_offsets[s + 1] as usize;
+            if o0 == o1 {
+                return false;
+            }
+            let a = prob.obs_adj_entries[o0 + rng.usize(o1 - o0)].peer_s as usize;
+            let ma_i = pos[a];
+            if ma_i < 0 {
+                return false;
+            }
+            let ma = ma_i as usize;
+            let c0 = prob.struct_cut_offsets[ma] as usize;
+            let c1 = prob.struct_cut_offsets[ma + 1] as usize;
+            if c0 == c1 {
+                return false;
+            }
+            prob.struct_cut_peers[c0 + rng.usize(c1 - c0)] as usize
+        };
+
+        if m == ms || prob.u_mat[s * m_len + m] <= METHYL_FORBID_HALF {
+            return false;
+        }
+        let t = at[m];
+        if t >= 0 && prob.u_mat[(t as usize) * m_len + ms] <= METHYL_FORBID_HALF {
+            return false;
+        }
+
+        let (q_fwd, q_rev) = if t < 0 {
+            (
+                move2_prop_prob_cpu(prob, pos, s, m, s, -1),
+                move2_prop_prob_cpu(prob, pos, s, ms, s, -1),
+            )
+        } else {
+            let tu = t as usize;
+            (
+                move2_prop_prob_cpu(prob, pos, s, m, s, t)
+                    + move2_prop_prob_cpu(prob, pos, tu, ms, s, t),
+                move2_prop_prob_cpu(prob, pos, s, ms, s, t)
+                    + move2_prop_prob_cpu(prob, pos, tu, m, s, t),
+            )
+        };
+        if q_fwd <= 0.0 || q_rev <= 0.0 {
+            return false;
+        }
+        let log_hastings = (q_rev / q_fwd).ln();
+
+        m_buf[0] = m;
+        m_buf[1] = ms;
+        let ns = if t < 0 {
+            s_buf[0] = s;
+            1
+        } else {
+            s_buf[0] = s;
+            s_buf[1] = t as usize;
+            2
+        };
+        let before = eval_subset_contrib(prob, at, pos, &m_buf[..2], &s_buf[..ns]);
+        at[ms] = t;
+        at[m] = s as i32;
+        pos[s] = m as i32;
+        if t >= 0 {
+            pos[t as usize] = ms as i32;
+        }
+        let delta = eval_subset_contrib(prob, at, pos, &m_buf[..2], &s_buf[..ns]) - before;
+        if mh_accept_cpu(rng, delta, temp, log_hastings) {
+            *cur += delta;
+            true
+        } else {
+            at[m] = t;
+            at[ms] = s as i32;
+            pos[s] = ms as i32;
+            if t >= 0 {
+                pos[t as usize] = m as i32;
+            }
+            false
+        }
+    } else if phase < 15 {
+        // Move 3: state-independent 4-body geminal residue involution (strictly symmetric)
+        let ng = gem_tbl.pairs.len();
+        if ng < 2 {
+            return false;
+        }
+        let ga = rng.usize(ng);
+        let gb = if (rng.next_u64() & 1) == 0 {
+            let n0 = gem_tbl.nbr_offsets[ga] as usize;
+            let n1 = gem_tbl.nbr_offsets[ga + 1] as usize;
+            if n0 < n1 {
+                gem_tbl.nbr_indices[n0 + rng.usize(n1 - n0)] as usize
+            } else {
+                let k = rng.usize(ng - 1);
+                if k >= ga {
+                    k + 1
+                } else {
+                    k
+                }
+            }
+        } else {
+            let k = rng.usize(ng - 1);
+            if k >= ga {
+                k + 1
+            } else {
+                k
+            }
+        };
+        let m1 = gem_tbl.pairs[ga][0] as usize;
+        let m2 = gem_tbl.pairs[ga][1] as usize;
+        let (mut m3, mut m4) = (gem_tbl.pairs[gb][0] as usize, gem_tbl.pairs[gb][1] as usize);
+        if (rng.next_u64() & 1) == 1 {
+            std::mem::swap(&mut m3, &mut m4);
+        }
+        let (s1, s2, s3, s4) = (at[m1], at[m2], at[m3], at[m4]);
+        if s1 < 0 && s2 < 0 && s3 < 0 && s4 < 0 {
+            return false;
+        }
+        if (s1 >= 0 && prob.u_mat[(s1 as usize) * m_len + m3] <= METHYL_FORBID_HALF)
+            || (s2 >= 0 && prob.u_mat[(s2 as usize) * m_len + m4] <= METHYL_FORBID_HALF)
+            || (s3 >= 0 && prob.u_mat[(s3 as usize) * m_len + m1] <= METHYL_FORBID_HALF)
+            || (s4 >= 0 && prob.u_mat[(s4 as usize) * m_len + m2] <= METHYL_FORBID_HALF)
+        {
+            return false;
+        }
+        m_buf = [m1, m2, m3, m4];
+        let mut ns = 0usize;
+        for &sx in &[s1, s2, s3, s4] {
+            if sx >= 0 {
+                s_buf[ns] = sx as usize;
+                ns += 1;
+            }
+        }
+        let before = eval_subset_contrib(prob, at, pos, &m_buf, &s_buf[..ns]);
+        at[m1] = s3;
+        at[m2] = s4;
+        at[m3] = s1;
+        at[m4] = s2;
+        if s3 >= 0 {
+            pos[s3 as usize] = m1 as i32;
+        }
+        if s4 >= 0 {
+            pos[s4 as usize] = m2 as i32;
+        }
+        if s1 >= 0 {
+            pos[s1 as usize] = m3 as i32;
+        }
+        if s2 >= 0 {
+            pos[s2 as usize] = m4 as i32;
+        }
+        let delta = eval_subset_contrib(prob, at, pos, &m_buf, &s_buf[..ns]) - before;
+        if mh_accept_cpu(rng, delta, temp, 0.0) {
+            *cur += delta;
+            true
+        } else {
+            at[m1] = s1;
+            at[m2] = s2;
+            at[m3] = s3;
+            at[m4] = s4;
+            if s1 >= 0 {
+                pos[s1 as usize] = m1 as i32;
+            }
+            if s2 >= 0 {
+                pos[s2 as usize] = m2 as i32;
+            }
+            if s3 >= 0 {
+                pos[s3 as usize] = m3 as i32;
+            }
+            if s4 >= 0 {
+                pos[s4 as usize] = m4 as i32;
+            }
+            false
+        }
+    } else {
+        // Move 4: state-independent intraresidue prochiral 2-flip involution (strictly symmetric)
+        let ng = gem_tbl.pairs.len();
+        if ng == 0 {
+            return false;
+        }
+        let g = rng.usize(ng);
+        let m1 = gem_tbl.pairs[g][0] as usize;
+        let m2 = gem_tbl.pairs[g][1] as usize;
+        let s1 = at[m1];
+        let s2 = at[m2];
+        if s1 == s2 {
+            return false;
+        }
+        if (s1 >= 0 && prob.u_mat[(s1 as usize) * m_len + m2] <= METHYL_FORBID_HALF)
+            || (s2 >= 0 && prob.u_mat[(s2 as usize) * m_len + m1] <= METHYL_FORBID_HALF)
+        {
+            return false;
+        }
+        m_buf[0] = m1;
+        m_buf[1] = m2;
+        let mut ns = 0usize;
+        if s1 >= 0 {
+            s_buf[ns] = s1 as usize;
+            ns += 1;
+        }
+        if s2 >= 0 {
+            s_buf[ns] = s2 as usize;
+            ns += 1;
+        }
+        let before = eval_subset_contrib(prob, at, pos, &m_buf[..2], &s_buf[..ns]);
+        at[m1] = s2;
+        at[m2] = s1;
+        if s1 >= 0 {
+            pos[s1 as usize] = m2 as i32;
+        }
+        if s2 >= 0 {
+            pos[s2 as usize] = m1 as i32;
+        }
+        let delta = eval_subset_contrib(prob, at, pos, &m_buf[..2], &s_buf[..ns]) - before;
+        if mh_accept_cpu(rng, delta, temp, 0.0) {
+            *cur += delta;
+            true
+        } else {
+            at[m1] = s1;
+            at[m2] = s2;
+            if s1 >= 0 {
+                pos[s1 as usize] = m1 as i32;
+            }
+            if s2 >= 0 {
+                pos[s2 as usize] = m2 as i32;
+            }
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CpuReplicaSchedule {
     total_steps: usize,
@@ -989,6 +1546,7 @@ struct CpuReplicaSchedule {
 
 fn run_single_cpu_replica(
     prob: &MethylContactProblem,
+    gem_tbl: &GeminalMoveTable,
     init: ReplicaInitState,
     sched: CpuReplicaSchedule,
 ) -> (Vec<i32>, f64) {
@@ -1009,331 +1567,54 @@ fn run_single_cpu_replica(
 
     let denom = (total_steps.saturating_sub(1)).max(1) as f64;
     let log_ratio = (t_end / t_start).ln();
-    let mut m_buf = [0usize; 4];
-    let mut s_buf = [0usize; 4];
 
     for step in 0..total_steps {
         let temp = t_start * (log_ratio * (step as f64 / denom)).exp();
-        let draw = rng.f64();
-
-        if draw < 0.44 {
-            // Move 1: single-root compatible slot placement / 2-way swap / excess-root unassign
-            let s = rng.usize(s_len);
-            let sl = &prob.slots[s];
-            if sl.is_empty() {
-                continue;
-            }
-            let m = sl[rng.usize(sl.len())] as usize;
-            let ms = pos[s];
-            if ms == m as i32 {
-                if s_len > m_len {
-                    m_buf[0] = m;
-                    s_buf[0] = s;
-                    let before = eval_subset_contrib(prob, &at, &pos, &m_buf[..1], &s_buf[..1]);
-                    at[m] = -1;
-                    pos[s] = -1;
-                    let delta =
-                        eval_subset_contrib(prob, &at, &pos, &m_buf[..1], &s_buf[..1]) - before;
-                    if delta >= 0.0 || rng.f64() < (delta / temp).exp() {
-                        cur += delta;
-                        if cur > best_sc {
-                            best_sc = cur;
-                            best_pos.copy_from_slice(&pos);
-                        }
-                    } else {
-                        at[m] = s as i32;
-                        pos[s] = m as i32;
-                    }
-                }
-                continue;
-            }
-            let t = at[m];
-            if ms >= 0
-                && t >= 0
-                && prob.u_mat[(t as usize) * m_len + (ms as usize)] <= METHYL_FORBID_HALF
-            {
-                continue;
-            }
-            let nm = if ms < 0 {
-                m_buf[0] = m;
-                1
-            } else {
-                m_buf[0] = m;
-                m_buf[1] = ms as usize;
-                2
-            };
-            let ns = if t < 0 {
-                s_buf[0] = s;
-                1
-            } else {
-                s_buf[0] = s;
-                s_buf[1] = t as usize;
-                2
-            };
-            let before = eval_subset_contrib(prob, &at, &pos, &m_buf[..nm], &s_buf[..ns]);
-            if ms >= 0 {
-                at[ms as usize] = t;
-            }
-            at[m] = s as i32;
-            pos[s] = m as i32;
-            if t >= 0 {
-                pos[t as usize] = ms;
-            }
-            let delta = eval_subset_contrib(prob, &at, &pos, &m_buf[..nm], &s_buf[..ns]) - before;
-            if delta >= 0.0 || rng.f64() < (delta / temp).exp() {
-                cur += delta;
-                if cur > best_sc {
-                    best_sc = cur;
-                    best_pos.copy_from_slice(&pos);
-                }
-            } else {
-                at[m] = t;
-                if ms >= 0 {
-                    at[ms as usize] = s as i32;
-                }
-                pos[s] = ms;
-                if t >= 0 {
-                    pos[t as usize] = m as i32;
-                }
-            }
-        } else if draw < 0.72 {
-            // Move 2: 3D contact-guided neighbor extension from anchored root
-            let s_anc = rng.usize(s_len);
-            let m_anc = pos[s_anc];
-            if m_anc < 0 {
-                continue;
-            }
-            let o0 = prob.obs_adj_offsets[s_anc] as usize;
-            let o1 = prob.obs_adj_offsets[s_anc + 1] as usize;
-            let c0 = prob.struct_cut_offsets[m_anc as usize] as usize;
-            let c1 = prob.struct_cut_offsets[m_anc as usize + 1] as usize;
-            if o0 == o1 || c0 == c1 {
-                continue;
-            }
-            let s = prob.obs_adj_entries[o0 + rng.usize(o1 - o0)].peer_s as usize;
-            let m = prob.struct_cut_peers[c0 + rng.usize(c1 - c0)] as usize;
-            if prob.u_mat[s * m_len + m] <= METHYL_FORBID_HALF || pos[s] == m as i32 {
-                continue;
-            }
-            let ms = pos[s];
-            let t = at[m];
-            if ms >= 0
-                && t >= 0
-                && prob.u_mat[(t as usize) * m_len + (ms as usize)] <= METHYL_FORBID_HALF
-            {
-                continue;
-            }
-            let nm = if ms < 0 {
-                m_buf[0] = m;
-                1
-            } else {
-                m_buf[0] = m;
-                m_buf[1] = ms as usize;
-                2
-            };
-            let ns = if t < 0 {
-                s_buf[0] = s;
-                1
-            } else {
-                s_buf[0] = s;
-                s_buf[1] = t as usize;
-                2
-            };
-            let before = eval_subset_contrib(prob, &at, &pos, &m_buf[..nm], &s_buf[..ns]);
-            if ms >= 0 {
-                at[ms as usize] = t;
-            }
-            at[m] = s as i32;
-            pos[s] = m as i32;
-            if t >= 0 {
-                pos[t as usize] = ms;
-            }
-            let delta = eval_subset_contrib(prob, &at, &pos, &m_buf[..nm], &s_buf[..ns]) - before;
-            if delta >= 0.0 || rng.f64() < (delta / temp).exp() {
-                cur += delta;
-                if cur > best_sc {
-                    best_sc = cur;
-                    best_pos.copy_from_slice(&pos);
-                }
-            } else {
-                at[m] = t;
-                if ms >= 0 {
-                    at[ms as usize] = s as i32;
-                }
-                pos[s] = ms;
-                if t >= 0 {
-                    pos[t as usize] = m as i32;
-                }
-            }
-        } else {
-            // Move 3 & 4: slot- & contact-guided 4-body geminal residue swap (78%) or prochiral flip (22%)
-            let s_seed = rng.usize(s_len);
-            let m1_i = pos[s_seed];
-            if m1_i < 0 {
-                continue;
-            }
-            let m1 = m1_i as usize;
-            let m2_i = prob.gem_site[m1];
-            if m2_i < 0 {
-                continue;
-            }
-            let m2 = m2_i as usize;
-
-            if rng.f64() < 0.22 {
-                let s1 = at[m1];
-                let s2 = at[m2];
-                if s1 == s2 {
-                    continue;
-                }
-                if (s1 >= 0 && prob.u_mat[(s1 as usize) * m_len + m2] <= METHYL_FORBID_HALF)
-                    || (s2 >= 0 && prob.u_mat[(s2 as usize) * m_len + m1] <= METHYL_FORBID_HALF)
-                {
-                    continue;
-                }
-                m_buf[0] = m1;
-                m_buf[1] = m2;
-                let mut ns = 0usize;
-                if s1 >= 0 {
-                    s_buf[ns] = s1 as usize;
-                    ns += 1;
-                }
-                if s2 >= 0 {
-                    s_buf[ns] = s2 as usize;
-                    ns += 1;
-                }
-                let before = eval_subset_contrib(prob, &at, &pos, &m_buf[..2], &s_buf[..ns]);
-                at[m1] = s2;
-                at[m2] = s1;
-                if s1 >= 0 {
-                    pos[s1 as usize] = m2 as i32;
-                }
-                if s2 >= 0 {
-                    pos[s2 as usize] = m1 as i32;
-                }
-                let delta =
-                    eval_subset_contrib(prob, &at, &pos, &m_buf[..2], &s_buf[..ns]) - before;
-                if delta >= 0.0 || rng.f64() < (delta / temp).exp() {
-                    cur += delta;
-                    if cur > best_sc {
-                        best_sc = cur;
-                        best_pos.copy_from_slice(&pos);
-                    }
-                } else {
-                    at[m1] = s1;
-                    at[m2] = s2;
-                    if s1 >= 0 {
-                        pos[s1 as usize] = m1 as i32;
-                    }
-                    if s2 >= 0 {
-                        pos[s2 as usize] = m2 as i32;
-                    }
-                }
-            } else {
-                // Contact-guided (50%) or compatible-slot-guided (50%) target geminal residue
-                let mut m3_opt: Option<usize> = None;
-                if rng.usize(2) == 0 {
-                    let o0 = prob.obs_adj_offsets[s_seed] as usize;
-                    let o1 = prob.obs_adj_offsets[s_seed + 1] as usize;
-                    if o0 < o1 {
-                        let s_nb = prob.obs_adj_entries[o0 + rng.usize(o1 - o0)].peer_s as usize;
-                        let m_nb = pos[s_nb];
-                        if m_nb >= 0 {
-                            let c0 = prob.struct_cut_offsets[m_nb as usize] as usize;
-                            let c1 = prob.struct_cut_offsets[m_nb as usize + 1] as usize;
-                            if c0 < c1 {
-                                let cand = prob.struct_cut_peers[c0 + rng.usize(c1 - c0)] as usize;
-                                if prob.gem_site[cand] >= 0 {
-                                    m3_opt = Some(cand);
-                                }
-                            }
-                        }
-                    }
-                }
-                let mut m3 = match m3_opt {
-                    Some(c) => c,
-                    None => {
-                        let sl = &prob.slots[s_seed];
-                        if sl.is_empty() {
-                            continue;
-                        }
-                        sl[rng.usize(sl.len())] as usize
-                    }
-                };
-                let m4_i = prob.gem_site[m3];
-                if m4_i < 0 || m3 == m1 || m3 == m2 {
-                    continue;
-                }
-                let mut m4 = m4_i as usize;
-                if rng.usize(2) == 1 {
-                    std::mem::swap(&mut m3, &mut m4);
-                }
-                let (s1, s2, s3, s4) = (at[m1], at[m2], at[m3], at[m4]);
-                if (s1 >= 0 && prob.u_mat[(s1 as usize) * m_len + m3] <= METHYL_FORBID_HALF)
-                    || (s2 >= 0 && prob.u_mat[(s2 as usize) * m_len + m4] <= METHYL_FORBID_HALF)
-                    || (s3 >= 0 && prob.u_mat[(s3 as usize) * m_len + m1] <= METHYL_FORBID_HALF)
-                    || (s4 >= 0 && prob.u_mat[(s4 as usize) * m_len + m2] <= METHYL_FORBID_HALF)
-                {
-                    continue;
-                }
-                m_buf = [m1, m2, m3, m4];
-                let mut ns = 0usize;
-                for &sx in &[s1, s2, s3, s4] {
-                    if sx >= 0 {
-                        s_buf[ns] = sx as usize;
-                        ns += 1;
-                    }
-                }
-                if ns == 0 {
-                    continue;
-                }
-                let before = eval_subset_contrib(prob, &at, &pos, &m_buf, &s_buf[..ns]);
-                at[m1] = s3;
-                at[m2] = s4;
-                at[m3] = s1;
-                at[m4] = s2;
-                if s3 >= 0 {
-                    pos[s3 as usize] = m1 as i32;
-                }
-                if s4 >= 0 {
-                    pos[s4 as usize] = m2 as i32;
-                }
-                if s1 >= 0 {
-                    pos[s1 as usize] = m3 as i32;
-                }
-                if s2 >= 0 {
-                    pos[s2 as usize] = m4 as i32;
-                }
-                let delta = eval_subset_contrib(prob, &at, &pos, &m_buf, &s_buf[..ns]) - before;
-                if delta >= 0.0 || rng.f64() < (delta / temp).exp() {
-                    cur += delta;
-                    if cur > best_sc {
-                        best_sc = cur;
-                        best_pos.copy_from_slice(&pos);
-                    }
-                } else {
-                    at[m1] = s1;
-                    at[m2] = s2;
-                    at[m3] = s3;
-                    at[m4] = s4;
-                    if s1 >= 0 {
-                        pos[s1 as usize] = m1 as i32;
-                    }
-                    if s2 >= 0 {
-                        pos[s2 as usize] = m2 as i32;
-                    }
-                    if s3 >= 0 {
-                        pos[s3 as usize] = m3 as i32;
-                    }
-                    if s4 >= 0 {
-                        pos[s4 as usize] = m4 as i32;
-                    }
-                }
-            }
+        if step_methyl_mcmc_cpu(prob, gem_tbl, &mut at, &mut pos, &mut cur, temp, &mut rng)
+            && cur > best_sc
+        {
+            best_sc = cur;
+            best_pos.copy_from_slice(&pos);
         }
     }
 
     let exact_best = evaluate_methyl_raw_score(prob, &best_pos);
     (best_pos, exact_best)
+}
+
+/// Run fixed-temperature CPU Metropolis–Hastings MCMC from `init_states` and return the
+/// terminal Markov chain states `pos[0..S]` (for stationary Boltzmann detailed-balance verification).
+pub fn sample_methyl_mcmc_terminal_cpu(
+    prob: &MethylContactProblem,
+    temperature: f64,
+    steps: usize,
+    replicas: usize,
+    seed: u64,
+) -> Vec<Vec<i32>> {
+    let reps = replicas.max(1);
+    if prob.s_len == 0 || prob.m_len == 0 {
+        return vec![vec![-1; prob.s_len]; reps];
+    }
+    let gem_tbl = build_geminal_move_table(prob);
+    let init_states = build_initial_replica_states(prob, reps, seed);
+    let mut seeder = Rng::new(seed ^ 0x4D43_4D43_5445_524D);
+    let mut out = Vec::with_capacity(reps);
+    for (mut at, mut pos, mut cur) in init_states {
+        let mut rng = Rng::new(seeder.next_u64());
+        for _ in 0..steps {
+            let _ = step_methyl_mcmc_cpu(
+                prob,
+                &gem_tbl,
+                &mut at,
+                &mut pos,
+                &mut cur,
+                temperature,
+                &mut rng,
+            );
+        }
+        out.push(pos);
+    }
+    out
 }
 
 /// Run deterministic multi-threaded CPU multi-replica simulated annealing on `prob`.
@@ -1353,6 +1634,7 @@ pub fn assign_methyl_cpu(
         };
     }
 
+    let gem_tbl = build_geminal_move_table(prob);
     let init_states = build_initial_replica_states(prob, replicas, cfg.seed);
     let mut seeder = Rng::new(cfg.seed ^ 0x4350_555F_414E_4E4C);
     let rep_seeds: Vec<u64> = (0..replicas).map(|_| seeder.next_u64()).collect();
@@ -1379,6 +1661,7 @@ pub fn assign_methyl_cpu(
         for (r, (st, rseed)) in init_states.into_iter().zip(rep_seeds).enumerate() {
             let (bp, bsc) = run_single_cpu_replica(
                 prob,
+                &gem_tbl,
                 st,
                 CpuReplicaSchedule {
                     total_steps,
@@ -1399,6 +1682,7 @@ pub fn assign_methyl_cpu(
             .map(|(i, (st, sd))| (i, st, sd))
             .collect();
 
+        let gem_ref = &gem_tbl;
         let results: Vec<Vec<(usize, Vec<i32>, f64)>> = thread::scope(|scope| {
             let mut handles = Vec::new();
             for slice in indexed.chunks(chunk) {
@@ -1409,6 +1693,7 @@ pub fn assign_methyl_cpu(
                     for &(idx, ref st, rseed) in slice {
                         let (bp, bsc) = run_single_cpu_replica(
                             prob,
+                            gem_ref,
                             st.clone(),
                             CpuReplicaSchedule {
                                 total_steps,
@@ -1436,8 +1721,115 @@ pub fn assign_methyl_cpu(
     consensus_and_calibrate_methyl(prob, &all_positions, &all_raw_scores)
 }
 
-/// Combine completed replica assignments via Boltzmann-weighted consensus marginals AND exact
-/// local-swap Boltzmann specificity calibration (`docs/specs/13-methyl-trosy.md` §3.3).
+/// Detect non-identity global cyclic subunit automorphisms $\tau_k(m) = (m + k B) \bmod M$
+/// ($K = M / B \in \{2, 3, 4, 5, 6, 8, 10, 12\}$) of `prob` around `cons_pos`, returning
+/// `(perm_pos, delta_raw)` for every valid symmetry image with `delta_raw > -40.0`.
+fn detect_cyclic_subunit_symmetries(
+    prob: &MethylContactProblem,
+    cons_pos: &[i32],
+    final_raw: f64,
+) -> Vec<(Vec<i32>, f64)> {
+    let m_len = prob.m_len;
+    let s_len = prob.s_len;
+    let mut out = Vec::new();
+    if m_len < 4 {
+        return out;
+    }
+
+    for &k_sub in &[2usize, 3, 4, 5, 6, 8, 10, 12] {
+        if !m_len.is_multiple_of(k_sub) {
+            continue;
+        }
+        let block = m_len / k_sub;
+        if block == 0 {
+            continue;
+        }
+        // Quick structural pre-filter on intra-subunit distance invariance
+        let probe_m2 = 1.min(block - 1);
+        if block >= 2 {
+            let d0 = prob.d_mat[probe_m2];
+            let d1 = prob.d_mat[block * m_len + (block + probe_m2)];
+            if (d0 - d1).abs() > 0.15 {
+                continue;
+            }
+        }
+
+        for shift_k in 1..k_sub {
+            let off = shift_k * block;
+            let mut valid = true;
+            for m in 0..m_len {
+                let gm = prob.gem_site[m];
+                let mt = (m + off) % m_len;
+                let gmt = prob.gem_site[mt];
+                if gm >= 0 {
+                    if gmt != (((gm as usize) + off) % m_len) as i32 {
+                        valid = false;
+                        break;
+                    }
+                } else if gmt >= 0 {
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                continue;
+            }
+
+            let mut perm_pos = vec![-1i32; s_len];
+            let mut changed = false;
+            for s in 0..s_len {
+                let m = cons_pos[s];
+                if m >= 0 {
+                    let mt = ((m as usize) + off) % m_len;
+                    if prob.u_mat[s * m_len + mt] <= METHYL_FORBID_HALF {
+                        valid = false;
+                        break;
+                    }
+                    perm_pos[s] = mt as i32;
+                    if perm_pos[s] != m {
+                        changed = true;
+                    }
+                }
+            }
+            if !valid || !changed {
+                continue;
+            }
+            // Deduplicate identical images across composite divisors (e.g. K=2 and K=4 shift 2)
+            if out
+                .iter()
+                .any(|(existing, _): &(Vec<i32>, f64)| existing == &perm_pos)
+            {
+                continue;
+            }
+            let perm_raw = evaluate_methyl_raw_score(prob, &perm_pos);
+            let delta = perm_raw - final_raw;
+            if delta > -40.0 {
+                out.push((perm_pos, delta));
+            }
+        }
+    }
+    out
+}
+
+/// Monotone piecewise-linear reliability calibration mapping raw local-swap + replica marginal
+/// specificity onto empirically calibrated methyl assignment confidence in `[0.0, 1.0]`.
+#[inline]
+pub fn calibrate_methyl_confidence_monotone(raw_p: f64) -> f64 {
+    const KNOTS_X: [f64; 8] = [0.0, 0.08, 0.20, 0.38, 0.55, 0.72, 0.86, 1.00];
+    const KNOTS_Y: [f64; 8] = [0.0, 0.10, 0.36, 0.62, 0.81, 0.90, 0.95, 0.99];
+    let x = raw_p.clamp(0.0, 1.0);
+    for i in 0..(KNOTS_X.len() - 1) {
+        if x <= KNOTS_X[i + 1] {
+            let t = (x - KNOTS_X[i]) / (KNOTS_X[i + 1] - KNOTS_X[i]).max(1e-12);
+            return (KNOTS_Y[i] + t * (KNOTS_Y[i + 1] - KNOTS_Y[i])).clamp(0.0, 1.0);
+        }
+    }
+    KNOTS_Y[KNOTS_Y.len() - 1]
+}
+
+/// Combine completed replica assignments via Boltzmann-weighted consensus marginals, global
+/// $C_K$ symmetry-orbit accounting, exact local-swap Boltzmann specificity, and monotone
+/// reliability calibration (`docs/specs/13-methyl-trosy.md` §3.3).
 pub fn consensus_and_calibrate_methyl(
     prob: &MethylContactProblem,
     positions: &[Vec<i32>],
@@ -1463,12 +1855,12 @@ pub fn consensus_and_calibrate_methyl(
     ranked.sort_by(|&a, &b| raw_scores[b].total_cmp(&raw_scores[a]));
     let top_k = (n_runs / 2).max(4).min(n_runs);
     let max_raw = raw_scores[ranked[0]];
-    const TAU_REP: f64 = 3.5;
+    let tau_rep = (0.85 * (s_len as f64).sqrt()).clamp(3.5, 12.0);
 
     let mut rep_weights = Vec::with_capacity(top_k);
     let mut w_sum = 0.0f64;
     for &idx in &ranked[..top_k] {
-        let w = ((raw_scores[idx] - max_raw) / TAU_REP).max(-30.0).exp();
+        let w = ((raw_scores[idx] - max_raw) / tau_rep).max(-30.0).exp();
         rep_weights.push((idx, w));
         w_sum += w;
     }
@@ -1505,8 +1897,9 @@ pub fn consensus_and_calibrate_methyl(
         }
     }
 
-    // If single top replica achieved strictly higher raw score than marginal-merged state (rare tie),
-    // adopt the top replica's valid injection while preserving marginal probabilities
+    // If single top replica achieved strictly higher raw score than marginal-merged state (e.g.
+    // symmetric C2 homodimer where half the replicas choose Chain A and half choose Chain B),
+    // adopt the top replica's globally coherent injection.
     let top_pos = &positions[ranked[0]];
     let merged_raw = evaluate_methyl_raw_from_both(prob, &cons_at, &cons_pos);
     if max_raw > merged_raw + 0.5 {
@@ -1527,13 +1920,40 @@ pub fn consensus_and_calibrate_methyl(
     }
 
     let final_raw = evaluate_methyl_raw_from_both(prob, &cons_at, &cons_pos);
+    let sym_images = detect_cyclic_subunit_symmetries(prob, &cons_pos, final_raw);
+
+    // When exact/near-exact global cyclic symmetries exist (`|delta_sym| <= 0.25`), sum replica
+    // consensus across the symmetry orbit `{m*} U {perm_pos[s]}` so the 1/K symmetry factor is
+    // accounted for once (exact 1/K in `p_swap`) rather than double-counted as `(1/K)^2`.
+    if !sym_images.is_empty() {
+        for s in 0..s_len {
+            let m = cons_pos[s];
+            if m >= 0 {
+                let mut wt = 0.0;
+                for &(r_idx, w) in &rep_weights {
+                    let rm = positions[r_idx][s];
+                    let in_orbit = rm == m
+                        || sym_images
+                            .iter()
+                            .any(|(pp, d)| d.abs() <= 0.25 && pp[s] == rm);
+                    if in_orbit {
+                        wt += w;
+                    }
+                }
+                cons_prob[s] = wt / w_sum;
+            }
+        }
+    }
 
     // Local-swap Boltzmann specificity factor across:
-    // 1. All compatible single-site swaps m' != m* (including intraresidue prochiral flip),
-    // 2. Unassigning root s (m' = -1), and
-    // 3. Coupled 4-body geminal residue swaps (m*, gem(m*)) <-> (m3, gem(m3)) for Leu/Val pairs!
-    const TAU_SWAP: f64 = 3.0;
-    const TAU_GEM4_SWAP: f64 = 4.2;
+    // 1. Unassigning root s (m' = -1),
+    // 2. All compatible single-site swaps m' != m* (with broadened prochiral rotamer temperature),
+    // 3. Coupled 4-body geminal residue swaps (m*, gem(m*)) <-> (m3, gem(m3)) in both orientations,
+    // 4. Global cyclic subunit symmetry images (capping C_K degenerate sites at <= 1/K), and
+    // 5. Local structural-fit violation & low-degree damping.
+    const TAU_SWAP: f64 = 3.1;
+    const TAU_PROCHIRAL: f64 = 9.0;
+    const TAU_GEM4_SWAP: f64 = 3.8;
     let mut confidence = vec![0.0f64; s_len];
     let mut work_at = cons_at.clone();
     let mut work_pos = cons_pos.clone();
@@ -1545,18 +1965,36 @@ pub fn consensus_and_calibrate_methyl(
             continue;
         }
         let m_star = m_star_i as usize;
+        let m_gem_i = prob.gem_site[m_star];
         let mut alt_exp_sum = 0.0f64;
 
-        // 1. Unassigning s -> -1
-        {
+        // Global symmetry images moving root `s` to a distinct symmetry-mate site
+        for (perm_pos, delta_sym) in &sym_images {
+            if perm_pos[s] != m_star_i {
+                alt_exp_sum += (delta_sym / TAU_SWAP).clamp(-40.0, 20.0).exp();
+            }
+        }
+
+        // 1. Cardinality-preserving competition with unassigned peaks `u` (`work_pos[u] < 0`)
+        // when `S > M` (spurious/artifact peaks exist in the 2D HMQC peak list).
+        for u in 0..s_len {
+            let pu = work_pos[u];
+            if pu >= 0 || u == s {
+                continue;
+            }
+            if prob.u_mat[u * m_len + m_star] <= METHYL_FORBID_HALF {
+                continue;
+            }
             let m_sub = [m_star];
-            let s_sub = [s];
+            let s_sub = [s, u];
             let before = eval_subset_contrib(prob, &work_at, &work_pos, &m_sub, &s_sub);
-            work_at[m_star] = -1;
+            work_at[m_star] = u as i32;
             work_pos[s] = -1;
+            work_pos[u] = m_star as i32;
             let delta = eval_subset_contrib(prob, &work_at, &work_pos, &m_sub, &s_sub) - before;
             work_at[m_star] = s as i32;
             work_pos[s] = m_star as i32;
+            work_pos[u] = -1;
             alt_exp_sum += (delta / TAU_SWAP).clamp(-40.0, 20.0).exp();
         }
 
@@ -1592,11 +2030,22 @@ pub fn consensus_and_calibrate_methyl(
                 work_pos[t as usize] = m_alt as i32;
             }
 
-            alt_exp_sum += (delta / TAU_SWAP).clamp(-40.0, 20.0).exp();
+            if m_gem_i == m_alt as i32 {
+                // Non-stereospecifically labeled prochiral geminal methyls (Leu CD1/CD2, Val CG1/CG2)
+                // carry an irreducible crystallographic/solution chi_2 / chi_1 rotamer-flip baseline
+                // uncertainty unless stereospecifically labeled (Gans et al. 2010; Lovell et al. 2000).
+                let p_leu = prob
+                    .class_posteriors
+                    .get(s)
+                    .map_or(0.5, |cp| cp.prob(MethylResidueClass::Leu));
+                let rot_prior = 0.10 + 0.36 * p_leu;
+                alt_exp_sum += (delta / TAU_PROCHIRAL).clamp(-40.0, 20.0).exp() + rot_prior;
+            } else {
+                alt_exp_sum += (delta / TAU_SWAP).clamp(-40.0, 20.0).exp();
+            }
         }
 
         // 3. Coupled 4-body geminal swaps (m_star, m_gem) <-> (m3, m4) when m_star has a geminal partner
-        let m_gem_i = prob.gem_site[m_star];
         if m_gem_i >= 0 {
             let m_gem = m_gem_i as usize;
             let s_gem = work_at[m_gem];
@@ -1663,14 +2112,57 @@ pub fn consensus_and_calibrate_methyl(
             }
         }
 
-        let obs_deg = prob.obs_adj_offsets[s + 1] - prob.obs_adj_offsets[s];
-        let deg_cap = if obs_deg == 0 && prob.slots[s].len() > 1 {
-            0.72
+        // Local structural-fit check: count well-satisfied vs discrepant/violated observed NOEs at m_star
+        let o0 = prob.obs_adj_offsets[s] as usize;
+        let o1 = prob.obs_adj_offsets[s + 1] as usize;
+        let mut tot_wt = 0.0f64;
+        let mut viol_wt = 0.0f64;
+        let mut disc_wt = 0.0f64;
+        let mut n_sat = 0usize;
+        for entry in &prob.obs_adj_entries[o0..o1] {
+            let pm = work_pos[entry.peer_s as usize];
+            if pm >= 0 {
+                let w = entry.weight as f64;
+                tot_wt += w;
+                let d = prob.d_mat[m_star * m_len + (pm as usize)];
+                if d > prob.d_cutoff {
+                    viol_wt += w;
+                } else if (d - entry.d_hat) > 2.6 {
+                    disc_wt += 0.55 * w;
+                } else if (d - entry.d_hat).abs() <= 2.4 {
+                    n_sat += 1;
+                }
+            }
+        }
+        let support_factor = if prob.slots[s].len() <= 1 {
+            1.0
+        } else {
+            match n_sat {
+                0 => 0.62,
+                1 => 0.85,
+                _ => 1.0,
+            }
+        };
+        let fit_factor = if tot_wt > 0.0 {
+            let bad_frac = ((viol_wt + disc_wt) / tot_wt).clamp(0.0, 1.0);
+            (1.0 - 0.50 * bad_frac).clamp(0.45, 1.0)
         } else {
             1.0
         };
+
         let p_swap = 1.0 / (1.0 + alt_exp_sum);
-        confidence[s] = (cons_prob[s] * p_swap * deg_cap).clamp(0.0, 1.0);
+        let raw_p = (cons_prob[s] * p_swap * support_factor * fit_factor).clamp(0.0, 1.0);
+        // Preserve exact <= 1/K symmetry ceiling when global symmetries exist
+        let sym_ceil = {
+            let sym_den = 1.0
+                + sym_images
+                    .iter()
+                    .filter(|(pp, _)| pp[s] != m_star_i)
+                    .map(|(_, d)| (d / TAU_SWAP).clamp(-40.0, 20.0).exp())
+                    .sum::<f64>();
+            1.0 / sym_den
+        };
+        confidence[s] = calibrate_methyl_confidence_monotone(raw_p).min(sym_ceil);
     }
 
     MethylAssignResult {
@@ -1769,15 +2261,89 @@ pub fn write_methyl_star_assignments(
         .map_err(|e| format!("failed to write NMR-STAR {}: {e}", path.as_ref().display()))
 }
 
-/// Summary accuracy and high-confidence (`>= hc_threshold`) precision metrics against ground-truth shifts.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Summary accuracy, explicit high-confidence (`>= hc_threshold`) abstention status, and
+/// 4-bin reliability curve (`ProteinReliabilityCurve` / `ECE`) against ground-truth sites.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MethylBenchmarkMetrics {
     pub correct: usize,
     pub total_matched_roots: usize,
     pub accuracy_pct: f64,
     pub hc_correct: usize,
     pub hc_total: usize,
+    /// `true` when `hc_total == 0` (zero predictions at `>= hc_threshold`; never reported as `100.0%`).
+    pub hc_abstained: bool,
+    /// `Some(hc_correct as f64 / hc_total as f64)` in `[0.0, 1.0]` when `hc_total > 0`, else `None`.
+    pub hc_precision_opt: Option<f64>,
+    /// Percentage in `[0.0, 100.0]` when `hc_total > 0`; `0.0` when `hc_abstained`.
     pub hc_precision_pct: f64,
+    pub reliability: ProteinReliabilityCurve,
+}
+
+/// Canonical evaluation metrics alias carrying abstention-safe HC precision and `ProteinReliabilityCurve`.
+pub type MethylEvalMetrics = MethylBenchmarkMetrics;
+
+/// Evaluate methyl assignment accuracy, abstention-safe high-confidence precision, and
+/// `ProteinReliabilityCurve` (`ECE`) directly against known per-root structural site indices.
+pub fn evaluate_methyl_assignment_against_truth(
+    result: &MethylAssignResult,
+    root_truth: &[Option<usize>],
+    hc_threshold: f64,
+) -> MethylEvalMetrics {
+    let mut correct = 0usize;
+    let mut total = 0usize;
+    let mut hc_correct = 0usize;
+    let mut hc_total = 0usize;
+    let mut placed_preds: Vec<(f64, bool)> = Vec::new();
+
+    for (s, truth_opt) in root_truth.iter().copied().enumerate() {
+        let Some(true_m) = truth_opt else {
+            continue;
+        };
+        if s >= result.position.len() {
+            break;
+        }
+        total += 1;
+        let pred_m = result.position[s];
+        let is_ok = pred_m == true_m as i32;
+        if is_ok {
+            correct += 1;
+        }
+        if pred_m >= 0 {
+            let conf = result.confidence.get(s).copied().unwrap_or(0.0);
+            placed_preds.push((conf, is_ok));
+            if conf >= hc_threshold {
+                hc_total += 1;
+                if is_ok {
+                    hc_correct += 1;
+                }
+            }
+        }
+    }
+
+    let accuracy_pct = if total > 0 {
+        100.0 * (correct as f64) / (total as f64)
+    } else {
+        0.0
+    };
+    let (hc_abstained, hc_precision_opt, hc_precision_pct) = if hc_total == 0 {
+        (true, None, 0.0)
+    } else {
+        let p = (hc_correct as f64) / (hc_total as f64);
+        (false, Some(p), 100.0 * p)
+    };
+    let reliability = ProteinReliabilityCurve::from_predictions(&placed_preds, hc_threshold);
+
+    MethylBenchmarkMetrics {
+        correct,
+        total_matched_roots: total,
+        accuracy_pct,
+        hc_correct,
+        hc_total,
+        hc_abstained,
+        hc_precision_opt,
+        hc_precision_pct,
+        reliability,
+    }
 }
 
 /// Evaluate methyl assignment accuracy and high-confidence precision against a ground-truth `Reference`.
@@ -1818,46 +2384,5 @@ pub fn evaluate_methyl_assignment(
         }
     }
 
-    let mut correct = 0usize;
-    let mut total = 0usize;
-    let mut hc_correct = 0usize;
-    let mut hc_total = 0usize;
-
-    for (s, truth_opt) in root_truth.into_iter().enumerate() {
-        let Some(true_m) = truth_opt else {
-            continue;
-        };
-        total += 1;
-        let pred_m = result.position[s];
-        let is_ok = pred_m == true_m as i32;
-        if is_ok {
-            correct += 1;
-        }
-        if pred_m >= 0 && result.confidence[s] >= hc_threshold {
-            hc_total += 1;
-            if is_ok {
-                hc_correct += 1;
-            }
-        }
-    }
-
-    let accuracy_pct = if total > 0 {
-        100.0 * (correct as f64) / (total as f64)
-    } else {
-        0.0
-    };
-    let hc_precision_pct = if hc_total > 0 {
-        100.0 * (hc_correct as f64) / (hc_total as f64)
-    } else {
-        100.0
-    };
-
-    MethylBenchmarkMetrics {
-        correct,
-        total_matched_roots: total,
-        accuracy_pct,
-        hc_correct,
-        hc_total,
-        hc_precision_pct,
-    }
+    evaluate_methyl_assignment_against_truth(result, &root_truth, hc_threshold)
 }

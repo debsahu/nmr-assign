@@ -665,13 +665,43 @@ pub fn extract_methyl_structure_from_pdb_file(
     extract_methyl_structure_from_pdb_str(&text, scheme)
 }
 
-/// Extract active `StructuralMethylSite`s, aromatic rings, and `d_cc` from PDB text (first model).
+/// Extract active `StructuralMethylSite`s, aromatic rings, and `d_cc` from PDB text (first model,
+/// first polypeptide chain).
 pub fn extract_methyl_structure_from_pdb_str(
     pdb_text: &str,
     scheme: &MethylLabelingScheme,
 ) -> Result<MethylStructureModel, String> {
+    extract_methyl_structure_inner(pdb_text, scheme, false)
+}
+
+/// Extract active `StructuralMethylSite`s, aromatic rings, and `d_cc` across ALL chains in the
+/// first model of a multi-chain homooligomer / heterooligomer PDB file.
+pub fn extract_multichain_methyl_structure_from_pdb_file(
+    path: impl AsRef<Path>,
+    scheme: &MethylLabelingScheme,
+) -> Result<MethylStructureModel, String> {
+    let text = fs::read_to_string(path.as_ref())
+        .map_err(|e| format!("failed to read PDB {}: {e}", path.as_ref().display()))?;
+    extract_multichain_methyl_structure_from_pdb_str(&text, scheme)
+}
+
+/// Extract active `StructuralMethylSite`s, aromatic rings, and `d_cc` across ALL chains in the
+/// first model of multi-chain PDB text.
+pub fn extract_multichain_methyl_structure_from_pdb_str(
+    pdb_text: &str,
+    scheme: &MethylLabelingScheme,
+) -> Result<MethylStructureModel, String> {
+    extract_methyl_structure_inner(pdb_text, scheme, true)
+}
+
+fn extract_methyl_structure_inner(
+    pdb_text: &str,
+    scheme: &MethylLabelingScheme,
+    all_chains: bool,
+) -> Result<MethylStructureModel, String> {
     #[derive(Default)]
     struct RawResidue {
+        chain_id: char,
         seq_id: i32,
         res_name: String,
         atoms: BTreeMap<String, Vec3>,
@@ -694,12 +724,14 @@ pub fn extract_methyl_structure_from_pdb_str(
             continue;
         }
         let chain_id = bytes[21] as char;
-        if let Some(ch) = selected_chain {
-            if chain_id != ch {
-                continue;
+        if !all_chains {
+            if let Some(ch) = selected_chain {
+                if chain_id != ch {
+                    continue;
+                }
+            } else {
+                selected_chain = Some(chain_id);
             }
-        } else {
-            selected_chain = Some(chain_id);
         }
         if bytes[26] as char != ' ' {
             continue;
@@ -723,6 +755,7 @@ pub fn extract_methyl_structure_from_pdb_str(
         let r_idx = *idx_by_seq.entry((chain_id, seq_id)).or_insert_with(|| {
             let id = residues.len();
             residues.push(RawResidue {
+                chain_id,
                 seq_id,
                 res_name: res_name.clone(),
                 atoms: BTreeMap::new(),
@@ -780,16 +813,17 @@ pub fn extract_methyl_structure_from_pdb_str(
     let mut sites: Vec<StructuralMethylSite> = Vec::new();
     for (r_idx, raw) in residues.iter().enumerate() {
         let phi_psi = {
-            let prev_c = if r_idx > 0 {
+            let prev_c = if r_idx > 0 && residues[r_idx - 1].chain_id == raw.chain_id {
                 residues[r_idx - 1].atoms.get("C").copied()
             } else {
                 None
             };
-            let next_n = if r_idx + 1 < residues.len() {
-                residues[r_idx + 1].atoms.get("N").copied()
-            } else {
-                None
-            };
+            let next_n =
+                if r_idx + 1 < residues.len() && residues[r_idx + 1].chain_id == raw.chain_id {
+                    residues[r_idx + 1].atoms.get("N").copied()
+                } else {
+                    None
+                };
             match (
                 prev_c,
                 raw.atoms.get("N").copied(),
@@ -936,6 +970,193 @@ pub fn extract_methyl_structure_from_pdb_str(
         aromatic_rings,
         d_cc,
     })
+}
+
+/// Construct an exact $C_K$-symmetric homooligomer (`K >= 2`, e.g. $C_2$ homodimer or $C_6$
+/// homohexamer) from a monomer `MethylStructureModel` by applying cyclic $z$-axis rotations
+/// $R_z(2\pi k / K)$ after radial translation chosen so the minimum inter-subunit methyl `C-C`
+/// contact distance equals `min_inter_subunit_cc_angstrom`.
+pub fn build_cn_homooligomer_methyl_model(
+    monomer: &MethylStructureModel,
+    n_subunits: usize,
+    min_inter_subunit_cc_angstrom: f64,
+) -> MethylStructureModel {
+    assert!(
+        n_subunits >= 2,
+        "homooligomer requires n_subunits >= 2, got {n_subunits}"
+    );
+    let m0 = monomer.sites.len();
+    let r0 = monomer.sequence.len();
+    if m0 == 0 {
+        return MethylStructureModel {
+            sequence: (0..n_subunits)
+                .flat_map(|_| monomer.sequence.iter().cloned())
+                .collect(),
+            seq_ids: monomer.seq_ids.repeat(n_subunits),
+            scheme: monomer.scheme.clone(),
+            sites: Vec::new(),
+            aromatic_rings: Vec::new(),
+            d_cc: Vec::new(),
+        };
+    }
+
+    // Center monomer at its methyl carbon centroid
+    let mut cen = [0.0f64; 3];
+    for st in &monomer.sites {
+        cen = v_add(cen, st.carbon_xyz);
+    }
+    cen = v_scale(cen, 1.0 / (m0 as f64));
+
+    let rot_z = |p: Vec3, theta: f64| -> Vec3 {
+        let (s, c) = theta.sin_cos();
+        [c * p[0] - s * p[1], s * p[0] + c * p[1], p[2]]
+    };
+
+    let min_inter_at_radius = |radius: f64| -> f64 {
+        let mut min_d = f64::INFINITY;
+        for k in 1..n_subunits {
+            let th = TAU * (k as f64) / (n_subunits as f64);
+            for a in &monomer.sites {
+                let pa = [
+                    a.carbon_xyz[0] - cen[0] + radius,
+                    a.carbon_xyz[1] - cen[1],
+                    a.carbon_xyz[2] - cen[2],
+                ];
+                for b in &monomer.sites {
+                    let pb0 = [
+                        b.carbon_xyz[0] - cen[0] + radius,
+                        b.carbon_xyz[1] - cen[1],
+                        b.carbon_xyz[2] - cen[2],
+                    ];
+                    let pb = rot_z(pb0, th);
+                    let d = v_dist(pa, pb);
+                    if d < min_d {
+                        min_d = d;
+                    }
+                }
+            }
+        }
+        min_d
+    };
+
+    let target_gap = min_inter_subunit_cc_angstrom.max(3.5);
+    let mut lo = 0.0f64;
+    let mut hi = 60.0f64;
+    while min_inter_at_radius(hi) < target_gap && hi < 500.0 {
+        hi *= 1.8;
+    }
+    for _ in 0..44 {
+        let mid = 0.5 * (lo + hi);
+        if min_inter_at_radius(mid) < target_gap {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let radius = 0.5 * (lo + hi);
+
+    let mut sequence = Vec::with_capacity(r0 * n_subunits);
+    let mut seq_ids = Vec::with_capacity(r0 * n_subunits);
+    let mut aromatic_rings = Vec::with_capacity(monomer.aromatic_rings.len() * n_subunits);
+    let mut sites = Vec::with_capacity(m0 * n_subunits);
+
+    for k in 0..n_subunits {
+        let th = TAU * (k as f64) / (n_subunits as f64);
+        sequence.extend_from_slice(&monomer.sequence);
+        seq_ids.extend_from_slice(&monomer.seq_ids);
+
+        for ring in &monomer.aromatic_rings {
+            let rc0 = [
+                ring.center[0] - cen[0] + radius,
+                ring.center[1] - cen[1],
+                ring.center[2] - cen[2],
+            ];
+            aromatic_rings.push(AromaticRing {
+                seq_id: ring.seq_id,
+                res_name: ring.res_name.clone(),
+                center: rot_z(rc0, th),
+                normal: rot_z(ring.normal, th),
+                ring_factor: ring.ring_factor,
+            });
+        }
+    }
+
+    for k in 0..n_subunits {
+        let th = TAU * (k as f64) / (n_subunits as f64);
+        let site_base = k * m0;
+        let res_base = k * r0;
+        for st in &monomer.sites {
+            let c0 = [
+                st.carbon_xyz[0] - cen[0] + radius,
+                st.carbon_xyz[1] - cen[1],
+                st.carbon_xyz[2] - cen[2],
+            ];
+            let h0 = [
+                st.proton_centroid_xyz[0] - cen[0] + radius,
+                st.proton_centroid_xyz[1] - cen[1],
+                st.proton_centroid_xyz[2] - cen[2],
+            ];
+            let c_xyz = rot_z(c0, th);
+            let qh_xyz = rot_z(h0, th);
+
+            let mut rc_shift = 0.0;
+            let mut rc_var = 0.0;
+            for ring in &aromatic_rings {
+                let dv = v_sub(qh_xyz, ring.center);
+                let d = v_dist(qh_xyz, ring.center);
+                if (1.8..10.5).contains(&d) {
+                    let cos_th = v_dot(dv, ring.normal) / d;
+                    rc_shift +=
+                        12.0 * ring.ring_factor * (1.0 - 3.0 * cos_th * cos_th) / (d * d * d);
+                    let prox = 0.85 * ring.ring_factor * (5.0 / d.max(3.2)).powi(3);
+                    rc_var += prox * prox;
+                }
+            }
+
+            sites.push(StructuralMethylSite {
+                site_idx: site_base + st.site_idx,
+                residue_idx: res_base + st.residue_idx,
+                seq_id: st.seq_id,
+                res_name: st.res_name.clone(),
+                carbon_atom: st.carbon_atom,
+                kind: st.kind,
+                carbon_xyz: c_xyz,
+                proton_centroid_xyz: qh_xyz,
+                chi_deg: st.chi_deg,
+                geminal_partner: st.geminal_partner.map(|p| site_base + p),
+                ring_current_h_offset_ppm: rc_shift.clamp(-1.25, 0.65),
+                ring_current_h_extra_sd_ppm: rc_var.sqrt().min(1.10),
+                phi_psi_deg: st.phi_psi_deg,
+            });
+        }
+    }
+
+    let m_len = sites.len();
+    let mut d_cc = vec![0.0f64; m_len * m_len];
+    for i in 0..m_len {
+        for j in (i + 1)..m_len {
+            let d = v_dist(sites[i].carbon_xyz, sites[j].carbon_xyz);
+            d_cc[i * m_len + j] = d;
+            d_cc[j * m_len + i] = d;
+        }
+    }
+
+    MethylStructureModel {
+        sequence,
+        seq_ids,
+        scheme: monomer.scheme.clone(),
+        sites,
+        aromatic_rings,
+        d_cc,
+    }
+}
+
+/// Convenience builder for an exact $C_2$-symmetric homodimer (`2 * M` sites).
+pub fn build_c2_homodimer_methyl_model(
+    monomer: &MethylStructureModel,
+    min_inter_subunit_cc_angstrom: f64,
+) -> MethylStructureModel {
+    build_cn_homooligomer_methyl_model(monomer, 2, min_inter_subunit_cc_angstrom)
 }
 
 fn resolve_methyl_and_parent_xyz(
