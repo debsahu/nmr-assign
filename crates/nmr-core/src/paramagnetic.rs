@@ -2338,12 +2338,37 @@ pub struct DeltaChiTensor {
     pub rhombicity: f64,
     /// ZYZ Euler angles $(\alpha, \beta, \gamma)$ in radians (`R = R_z(γ) * R_y(β) * R_z(α)`).
     pub euler_zyz_rad: [f64; 3],
+    /// Fitted additive constant PCS referencing offset $\delta_{\text{off}}$ in ppm (`0.0` when `fit_offset == false`).
+    #[serde(default)]
+    pub pcs_offset_ppm: f64,
     /// Root-mean-square PCS residual (ppm).
     pub rmsd_ppm: f64,
     /// Cornilescu-style PCS quality factor $Q = \sqrt{\sum(\Delta\delta^{\text{obs}} - \Delta\delta^{\text{calc}})^2 / \sum(\Delta\delta^{\text{obs}})^2}$.
     pub q_factor: f64,
-    /// Singular value condition number $\sigma_{\max} / \sigma_{\min}$ of the $N \times 5$ design matrix.
+    /// Singular value condition number $\sigma_{\max} / \sigma_{\min}$ of the $N \times 5$ (or $N \times 6$) design matrix.
     pub condition_number: f64,
+}
+
+/// Configuration options for linear and variable-projection (`VarPro`) pseudocontact shift (`PCS`) fitting.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PcsFitOptions {
+    /// Jointly fit a constant inter-sample referencing offset $\delta_{\text{off}}$ (ppm) alongside the
+    /// 5 traceless $\Delta\boldsymbol{\chi}$ components (`6` linear parameters; `9` total in `VarPro`).
+    pub fit_offset: bool,
+    /// Optional standardized-residual Huber IRLS threshold $k_{\text{Huber}} > 0$ (`None` uses exact GLS/SVD).
+    pub huber_k: Option<f64>,
+    /// Maximum Huber IRLS iterations when `huber_k` is `Some(...)` (default `25`).
+    pub max_irls_iters: usize,
+}
+
+impl Default for PcsFitOptions {
+    fn default() -> Self {
+        Self {
+            fit_offset: false,
+            huber_k: None,
+            max_irls_iters: 25,
+        }
+    }
 }
 
 /// Construct a proper right-handed rotation matrix $R = R_z(\gamma) R_y(\beta) R_z(\alpha) \in SO(3)$
@@ -2416,14 +2441,17 @@ pub fn predict_pcs_spherical_ppm(
         * (dchi_ax * (3.0 * cos2_theta - 1.0) + 1.5 * dchi_rh * sin2_cos2phi)
 }
 
-/// Predict pseudocontact shift (ppm) directly from a fitted [`DeltaChiTensor`].
+/// Predict pseudocontact shift (ppm) directly from a fitted [`DeltaChiTensor`]
+/// (including `tensor.pcs_offset_ppm`, which is `0.0` for standard 5-parameter fits).
 #[inline]
 pub fn predict_pcs_from_tensor(coord: Vec3, tensor: &DeltaChiTensor) -> f64 {
     let row = pcs_design_row(coord, tensor.metal_pos_angstrom);
-    row.iter()
+    let dipolar: f64 = row
+        .iter()
         .zip(&tensor.components_5)
         .map(|(&r, &c)| r * c)
-        .sum()
+        .sum();
+    dipolar + tensor.pcs_offset_ppm
 }
 
 /// Exact 5-component traceless Cartesian design-matrix row for $\mathbf{x} = [\Delta\chi_{xx}, \Delta\chi_{yy}, \Delta\chi_{xy}, \Delta\chi_{xz}, \Delta\chi_{yz}]^T$:
@@ -2498,32 +2526,41 @@ fn validate_pcs_observation_slice(obs: &[PcsObservation], min_count: usize) -> R
     Ok(())
 }
 
-/// Self-contained thin Hestenes one-sided Jacobi Singular Value Decomposition of an $N \times 5$
-/// matrix $A = U \Sigma V^T$ ($N \ge 6$), solving $A x \approx b$ in least squares without squaring $\kappa(A)$.
-fn solve_nx5_svd(a_rows: &[[f64; 5]], b: &[f64]) -> Result<([f64; 5], f64), String> {
+/// Dimensionless equilibration scale for the optional 6th constant-offset column in PCS SVD so its
+/// Euclidean norm matches the $\mathcal{O}(0.1)$ dipolar design columns at $r \sim 10\text{–}30\text{ Å}$.
+const PCS_OFFSET_COL_SCALE: f64 = 0.1;
+
+/// Self-contained thin Hestenes one-sided Jacobi Singular Value Decomposition of an $N \times K$
+/// matrix $A = U \Sigma V^T$ ($K \in \{5, 6\}$, $N \ge K + 1$), solving $A x \approx b$ in least squares
+/// without squaring $\kappa(A)$.
+fn solve_nxk_svd<const K: usize>(
+    a_rows: &[[f64; K]],
+    b: &[f64],
+) -> Result<([f64; K], f64), String> {
     let n = a_rows.len();
-    if n < 6 || b.len() != n {
+    if n < K + 1 || b.len() != n {
         return Err(format!(
-            "5-parameter PCS tensor SVD requires at least 6 observations (>= 1 DoF, got {n})"
+            "{K}-parameter PCS tensor SVD requires at least {} observations (>= 1 DoF, got {n})",
+            K + 1
         ));
     }
     if a_rows.iter().any(|r| r.iter().any(|v| !v.is_finite())) || b.iter().any(|v| !v.is_finite()) {
         return Err("non-finite entry in PCS design matrix or observation vector".to_string());
     }
 
-    // Store columns w_0..w_4 of length n; initialize V = I_5
-    let mut cols: Vec<Vec<f64>> = (0..5)
+    // Store columns w_0..w_{K-1} of length n; initialize V = I_K
+    let mut cols: Vec<Vec<f64>> = (0..K)
         .map(|j| a_rows.iter().map(|r| r[j]).collect())
         .collect();
-    let mut v = [[0.0_f64; 5]; 5];
+    let mut v = [[0.0_f64; K]; K];
     for (j, row) in v.iter_mut().enumerate() {
         row[j] = 1.0;
     }
 
-    for _sweep in 0..40 {
+    for _sweep in 0..45 {
         let mut max_off = 0.0_f64;
-        for p in 0..5 {
-            for q in (p + 1)..5 {
+        for p in 0..K {
+            for q in (p + 1)..K {
                 let mut app = 0.0_f64;
                 let mut aqq = 0.0_f64;
                 let mut apq = 0.0_f64;
@@ -2568,8 +2605,8 @@ fn solve_nx5_svd(a_rows: &[[f64; 5]], b: &[f64]) -> Result<([f64; 5], f64), Stri
         }
     }
 
-    let mut sigmas = [0.0_f64; 5];
-    for j in 0..5 {
+    let mut sigmas = [0.0_f64; K];
+    for j in 0..K {
         let norm_sq: f64 = cols[j].iter().map(|&val| val * val).sum();
         sigmas[j] = norm_sq.sqrt();
     }
@@ -2588,14 +2625,14 @@ fn solve_nx5_svd(a_rows: &[[f64; 5]], b: &[f64]) -> Result<([f64; 5], f64), Stri
         ));
     }
 
-    let mut x = [0.0_f64; 5];
-    for j in 0..5 {
+    let mut x = [0.0_f64; K];
+    for j in 0..K {
         let mut ut_b = 0.0_f64;
         for i in 0..n {
             ut_b += (cols[j][i] / sigmas[j]) * b[i];
         }
         let coeff = ut_b / sigmas[j];
-        for k in 0..5 {
+        for k in 0..K {
             x[k] += coeff * v[k][j];
         }
     }
@@ -2663,6 +2700,7 @@ fn jacobi_sym_3x3(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
 fn build_delta_chi_tensor(
     metal_pos: Vec3,
     x: [f64; 5],
+    pcs_offset_ppm: f64,
     cond: f64,
     obs: &[PcsObservation],
 ) -> DeltaChiTensor {
@@ -2719,7 +2757,7 @@ fn build_delta_chi_tensor(
     let mut sum_sq_obs = 0.0_f64;
     for o in obs {
         let row = pcs_design_row(o.coord_angstrom, metal_pos);
-        let calc: f64 = (0..5).map(|j| row[j] * x[j]).sum();
+        let calc: f64 = (0..5).map(|j| row[j] * x[j]).sum::<f64>() + pcs_offset_ppm;
         let diff = o.pcs_ppm - calc;
         sum_sq_err += diff * diff;
         sum_sq_obs += o.pcs_ppm * o.pcs_ppm;
@@ -2745,6 +2783,7 @@ fn build_delta_chi_tensor(
         dchi_rh,
         rhombicity,
         euler_zyz_rad,
+        pcs_offset_ppm,
         rmsd_ppm,
         q_factor,
         condition_number: cond,
@@ -2755,7 +2794,7 @@ fn build_delta_chi_tensor(
 /// `o.uncertainty_ppm` and isotropic 3D RMS nuclear coordinate uncertainty
 /// `o.coord_uncertainty_angstrom` propagated analytically via $\nabla_{\mathbf{r}}\Delta\delta^{\text{PCS}}$
 /// (`Schmitz et al. 2008`).
-fn effective_pcs_sigma_ppm(o: &PcsObservation, metal_pos: Vec3, x: &[f64; 5]) -> f64 {
+pub fn effective_pcs_sigma_ppm(o: &PcsObservation, metal_pos: Vec3, x: &[f64; 5]) -> f64 {
     let sig_ppm = o.uncertainty_ppm.max(1e-12);
     if o.coord_uncertainty_angstrom <= 1e-9 {
         return sig_ppm;
@@ -2792,24 +2831,90 @@ fn effective_pcs_sigma_ppm(o: &PcsObservation, metal_pos: Vec3, x: &[f64; 5]) ->
     (sig_ppm * sig_ppm + var_coord).sqrt().max(1e-12)
 }
 
-/// Fit the 5-parameter traceless symmetric $\Delta\boldsymbol{\chi}$ tensor at fixed metal position
-/// `metal_pos_angstrom` via weighted linear SVD, with optional analytic coordinate-gradient GLS
-/// error propagation (`Schmitz et al., J. Biomol. NMR 2008`).
-pub fn fit_pcs_tensor_svd(
+/// Twice the heteroscedastic Gaussian negative log-likelihood (omitting additive constant $N\ln(2\pi)$):
+/// $$\mathcal{L}_{2\text{NLL}}(\mathbf{x}_M, \Delta\boldsymbol{\chi}, \delta_{\text{off}}) = \sum_{i=1}^N \left[\left(\frac{\Delta\delta^{\text{obs}}_i - \Delta\delta^{\text{calc}}_i}{\sigma_{\text{eff},i}(\mathbf{x}_M)}\right)^2 + 2\ln\sigma_{\text{eff},i}(\mathbf{x}_M)\right].$$
+///
+/// Including $+2\ln\sigma_{\text{eff},i}(\mathbf{x}_M)$ prevents `VarPro` metal-position optimization from
+/// artificially inflating coordinate-gradient uncertainty $\sigma_{\text{eff},i}(\mathbf{x}_M)$ by moving
+/// $\mathbf{x}_M$ close to uncertain nuclei or inflating $\|\Delta\boldsymbol{\chi}\|$.
+pub fn pcs_gaussian_two_nll(obs: &[PcsObservation], tensor: &DeltaChiTensor) -> f64 {
+    let mut two_nll = 0.0_f64;
+    for o in obs {
+        let pred = predict_pcs_from_tensor(o.coord_angstrom, tensor);
+        let sig = effective_pcs_sigma_ppm(o, tensor.metal_pos_angstrom, &tensor.components_5);
+        let z = (o.pcs_ppm - pred) / sig;
+        two_nll += z * z + 2.0 * sig.ln();
+    }
+    two_nll
+}
+
+fn solve_pcs_linear_step(
     obs: &[PcsObservation],
     metal_pos_angstrom: Vec3,
+    weights: &[f64],
+    fit_offset: bool,
+) -> Result<([f64; 5], f64, f64), String> {
+    if fit_offset {
+        let mut a6 = Vec::with_capacity(obs.len());
+        let mut b_vec = Vec::with_capacity(obs.len());
+        for (o, &w) in obs.iter().zip(weights.iter()) {
+            let r5 = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
+            a6.push([
+                r5[0] * w,
+                r5[1] * w,
+                r5[2] * w,
+                r5[3] * w,
+                r5[4] * w,
+                PCS_OFFSET_COL_SCALE * w,
+            ]);
+            b_vec.push(o.pcs_ppm * w);
+        }
+        let (x6, cond) = solve_nxk_svd::<6>(&a6, &b_vec)?;
+        let x5 = [x6[0], x6[1], x6[2], x6[3], x6[4]];
+        let off = x6[5] * PCS_OFFSET_COL_SCALE;
+        Ok((x5, off, cond))
+    } else {
+        let mut a5 = Vec::with_capacity(obs.len());
+        let mut b_vec = Vec::with_capacity(obs.len());
+        for (o, &w) in obs.iter().zip(weights.iter()) {
+            let mut r5 = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
+            for v in &mut r5 {
+                *v *= w;
+            }
+            a5.push(r5);
+            b_vec.push(o.pcs_ppm * w);
+        }
+        let (x5, cond) = solve_nxk_svd::<5>(&a5, &b_vec)?;
+        Ok((x5, 0.0, cond))
+    }
+}
+
+/// Fit the traceless symmetric $\Delta\boldsymbol{\chi}$ tensor (and optional constant referencing offset
+/// $\delta_{\text{off}}$ when `opts.fit_offset == true`) at fixed metal position `metal_pos_angstrom` via
+/// weighted linear SVD, analytic coordinate-gradient GLS (`Schmitz et al. 2008`), and optional standardized
+/// Huber IRLS (`opts.huber_k`).
+pub fn fit_pcs_tensor_with_options(
+    obs: &[PcsObservation],
+    metal_pos_angstrom: Vec3,
+    opts: &PcsFitOptions,
 ) -> Result<DeltaChiTensor, String> {
     if !metal_pos_angstrom.iter().all(|v| v.is_finite()) {
         return Err(format!(
             "non-finite metal coordinate {metal_pos_angstrom:?} in PCS tensor SVD fit"
         ));
     }
-    validate_pcs_observation_slice(obs, 6)?;
+    if let Some(hk) = opts.huber_k {
+        if !hk.is_finite() || hk <= 0.0 {
+            return Err(format!(
+                "invalid huber_k ({hk}): dimensionless Huber threshold must be finite and > 0"
+            ));
+        }
+    }
+    let min_obs = if opts.fit_offset { 7 } else { 6 };
+    validate_pcs_observation_slice(obs, min_obs)?;
 
-    let mut a_rows = Vec::with_capacity(obs.len());
-    let mut b_vec = Vec::with_capacity(obs.len());
+    let mut weights = Vec::with_capacity(obs.len());
     let mut has_coord_unc = false;
-
     for o in obs {
         let r = v_dist(o.coord_angstrom, metal_pos_angstrom);
         if r < 1.2 {
@@ -2821,38 +2926,72 @@ pub fn fit_pcs_tensor_svd(
         if o.coord_uncertainty_angstrom > 1e-9 {
             has_coord_unc = true;
         }
-        let w = 1.0 / o.uncertainty_ppm.max(1e-12);
-        let mut row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
-        for v in &mut row {
-            *v *= w;
-        }
-        a_rows.push(row);
-        b_vec.push(o.pcs_ppm * w);
+        weights.push(1.0 / o.uncertainty_ppm.max(1e-12));
     }
 
-    let (mut x, mut cond) = solve_nx5_svd(&a_rows, &b_vec)?;
+    let (mut x, mut off, mut cond) =
+        solve_pcs_linear_step(obs, metal_pos_angstrom, &weights, opts.fit_offset)?;
 
-    // Analytic coordinate-uncertainty error propagation (Schmitz et al. 2008)
+    // Analytic coordinate-uncertainty GLS propagation (Schmitz et al. 2008)
     if has_coord_unc {
         for _ in 0..2 {
-            a_rows.clear();
-            b_vec.clear();
-            for o in obs {
-                let w = 1.0 / effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
-                let mut row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
-                for v in &mut row {
-                    *v *= w;
-                }
-                a_rows.push(row);
-                b_vec.push(o.pcs_ppm * w);
+            for (w_slot, o) in weights.iter_mut().zip(obs.iter()) {
+                *w_slot = 1.0 / effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
             }
-            let (x_gls, cond_gls) = solve_nx5_svd(&a_rows, &b_vec)?;
+            let (x_gls, off_gls, cond_gls) =
+                solve_pcs_linear_step(obs, metal_pos_angstrom, &weights, opts.fit_offset)?;
             x = x_gls;
+            off = off_gls;
             cond = cond_gls;
         }
     }
 
-    Ok(build_delta_chi_tensor(metal_pos_angstrom, x, cond, obs))
+    // Optional standardized-residual Huber IRLS
+    if let Some(hk) = opts.huber_k {
+        let k = hk.max(1e-6);
+        for _ in 0..opts.max_irls_iters.max(1) {
+            for (w_slot, o) in weights.iter_mut().zip(obs.iter()) {
+                let base_row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
+                let pred: f64 = base_row.iter().zip(&x).map(|(&r, &c)| r * c).sum::<f64>() + off;
+                let sig_eff = effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
+                let z_i = (o.pcs_ppm - pred).abs() / sig_eff;
+                let huber_w = if z_i <= k { 1.0 } else { (k / z_i).sqrt() };
+                *w_slot = huber_w / sig_eff;
+            }
+            let (x_new, off_new, new_cond) =
+                solve_pcs_linear_step(obs, metal_pos_angstrom, &weights, opts.fit_offset)?;
+            let step_sq = x_new
+                .iter()
+                .zip(&x)
+                .map(|(&xn, &xo)| (xn - xo).powi(2))
+                .sum::<f64>()
+                + (off_new - off).powi(2);
+            x = x_new;
+            off = off_new;
+            cond = new_cond;
+            if step_sq.sqrt() < 1e-10 {
+                break;
+            }
+        }
+    }
+
+    Ok(build_delta_chi_tensor(
+        metal_pos_angstrom,
+        x,
+        off,
+        cond,
+        obs,
+    ))
+}
+
+/// Fit the 5-parameter traceless symmetric $\Delta\boldsymbol{\chi}$ tensor at fixed metal position
+/// `metal_pos_angstrom` via weighted linear SVD, with optional analytic coordinate-gradient GLS
+/// error propagation (`Schmitz et al., J. Biomol. NMR 2008`).
+pub fn fit_pcs_tensor_svd(
+    obs: &[PcsObservation],
+    metal_pos_angstrom: Vec3,
+) -> Result<DeltaChiTensor, String> {
+    fit_pcs_tensor_with_options(obs, metal_pos_angstrom, &PcsFitOptions::default())
 }
 
 /// Exclude pseudocontact shift (`PCS`) observations that fall inside the paramagnetic `PRE` core
@@ -2907,49 +3046,15 @@ pub fn fit_pcs_tensor_robust(
     huber_k: f64,
     max_iters: usize,
 ) -> Result<DeltaChiTensor, String> {
-    if !huber_k.is_finite() || huber_k <= 0.0 {
-        return Err(format!(
-            "invalid huber_k ({huber_k}): dimensionless Huber threshold must be finite and > 0"
-        ));
-    }
-    let init = fit_pcs_tensor_svd(obs, metal_pos_angstrom)?;
-    let k = huber_k.max(1e-6);
-    let mut x = init.components_5;
-    let mut cond = init.condition_number;
-
-    for _ in 0..max_iters.max(1) {
-        let mut a_rows = Vec::with_capacity(obs.len());
-        let mut b_vec = Vec::with_capacity(obs.len());
-        for o in obs {
-            let base_row = pcs_design_row(o.coord_angstrom, metal_pos_angstrom);
-            let pred: f64 = base_row.iter().zip(&x).map(|(&r, &c)| r * c).sum();
-            let sig_eff = effective_pcs_sigma_ppm(o, metal_pos_angstrom, &x);
-            let z_i = (o.pcs_ppm - pred).abs() / sig_eff;
-            let base_w = 1.0 / sig_eff;
-            let huber_w = if z_i <= k { 1.0 } else { (k / z_i).sqrt() };
-            let w = base_w * huber_w;
-            let mut row = base_row;
-            for v in &mut row {
-                *v *= w;
-            }
-            a_rows.push(row);
-            b_vec.push(o.pcs_ppm * w);
-        }
-        let (x_new, new_cond) = solve_nx5_svd(&a_rows, &b_vec)?;
-        let step_norm: f64 = x_new
-            .iter()
-            .zip(&x)
-            .map(|(&xn, &xo)| (xn - xo).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        x = x_new;
-        cond = new_cond;
-        if step_norm < 1e-10 {
-            break;
-        }
-    }
-
-    Ok(build_delta_chi_tensor(metal_pos_angstrom, x, cond, obs))
+    fit_pcs_tensor_with_options(
+        obs,
+        metal_pos_angstrom,
+        &PcsFitOptions {
+            fit_offset: false,
+            huber_k: Some(huber_k),
+            max_irls_iters: max_iters,
+        },
+    )
 }
 
 /// Automatically exclude core blind-sphere ($p_{\text{bleach}} \ge \text{hard\_bleach\_cutoff}$) and
@@ -2980,16 +3085,17 @@ pub fn fit_pcs_tensor_paramagnetic(
     Ok((tensor, filtered))
 }
 
-/// Variable-projection (`VarPro`) 3D metal-position and 5-parameter $\Delta\boldsymbol{\chi}$-tensor
-/// refinement (`Schmitz et al. 2008`) strictly bounded to the ball
-/// $\|\mathbf{x}_{\text{M}} - \text{initial\_metal\_pos}\|_2 \le \text{search\_radius\_angstrom}$:
-/// coarse 3D grid search around `initial_metal_pos` followed by constrained 3D Nelder–Mead simplex
-/// optimization, solving exact 5-component linear SVD at every candidate site.
-pub fn refine_metal_position_and_tensor(
+/// Variable-projection (`VarPro`) 3D metal-position and $\Delta\boldsymbol{\chi}$-tensor (plus optional
+/// constant referencing offset $\delta_{\text{off}}$ when `opts.fit_offset == true`) refinement
+/// (`Golub & Pereyra, SIAM J. Numer. Anal. 1973, 10, 413–432`; `Schmitz et al. 2008`) strictly bounded
+/// to $\|\mathbf{x}_{\text{M}} - \text{initial\_metal\_pos}\|_2 \le \text{search\_radius\_angstrom}$,
+/// minimizing exact twice-negative heteroscedastic Gaussian log-likelihood [`pcs_gaussian_two_nll`].
+pub fn refine_metal_position_and_tensor_with_options(
     obs: &[PcsObservation],
     initial_metal_pos: Vec3,
     search_radius_angstrom: f64,
     grid_step_angstrom: f64,
+    opts: &PcsFitOptions,
 ) -> Result<DeltaChiTensor, String> {
     if !initial_metal_pos.iter().all(|v| v.is_finite())
         || !search_radius_angstrom.is_finite()
@@ -3004,19 +3110,20 @@ pub fn refine_metal_position_and_tensor(
             "negative search_radius_angstrom ({search_radius_angstrom}) in VarPro PCS refinement"
         ));
     }
-    validate_pcs_observation_slice(obs, 8)?;
-    if obs.len() < 8 {
+    let min_obs = if opts.fit_offset { 9 } else { 8 };
+    validate_pcs_observation_slice(obs, min_obs)?;
+    if obs.len() < min_obs {
         return Err(format!(
-            "joint 8-parameter metal-position + DeltaChi refinement requires >= 8 PCS observations, got {}",
+            "joint {min_obs}-parameter metal-position + DeltaChi refinement requires >= {min_obs} PCS observations, got {}",
             obs.len()
         ));
     }
     if search_radius_angstrom == 0.0 {
-        return fit_pcs_tensor_svd(obs, initial_metal_pos);
+        return fit_pcs_tensor_with_options(obs, initial_metal_pos, opts);
     }
 
     let rad = search_radius_angstrom;
-    let eval_chi2 = |m: Vec3| -> f64 {
+    let eval_two_nll = |m: Vec3| -> f64 {
         if v_dist(m, initial_metal_pos) > rad + 1e-12 {
             return 1e30;
         }
@@ -3025,16 +3132,14 @@ pub fn refine_metal_position_and_tensor(
                 return 1e30;
             }
         }
-        match fit_pcs_tensor_svd(obs, m) {
+        match fit_pcs_tensor_with_options(obs, m, opts) {
             Ok(t) => {
-                let mut chi2 = 0.0_f64;
-                for o in obs {
-                    let pred = predict_pcs_from_tensor(o.coord_angstrom, &t);
-                    let sig = effective_pcs_sigma_ppm(o, m, &t.components_5);
-                    let z = (o.pcs_ppm - pred) / sig;
-                    chi2 += z * z;
+                let nll = pcs_gaussian_two_nll(obs, &t);
+                if nll.is_finite() {
+                    nll
+                } else {
+                    1e30
                 }
-                chi2
             }
             Err(_) => 1e30,
         }
@@ -3042,7 +3147,7 @@ pub fn refine_metal_position_and_tensor(
 
     // Stage 1: Coarse 3D grid search inside ||dm||_2 <= rad
     let mut best_m = initial_metal_pos;
-    let mut best_f = eval_chi2(initial_metal_pos);
+    let mut best_f = eval_two_nll(initial_metal_pos);
     let step = grid_step_angstrom.max(0.25);
     let n_steps = (rad / step).ceil() as isize;
     for ix in -n_steps..=n_steps {
@@ -3057,7 +3162,7 @@ pub fn refine_metal_position_and_tensor(
                     initial_metal_pos[1] + dm[1],
                     initial_metal_pos[2] + dm[2],
                 ];
-                let f = eval_chi2(cand);
+                let f = eval_two_nll(cand);
                 if f < best_f {
                     best_f = f;
                     best_m = cand;
@@ -3078,7 +3183,7 @@ pub fn refine_metal_position_and_tensor(
                 v[axis] = 0.5 * (best_m[axis] + initial_metal_pos[axis]);
             }
         }
-        simplex[axis + 1] = (v, eval_chi2(v));
+        simplex[axis + 1] = (v, eval_two_nll(v));
     }
 
     for _iter in 0..200 {
@@ -3099,7 +3204,7 @@ pub fn refine_metal_position_and_tensor(
             centroid[1] + (centroid[1] - worst[1]),
             centroid[2] + (centroid[2] - worst[2]),
         ];
-        let f_ref = eval_chi2(reflected);
+        let f_ref = eval_two_nll(reflected);
 
         if f_ref < simplex[0].1 {
             let expanded = [
@@ -3107,7 +3212,7 @@ pub fn refine_metal_position_and_tensor(
                 centroid[1] + 2.0 * (reflected[1] - centroid[1]),
                 centroid[2] + 2.0 * (reflected[2] - centroid[2]),
             ];
-            let f_exp = eval_chi2(expanded);
+            let f_exp = eval_two_nll(expanded);
             simplex[3] = if f_exp < f_ref {
                 (expanded, f_exp)
             } else {
@@ -3129,7 +3234,7 @@ pub fn refine_metal_position_and_tensor(
                     centroid[2] + 0.5 * (worst[2] - centroid[2]),
                 ]
             };
-            let f_con = eval_chi2(contracted);
+            let f_con = eval_two_nll(contracted);
             if f_con < simplex[3].1 {
                 simplex[3] = (contracted, f_con);
             } else {
@@ -3138,12 +3243,32 @@ pub fn refine_metal_position_and_tensor(
                     for (coord_val, &b_val) in item.0.iter_mut().zip(&best_pt) {
                         *coord_val = b_val + 0.5 * (*coord_val - b_val);
                     }
-                    item.1 = eval_chi2(item.0);
+                    item.1 = eval_two_nll(item.0);
                 }
             }
         }
     }
 
     simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
-    fit_pcs_tensor_svd(obs, simplex[0].0)
+    fit_pcs_tensor_with_options(obs, simplex[0].0, opts)
+}
+
+/// Variable-projection (`VarPro`) 3D metal-position and 5-parameter $\Delta\boldsymbol{\chi}$-tensor
+/// refinement (`Schmitz et al. 2008`) strictly bounded to the ball
+/// $\|\mathbf{x}_{\text{M}} - \text{initial\_metal\_pos}\|_2 \le \text{search\_radius\_angstrom}$:
+/// coarse 3D grid search around `initial_metal_pos` followed by constrained 3D Nelder–Mead simplex
+/// optimization minimizing exact heteroscedastic Gaussian `2 * NLL`.
+pub fn refine_metal_position_and_tensor(
+    obs: &[PcsObservation],
+    initial_metal_pos: Vec3,
+    search_radius_angstrom: f64,
+    grid_step_angstrom: f64,
+) -> Result<DeltaChiTensor, String> {
+    refine_metal_position_and_tensor_with_options(
+        obs,
+        initial_metal_pos,
+        search_radius_angstrom,
+        grid_step_angstrom,
+        &PcsFitOptions::default(),
+    )
 }
