@@ -1,0 +1,1738 @@
+# BMRB ID: bmr15594
+# Related wwPDB ID: 1KSM (https://files.rcsb.org/download/1KSM.pdb, wwPDB CC0 1.0 Public Domain)
+# Protein: Bovine Calbindin D9k (P43M, 75 aa) in presence of paramagnetic Yb3+ at EF-hand site II
+# Fold class: paramagnetic lanthanide EF-hand metalloprotein (pseudocontact shifts + PRE)
+# Literature: Barnwal, R. P., Rout, A. K., Chary, K. V. R. & Atreya, H. S., Open Magn. Reson. J. 2008, 1, 16-28
+# Source: BioMagResBank (https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr15594/bmr15594_3.str, CC0 1.0 Public Domain)
+# Upstream SHA-256: 7f16905c3c3d7705a8a6c53e330e41fcc3e4097aa4e0dae3f6727d1001ed781d
+data_15594
+
+#######################
+#  Entry information  #
+#######################
+
+save_entry_information
+   _Entry.Sf_category                    entry_information
+   _Entry.Sf_framecode                   entry_information
+   _Entry.ID                             15594
+   _Entry.Title                         
+;
+Rapid Measurement of Pseudocontact Shifts in Paramagnetic Proteins by GFT NMR Spectroscopy
+;
+   _Entry.Type                           macromolecule
+   _Entry.Version_type                   original
+   _Entry.Submission_date                2007-12-13
+   _Entry.Accession_date                 2007-12-13
+   _Entry.Last_release_date              .
+   _Entry.Original_release_date          .
+   _Entry.Origination                    author
+   _Entry.NMR_STAR_version               3.1.1.61
+   _Entry.Original_NMR_STAR_version      3.0.8.112
+   _Entry.Experimental_method            NMR
+   _Entry.Experimental_method_subtype    solution
+   _Entry.Details                       'This deposition contains all assignments of calbindin with Yb3+.'
+   _Entry.BMRB_internal_directory_name   .
+
+   loop_
+      _Entry_author.Ordinal
+      _Entry_author.Given_name
+      _Entry_author.Family_name
+      _Entry_author.First_initial
+      _Entry_author.Middle_initials
+      _Entry_author.Family_title
+      _Entry_author.Entry_ID
+
+      1 'Ravi Pratap' Barnwal . . . 15594 
+      2 'Ashok K'     Rout    . . . 15594 
+      3 'Kandala VR'  Chary   . . . 15594 
+      4  HS           Atreya  . . . 15594 
+
+   stop_
+
+   loop_
+      _Data_set.Type
+      _Data_set.Count
+      _Data_set.Entry_ID
+
+      assigned_chemical_shifts 1 15594 
+
+   stop_
+
+   loop_
+      _Datum.Type
+      _Datum.Count
+      _Datum.Entry_ID
+
+      '13C chemical shifts' 113 15594 
+      '15N chemical shifts'  52 15594 
+      '1H chemical shifts'   89 15594 
+
+   stop_
+
+   loop_
+      _Release.Release_number
+      _Release.Format_type
+      _Release.Format_version
+      _Release.Date
+      _Release.Submission_date
+      _Release.Type
+      _Release.Author
+      _Release.Detail
+      _Release.Entry_ID
+
+      2 . . 2008-03-12 2007-12-13 update   author 'update residue 34 as THR' 15594 
+      1 . . 2008-02-11 2007-12-13 original author 'original release'         15594 
+
+   stop_
+
+   loop_
+      _Related_entries.Database_name
+      _Related_entries.Database_accession_code
+      _Related_entries.Relationship
+      _Related_entries.Entry_ID
+
+      BMRB 6699 'La3+ monosubstituted calbindin D9k' 15594 
+      PDB  2BCA   .                                   15594 
+
+   stop_
+
+save_
+
+
+###############
+#  Citations  #
+###############
+
+save_citation_1
+   _Citation.Sf_category                  citations
+   _Citation.Sf_framecode                 citation_1
+   _Citation.Entry_ID                     15594
+   _Citation.ID                           1
+   _Citation.Class                       'entry citation'
+   _Citation.CAS_abstract_code            .
+   _Citation.MEDLINE_UI_code              .
+   _Citation.DOI                          .
+   _Citation.PubMed_ID                    .
+   _Citation.Full_citation                .
+   _Citation.Title                       'Rapid Measurement of Pseudocontact Shifts in Paramagnetic Proteins by GFT NMR Spectroscopy'
+   _Citation.Status                       published
+   _Citation.Type                         journal
+   _Citation.Journal_abbrev              'Open Mag. Res. J.'
+   _Citation.Journal_name_full           'The Open Magnetic Resonance Journal'
+   _Citation.Journal_volume               1
+   _Citation.Journal_issue                .
+   _Citation.Journal_ASTM                 .
+   _Citation.Journal_ISSN                 .
+   _Citation.Journal_CSD                  .
+   _Citation.Book_title                   .
+   _Citation.Book_chapter_title           .
+   _Citation.Book_volume                  .
+   _Citation.Book_series                  .
+   _Citation.Book_publisher               .
+   _Citation.Book_publisher_city          .
+   _Citation.Book_ISBN                    .
+   _Citation.Conference_title             .
+   _Citation.Conference_site              .
+   _Citation.Conference_state_province    .
+   _Citation.Conference_country           .
+   _Citation.Conference_start_date        .
+   _Citation.Conference_end_date          .
+   _Citation.Conference_abstract_number   .
+   _Citation.Thesis_institution           .
+   _Citation.Thesis_institution_city      .
+   _Citation.Thesis_institution_country   .
+   _Citation.WWW_URL                      .
+   _Citation.Page_first                   16
+   _Citation.Page_last                    28
+   _Citation.Year                         2008
+   _Citation.Details                      .
+
+   loop_
+      _Citation_author.Ordinal
+      _Citation_author.Given_name
+      _Citation_author.Family_name
+      _Citation_author.First_initial
+      _Citation_author.Middle_initials
+      _Citation_author.Family_title
+      _Citation_author.Entry_ID
+      _Citation_author.Citation_ID
+
+      1 'Ravi Pratap' Barnwal . . . 15594 1 
+      2 'Ashok K'     Rout    . . . 15594 1 
+      3 'Kandala VR'  Chary   . . . 15594 1 
+      4  HS           Atreya  . . . 15594 1 
+
+   stop_
+
+   loop_
+      _Citation_keyword.Keyword
+      _Citation_keyword.Entry_ID
+      _Citation_keyword.Citation_ID
+
+      'GFT NMR'               15594 1 
+      'pseudo-contact shifts' 15594 1 
+
+   stop_
+
+save_
+
+
+#############################################
+#  Molecular system (assembly) description  #
+#############################################
+
+save_assembly
+   _Assembly.Sf_category                       assembly
+   _Assembly.Sf_framecode                      assembly
+   _Assembly.Entry_ID                          15594
+   _Assembly.ID                                1
+   _Assembly.Name                             'calbindin with Yb3+'
+   _Assembly.BMRB_code                         .
+   _Assembly.Number_of_components              .
+   _Assembly.Organic_ligands                   .
+   _Assembly.Metal_ions                        .
+   _Assembly.Non_standard_bonds                .
+   _Assembly.Ambiguous_conformational_states   .
+   _Assembly.Ambiguous_chem_comp_sites         .
+   _Assembly.Molecules_in_chemical_exchange    .
+   _Assembly.Paramagnetic                      no
+   _Assembly.Thiol_state                       .
+   _Assembly.Molecular_mass                    .
+   _Assembly.Enzyme_commission_number          .
+   _Assembly.Details                           .
+   _Assembly.DB_query_date                     .
+   _Assembly.DB_query_revised_last_date        .
+
+   loop_
+      _Entity_assembly.ID
+      _Entity_assembly.Entity_assembly_name
+      _Entity_assembly.Entity_ID
+      _Entity_assembly.Entity_label
+      _Entity_assembly.Asym_ID
+      _Entity_assembly.PDB_chain_ID
+      _Entity_assembly.Experimental_data_reported
+      _Entity_assembly.Physical_state
+      _Entity_assembly.Conformational_isomer
+      _Entity_assembly.Chemical_exchange_state
+      _Entity_assembly.Magnetic_equivalence_group_code
+      _Entity_assembly.Role
+      _Entity_assembly.Details
+      _Entity_assembly.Entry_ID
+      _Entity_assembly.Assembly_ID
+
+      1 'sub unit 1' 1 $calbindin_in_presence_of_Yb3+ A . yes native no no . . . 15594 1 
+      2  CA          2 $CA                            B . no  .      .  no . . . 15594 1 
+      3  YB          3 $YB                            C . no  .      .  no . . . 15594 1 
+
+   stop_
+
+save_
+
+
+    ####################################
+    #  Biological polymers and ligands #
+    ####################################
+
+save_calbindin_in_presence_of_Yb3+
+   _Entity.Sf_category                       entity
+   _Entity.Sf_framecode                      calbindin_in_presence_of_Yb3+
+   _Entity.Entry_ID                          15594
+   _Entity.ID                                1
+   _Entity.BMRB_code                         .
+   _Entity.Name                              calbindin_in_presence_of_Yb3+
+   _Entity.Type                              polymer
+   _Entity.Polymer_common_type               .
+   _Entity.Polymer_type                      polypeptide(L)
+   _Entity.Polymer_type_details              .
+   _Entity.Polymer_strand_ID                 .
+   _Entity.Polymer_seq_one_letter_code_can   .
+   _Entity.Polymer_seq_one_letter_code      
+;
+KSPEELKGIFEKYAAKEGDP
+NQLSKEELKLLLQTEFPSLL
+KGMSTLDELFEELDKNGDGE
+VSFEEFQVLVKKISQ
+;
+   _Entity.Target_identifier                 .
+   _Entity.Polymer_author_defined_seq        .
+   _Entity.Polymer_author_seq_details        .
+   _Entity.Ambiguous_conformational_states   no
+   _Entity.Ambiguous_chem_comp_sites         no
+   _Entity.Nstd_monomer                      no
+   _Entity.Nstd_chirality                    no
+   _Entity.Nstd_linkage                      no
+   _Entity.Nonpolymer_comp_ID                .
+   _Entity.Nonpolymer_comp_label             .
+   _Entity.Number_of_monomers                75
+   _Entity.Number_of_nonpolymer_components   .
+   _Entity.Paramagnetic                      no
+   _Entity.Thiol_state                      'not present'
+   _Entity.Src_method                        .
+   _Entity.Parent_entity_ID                  .
+   _Entity.Fragment                          .
+   _Entity.Mutation                          .
+   _Entity.EC_number                         .
+   _Entity.Calc_isoelectric_point            .
+   _Entity.Formula_weight                    .
+   _Entity.Formula_weight_exptl              .
+   _Entity.Formula_weight_exptl_meth         .
+   _Entity.Details                           .
+   _Entity.DB_query_date                     .
+   _Entity.DB_query_revised_last_date        2015-11-26
+
+   loop_
+      _Entity_db_link.Ordinal
+      _Entity_db_link.Author_supplied
+      _Entity_db_link.Database_code
+      _Entity_db_link.Accession_code
+      _Entity_db_link.Entry_mol_code
+      _Entity_db_link.Entry_mol_name
+      _Entity_db_link.Entry_experimental_method
+      _Entity_db_link.Entry_structure_resolution
+      _Entity_db_link.Entry_relation_type
+      _Entity_db_link.Entry_details
+      _Entity_db_link.Chimera_segment_ID
+      _Entity_db_link.Seq_query_to_submitted_percent
+      _Entity_db_link.Seq_subject_length
+      _Entity_db_link.Seq_identity
+      _Entity_db_link.Seq_positive
+      _Entity_db_link.Seq_homology_expectation_val
+      _Entity_db_link.Seq_align_begin
+      _Entity_db_link.Seq_align_end
+      _Entity_db_link.Seq_difference_details
+      _Entity_db_link.Seq_alignment_details
+      _Entity_db_link.Entry_ID
+      _Entity_db_link.Entity_ID
+
+       1 no BMRB             16340 .  Calbindin_D9K                                                                                                                    . . . . . 100.00 76  98.67  98.67 1.15e-40 . . . . 15594 1 
+       2 no BMRB             16758 .  calbindin                                                                                                                        . . . . . 100.00 75  97.33  97.33 1.63e-39 . . . . 15594 1 
+       3 no BMRB               247 .  calbindin                                                                                                                        . . . . . 100.00 76  98.67  98.67 1.31e-40 . . . . 15594 1 
+       4 no BMRB               325 .  calbindin                                                                                                                        . . . . . 100.00 76  98.67  98.67 1.31e-40 . . . . 15594 1 
+       5 no BMRB               326 .  calbindin                                                                                                                        . . . . . 100.00 76  98.67  98.67 1.15e-40 . . . . 15594 1 
+       6 no BMRB               327 .  calbindin                                                                                                                        . . . . . 100.00 76  98.67  98.67 1.15e-40 . . . . 15594 1 
+       7 no BMRB              4581 . "CALBINDIN D9K"                                                                                                                   . . . . . 100.00 75  98.67  98.67 6.04e-41 . . . . 15594 1 
+       8 no PDB  1B1G               . "Solvated Refinement Of Ca-Loaded Calbindin D9k"                                                                                  . . . . . 100.00 75  98.67  98.67 1.47e-40 . . . . 15594 1 
+       9 no PDB  1BOC               . "The Solution Structures Of Mutant Calbindin D9k's, As Determined By Nmr, Show That The Calcium Binding Site Can Adopt Different" . . . . . 100.00 76  97.33  97.33 1.53e-39 . . . . 15594 1 
+      10 no PDB  1CDN               . "Solution Structure Of (Cd2+)1-Calbindin D9k Reveals Details Of The Stepwise Structural Changes Along The Apo--> (Ca2+) Ii1--> (" . . . . . 100.00 76  98.67  98.67 1.15e-40 . . . . 15594 1 
+      11 no PDB  1CLB               . "Determination Of The Solution Structure Of Apo Calbindin D9k By Nmr Spectroscopy"                                                . . . . . 100.00 76  98.67  98.67 1.15e-40 . . . . 15594 1 
+      12 no PDB  1D1O               . "Cooperativity In Ef-Hand Ca2+-Binding Proteins: Evidence Of Site-Site Communication From Binding-Induced Changes In Structure A" . . . . . 100.00 75  98.67  98.67 6.04e-41 . . . . 15594 1 
+      13 no PDB  1HT9               . "Domain Swapping Ef-Hands"                                                                                                        . . . . . 100.00 76  98.67  98.67 2.68e-41 . . . . 15594 1 
+      14 no PDB  1IG5               . "Bovine Calbindin D9k Binding Mg2+"                                                                                               . . . . . 100.00 75  98.67  98.67 1.44e-40 . . . . 15594 1 
+      15 no PDB  1IGV               . "Bovine Calbindin D9k Binding Mn2+"                                                                                               . . . . . 100.00 75  98.67  98.67 1.44e-40 . . . . 15594 1 
+      16 no PDB  1KCY               . "Nmr Solution Structure Of Apo Calbindin D9k (F36g + P43m Mutant)"                                                                . . . . . 100.00 75  98.67  98.67 1.20e-40 . . . . 15594 1 
+      17 no PDB  1KQV               . "Family Of Nmr Solution Structures Of Ca Ln Calbindin D9k"                                                                        . . . . . 100.00 79 100.00 100.00 3.77e-42 . . . . 15594 1 
+      18 no PDB  1KSM               . "Average Nmr Solution Structure Of Ca Ln Calbindin D9k"                                                                           . . . . . 100.00 79 100.00 100.00 3.77e-42 . . . . 15594 1 
+      19 no PDB  1N65               . "Family Of Nmr Solution Structures Of Ca Ce Calbindin D9k In Denaturating Conditions"                                             . . . . . 100.00 75 100.00 100.00 6.15e-42 . . . . 15594 1 
+      20 no PDB  2BCA               . "High-Resolution Solution Structure Of Calcium-Loaded Calbindin D9k"                                                              . . . . . 100.00 76  98.67  98.67 1.15e-40 . . . . 15594 1 
+      21 no PDB  2BCB               . "High-Resolution Solution Structure Of Calcium-Loaded Calbindin D9k"                                                              . . . . . 100.00 75  98.67  98.67 1.47e-40 . . . . 15594 1 
+      22 no PDB  2MAZ               . "Backbone 1h, 13c, And 15n Chemical Shift Assignments For Bovine Apo Calbindin"                                                   . . . . . 100.00 75 100.00 100.00 6.15e-42 . . . . 15594 1 
+      23 no PDB  3ICB               . "The Refined Structure Of Vitamin D-Dependent Calcium- Binding Protein From Bovine Intestine. Molecular Details, Ion Binding, An" . . . . . 100.00 75  98.67  98.67 1.44e-40 . . . . 15594 1 
+      24 no PDB  4ICB               . "Proline Cis-trans Isomers In Calbindin D9k Observed By X-ray Crystallography"                                                    . . . . . 100.00 76  98.67  98.67 1.31e-40 . . . . 15594 1 
+      25 no GB   AAA30420           . "calcium-binding protein [Bos taurus]"                                                                                            . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      26 no GB   AAA72542           . "intestinal calcium binding protein (ICaBP), minor A form [synthetic construct]"                                                  . . . . . 100.00 76  98.67  98.67 1.31e-40 . . . . 15594 1 
+      27 no GB   AAI18481           . "S100 calcium binding protein G [Bos taurus]"                                                                                     . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      28 no GB   ADO85633           . "calbindin D9K [Ovis aries]"                                                                                                      . . . . .  53.33 40  97.50  97.50 4.60e-08 . . . . 15594 1 
+      29 no PRF  0707237A:PDB=3ICB  . "protein,Ca binding"                                                                                                              . . . . . 100.00 75  98.67  98.67 1.44e-40 . . . . 15594 1 
+      30 no REF  NP_776682          . "protein S100-G [Bos taurus]"                                                                                                     . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      31 no REF  XP_004021986       . "PREDICTED: protein S100-G [Ovis aries]"                                                                                          . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      32 no REF  XP_005701114       . "PREDICTED: protein S100-G [Capra hircus]"                                                                                        . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      33 no REF  XP_005888771       . "PREDICTED: protein S100-G [Bos mutus]"                                                                                           . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      34 no REF  XP_005982038       . "PREDICTED: protein S100-G [Pantholops hodgsonii]"                                                                                . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      35 no SP   P02633             . "RecName: Full=Protein S100-G; AltName: Full=Calbindin-D9k; AltName: Full=S100 calcium-binding protein G; AltName: Full=Vitamin " . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+      36 no TPG  DAA12577           . "TPA: protein S100-G [Bos taurus]"                                                                                                . . . . . 100.00 79  98.67  98.67 8.64e-41 . . . . 15594 1 
+
+   stop_
+
+   loop_
+      _Entity_comp_index.ID
+      _Entity_comp_index.Auth_seq_ID
+      _Entity_comp_index.Comp_ID
+      _Entity_comp_index.Comp_label
+      _Entity_comp_index.Entry_ID
+      _Entity_comp_index.Entity_ID
+
+       1 . LYS . 15594 1 
+       2 . SER . 15594 1 
+       3 . PRO . 15594 1 
+       4 . GLU . 15594 1 
+       5 . GLU . 15594 1 
+       6 . LEU . 15594 1 
+       7 . LYS . 15594 1 
+       8 . GLY . 15594 1 
+       9 . ILE . 15594 1 
+      10 . PHE . 15594 1 
+      11 . GLU . 15594 1 
+      12 . LYS . 15594 1 
+      13 . TYR . 15594 1 
+      14 . ALA . 15594 1 
+      15 . ALA . 15594 1 
+      16 . LYS . 15594 1 
+      17 . GLU . 15594 1 
+      18 . GLY . 15594 1 
+      19 . ASP . 15594 1 
+      20 . PRO . 15594 1 
+      21 . ASN . 15594 1 
+      22 . GLN . 15594 1 
+      23 . LEU . 15594 1 
+      24 . SER . 15594 1 
+      25 . LYS . 15594 1 
+      26 . GLU . 15594 1 
+      27 . GLU . 15594 1 
+      28 . LEU . 15594 1 
+      29 . LYS . 15594 1 
+      30 . LEU . 15594 1 
+      31 . LEU . 15594 1 
+      32 . LEU . 15594 1 
+      33 . GLN . 15594 1 
+      34 . THR . 15594 1 
+      35 . GLU . 15594 1 
+      36 . PHE . 15594 1 
+      37 . PRO . 15594 1 
+      38 . SER . 15594 1 
+      39 . LEU . 15594 1 
+      40 . LEU . 15594 1 
+      41 . LYS . 15594 1 
+      42 . GLY . 15594 1 
+      43 . MET . 15594 1 
+      44 . SER . 15594 1 
+      45 . THR . 15594 1 
+      46 . LEU . 15594 1 
+      47 . ASP . 15594 1 
+      48 . GLU . 15594 1 
+      49 . LEU . 15594 1 
+      50 . PHE . 15594 1 
+      51 . GLU . 15594 1 
+      52 . GLU . 15594 1 
+      53 . LEU . 15594 1 
+      54 . ASP . 15594 1 
+      55 . LYS . 15594 1 
+      56 . ASN . 15594 1 
+      57 . GLY . 15594 1 
+      58 . ASP . 15594 1 
+      59 . GLY . 15594 1 
+      60 . GLU . 15594 1 
+      61 . VAL . 15594 1 
+      62 . SER . 15594 1 
+      63 . PHE . 15594 1 
+      64 . GLU . 15594 1 
+      65 . GLU . 15594 1 
+      66 . PHE . 15594 1 
+      67 . GLN . 15594 1 
+      68 . VAL . 15594 1 
+      69 . LEU . 15594 1 
+      70 . VAL . 15594 1 
+      71 . LYS . 15594 1 
+      72 . LYS . 15594 1 
+      73 . ILE . 15594 1 
+      74 . SER . 15594 1 
+      75 . GLN . 15594 1 
+
+   stop_
+
+   loop_
+      _Entity_poly_seq.Hetero
+      _Entity_poly_seq.Mon_ID
+      _Entity_poly_seq.Num
+      _Entity_poly_seq.Comp_index_ID
+      _Entity_poly_seq.Entry_ID
+      _Entity_poly_seq.Entity_ID
+
+      . LYS  1  1 15594 1 
+      . SER  2  2 15594 1 
+      . PRO  3  3 15594 1 
+      . GLU  4  4 15594 1 
+      . GLU  5  5 15594 1 
+      . LEU  6  6 15594 1 
+      . LYS  7  7 15594 1 
+      . GLY  8  8 15594 1 
+      . ILE  9  9 15594 1 
+      . PHE 10 10 15594 1 
+      . GLU 11 11 15594 1 
+      . LYS 12 12 15594 1 
+      . TYR 13 13 15594 1 
+      . ALA 14 14 15594 1 
+      . ALA 15 15 15594 1 
+      . LYS 16 16 15594 1 
+      . GLU 17 17 15594 1 
+      . GLY 18 18 15594 1 
+      . ASP 19 19 15594 1 
+      . PRO 20 20 15594 1 
+      . ASN 21 21 15594 1 
+      . GLN 22 22 15594 1 
+      . LEU 23 23 15594 1 
+      . SER 24 24 15594 1 
+      . LYS 25 25 15594 1 
+      . GLU 26 26 15594 1 
+      . GLU 27 27 15594 1 
+      . LEU 28 28 15594 1 
+      . LYS 29 29 15594 1 
+      . LEU 30 30 15594 1 
+      . LEU 31 31 15594 1 
+      . LEU 32 32 15594 1 
+      . GLN 33 33 15594 1 
+      . THR 34 34 15594 1 
+      . GLU 35 35 15594 1 
+      . PHE 36 36 15594 1 
+      . PRO 37 37 15594 1 
+      . SER 38 38 15594 1 
+      . LEU 39 39 15594 1 
+      . LEU 40 40 15594 1 
+      . LYS 41 41 15594 1 
+      . GLY 42 42 15594 1 
+      . MET 43 43 15594 1 
+      . SER 44 44 15594 1 
+      . THR 45 45 15594 1 
+      . LEU 46 46 15594 1 
+      . ASP 47 47 15594 1 
+      . GLU 48 48 15594 1 
+      . LEU 49 49 15594 1 
+      . PHE 50 50 15594 1 
+      . GLU 51 51 15594 1 
+      . GLU 52 52 15594 1 
+      . LEU 53 53 15594 1 
+      . ASP 54 54 15594 1 
+      . LYS 55 55 15594 1 
+      . ASN 56 56 15594 1 
+      . GLY 57 57 15594 1 
+      . ASP 58 58 15594 1 
+      . GLY 59 59 15594 1 
+      . GLU 60 60 15594 1 
+      . VAL 61 61 15594 1 
+      . SER 62 62 15594 1 
+      . PHE 63 63 15594 1 
+      . GLU 64 64 15594 1 
+      . GLU 65 65 15594 1 
+      . PHE 66 66 15594 1 
+      . GLN 67 67 15594 1 
+      . VAL 68 68 15594 1 
+      . LEU 69 69 15594 1 
+      . VAL 70 70 15594 1 
+      . LYS 71 71 15594 1 
+      . LYS 72 72 15594 1 
+      . ILE 73 73 15594 1 
+      . SER 74 74 15594 1 
+      . GLN 75 75 15594 1 
+
+   stop_
+
+save_
+
+
+save_CA
+   _Entity.Sf_category                       entity
+   _Entity.Sf_framecode                      CA
+   _Entity.Entry_ID                          15594
+   _Entity.ID                                2
+   _Entity.BMRB_code                         .
+   _Entity.Name                              CA
+   _Entity.Type                              non-polymer
+   _Entity.Polymer_common_type               .
+   _Entity.Polymer_type                      .
+   _Entity.Polymer_type_details              .
+   _Entity.Polymer_strand_ID                 .
+   _Entity.Polymer_seq_one_letter_code_can   .
+   _Entity.Polymer_seq_one_letter_code       .
+   _Entity.Target_identifier                 .
+   _Entity.Polymer_author_defined_seq        .
+   _Entity.Polymer_author_seq_details        .
+   _Entity.Ambiguous_conformational_states   no
+   _Entity.Ambiguous_chem_comp_sites         no
+   _Entity.Nstd_monomer                      .
+   _Entity.Nstd_chirality                    no
+   _Entity.Nstd_linkage                      no
+   _Entity.Nonpolymer_comp_ID                CA
+   _Entity.Nonpolymer_comp_label             .
+   _Entity.Number_of_monomers                .
+   _Entity.Number_of_nonpolymer_components   .
+   _Entity.Paramagnetic                      .
+   _Entity.Thiol_state                       .
+   _Entity.Src_method                        .
+   _Entity.Parent_entity_ID                  2
+   _Entity.Fragment                          .
+   _Entity.Mutation                          .
+   _Entity.EC_number                         .
+   _Entity.Calc_isoelectric_point            .
+   _Entity.Formula_weight                    .
+   _Entity.Formula_weight_exptl              .
+   _Entity.Formula_weight_exptl_meth         .
+   _Entity.Details                           .
+   _Entity.DB_query_date                     .
+   _Entity.DB_query_revised_last_date        .
+
+   loop_
+      _Entity_comp_index.ID
+      _Entity_comp_index.Auth_seq_ID
+      _Entity_comp_index.Comp_ID
+      _Entity_comp_index.Comp_label
+      _Entity_comp_index.Entry_ID
+      _Entity_comp_index.Entity_ID
+
+      1 . CA . 15594 2 
+
+   stop_
+
+save_
+
+
+save_YB
+   _Entity.Sf_category                       entity
+   _Entity.Sf_framecode                      YB
+   _Entity.Entry_ID                          15594
+   _Entity.ID                                3
+   _Entity.BMRB_code                         .
+   _Entity.Name                              YB
+   _Entity.Type                              non-polymer
+   _Entity.Polymer_common_type               .
+   _Entity.Polymer_type                      .
+   _Entity.Polymer_type_details              .
+   _Entity.Polymer_strand_ID                 .
+   _Entity.Polymer_seq_one_letter_code_can   .
+   _Entity.Polymer_seq_one_letter_code       .
+   _Entity.Target_identifier                 .
+   _Entity.Polymer_author_defined_seq        .
+   _Entity.Polymer_author_seq_details        .
+   _Entity.Ambiguous_conformational_states   no
+   _Entity.Ambiguous_chem_comp_sites         no
+   _Entity.Nstd_monomer                      .
+   _Entity.Nstd_chirality                    no
+   _Entity.Nstd_linkage                      no
+   _Entity.Nonpolymer_comp_ID                YB
+   _Entity.Nonpolymer_comp_label             .
+   _Entity.Number_of_monomers                .
+   _Entity.Number_of_nonpolymer_components   .
+   _Entity.Paramagnetic                      .
+   _Entity.Thiol_state                       .
+   _Entity.Src_method                        .
+   _Entity.Parent_entity_ID                  3
+   _Entity.Fragment                          .
+   _Entity.Mutation                          .
+   _Entity.EC_number                         .
+   _Entity.Calc_isoelectric_point            .
+   _Entity.Formula_weight                    .
+   _Entity.Formula_weight_exptl              .
+   _Entity.Formula_weight_exptl_meth         .
+   _Entity.Details                           .
+   _Entity.DB_query_date                     .
+   _Entity.DB_query_revised_last_date        .
+
+   loop_
+      _Entity_comp_index.ID
+      _Entity_comp_index.Auth_seq_ID
+      _Entity_comp_index.Comp_ID
+      _Entity_comp_index.Comp_label
+      _Entity_comp_index.Entry_ID
+      _Entity_comp_index.Entity_ID
+
+      1 . YB . 15594 3 
+
+   stop_
+
+save_
+
+
+    ####################
+    #  Natural source  #
+    ####################
+
+save_natural_source
+   _Entity_natural_src_list.Sf_category    natural_source
+   _Entity_natural_src_list.Sf_framecode   natural_source
+   _Entity_natural_src_list.Entry_ID       15594
+   _Entity_natural_src_list.ID             1
+
+   loop_
+      _Entity_natural_src.ID
+      _Entity_natural_src.Entity_ID
+      _Entity_natural_src.Entity_label
+      _Entity_natural_src.Entity_chimera_segment_ID
+      _Entity_natural_src.NCBI_taxonomy_ID
+      _Entity_natural_src.Type
+      _Entity_natural_src.Common
+      _Entity_natural_src.Organism_name_scientific
+      _Entity_natural_src.Organism_name_common
+      _Entity_natural_src.Organism_acronym
+      _Entity_natural_src.ICTVdb_decimal_code
+      _Entity_natural_src.Superkingdom
+      _Entity_natural_src.Kingdom
+      _Entity_natural_src.Genus
+      _Entity_natural_src.Species
+      _Entity_natural_src.Strain
+      _Entity_natural_src.Variant
+      _Entity_natural_src.Subvariant
+      _Entity_natural_src.Organ
+      _Entity_natural_src.Tissue
+      _Entity_natural_src.Tissue_fraction
+      _Entity_natural_src.Cell_line
+      _Entity_natural_src.Cell_type
+      _Entity_natural_src.ATCC_number
+      _Entity_natural_src.Organelle
+      _Entity_natural_src.Cellular_location
+      _Entity_natural_src.Fragment
+      _Entity_natural_src.Fraction
+      _Entity_natural_src.Secretion
+      _Entity_natural_src.Plasmid
+      _Entity_natural_src.Plasmid_details
+      _Entity_natural_src.Gene_mnemonic
+      _Entity_natural_src.Dev_stage
+      _Entity_natural_src.Details
+      _Entity_natural_src.Citation_ID
+      _Entity_natural_src.Citation_label
+      _Entity_natural_src.Entry_ID
+      _Entity_natural_src.Entity_natural_src_list_ID
+
+      1 1 $calbindin_in_presence_of_Yb3+ . 562 plasmid . 'Escherichia coli' 'E. coli' . . Bacteria . Escherichia coli . . . . . . . . . . . . . . . . . . . . . 15594 1 
+
+   stop_
+
+save_
+
+
+    #########################
+    #  Experimental source  #
+    #########################
+
+save_experimental_source
+   _Entity_experimental_src_list.Sf_category    experimental_source
+   _Entity_experimental_src_list.Sf_framecode   experimental_source
+   _Entity_experimental_src_list.Entry_ID       15594
+   _Entity_experimental_src_list.ID             1
+
+   loop_
+      _Entity_experimental_src.ID
+      _Entity_experimental_src.Entity_ID
+      _Entity_experimental_src.Entity_label
+      _Entity_experimental_src.Entity_chimera_segment_ID
+      _Entity_experimental_src.Production_method
+      _Entity_experimental_src.Host_org_scientific_name
+      _Entity_experimental_src.Host_org_name_common
+      _Entity_experimental_src.Host_org_details
+      _Entity_experimental_src.Host_org_NCBI_taxonomy_ID
+      _Entity_experimental_src.Host_org_genus
+      _Entity_experimental_src.Host_org_species
+      _Entity_experimental_src.Host_org_strain
+      _Entity_experimental_src.Host_org_variant
+      _Entity_experimental_src.Host_org_subvariant
+      _Entity_experimental_src.Host_org_organ
+      _Entity_experimental_src.Host_org_tissue
+      _Entity_experimental_src.Host_org_tissue_fraction
+      _Entity_experimental_src.Host_org_cell_line
+      _Entity_experimental_src.Host_org_cell_type
+      _Entity_experimental_src.Host_org_cellular_location
+      _Entity_experimental_src.Host_org_organelle
+      _Entity_experimental_src.Host_org_gene
+      _Entity_experimental_src.Host_org_culture_collection
+      _Entity_experimental_src.Host_org_ATCC_number
+      _Entity_experimental_src.Vector_type
+      _Entity_experimental_src.PDBview_host_org_vector_name
+      _Entity_experimental_src.PDBview_plasmid_name
+      _Entity_experimental_src.Vector_name
+      _Entity_experimental_src.Vector_details
+      _Entity_experimental_src.Vendor_name
+      _Entity_experimental_src.Host_org_dev_stage
+      _Entity_experimental_src.Details
+      _Entity_experimental_src.Citation_ID
+      _Entity_experimental_src.Citation_label
+      _Entity_experimental_src.Entry_ID
+      _Entity_experimental_src.Entity_experimental_src_list_ID
+
+      1 1 $calbindin_in_presence_of_Yb3+ . 'recombinant technology' 'Escherichia coli' . . . Escherichia coli . . . . . . . . . . . . . . . . NA . . . . . . 15594 1 
+
+   stop_
+
+save_
+
+
+    #################################
+    #  Polymer residues and ligands #
+    #################################
+
+save_chem_comp_CA
+   _Chem_comp.Sf_category                       chem_comp
+   _Chem_comp.Sf_framecode                      chem_comp_CA
+   _Chem_comp.Entry_ID                          15594
+   _Chem_comp.ID                                CA
+   _Chem_comp.Provenance                        .
+   _Chem_comp.Name                             'CALCIUM ION'
+   _Chem_comp.Type                              non-polymer
+   _Chem_comp.BMRB_code                         .
+   _Chem_comp.PDB_code                          CA
+   _Chem_comp.Ambiguous_flag                    .
+   _Chem_comp.Initial_date                      .
+   _Chem_comp.Modified_date                     .
+   _Chem_comp.Release_status                    .
+   _Chem_comp.Replaced_by                       .
+   _Chem_comp.Replaces                          .
+   _Chem_comp.One_letter_code                   .
+   _Chem_comp.Three_letter_code                 .
+   _Chem_comp.Number_atoms_all                  .
+   _Chem_comp.Number_atoms_nh                   .
+   _Chem_comp.PubChem_code                      .
+   _Chem_comp.Subcomponent_list                 .
+   _Chem_comp.InChI_code                        .
+   _Chem_comp.Mon_nstd_flag                     .
+   _Chem_comp.Mon_nstd_class                    .
+   _Chem_comp.Mon_nstd_details                  .
+   _Chem_comp.Mon_nstd_parent                   .
+   _Chem_comp.Mon_nstd_parent_comp_ID           .
+   _Chem_comp.Std_deriv_one_letter_code         .
+   _Chem_comp.Std_deriv_three_letter_code       .
+   _Chem_comp.Std_deriv_BMRB_code               .
+   _Chem_comp.Std_deriv_PDB_code                .
+   _Chem_comp.Std_deriv_chem_comp_name          .
+   _Chem_comp.Synonyms                          .
+   _Chem_comp.Formal_charge                     2
+   _Chem_comp.Paramagnetic                      .
+   _Chem_comp.Aromatic                          no
+   _Chem_comp.Formula                           Ca
+   _Chem_comp.Formula_weight                    40.078
+   _Chem_comp.Formula_mono_iso_wt_nat           .
+   _Chem_comp.Formula_mono_iso_wt_13C           .
+   _Chem_comp.Formula_mono_iso_wt_15N           .
+   _Chem_comp.Formula_mono_iso_wt_13C_15N       .
+   _Chem_comp.Image_file_name                   .
+   _Chem_comp.Image_file_format                 .
+   _Chem_comp.Topo_file_name                    .
+   _Chem_comp.Topo_file_format                  .
+   _Chem_comp.Struct_file_name                  .
+   _Chem_comp.Struct_file_format                .
+   _Chem_comp.Stereochem_param_file_name        .
+   _Chem_comp.Stereochem_param_file_format      .
+   _Chem_comp.Model_details                     .
+   _Chem_comp.Model_erf                         .
+   _Chem_comp.Model_source                      .
+   _Chem_comp.Model_coordinates_details         .
+   _Chem_comp.Model_coordinates_missing_flag    .
+   _Chem_comp.Ideal_coordinates_details         .
+   _Chem_comp.Ideal_coordinates_missing_flag    .
+   _Chem_comp.Model_coordinates_db_code         .
+   _Chem_comp.Processing_site                   .
+   _Chem_comp.Vendor                            .
+   _Chem_comp.Vendor_product_code               .
+   _Chem_comp.Details                          
+;
+Information obtained from PDB's Chemical Component Dictionary
+at http://wwpdb-remediation.rutgers.edu/downloads.html
+Downloaded on Mon Aug 20 19:28:44 2007
+;
+   _Chem_comp.DB_query_date                     .
+   _Chem_comp.DB_last_query_revised_last_date   .
+
+   loop_
+      _Chem_comp_descriptor.Descriptor
+      _Chem_comp_descriptor.Type
+      _Chem_comp_descriptor.Program
+      _Chem_comp_descriptor.Program_version
+      _Chem_comp_descriptor.Entry_ID
+      _Chem_comp_descriptor.Comp_ID
+
+      [Ca++]         SMILES_CANONICAL CACTVS                 2.87 15594 CA 
+      [Ca+2]         SMILES           OpenEye/OEToolkits 1.4.2    15594 CA 
+      [Ca+2]         SMILES_CANONICAL OpenEye/OEToolkits 1.4.2    15594 CA 
+      InChI=1/Ca/q+2 INCHI            InChi                  1    15594 CA 
+
+   stop_
+
+   loop_
+      _Chem_comp_identifier.Identifier
+      _Chem_comp_identifier.Type
+      _Chem_comp_identifier.Program
+      _Chem_comp_identifier.Program_version
+      _Chem_comp_identifier.Entry_ID
+      _Chem_comp_identifier.Comp_ID
+
+      'calcium(+2) cation' 'SYSTEMATIC NAME' OpenEye/Lexichem 1.4 15594 CA 
+
+   stop_
+
+   loop_
+      _Chem_comp_atom.Atom_ID
+      _Chem_comp_atom.BMRB_code
+      _Chem_comp_atom.PDB_atom_ID
+      _Chem_comp_atom.Alt_atom_ID
+      _Chem_comp_atom.Auth_atom_ID
+      _Chem_comp_atom.Type_symbol
+      _Chem_comp_atom.Isotope_number
+      _Chem_comp_atom.Chirality
+      _Chem_comp_atom.Stereo_config
+      _Chem_comp_atom.Charge
+      _Chem_comp_atom.Partial_charge
+      _Chem_comp_atom.Oxidation_number
+      _Chem_comp_atom.Unpaired_electron_number
+      _Chem_comp_atom.Align
+      _Chem_comp_atom.Aromatic_flag
+      _Chem_comp_atom.Leaving_atom_flag
+      _Chem_comp_atom.Substruct_code
+      _Chem_comp_atom.Ionizable
+      _Chem_comp_atom.Drawing_2D_coord_x
+      _Chem_comp_atom.Drawing_2D_coord_y
+      _Chem_comp_atom.Model_Cartn_x
+      _Chem_comp_atom.Model_Cartn_x_esd
+      _Chem_comp_atom.Model_Cartn_y
+      _Chem_comp_atom.Model_Cartn_y_esd
+      _Chem_comp_atom.Model_Cartn_z
+      _Chem_comp_atom.Model_Cartn_z_esd
+      _Chem_comp_atom.Model_Cartn_x_ideal
+      _Chem_comp_atom.Model_Cartn_y_ideal
+      _Chem_comp_atom.Model_Cartn_z_ideal
+      _Chem_comp_atom.PDBX_ordinal
+      _Chem_comp_atom.Details
+      _Chem_comp_atom.Entry_ID
+      _Chem_comp_atom.Comp_ID
+
+      CA . CA . . CA . N . 2 . . . . no no . . . . . . . . . . . . . . . 15594 CA 
+
+   stop_
+
+save_
+
+
+save_chem_comp_YB
+   _Chem_comp.Sf_category                       chem_comp
+   _Chem_comp.Sf_framecode                      chem_comp_YB
+   _Chem_comp.Entry_ID                          15594
+   _Chem_comp.ID                                YB
+   _Chem_comp.Provenance                        .
+   _Chem_comp.Name                             'YTTERBIUM (III) ION'
+   _Chem_comp.Type                              non-polymer
+   _Chem_comp.BMRB_code                         .
+   _Chem_comp.PDB_code                          YB
+   _Chem_comp.Ambiguous_flag                    .
+   _Chem_comp.Initial_date                      .
+   _Chem_comp.Modified_date                     .
+   _Chem_comp.Release_status                    .
+   _Chem_comp.Replaced_by                       .
+   _Chem_comp.Replaces                          .
+   _Chem_comp.One_letter_code                   .
+   _Chem_comp.Three_letter_code                 .
+   _Chem_comp.Number_atoms_all                  .
+   _Chem_comp.Number_atoms_nh                   .
+   _Chem_comp.PubChem_code                      .
+   _Chem_comp.Subcomponent_list                 .
+   _Chem_comp.InChI_code                        .
+   _Chem_comp.Mon_nstd_flag                     .
+   _Chem_comp.Mon_nstd_class                    .
+   _Chem_comp.Mon_nstd_details                  .
+   _Chem_comp.Mon_nstd_parent                   .
+   _Chem_comp.Mon_nstd_parent_comp_ID           .
+   _Chem_comp.Std_deriv_one_letter_code         .
+   _Chem_comp.Std_deriv_three_letter_code       .
+   _Chem_comp.Std_deriv_BMRB_code               .
+   _Chem_comp.Std_deriv_PDB_code                .
+   _Chem_comp.Std_deriv_chem_comp_name          .
+   _Chem_comp.Synonyms                          .
+   _Chem_comp.Formal_charge                     3
+   _Chem_comp.Paramagnetic                      .
+   _Chem_comp.Aromatic                          no
+   _Chem_comp.Formula                           Yb
+   _Chem_comp.Formula_weight                    173.040
+   _Chem_comp.Formula_mono_iso_wt_nat           .
+   _Chem_comp.Formula_mono_iso_wt_13C           .
+   _Chem_comp.Formula_mono_iso_wt_15N           .
+   _Chem_comp.Formula_mono_iso_wt_13C_15N       .
+   _Chem_comp.Image_file_name                   .
+   _Chem_comp.Image_file_format                 .
+   _Chem_comp.Topo_file_name                    .
+   _Chem_comp.Topo_file_format                  .
+   _Chem_comp.Struct_file_name                  .
+   _Chem_comp.Struct_file_format                .
+   _Chem_comp.Stereochem_param_file_name        .
+   _Chem_comp.Stereochem_param_file_format      .
+   _Chem_comp.Model_details                     .
+   _Chem_comp.Model_erf                         .
+   _Chem_comp.Model_source                      .
+   _Chem_comp.Model_coordinates_details         .
+   _Chem_comp.Model_coordinates_missing_flag    .
+   _Chem_comp.Ideal_coordinates_details         .
+   _Chem_comp.Ideal_coordinates_missing_flag    .
+   _Chem_comp.Model_coordinates_db_code         .
+   _Chem_comp.Processing_site                   .
+   _Chem_comp.Vendor                            .
+   _Chem_comp.Vendor_product_code               .
+   _Chem_comp.Details                          
+;
+Information obtained from PDB's Chemical Component Dictionary
+at http://wwpdb-remediation.rutgers.edu/downloads.html
+Downloaded on Tue Aug 21 03:44:53 2007
+;
+   _Chem_comp.DB_query_date                     .
+   _Chem_comp.DB_last_query_revised_last_date   .
+
+   loop_
+      _Chem_comp_descriptor.Descriptor
+      _Chem_comp_descriptor.Type
+      _Chem_comp_descriptor.Program
+      _Chem_comp_descriptor.Program_version
+      _Chem_comp_descriptor.Entry_ID
+      _Chem_comp_descriptor.Comp_ID
+
+      InChI=1/Yb/q+3 INCHI            InChi                  1    15594 YB 
+      [Yb+3]         SMILES           OpenEye/OEToolkits 1.4.2    15594 YB 
+      [Yb+3]         SMILES_CANONICAL CACTVS                 2.87 15594 YB 
+      [Yb+3]         SMILES_CANONICAL OpenEye/OEToolkits 1.4.2    15594 YB 
+
+   stop_
+
+   loop_
+      _Chem_comp_identifier.Identifier
+      _Chem_comp_identifier.Type
+      _Chem_comp_identifier.Program
+      _Chem_comp_identifier.Program_version
+      _Chem_comp_identifier.Entry_ID
+      _Chem_comp_identifier.Comp_ID
+
+      'ytterbium(+3) cation' 'SYSTEMATIC NAME' OpenEye/Lexichem 1.4 15594 YB 
+
+   stop_
+
+   loop_
+      _Chem_comp_atom.Atom_ID
+      _Chem_comp_atom.BMRB_code
+      _Chem_comp_atom.PDB_atom_ID
+      _Chem_comp_atom.Alt_atom_ID
+      _Chem_comp_atom.Auth_atom_ID
+      _Chem_comp_atom.Type_symbol
+      _Chem_comp_atom.Isotope_number
+      _Chem_comp_atom.Chirality
+      _Chem_comp_atom.Stereo_config
+      _Chem_comp_atom.Charge
+      _Chem_comp_atom.Partial_charge
+      _Chem_comp_atom.Oxidation_number
+      _Chem_comp_atom.Unpaired_electron_number
+      _Chem_comp_atom.Align
+      _Chem_comp_atom.Aromatic_flag
+      _Chem_comp_atom.Leaving_atom_flag
+      _Chem_comp_atom.Substruct_code
+      _Chem_comp_atom.Ionizable
+      _Chem_comp_atom.Drawing_2D_coord_x
+      _Chem_comp_atom.Drawing_2D_coord_y
+      _Chem_comp_atom.Model_Cartn_x
+      _Chem_comp_atom.Model_Cartn_x_esd
+      _Chem_comp_atom.Model_Cartn_y
+      _Chem_comp_atom.Model_Cartn_y_esd
+      _Chem_comp_atom.Model_Cartn_z
+      _Chem_comp_atom.Model_Cartn_z_esd
+      _Chem_comp_atom.Model_Cartn_x_ideal
+      _Chem_comp_atom.Model_Cartn_y_ideal
+      _Chem_comp_atom.Model_Cartn_z_ideal
+      _Chem_comp_atom.PDBX_ordinal
+      _Chem_comp_atom.Details
+      _Chem_comp_atom.Entry_ID
+      _Chem_comp_atom.Comp_ID
+
+      YB . YB . . YB . N . 3 . . . . no no . . . . . . . . . . . . . . . 15594 YB 
+
+   stop_
+
+save_
+
+
+#####################################
+#  Sample contents and methodology  #
+#####################################
+	 
+    ########################
+    #  Sample description  #
+    ########################
+
+save_sample_1
+   _Sample.Sf_category                      sample
+   _Sample.Sf_framecode                     sample_1
+   _Sample.Entry_ID                         15594
+   _Sample.ID                               1
+   _Sample.Type                             solution
+   _Sample.Sub_type                         .
+   _Sample.Details                          .
+   _Sample.Aggregate_sample_number          .
+   _Sample.Solvent_system                  '90% H2O/10% D2O; The lingad Ca:Yb ration has been used 1:1 for the work.'
+   _Sample.Preparation_date                 .
+   _Sample.Preparation_expiration_date      .
+   _Sample.Polycrystallization_protocol     .
+   _Sample.Single_crystal_protocol          .
+   _Sample.Crystal_grow_apparatus           .
+   _Sample.Crystal_grow_atmosphere          .
+   _Sample.Crystal_grow_details             .
+   _Sample.Crystal_grow_method              .
+   _Sample.Crystal_grow_method_cit_ID       .
+   _Sample.Crystal_grow_pH                  .
+   _Sample.Crystal_grow_pH_range            .
+   _Sample.Crystal_grow_pressure            .
+   _Sample.Crystal_grow_pressure_esd        .
+   _Sample.Crystal_grow_seeding             .
+   _Sample.Crystal_grow_seeding_cit_ID      .
+   _Sample.Crystal_grow_temp                .
+   _Sample.Crystal_grow_temp_details        .
+   _Sample.Crystal_grow_temp_esd            .
+   _Sample.Crystal_grow_time                .
+   _Sample.Oriented_sample_prep_protocol    .
+   _Sample.Lyophilization_cryo_protectant   .
+   _Sample.Storage_protocol                 .
+
+   loop_
+      _Sample_component.ID
+      _Sample_component.Mol_common_name
+      _Sample_component.Isotopic_labeling
+      _Sample_component.Assembly_ID
+      _Sample_component.Assembly_label
+      _Sample_component.Entity_ID
+      _Sample_component.Entity_label
+      _Sample_component.Product_ID
+      _Sample_component.Type
+      _Sample_component.Concentration_val
+      _Sample_component.Concentration_val_min
+      _Sample_component.Concentration_val_max
+      _Sample_component.Concentration_val_units
+      _Sample_component.Concentration_val_err
+      _Sample_component.Vendor
+      _Sample_component.Vendor_product_name
+      _Sample_component.Vendor_product_code
+      _Sample_component.Entry_ID
+      _Sample_component.Sample_ID
+
+      1 'sub unit 1' '[U-98% 13C; U-98% 15N]' . . 1 $calbindin_in_presence_of_Yb3+ . .  1.6 . . mM . . . . 15594 1 
+      2  D2O         '[U-100% 2H]'            . .  .  .                             . . 10   . . %  . . . . 15594 1 
+      3  H2O          .                       . .  .  .                             . . 90   . . %  . . . . 15594 1 
+
+   stop_
+
+save_
+
+
+#######################
+#  Sample conditions  #
+#######################
+
+save_sample_conditions_1
+   _Sample_condition_list.Sf_category    sample_conditions
+   _Sample_condition_list.Sf_framecode   sample_conditions_1
+   _Sample_condition_list.Entry_ID       15594
+   _Sample_condition_list.ID             1
+   _Sample_condition_list.Details        .
+
+   loop_
+      _Sample_condition_variable.Type
+      _Sample_condition_variable.Val
+      _Sample_condition_variable.Val_err
+      _Sample_condition_variable.Val_units
+      _Sample_condition_variable.Entry_ID
+      _Sample_condition_variable.Sample_condition_list_ID
+
+      pH            6.0 . pH  15594 1 
+      pressure      1   . atm 15594 1 
+      temperature 298   . K   15594 1 
+
+   stop_
+
+save_
+
+
+############################
+#  Computer software used  #
+############################
+
+save_VNMR
+   _Software.Sf_category    software
+   _Software.Sf_framecode   VNMR
+   _Software.Entry_ID       15594
+   _Software.ID             1
+   _Software.Name           VNMR
+   _Software.Version        .
+   _Software.Details        .
+
+   loop_
+      _Vendor.Name
+      _Vendor.Address
+      _Vendor.Electronic_address
+      _Vendor.Entry_ID
+      _Vendor.Software_ID
+
+      Varian . . 15594 1 
+
+   stop_
+
+   loop_
+      _Task.Task
+      _Task.Entry_ID
+      _Task.Software_ID
+
+      collection 15594 1 
+
+   stop_
+
+save_
+
+
+save_xwinnmr
+   _Software.Sf_category    software
+   _Software.Sf_framecode   xwinnmr
+   _Software.Entry_ID       15594
+   _Software.ID             2
+   _Software.Name           xwinnmr
+   _Software.Version        .
+   _Software.Details        .
+
+   loop_
+      _Vendor.Name
+      _Vendor.Address
+      _Vendor.Electronic_address
+      _Vendor.Entry_ID
+      _Vendor.Software_ID
+
+      'Bruker Biospin' . . 15594 2 
+
+   stop_
+
+   loop_
+      _Task.Task
+      _Task.Entry_ID
+      _Task.Software_ID
+
+      collection 15594 2 
+
+   stop_
+
+save_
+
+
+#########################
+#  Experimental detail  #
+#########################
+
+    ##################################
+    #  NMR Spectrometer definitions  #
+    ##################################
+
+save_spectrometer_1
+   _NMR_spectrometer.Sf_category      NMR_spectrometer
+   _NMR_spectrometer.Sf_framecode     spectrometer_1
+   _NMR_spectrometer.Entry_ID         15594
+   _NMR_spectrometer.ID               1
+   _NMR_spectrometer.Details          .
+   _NMR_spectrometer.Manufacturer     Bruker
+   _NMR_spectrometer.Model            Avance
+   _NMR_spectrometer.Serial_number    .
+   _NMR_spectrometer.Field_strength   500
+
+save_
+
+
+save_spectrometer_2
+   _NMR_spectrometer.Sf_category      NMR_spectrometer
+   _NMR_spectrometer.Sf_framecode     spectrometer_2
+   _NMR_spectrometer.Entry_ID         15594
+   _NMR_spectrometer.ID               2
+   _NMR_spectrometer.Details          .
+   _NMR_spectrometer.Manufacturer     Varian
+   _NMR_spectrometer.Model            INOVA
+   _NMR_spectrometer.Serial_number    .
+   _NMR_spectrometer.Field_strength   600
+
+save_
+
+
+save_NMR_spectrometer_list
+   _NMR_spectrometer_list.Sf_category    NMR_spectrometer_list
+   _NMR_spectrometer_list.Sf_framecode   NMR_spectrometer_list
+   _NMR_spectrometer_list.Entry_ID       15594
+   _NMR_spectrometer_list.ID             1
+
+   loop_
+      _NMR_spectrometer_view.ID
+      _NMR_spectrometer_view.Name
+      _NMR_spectrometer_view.Manufacturer
+      _NMR_spectrometer_view.Model
+      _NMR_spectrometer_view.Serial_number
+      _NMR_spectrometer_view.Field_strength
+      _NMR_spectrometer_view.Details
+      _NMR_spectrometer_view.Citation_ID
+      _NMR_spectrometer_view.Citation_label
+      _NMR_spectrometer_view.Entry_ID
+      _NMR_spectrometer_view.NMR_spectrometer_list_ID
+
+      1 spectrometer_1 Bruker Avance . 500 . . . 15594 1 
+      2 spectrometer_1 Varian INOVA  . 600 . . . 15594 1 
+
+   stop_
+
+save_
+
+
+    #############################
+    #  NMR applied experiments  #
+    #############################
+
+save_experiment_list
+   _Experiment_list.Sf_category    experiment_list
+   _Experiment_list.Sf_framecode   experiment_list
+   _Experiment_list.Entry_ID       15594
+   _Experiment_list.ID             1
+   _Experiment_list.Details        .
+
+   loop_
+      _Experiment.ID
+      _Experiment.Name
+      _Experiment.Raw_data_flag
+      _Experiment.NMR_spec_expt_ID
+      _Experiment.NMR_spec_expt_label
+      _Experiment.MS_expt_ID
+      _Experiment.MS_expt_label
+      _Experiment.SAXS_expt_ID
+      _Experiment.SAXS_expt_label
+      _Experiment.FRET_expt_ID
+      _Experiment.FRET_expt_label
+      _Experiment.EMR_expt_ID
+      _Experiment.EMR_expt_label
+      _Experiment.Sample_ID
+      _Experiment.Sample_label
+      _Experiment.Sample_state
+      _Experiment.Sample_volume
+      _Experiment.Sample_volume_units
+      _Experiment.Sample_condition_list_ID
+      _Experiment.Sample_condition_list_label
+      _Experiment.Sample_spinning_rate
+      _Experiment.Sample_angle
+      _Experiment.NMR_tube_type
+      _Experiment.NMR_spectrometer_ID
+      _Experiment.NMR_spectrometer_label
+      _Experiment.NMR_spectrometer_probe_ID
+      _Experiment.NMR_spectrometer_probe_label
+      _Experiment.NMR_spectral_processing_ID
+      _Experiment.NMR_spectral_processing_label
+      _Experiment.Mass_spectrometer_ID
+      _Experiment.Mass_spectrometer_label
+      _Experiment.Xray_instrument_ID
+      _Experiment.Xray_instrument_label
+      _Experiment.Fluorescence_instrument_ID
+      _Experiment.Fluorescence_instrument_label
+      _Experiment.EMR_instrument_ID
+      _Experiment.EMR_instrument_label
+      _Experiment.Chromatographic_system_ID
+      _Experiment.Chromatographic_system_label
+      _Experiment.Chromatographic_column_ID
+      _Experiment.Chromatographic_column_label
+      _Experiment.Entry_ID
+      _Experiment.Experiment_list_ID
+
+      1 '2D 1H-15N HSQC' no . . . . . . . . . . 1 $sample_1 isotropic . . 1 $sample_conditions_1 . . . 1 $spectrometer_1 . . . . . . . . . . . . . . . . 15594 1 
+      2 'GFT HNCO'       no . . . . . . . . . . 1 $sample_1 isotropic . . 1 $sample_conditions_1 . . . 1 $spectrometer_1 . . . . . . . . . . . . . . . . 15594 1 
+      3 'GFT HN(CO)CA'   no . . . . . . . . . . 1 $sample_1 isotropic . . 1 $sample_conditions_1 . . . 1 $spectrometer_1 . . . . . . . . . . . . . . . . 15594 1 
+      4 'GFT CB(CACO)NH' no . . . . . . . . . . 1 $sample_1 isotropic . . 1 $sample_conditions_1 . . . 1 $spectrometer_1 . . . . . . . . . . . . . . . . 15594 1 
+      5 'GFT HNHA'       no . . . . . . . . . . 1 $sample_1 isotropic . . 1 $sample_conditions_1 . . . 1 $spectrometer_1 . . . . . . . . . . . . . . . . 15594 1 
+
+   stop_
+
+save_
+
+
+####################
+#  NMR parameters  #
+####################
+
+    ##############################
+    #  Assigned chemical shifts  #
+    ##############################
+
+	################################
+	#  Chemical shift referencing  #
+	################################
+
+save_chemical_shift_reference_1
+   _Chem_shift_reference.Sf_category    chem_shift_reference
+   _Chem_shift_reference.Sf_framecode   chemical_shift_reference_1
+   _Chem_shift_reference.Entry_ID       15594
+   _Chem_shift_reference.ID             1
+   _Chem_shift_reference.Details        .
+
+   loop_
+      _Chem_shift_ref.Atom_type
+      _Chem_shift_ref.Atom_isotope_number
+      _Chem_shift_ref.Mol_common_name
+      _Chem_shift_ref.Atom_group
+      _Chem_shift_ref.Concentration_val
+      _Chem_shift_ref.Concentration_units
+      _Chem_shift_ref.Solvent
+      _Chem_shift_ref.Rank
+      _Chem_shift_ref.Chem_shift_units
+      _Chem_shift_ref.Chem_shift_val
+      _Chem_shift_ref.Ref_method
+      _Chem_shift_ref.Ref_type
+      _Chem_shift_ref.Indirect_shift_ratio
+      _Chem_shift_ref.External_ref_loc
+      _Chem_shift_ref.External_ref_sample_geometry
+      _Chem_shift_ref.External_ref_axis
+      _Chem_shift_ref.Indirect_shift_ratio_cit_ID
+      _Chem_shift_ref.Indirect_shift_ratio_cit_label
+      _Chem_shift_ref.Ref_correction_type
+      _Chem_shift_ref.Correction_val
+      _Chem_shift_ref.Correction_val_cit_ID
+      _Chem_shift_ref.Correction_val_cit_label
+      _Chem_shift_ref.Entry_ID
+      _Chem_shift_ref.Chem_shift_reference_ID
+
+      C 13 DSS 'methyl protons' . . . . ppm 0.00 .        indirect 0.251449530 . . . . . . . . . 15594 1 
+      H  1 DSS 'methyl protons' . . . . ppm 0.00 internal direct   1.000000000 . . . . . . . . . 15594 1 
+      N 15 DSS 'methyl protons' . . . . ppm 0.00 .        indirect 0.101329118 . . . . . . . . . 15594 1 
+
+   stop_
+
+save_
+
+
+     ###################################
+     #  Assigned chemical shift lists  #
+     ###################################
+
+###################################################################
+#       Chemical Shift Ambiguity Index Value Definitions          #
+#                                                                 #
+# The values other than 1 are used for those atoms with different #
+# chemical shifts that cannot be assigned to stereospecific atoms #
+# or to specific residues or chains.                              #
+#                                                                 #
+#   Index Value            Definition                             #
+#                                                                 #
+#      1             Unique (including isolated methyl protons,   #
+#                         geminal atoms, and geminal methyl       #
+#                         groups with identical chemical shifts)  #
+#                         (e.g. ILE HD11, HD12, HD13 protons)     #
+#      2             Ambiguity of geminal atoms or geminal methyl #
+#                         proton groups (e.g. ASP HB2 and HB3     #
+#                         protons, LEU CD1 and CD2 carbons, or    #
+#                         LEU HD11, HD12, HD13 and HD21, HD22,    #
+#                         HD23 methyl protons)                    #
+#      3             Aromatic atoms on opposite sides of          #
+#                         symmetrical rings (e.g. TYR HE1 and HE2 #
+#                         protons)                                #
+#      4             Intraresidue ambiguities (e.g. LYS HG and    #
+#                         HD protons or TRP HZ2 and HZ3 protons)  #
+#      5             Interresidue ambiguities (LYS 12 vs. LYS 27) #
+#      6             Intermolecular ambiguities (e.g. ASP 31 CA   #
+#                         in monomer 1 and ASP 31 CA in monomer 2 #
+#                         of an asymmetrical homodimer, duplex    #
+#                         DNA assignments, or other assignments   #
+#                         that may apply to atoms in one or more  #
+#                         molecule in the molecular assembly)     #
+#      9             Ambiguous, specific ambiguity not defined    #
+#                                                                 #
+###################################################################
+save_assigned_chem_shift_list_1
+   _Assigned_chem_shift_list.Sf_category                   assigned_chemical_shifts
+   _Assigned_chem_shift_list.Sf_framecode                  assigned_chem_shift_list_1
+   _Assigned_chem_shift_list.Entry_ID                      15594
+   _Assigned_chem_shift_list.ID                            1
+   _Assigned_chem_shift_list.Sample_condition_list_ID      1
+   _Assigned_chem_shift_list.Sample_condition_list_label  $sample_conditions_1
+   _Assigned_chem_shift_list.Chem_shift_reference_ID       1
+   _Assigned_chem_shift_list.Chem_shift_reference_label   $chemical_shift_reference_1
+   _Assigned_chem_shift_list.Chem_shift_1H_err             .
+   _Assigned_chem_shift_list.Chem_shift_13C_err            .
+   _Assigned_chem_shift_list.Chem_shift_15N_err            .
+   _Assigned_chem_shift_list.Chem_shift_31P_err            .
+   _Assigned_chem_shift_list.Chem_shift_2H_err             .
+   _Assigned_chem_shift_list.Chem_shift_19F_err            .
+   _Assigned_chem_shift_list.Error_derivation_method       .
+   _Assigned_chem_shift_list.Details                       .
+   _Assigned_chem_shift_list.Text_data_format              .
+   _Assigned_chem_shift_list.Text_data                     .
+
+   loop_
+      _Chem_shift_experiment.Experiment_ID
+      _Chem_shift_experiment.Experiment_name
+      _Chem_shift_experiment.Sample_ID
+      _Chem_shift_experiment.Sample_label
+      _Chem_shift_experiment.Sample_state
+      _Chem_shift_experiment.Entry_ID
+      _Chem_shift_experiment.Assigned_chem_shift_list_ID
+
+      1 '2D 1H-15N HSQC' . . . 15594 1 
+      2 'GFT HNCO'       . . . 15594 1 
+      3 'GFT HN(CO)CA'   . . . 15594 1 
+      4 'GFT CB(CACO)NH' . . . 15594 1 
+      5 'GFT HNHA'       . . . 15594 1 
+
+   stop_
+
+   loop_
+      _Atom_chem_shift.ID
+      _Atom_chem_shift.Assembly_atom_ID
+      _Atom_chem_shift.Entity_assembly_ID
+      _Atom_chem_shift.Entity_ID
+      _Atom_chem_shift.Comp_index_ID
+      _Atom_chem_shift.Seq_ID
+      _Atom_chem_shift.Comp_ID
+      _Atom_chem_shift.Atom_ID
+      _Atom_chem_shift.Atom_type
+      _Atom_chem_shift.Atom_isotope_number
+      _Atom_chem_shift.Val
+      _Atom_chem_shift.Val_err
+      _Atom_chem_shift.Assign_fig_of_merit
+      _Atom_chem_shift.Ambiguity_code
+      _Atom_chem_shift.Occupancy
+      _Atom_chem_shift.Resonance_ID
+      _Atom_chem_shift.Auth_entity_assembly_ID
+      _Atom_chem_shift.Auth_asym_ID
+      _Atom_chem_shift.Auth_seq_ID
+      _Atom_chem_shift.Auth_comp_ID
+      _Atom_chem_shift.Auth_atom_ID
+      _Atom_chem_shift.Details
+      _Atom_chem_shift.Entry_ID
+      _Atom_chem_shift.Assigned_chem_shift_list_ID
+
+        1 . 1 1  1  1 LYS H   H  1   8.75 0.05 . 1 . . . .  1 LYS HN . 15594 1 
+        2 . 1 1  1  1 LYS C   C 13 173.78 0.05 . 1 . . . .  1 LYS C  . 15594 1 
+        3 . 1 1  1  1 LYS CA  C 13  54.99 0.05 . 1 . . . .  1 LYS CA . 15594 1 
+        4 . 1 1  1  1 LYS CB  C 13  34.47 0.05 . 1 . . . .  1 LYS CB . 15594 1 
+        5 . 1 1  1  1 LYS N   N 15 123.83 0.05 . 1 . . . .  1 LYS N  . 15594 1 
+        6 . 1 1  2  2 SER H   H  1   9.01 0.05 . 1 . . . .  2 SER HN . 15594 1 
+        7 . 1 1  2  2 SER HA  H  1   4.68 0.05 . 1 . . . .  2 SER HA . 15594 1 
+        8 . 1 1  2  2 SER N   N 15 119.39 0.05 . 1 . . . .  2 SER N  . 15594 1 
+        9 . 1 1  3  3 PRO C   C 13 177.63 0.05 . 1 . . . .  3 PRO C  . 15594 1 
+       10 . 1 1  3  3 PRO CA  C 13  65    0.05 . 1 . . . .  3 PRO CA . 15594 1 
+       11 . 1 1  3  3 PRO CB  C 13  31.79 0.05 . 1 . . . .  3 PRO CB . 15594 1 
+       12 . 1 1  4  4 GLU H   H  1   8.60 0.05 . 1 . . . .  4 GLU HN . 15594 1 
+       13 . 1 1  4  4 GLU HA  H  1   3.90 0.05 . 1 . . . .  4 GLU HA . 15594 1 
+       14 . 1 1  4  4 GLU C   C 13 177.91 0.05 . 1 . . . .  4 GLU C  . 15594 1 
+       15 . 1 1  4  4 GLU CB  C 13  28.98 0.05 . 1 . . . .  4 GLU CB . 15594 1 
+       16 . 1 1  4  4 GLU N   N 15 117.75 0.05 . 1 . . . .  4 GLU N  . 15594 1 
+       17 . 1 1  5  5 GLU H   H  1   7.98 0.05 . 1 . . . .  5 GLU HN . 15594 1 
+       18 . 1 1  5  5 GLU HA  H  1   4.17 0.05 . 1 . . . .  5 GLU HA . 15594 1 
+       19 . 1 1  5  5 GLU C   C 13 178.29 0.05 . 1 . . . .  5 GLU C  . 15594 1 
+       20 . 1 1  5  5 GLU CA  C 13  58.14 0.05 . 1 . . . .  5 GLU CA . 15594 1 
+       21 . 1 1  5  5 GLU CB  C 13  30.45 0.05 . 1 . . . .  5 GLU CB . 15594 1 
+       22 . 1 1  5  5 GLU N   N 15 121.89 0.05 . 1 . . . .  5 GLU N  . 15594 1 
+       23 . 1 1  6  6 LEU H   H  1   8.45 0.05 . 1 . . . .  6 LEU HN . 15594 1 
+       24 . 1 1  6  6 LEU HA  H  1   4.31 0.05 . 1 . . . .  6 LEU HA . 15594 1 
+       25 . 1 1  6  6 LEU C   C 13 176.66 0.05 . 1 . . . .  6 LEU C  . 15594 1 
+       26 . 1 1  6  6 LEU CA  C 13  57.31 0.05 . 1 . . . .  6 LEU CA . 15594 1 
+       27 . 1 1  6  6 LEU CB  C 13  42.09 0.05 . 1 . . . .  6 LEU CB . 15594 1 
+       28 . 1 1  6  6 LEU N   N 15 120.25 0.05 . 1 . . . .  6 LEU N  . 15594 1 
+       29 . 1 1  7  7 LYS H   H  1   8.10 0.05 . 1 . . . .  7 LYS HN . 15594 1 
+       30 . 1 1  7  7 LYS HA  H  1   3.76 0.05 . 1 . . . .  7 LYS HA . 15594 1 
+       31 . 1 1  7  7 LYS C   C 13 176.16 0.05 . 1 . . . .  7 LYS C  . 15594 1 
+       32 . 1 1  7  7 LYS CA  C 13  59.11 0.05 . 1 . . . .  7 LYS CA . 15594 1 
+       33 . 1 1  7  7 LYS CB  C 13  32.11 0.05 . 1 . . . .  7 LYS CB . 15594 1 
+       34 . 1 1  7  7 LYS N   N 15 120.96 0.05 . 1 . . . .  7 LYS N  . 15594 1 
+       35 . 1 1  8  8 GLY H   H  1   7.86 0.05 . 1 . . . .  8 GLY HN . 15594 1 
+       36 . 1 1  8  8 GLY HA2 H  1   3.97 0.05 . 1 . . . .  8 GLY HA . 15594 1 
+       37 . 1 1  8  8 GLY HA3 H  1   3.97 0.05 . 1 . . . .  8 GLY HA . 15594 1 
+       38 . 1 1  8  8 GLY C   C 13 175.52 0.05 . 1 . . . .  8 GLY C  . 15594 1 
+       39 . 1 1  8  8 GLY CA  C 13  46.49 0.05 . 1 . . . .  8 GLY CA . 15594 1 
+       40 . 1 1  8  8 GLY N   N 15 105.43 0.05 . 1 . . . .  8 GLY N  . 15594 1 
+       41 . 1 1  9  9 ILE H   H  1   8.13 0.05 . 1 . . . .  9 ILE HN . 15594 1 
+       42 . 1 1  9  9 ILE HA  H  1   4.14 0.05 . 1 . . . .  9 ILE HA . 15594 1 
+       43 . 1 1  9  9 ILE C   C 13 175.32 0.05 . 1 . . . .  9 ILE C  . 15594 1 
+       44 . 1 1  9  9 ILE CA  C 13  65.01 0.05 . 1 . . . .  9 ILE CA . 15594 1 
+       45 . 1 1  9  9 ILE CB  C 13  39.04 0.05 . 1 . . . .  9 ILE CB . 15594 1 
+       46 . 1 1  9  9 ILE N   N 15 122.87 0.05 . 1 . . . .  9 ILE N  . 15594 1 
+       47 . 1 1 10 10 PHE H   H  1   8.59 0.05 . 1 . . . . 10 PHE HN . 15594 1 
+       48 . 1 1 10 10 PHE HA  H  1   4.47 0.05 . 1 . . . . 10 PHE HA . 15594 1 
+       49 . 1 1 10 10 PHE C   C 13 175.01 0.05 . 1 . . . . 10 PHE C  . 15594 1 
+       50 . 1 1 10 10 PHE CA  C 13  62.47 0.05 . 1 . . . . 10 PHE CA . 15594 1 
+       51 . 1 1 10 10 PHE CB  C 13  39.67 0.05 . 1 . . . . 10 PHE CB . 15594 1 
+       52 . 1 1 10 10 PHE N   N 15 120.43 0.05 . 1 . . . . 10 PHE N  . 15594 1 
+       53 . 1 1 11 11 GLU H   H  1   8.60 0.05 . 1 . . . . 11 GLU HN . 15594 1 
+       54 . 1 1 11 11 GLU HA  H  1   3.75 0.05 . 1 . . . . 11 GLU HA . 15594 1 
+       55 . 1 1 11 11 GLU C   C 13 177.63 0.05 . 1 . . . . 11 GLU C  . 15594 1 
+       56 . 1 1 11 11 GLU CA  C 13  58.44 0.05 . 1 . . . . 11 GLU CA . 15594 1 
+       57 . 1 1 11 11 GLU CB  C 13  29.84 0.05 . 1 . . . . 11 GLU CB . 15594 1 
+       58 . 1 1 11 11 GLU N   N 15 115.41 0.05 . 1 . . . . 11 GLU N  . 15594 1 
+       59 . 1 1 12 12 LYS H   H  1   7.94 0.05 . 1 . . . . 12 LYS HN . 15594 1 
+       60 . 1 1 12 12 LYS HA  H  1   4.08 0.05 . 1 . . . . 12 LYS HA . 15594 1 
+       61 . 1 1 12 12 LYS CA  C 13  58.44 0.05 . 1 . . . . 12 LYS CA . 15594 1 
+       62 . 1 1 12 12 LYS CB  C 13  32.72 0.05 . 1 . . . . 12 LYS CB . 15594 1 
+       63 . 1 1 12 12 LYS N   N 15 119.22 0.05 . 1 . . . . 12 LYS N  . 15594 1 
+       64 . 1 1 13 13 TYR H   H  1   7.74 0.05 . 1 . . . . 13 TYR HN . 15594 1 
+       65 . 1 1 13 13 TYR HA  H  1   4.58 0.05 . 1 . . . . 13 TYR HA . 15594 1 
+       66 . 1 1 13 13 TYR C   C 13  39.87 0.05 . 1 . . . . 13 TYR C  . 15594 1 
+       67 . 1 1 13 13 TYR CA  C 13  61.28 0.05 . 1 . . . . 13 TYR CA . 15594 1 
+       68 . 1 1 13 13 TYR CB  C 13 175.51 0.05 . 1 . . . . 13 TYR CB . 15594 1 
+       69 . 1 1 13 13 TYR N   N 15 115.32 0.05 . 1 . . . . 13 TYR N  . 15594 1 
+       70 . 1 1 14 14 ALA H   H  1   9.06 0.05 . 1 . . . . 14 ALA HN . 15594 1 
+       71 . 1 1 14 14 ALA HA  H  1   3.85 0.05 . 1 . . . . 14 ALA HA . 15594 1 
+       72 . 1 1 14 14 ALA C   C 13 177.99 0.05 . 1 . . . . 14 ALA C  . 15594 1 
+       73 . 1 1 14 14 ALA CA  C 13  54.28 0.05 . 1 . . . . 14 ALA CA . 15594 1 
+       74 . 1 1 14 14 ALA CB  C 13  18.79 0.05 . 1 . . . . 14 ALA CB . 15594 1 
+       75 . 1 1 14 14 ALA N   N 15 120.14 0.05 . 1 . . . . 14 ALA N  . 15594 1 
+       76 . 1 1 15 15 ALA H   H  1   7.35 0.05 . 1 . . . . 15 ALA HN . 15594 1 
+       77 . 1 1 15 15 ALA HA  H  1   4.55 0.05 . 1 . . . . 15 ALA HA . 15594 1 
+       78 . 1 1 15 15 ALA C   C 13 176.27 0.05 . 1 . . . . 15 ALA C  . 15594 1 
+       79 . 1 1 15 15 ALA CA  C 13  52.28 0.05 . 1 . . . . 15 ALA CA . 15594 1 
+       80 . 1 1 15 15 ALA CB  C 13  19.67 0.05 . 1 . . . . 15 ALA CB . 15594 1 
+       81 . 1 1 15 15 ALA N   N 15 117.64 0.05 . 1 . . . . 15 ALA N  . 15594 1 
+       82 . 1 1 16 16 LYS H   H  1   7.69 0.05 . 1 . . . . 16 LYS HN . 15594 1 
+       83 . 1 1 16 16 LYS HA  H  1   4.20 0.05 . 1 . . . . 16 LYS HA . 15594 1 
+       84 . 1 1 16 16 LYS C   C 13 175.83 0.05 . 1 . . . . 16 LYS C  . 15594 1 
+       85 . 1 1 16 16 LYS CA  C 13  59.78 0.05 . 1 . . . . 16 LYS CA . 15594 1 
+       86 . 1 1 16 16 LYS CB  C 13  33.30 0.05 . 1 . . . . 16 LYS CB . 15594 1 
+       87 . 1 1 16 16 LYS N   N 15 120.34 0.05 . 1 . . . . 16 LYS N  . 15594 1 
+       88 . 1 1 17 17 GLU H   H  1  10.17 0.05 . 1 . . . . 17 GLU HN . 15594 1 
+       89 . 1 1 17 17 GLU HA  H  1   4.99 0.05 . 1 . . . . 17 GLU HA . 15594 1 
+       90 . 1 1 17 17 GLU C   C 13 174.79 0.05 . 1 . . . . 17 GLU C  . 15594 1 
+       91 . 1 1 17 17 GLU CA  C 13  53.91 0.05 . 1 . . . . 17 GLU CA . 15594 1 
+       92 . 1 1 17 17 GLU N   N 15 116.56 0.05 . 1 . . . . 17 GLU N  . 15594 1 
+       93 . 1 1 18 18 GLY H   H  1   9.10 0.05 . 1 . . . . 18 GLY HN . 15594 1 
+       94 . 1 1 18 18 GLY N   N 15 113.23 0.05 . 1 . . . . 18 GLY N  . 15594 1 
+       95 . 1 1 19 19 ASP H   H  1   7.73 0.05 . 1 . . . . 19 ASP HN . 15594 1 
+       96 . 1 1 19 19 ASP N   N 15 126.28 0.05 . 1 . . . . 19 ASP N  . 15594 1 
+       97 . 1 1 21 21 ASN H   H  1   9.09 0.05 . 1 . . . . 21 ASN HN . 15594 1 
+       98 . 1 1 21 21 ASN N   N 15 115.85 0.05 . 1 . . . . 21 ASN N  . 15594 1 
+       99 . 1 1 24 24 SER C   C 13 176.12 0.05 . 1 . . . . 24 SER C  . 15594 1 
+      100 . 1 1 25 25 LYS H   H  1  10.40 0.05 . 1 . . . . 25 LYS HN . 15594 1 
+      101 . 1 1 25 25 LYS C   C 13 177.60 0.05 . 1 . . . . 25 LYS C  . 15594 1 
+      102 . 1 1 25 25 LYS N   N 15 124.35 0.05 . 1 . . . . 25 LYS N  . 15594 1 
+      103 . 1 1 26 26 GLU H   H  1   9.25 0.05 . 1 . . . . 26 GLU HN . 15594 1 
+      104 . 1 1 26 26 GLU N   N 15 118.47 0.05 . 1 . . . . 26 GLU N  . 15594 1 
+      105 . 1 1 27 27 GLU C   C 13 178.58 0.05 . 1 . . . . 27 GLU C  . 15594 1 
+      106 . 1 1 27 27 GLU CA  C 13  59.92 0.05 . 1 . . . . 27 GLU CA . 15594 1 
+      107 . 1 1 28 28 LEU H   H  1  10.81 0.05 . 1 . . . . 28 LEU HN . 15594 1 
+      108 . 1 1 28 28 LEU C   C 13 177.28 0.05 . 1 . . . . 28 LEU C  . 15594 1 
+      109 . 1 1 28 28 LEU CB  C 13  43.57 0.05 . 1 . . . . 28 LEU CB . 15594 1 
+      110 . 1 1 28 28 LEU N   N 15 121.06 0.05 . 1 . . . . 28 LEU N  . 15594 1 
+      111 . 1 1 29 29 LYS H   H  1   9.68 0.05 . 1 . . . . 29 LYS HN . 15594 1 
+      112 . 1 1 29 29 LYS HA  H  1   4.48 0.05 . 1 . . . . 29 LYS HA . 15594 1 
+      113 . 1 1 29 29 LYS C   C 13 176.67 0.05 . 1 . . . . 29 LYS C  . 15594 1 
+      114 . 1 1 29 29 LYS CA  C 13  60.77 0.05 . 1 . . . . 29 LYS CA . 15594 1 
+      115 . 1 1 29 29 LYS CB  C 13  32.91 0.05 . 1 . . . . 29 LYS CB . 15594 1 
+      116 . 1 1 29 29 LYS N   N 15 121.14 0.05 . 1 . . . . 29 LYS N  . 15594 1 
+      117 . 1 1 30 30 LEU H   H  1   8.41 0.05 . 1 . . . . 30 LEU HN . 15594 1 
+      118 . 1 1 30 30 LEU CA  C 13  57.73 0.05 . 1 . . . . 30 LEU CA . 15594 1 
+      119 . 1 1 30 30 LEU CB  C 13  42.57 0.05 . 1 . . . . 30 LEU CB . 15594 1 
+      120 . 1 1 30 30 LEU N   N 15 119    0.05 . 1 . . . . 30 LEU N  . 15594 1 
+      121 . 1 1 31 31 LEU H   H  1   9.01 0.05 . 1 . . . . 31 LEU HN . 15594 1 
+      122 . 1 1 31 31 LEU HA  H  1   2.92 0.05 . 1 . . . . 31 LEU HA . 15594 1 
+      123 . 1 1 31 31 LEU C   C 13 178.28 0.05 . 1 . . . . 31 LEU C  . 15594 1 
+      124 . 1 1 31 31 LEU CA  C 13  59.03 0.05 . 1 . . . . 31 LEU CA . 15594 1 
+      125 . 1 1 31 31 LEU N   N 15 124.84 0.05 . 1 . . . . 31 LEU N  . 15594 1 
+      126 . 1 1 32 32 LEU H   H  1   9.68 0.05 . 1 . . . . 32 LEU HN . 15594 1 
+      127 . 1 1 32 32 LEU HA  H  1   4.49 0.05 . 1 . . . . 32 LEU HA . 15594 1 
+      128 . 1 1 32 32 LEU C   C 13 177.36 0.05 . 1 . . . . 32 LEU C  . 15594 1 
+      129 . 1 1 32 32 LEU CA  C 13  58.52 0.05 . 1 . . . . 32 LEU CA . 15594 1 
+      130 . 1 1 32 32 LEU CB  C 13  42.76 0.05 . 1 . . . . 32 LEU CB . 15594 1 
+      131 . 1 1 32 32 LEU N   N 15 120.58 0.05 . 1 . . . . 32 LEU N  . 15594 1 
+      132 . 1 1 33 33 GLN H   H  1   9.14 0.05 . 1 . . . . 33 GLN HN . 15594 1 
+      133 . 1 1 33 33 GLN HA  H  1   4.25 0.05 . 1 . . . . 33 GLN HA . 15594 1 
+      134 . 1 1 33 33 GLN C   C 13 176.05 0.05 . 1 . . . . 33 GLN C  . 15594 1 
+      135 . 1 1 33 33 GLN CA  C 13  58.60 0.05 . 1 . . . . 33 GLN CA . 15594 1 
+      136 . 1 1 33 33 GLN CB  C 13  29.73 0.05 . 1 . . . . 33 GLN CB . 15594 1 
+      137 . 1 1 33 33 GLN N   N 15 115.01 0.05 . 1 . . . . 33 GLN N  . 15594 1 
+      138 . 1 1 34 34 THR H   H  1   8    0.05 . 1 . . . . 34 THR HN . 15594 1 
+      139 . 1 1 34 34 THR HA  H  1   4.39 0.05 . 1 . . . . 34 THR HA . 15594 1 
+      140 . 1 1 34 34 THR C   C 13 174.13 0.05 . 1 . . . . 34 THR C  . 15594 1 
+      141 . 1 1 34 34 THR CA  C 13  65.25 0.05 . 1 . . . . 34 THR CA . 15594 1 
+      142 . 1 1 34 34 THR CB  C 13  69.92 0.05 . 1 . . . . 34 THR CB . 15594 1 
+      143 . 1 1 34 34 THR N   N 15 111.18 0.05 . 1 . . . . 34 THR N  . 15594 1 
+      144 . 1 1 35 35 GLU H   H  1   8.81 0.05 . 1 . . . . 35 GLU HN . 15594 1 
+      145 . 1 1 35 35 GLU HA  H  1   4.47 0.05 . 1 . . . . 35 GLU HA . 15594 1 
+      146 . 1 1 35 35 GLU C   C 13 175.43 0.05 . 1 . . . . 35 GLU C  . 15594 1 
+      147 . 1 1 35 35 GLU CA  C 13  56.17 0.05 . 1 . . . . 35 GLU CA . 15594 1 
+      148 . 1 1 35 35 GLU CB  C 13  30.90 0.05 . 1 . . . . 35 GLU CB . 15594 1 
+      149 . 1 1 35 35 GLU N   N 15 116.41 0.05 . 1 . . . . 35 GLU N  . 15594 1 
+      150 . 1 1 36 36 PHE H   H  1   8.23 0.05 . 1 . . . . 36 PHE HN . 15594 1 
+      151 . 1 1 36 36 PHE HA  H  1   5.50 0.05 . 1 . . . . 36 PHE HA . 15594 1 
+      152 . 1 1 36 36 PHE N   N 15 115.09 0.05 . 1 . . . . 36 PHE N  . 15594 1 
+      153 . 1 1 37 37 PRO C   C 13 178.14 0.05 . 1 . . . . 37 PRO C  . 15594 1 
+      154 . 1 1 37 37 PRO CA  C 13  64.94 0.05 . 1 . . . . 37 PRO CA . 15594 1 
+      155 . 1 1 37 37 PRO CB  C 13  31.60 0.05 . 1 . . . . 37 PRO CB . 15594 1 
+      156 . 1 1 38 38 SER H   H  1   8.66 0.05 . 1 . . . . 38 SER HN . 15594 1 
+      157 . 1 1 38 38 SER HA  H  1   4.50 0.05 . 1 . . . . 38 SER HA . 15594 1 
+      158 . 1 1 38 38 SER C   C 13 174.83 0.05 . 1 . . . . 38 SER C  . 15594 1 
+      159 . 1 1 38 38 SER CA  C 13  59.97 0.05 . 1 . . . . 38 SER CA . 15594 1 
+      160 . 1 1 38 38 SER CB  C 13  62.69 0.05 . 1 . . . . 38 SER CB . 15594 1 
+      161 . 1 1 38 38 SER N   N 15 114.03 0.05 . 1 . . . . 38 SER N  . 15594 1 
+      162 . 1 1 39 39 LEU H   H  1   8.26 0.05 . 1 . . . . 39 LEU HN . 15594 1 
+      163 . 1 1 39 39 LEU HA  H  1   4.52 0.05 . 1 . . . . 39 LEU HA . 15594 1 
+      164 . 1 1 39 39 LEU C   C 13 176.78 0.05 . 1 . . . . 39 LEU C  . 15594 1 
+      165 . 1 1 39 39 LEU CA  C 13  56.60 0.05 . 1 . . . . 39 LEU CA . 15594 1 
+      166 . 1 1 39 39 LEU CB  C 13  42.61 0.05 . 1 . . . . 39 LEU CB . 15594 1 
+      167 . 1 1 39 39 LEU N   N 15 122.65 0.05 . 1 . . . . 39 LEU N  . 15594 1 
+      168 . 1 1 40 40 LEU H   H  1   8.07 0.05 . 1 . . . . 40 LEU HN . 15594 1 
+      169 . 1 1 40 40 LEU HA  H  1   4.83 0.05 . 1 . . . . 40 LEU HA . 15594 1 
+      170 . 1 1 40 40 LEU C   C 13 175.69 0.05 . 1 . . . . 40 LEU C  . 15594 1 
+      171 . 1 1 40 40 LEU CA  C 13  54.51 0.05 . 1 . . . . 40 LEU CA . 15594 1 
+      172 . 1 1 40 40 LEU CB  C 13  42.02 0.05 . 1 . . . . 40 LEU CB . 15594 1 
+      173 . 1 1 40 40 LEU N   N 15 117.39 0.05 . 1 . . . . 40 LEU N  . 15594 1 
+      174 . 1 1 41 41 LYS H   H  1   7.77 0.05 . 1 . . . . 41 LYS HN . 15594 1 
+      175 . 1 1 41 41 LYS HA  H  1   4.61 0.05 . 1 . . . . 41 LYS HA . 15594 1 
+      176 . 1 1 41 41 LYS C   C 13 175.38 0.05 . 1 . . . . 41 LYS C  . 15594 1 
+      177 . 1 1 41 41 LYS CA  C 13  56.17 0.05 . 1 . . . . 41 LYS CA . 15594 1 
+      178 . 1 1 41 41 LYS CB  C 13  32.95 0.05 . 1 . . . . 41 LYS CB . 15594 1 
+      179 . 1 1 41 41 LYS N   N 15 120.53 0.05 . 1 . . . . 41 LYS N  . 15594 1 
+      180 . 1 1 42 42 GLY H   H  1   8.39 0.05 . 1 . . . . 42 GLY HN . 15594 1 
+      181 . 1 1 42 42 GLY HA2 H  1   4.28 0.05 . 1 . . . . 42 GLY HA . 15594 1 
+      182 . 1 1 42 42 GLY HA3 H  1   4.28 0.05 . 1 . . . . 42 GLY HA . 15594 1 
+      183 . 1 1 42 42 GLY C   C 13 177.19 0.05 . 1 . . . . 42 GLY C  . 15594 1 
+      184 . 1 1 42 42 GLY N   N 15 109.28 0.05 . 1 . . . . 42 GLY N  . 15594 1 
+      185 . 1 1 43 43 MET H   H  1   9.02 0.05 . 1 . . . . 43 MET HN . 15594 1 
+      186 . 1 1 43 43 MET C   C 13 175.52 0.05 . 1 . . . . 43 MET C  . 15594 1 
+      187 . 1 1 43 43 MET N   N 15 121.11 0.05 . 1 . . . . 43 MET N  . 15594 1 
+      188 . 1 1 44 44 SER H   H  1   8.70 0.05 . 1 . . . . 44 SER HN . 15594 1 
+      189 . 1 1 44 44 SER C   C 13 173.54 0.05 . 1 . . . . 44 SER C  . 15594 1 
+      190 . 1 1 44 44 SER N   N 15 116.19 0.05 . 1 . . . . 44 SER N  . 15594 1 
+      191 . 1 1 45 45 THR H   H  1   8.44 0.05 . 1 . . . . 45 THR HN . 15594 1 
+      192 . 1 1 45 45 THR C   C 13 174.30 0.05 . 1 . . . . 45 THR C  . 15594 1 
+      193 . 1 1 45 45 THR N   N 15 113.74 0.05 . 1 . . . . 45 THR N  . 15594 1 
+      194 . 1 1 46 46 LEU H   H  1   9.38 0.05 . 1 . . . . 46 LEU HN . 15594 1 
+      195 . 1 1 46 46 LEU C   C 13 177.76 0.05 . 1 . . . . 46 LEU C  . 15594 1 
+      196 . 1 1 46 46 LEU N   N 15 123.97 0.05 . 1 . . . . 46 LEU N  . 15594 1 
+      197 . 1 1 47 47 ASP H   H  1   8.99 0.05 . 1 . . . . 47 ASP HN . 15594 1 
+      198 . 1 1 47 47 ASP N   N 15 118.62 0.05 . 1 . . . . 47 ASP N  . 15594 1 
+      199 . 1 1 49 49 LEU H   H  1   9.74 0.05 . 1 . . . . 49 LEU HN . 15594 1 
+      200 . 1 1 49 49 LEU N   N 15 123.88 0.05 . 1 . . . . 49 LEU N  . 15594 1 
+      201 . 1 1 50 50 PHE H   H  1  10.73 0.05 . 1 . . . . 50 PHE HN . 15594 1 
+      202 . 1 1 50 50 PHE N   N 15 121.38 0.05 . 1 . . . . 50 PHE N  . 15594 1 
+      203 . 1 1 51 51 GLU H   H  1   7.86 0.05 . 1 . . . . 51 GLU HN . 15594 1 
+      204 . 1 1 51 51 GLU HA  H  1   3.53 0.05 . 1 . . . . 51 GLU HA . 15594 1 
+      205 . 1 1 51 51 GLU N   N 15 114.87 0.05 . 1 . . . . 51 GLU N  . 15594 1 
+      206 . 1 1 66 66 PHE CA  C 13  58.85 0.05 . 1 . . . . 66 PHE CA . 15594 1 
+      207 . 1 1 67 67 GLN H   H  1   5.67 0.05 . 1 . . . . 67 GLN HN . 15594 1 
+      208 . 1 1 67 67 GLN C   C 13 174.81 0.05 . 1 . . . . 67 GLN C  . 15594 1 
+      209 . 1 1 67 67 GLN CA  C 13  56.34 0.05 . 1 . . . . 67 GLN CA . 15594 1 
+      210 . 1 1 67 67 GLN N   N 15 114.05 0.05 . 1 . . . . 67 GLN N  . 15594 1 
+      211 . 1 1 68 68 VAL H   H  1   5.76 0.05 . 1 . . . . 68 VAL HN . 15594 1 
+      212 . 1 1 68 68 VAL C   C 13 175.77 0.05 . 1 . . . . 68 VAL C  . 15594 1 
+      213 . 1 1 68 68 VAL CA  C 13  63.99 0.05 . 1 . . . . 68 VAL CA . 15594 1 
+      214 . 1 1 68 68 VAL CB  C 13  31.31 0.05 . 1 . . . . 68 VAL CB . 15594 1 
+      215 . 1 1 68 68 VAL N   N 15 116.28 0.05 . 1 . . . . 68 VAL N  . 15594 1 
+      216 . 1 1 69 69 LEU H   H  1   7.15 0.05 . 1 . . . . 69 LEU HN . 15594 1 
+      217 . 1 1 69 69 LEU HA  H  1   4.04 0.05 . 1 . . . . 69 LEU HA . 15594 1 
+      218 . 1 1 69 69 LEU C   C 13 176.21 0.05 . 1 . . . . 69 LEU C  . 15594 1 
+      219 . 1 1 69 69 LEU CA  C 13  56.27 0.05 . 1 . . . . 69 LEU CA . 15594 1 
+      220 . 1 1 69 69 LEU CB  C 13  42.01 0.05 . 1 . . . . 69 LEU CB . 15594 1 
+      221 . 1 1 69 69 LEU N   N 15 120.35 0.05 . 1 . . . . 69 LEU N  . 15594 1 
+      222 . 1 1 70 70 VAL H   H  1   6.81 0.05 . 1 . . . . 70 VAL HN . 15594 1 
+      223 . 1 1 70 70 VAL HA  H  1   3.17 0.05 . 1 . . . . 70 VAL HA . 15594 1 
+      224 . 1 1 70 70 VAL C   C 13 175.76 0.05 . 1 . . . . 70 VAL C  . 15594 1 
+      225 . 1 1 70 70 VAL CA  C 13  65.11 0.05 . 1 . . . . 70 VAL CA . 15594 1 
+      226 . 1 1 70 70 VAL CB  C 13  31.19 0.05 . 1 . . . . 70 VAL CB . 15594 1 
+      227 . 1 1 70 70 VAL N   N 15 115.79 0.05 . 1 . . . . 70 VAL N  . 15594 1 
+      228 . 1 1 71 71 LYS H   H  1   7.19 0.05 . 1 . . . . 71 LYS HN . 15594 1 
+      229 . 1 1 71 71 LYS HA  H  1   3.88 0.05 . 1 . . . . 71 LYS HA . 15594 1 
+      230 . 1 1 71 71 LYS C   C 13 176.10 0.05 . 1 . . . . 71 LYS C  . 15594 1 
+      231 . 1 1 71 71 LYS CA  C 13  57.68 0.05 . 1 . . . . 71 LYS CA . 15594 1 
+      232 . 1 1 71 71 LYS CB  C 13  31.93 0.05 . 1 . . . . 71 LYS CB . 15594 1 
+      233 . 1 1 71 71 LYS N   N 15 117.82 0.05 . 1 . . . . 71 LYS N  . 15594 1 
+      234 . 1 1 72 72 LYS H   H  1   7.45 0.05 . 1 . . . . 72 LYS HN . 15594 1 
+      235 . 1 1 72 72 LYS HA  H  1   4.18 0.05 . 1 . . . . 72 LYS HA . 15594 1 
+      236 . 1 1 72 72 LYS C   C 13 176.18 0.05 . 1 . . . . 72 LYS C  . 15594 1 
+      237 . 1 1 72 72 LYS CA  C 13  56.95 0.05 . 1 . . . . 72 LYS CA . 15594 1 
+      238 . 1 1 72 72 LYS CB  C 13  33.61 0.05 . 1 . . . . 72 LYS CB . 15594 1 
+      239 . 1 1 72 72 LYS N   N 15 116.93 0.05 . 1 . . . . 72 LYS N  . 15594 1 
+      240 . 1 1 73 73 ILE H   H  1   7.44 0.05 . 1 . . . . 73 ILE HN . 15594 1 
+      241 . 1 1 73 73 ILE HA  H  1   4.18 0.05 . 1 . . . . 73 ILE HA . 15594 1 
+      242 . 1 1 73 73 ILE C   C 13 174.44 0.05 . 1 . . . . 73 ILE C  . 15594 1 
+      243 . 1 1 73 73 ILE CA  C 13  61.51 0.05 . 1 . . . . 73 ILE CA . 15594 1 
+      244 . 1 1 73 73 ILE CB  C 13  38.61 0.05 . 1 . . . . 73 ILE CB . 15594 1 
+      245 . 1 1 73 73 ILE N   N 15 114.56 0.05 . 1 . . . . 73 ILE N  . 15594 1 
+      246 . 1 1 74 74 SER H   H  1   7.79 0.05 . 1 . . . . 74 SER HN . 15594 1 
+      247 . 1 1 74 74 SER HA  H  1   4.52 0.05 . 1 . . . . 74 SER HA . 15594 1 
+      248 . 1 1 74 74 SER C   C 13 171.58 0.05 . 1 . . . . 74 SER C  . 15594 1 
+      249 . 1 1 74 74 SER CA  C 13  57.96 0.05 . 1 . . . . 74 SER CA . 15594 1 
+      250 . 1 1 74 74 SER CB  C 13  63.82 0.05 . 1 . . . . 74 SER CB . 15594 1 
+      251 . 1 1 74 74 SER N   N 15 117.31 0.05 . 1 . . . . 74 SER N  . 15594 1 
+      252 . 1 1 75 75 GLN H   H  1   7.63 0.05 . 1 . . . . 75 GLN HN . 15594 1 
+      253 . 1 1 75 75 GLN HA  H  1   4.09 0.05 . 1 . . . . 75 GLN HA . 15594 1 
+      254 . 1 1 75 75 GLN N   N 15 126.19 0.05 . 1 . . . . 75 GLN N  . 15594 1 
+
+   stop_
+
+save_
+

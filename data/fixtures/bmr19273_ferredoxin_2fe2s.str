@@ -1,0 +1,1819 @@
+# BMRB ID: bmr19273
+# Related wwPDB ID: 1I7H (https://files.rcsb.org/download/1I7H.pdb, wwPDB CC0 1.0 Public Domain)
+# Protein: Escherichia coli ISC-type [2Fe-2S] holo-Ferredoxin (Fdx, 115 aa)
+# Fold class: paramagnetic [2Fe-2S] metalloprotein (CYS46, CYS52, CYS55, CYS91)
+# Literature: Yan, R., Adinolfi, S., Iannuzzi, C., Kelly, G., Oregioni, A., Martin, S. & Pastore, A., PLoS ONE 2013, 8(11), e78948
+# Source: BioMagResBank (https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr19273/bmr19273_3.str, CC0 1.0 Public Domain)
+# Upstream SHA-256: f7615e7e78e6b8596969796bf3357fc3fa04c4b7482e04e686a71865c8c1d0c9
+data_19273
+
+
+#######################
+#  Entry information  #
+#######################
+save_entry_information
+   _Entry.Sf_category                    entry_information
+   _Entry.Sf_framecode                   entry_information
+   _Entry.ID                             19273
+   _Entry.Title
+;
+Structural characterization of E. coli ISC-type Ferredoxin
+;
+   _Entry.Type                           macromolecule
+   _Entry.Version_type                   original
+   _Entry.Submission_date                2013-05-28
+   _Entry.Accession_date                 2013-05-28
+   _Entry.Last_release_date              2013-05-28
+   _Entry.Original_release_date          2013-05-28
+   _Entry.Origination                    author
+   _Entry.Format_name                    .
+   _Entry.NMR_STAR_version               3.2.14.0
+   _Entry.NMR_STAR_dict_location         .
+   _Entry.Original_NMR_STAR_version      3.1
+   _Entry.Experimental_method            NMR
+   _Entry.Experimental_method_subtype    solution
+   _Entry.Source_data_format             .
+   _Entry.Source_data_format_version     .
+   _Entry.Generated_software_name        .
+   _Entry.Generated_software_version     .
+   _Entry.Generated_software_ID          .
+   _Entry.Generated_software_label       .
+   _Entry.Generated_date                 .
+   _Entry.DOI                            .
+   _Entry.UUID                           .
+   _Entry.Related_coordinate_file_name   .
+   _Entry.Details                        .
+   _Entry.BMRB_internal_directory_name   .
+
+   loop_
+      _Entry_author.Ordinal
+      _Entry_author.Given_name
+      _Entry_author.Family_name
+      _Entry_author.First_initial
+      _Entry_author.Middle_initials
+      _Entry_author.Family_title
+      _Entry_author.ORCID
+      _Entry_author.Entry_ID
+
+      1   Salvatore   Adinolfi   .   .   .   .   19273
+      2   Clara       Iannuzi    .   .   .   .   19273
+      3   Geoff       Kelly      .   .   .   .   19273
+      4   Alain       Oregioni   .   .   .   .   19273
+      5   Stephen     Martin     .   .   .   .   19273
+   stop_
+
+   loop_
+      _SG_project.SG_project_ID
+      _SG_project.Project_name
+      _SG_project.Full_name_of_center
+      _SG_project.Initial_of_center
+      _SG_project.Entry_ID
+
+      1   'not applicable'   'not applicable'   .   19273
+   stop_
+
+   loop_
+      _Data_set.Type
+      _Data_set.Count
+      _Data_set.Entry_ID
+
+      assigned_chemical_shifts   1   19273
+   stop_
+
+   loop_
+      _Datum.Type
+      _Datum.Count
+      _Datum.Entry_ID
+
+      '13C chemical shifts'   241   19273
+      '15N chemical shifts'   81    19273
+      '1H chemical shifts'    81    19273
+   stop_
+
+   loop_
+      _Release.Release_number
+      _Release.Format_type
+      _Release.Format_version
+      _Release.Date
+      _Release.Submission_date
+      _Release.Type
+      _Release.Author
+      _Release.Detail
+      _Release.Entry_ID
+
+      2   .   .   2022-04-01   2013-05-28   update     BMRB     'update Polymer_type'   19273
+      1   .   .   2014-02-13   2013-05-28   original   author   'original release'      19273
+   stop_
+save_
+
+
+###############
+#  Citations  #
+###############
+save_entry_citation
+   _Citation.Sf_category                  citations
+   _Citation.Sf_framecode                 entry_citation
+   _Citation.Entry_ID                     19273
+   _Citation.ID                           1
+   _Citation.Name                         .
+   _Citation.Class                        'entry citation'
+   _Citation.CAS_abstract_code            .
+   _Citation.MEDLINE_UI_code              .
+   _Citation.PubMed_ID                    24265733
+   _Citation.DOI                          .
+   _Citation.Full_citation                .
+   _Citation.Title
+;
+Cluster and fold stability of E. coli ISC-type ferredoxin.
+;
+   _Citation.Status                       published
+   _Citation.Type                         journal
+   _Citation.Journal_abbrev               'PLoS ONE'
+   _Citation.Journal_name_full            'PloS one'
+   _Citation.Journal_volume               8
+   _Citation.Journal_issue                11
+   _Citation.Journal_ASTM                 .
+   _Citation.Journal_ISSN                 .
+   _Citation.Journal_CSD                  .
+   _Citation.Book_title                   .
+   _Citation.Book_chapter_title           .
+   _Citation.Book_volume                  .
+   _Citation.Book_series                  .
+   _Citation.Book_publisher               .
+   _Citation.Book_publisher_city          .
+   _Citation.Book_ISBN                    .
+   _Citation.Conference_title             .
+   _Citation.Conference_site              .
+   _Citation.Conference_state_province    .
+   _Citation.Conference_country           .
+   _Citation.Conference_start_date        .
+   _Citation.Conference_end_date          .
+   _Citation.Conference_abstract_number   .
+   _Citation.Thesis_institution           .
+   _Citation.Thesis_institution_city      .
+   _Citation.Thesis_institution_country   .
+   _Citation.WWW_URL                      .
+   _Citation.Page_first                   e78948
+   _Citation.Page_last                    e78948
+   _Citation.Year                         2013
+   _Citation.Details                      .
+
+   loop_
+      _Citation_author.Ordinal
+      _Citation_author.Given_name
+      _Citation_author.Family_name
+      _Citation_author.First_initial
+      _Citation_author.Middle_initials
+      _Citation_author.Family_title
+      _Citation_author.ORCID
+      _Citation_author.Entry_ID
+      _Citation_author.Citation_ID
+
+      1   Robert      Yan        .   .   .   .   19273   1
+      2   Salvatore   Adinolfi   .   .   .   .   19273   1
+      3   Clara       Iannuzzi   .   .   .   .   19273   1
+      4   Geoff       Kelly      .   .   .   .   19273   1
+      5   Alain       Oregioni   .   .   .   .   19273   1
+      6   Stephen     Martin     .   .   .   .   19273   1
+      7   Annalisa    Pastore    .   .   .   .   19273   1
+   stop_
+
+   loop_
+      _Citation_keyword.Keyword
+      _Citation_keyword.Entry_ID
+      _Citation_keyword.Citation_ID
+
+      'Fe-S cluster'          19273   1
+      Ferredoxin              19273   1
+      Frataxin                19273   1
+      "Friedreich's Ataxia"   19273   1
+      'NMR assignments'       19273   1
+   stop_
+save_
+
+
+#############################################
+#  Molecular system (assembly) description  #
+#############################################
+save_assembly
+   _Assembly.Sf_category                       assembly
+   _Assembly.Sf_framecode                      assembly
+   _Assembly.Entry_ID                          19273
+   _Assembly.ID                                1
+   _Assembly.Name                              holo-Ferredoxin
+   _Assembly.BMRB_code                         .
+   _Assembly.Number_of_components              2
+   _Assembly.Organic_ligands                   .
+   _Assembly.Metal_ions                        .
+   _Assembly.Non_standard_bonds                no
+   _Assembly.Ambiguous_conformational_states   .
+   _Assembly.Ambiguous_chem_comp_sites         .
+   _Assembly.Molecules_in_chemical_exchange    .
+   _Assembly.Paramagnetic                      no
+   _Assembly.Thiol_state                       .
+   _Assembly.Molecular_mass                    12833.92
+   _Assembly.Enzyme_commission_number          .
+   _Assembly.Details                           '[2Fe-2S] cluster containing ferredoxin in oxidised state'
+   _Assembly.DB_query_date                     .
+   _Assembly.DB_query_revised_last_date        .
+
+   loop_
+      _Entity_assembly.ID
+      _Entity_assembly.Entity_assembly_name
+      _Entity_assembly.Entity_ID
+      _Entity_assembly.Entity_label
+      _Entity_assembly.Asym_ID
+      _Entity_assembly.PDB_chain_ID
+      _Entity_assembly.Experimental_data_reported
+      _Entity_assembly.Physical_state
+      _Entity_assembly.Conformational_isomer
+      _Entity_assembly.Chemical_exchange_state
+      _Entity_assembly.Magnetic_equivalence_group_code
+      _Entity_assembly.Role
+      _Entity_assembly.Details
+      _Entity_assembly.Entry_ID
+      _Entity_assembly.Assembly_ID
+
+      1   holo--Ferredoxin   1   $holo-Ferredoxin   A   .   yes   native   no   no   .   .   .   19273   1
+      2   '2FE 2S'           2   $entity_FES        .   .   no    native   no   no   .   .   .   19273   1
+   stop_
+
+   loop_
+      _Assembly_db_link.Author_supplied
+      _Assembly_db_link.Database_code
+      _Assembly_db_link.Accession_code
+      _Assembly_db_link.Entry_mol_code
+      _Assembly_db_link.Entry_mol_name
+      _Assembly_db_link.Entry_experimental_method
+      _Assembly_db_link.Entry_structure_resolution
+      _Assembly_db_link.Entry_relation_type
+      _Assembly_db_link.Entry_details
+      _Assembly_db_link.Entry_ID
+      _Assembly_db_link.Assembly_ID
+
+      yes   PDB   1I7H   .   .   X-ray   1.7   'structure of the protein assigned in this study'   .   19273   1
+   stop_
+save_
+
+
+    ####################################
+    #  Biological polymers and ligands #
+    ####################################
+save_holo-Ferredoxin
+   _Entity.Sf_category                       entity
+   _Entity.Sf_framecode                      holo-Ferredoxin
+   _Entity.Entry_ID                          19273
+   _Entity.ID                                1
+   _Entity.BMRB_code                         .
+   _Entity.Name                              holo-Ferredoxin
+   _Entity.Type                              polymer
+   _Entity.Polymer_common_type               .
+   _Entity.Polymer_type                      polypeptide(L)
+   _Entity.Polymer_type_details              .
+   _Entity.Polymer_strand_ID                 .
+   _Entity.Polymer_seq_one_letter_code_can   .
+   _Entity.Polymer_seq_one_letter_code
+;
+QGAMAPKIVILPHQDLCPDG
+AVLEANSGETILDAALRNGI
+EIEHACEKSCACTTCHCIVR
+EGFDSLPESSEQEDDMLDKA
+WGLEPESRLSCQARVTDEDL
+VVEIPRYTINHAREH
+;
+   _Entity.Target_identifier                 .
+   _Entity.Polymer_author_defined_seq        .
+   _Entity.Polymer_author_seq_details        'Residues -3 to 1 represent vector encoded sequence after cleavage with TEV'
+   _Entity.Ambiguous_conformational_states   no
+   _Entity.Ambiguous_chem_comp_sites         no
+   _Entity.Nstd_monomer                      no
+   _Entity.Nstd_chirality                    no
+   _Entity.Nstd_linkage                      no
+   _Entity.Nonpolymer_comp_ID                .
+   _Entity.Nonpolymer_comp_label             .
+   _Entity.Number_of_monomers                115
+   _Entity.Number_of_nonpolymer_components   .
+   _Entity.Paramagnetic                      no
+   _Entity.Thiol_state                       'free and other bound'
+   _Entity.Src_method                        .
+   _Entity.Parent_entity_ID                  .
+   _Entity.Fragment                          .
+   _Entity.Mutation                          .
+   _Entity.EC_number                         .
+   _Entity.Calc_isoelectric_point            .
+   _Entity.Formula_weight                    12658.1
+   _Entity.Formula_weight_exptl              .
+   _Entity.Formula_weight_exptl_meth         .
+   _Entity.Details                           .
+   _Entity.DB_query_date                     .
+   _Entity.DB_query_revised_last_date        .
+
+   loop_
+      _Entity_biological_function.Biological_function
+      _Entity_biological_function.Entry_ID
+      _Entity_biological_function.Entity_ID
+
+
+;
+Ferredoxin are iron-sulfur proteins that transfer electrons in a wide variety of
+metabolic reactions. Although the function of this ferredoxin is unknown it is
+probable that it has a role as a cellular electron transfer protein. Involved in
+the in vivo assembly of the Fe-S clusters in a wide variety of iron-sulfur
+proteins.
+;
+          19273   1
+   stop_
+
+   loop_
+      _Entity_comp_index.ID
+      _Entity_comp_index.Auth_seq_ID
+      _Entity_comp_index.Comp_ID
+      _Entity_comp_index.Comp_label
+      _Entity_comp_index.Entry_ID
+      _Entity_comp_index.Entity_ID
+
+      1     -3    GLN   .   19273   1
+      2     -2    GLY   .   19273   1
+      3     -1    ALA   .   19273   1
+      4     0     MET   .   19273   1
+      5     1     ALA   .   19273   1
+      6     2     PRO   .   19273   1
+      7     3     LYS   .   19273   1
+      8     4     ILE   .   19273   1
+      9     5     VAL   .   19273   1
+      10    6     ILE   .   19273   1
+      11    7     LEU   .   19273   1
+      12    8     PRO   .   19273   1
+      13    9     HIS   .   19273   1
+      14    10    GLN   .   19273   1
+      15    11    ASP   .   19273   1
+      16    12    LEU   .   19273   1
+      17    13    CYS   .   19273   1
+      18    14    PRO   .   19273   1
+      19    15    ASP   .   19273   1
+      20    16    GLY   .   19273   1
+      21    17    ALA   .   19273   1
+      22    18    VAL   .   19273   1
+      23    19    LEU   .   19273   1
+      24    20    GLU   .   19273   1
+      25    21    ALA   .   19273   1
+      26    22    ASN   .   19273   1
+      27    23    SER   .   19273   1
+      28    24    GLY   .   19273   1
+      29    25    GLU   .   19273   1
+      30    26    THR   .   19273   1
+      31    27    ILE   .   19273   1
+      32    28    LEU   .   19273   1
+      33    29    ASP   .   19273   1
+      34    30    ALA   .   19273   1
+      35    31    ALA   .   19273   1
+      36    32    LEU   .   19273   1
+      37    33    ARG   .   19273   1
+      38    34    ASN   .   19273   1
+      39    35    GLY   .   19273   1
+      40    36    ILE   .   19273   1
+      41    37    GLU   .   19273   1
+      42    38    ILE   .   19273   1
+      43    39    GLU   .   19273   1
+      44    40    HIS   .   19273   1
+      45    41    ALA   .   19273   1
+      46    42    CYS   .   19273   1
+      47    43    GLU   .   19273   1
+      48    44    LYS   .   19273   1
+      49    45    SER   .   19273   1
+      50    46    CYS   .   19273   1
+      51    47    ALA   .   19273   1
+      52    48    CYS   .   19273   1
+      53    49    THR   .   19273   1
+      54    50    THR   .   19273   1
+      55    51    CYS   .   19273   1
+      56    52    HIS   .   19273   1
+      57    53    CYS   .   19273   1
+      58    54    ILE   .   19273   1
+      59    55    VAL   .   19273   1
+      60    56    ARG   .   19273   1
+      61    57    GLU   .   19273   1
+      62    58    GLY   .   19273   1
+      63    59    PHE   .   19273   1
+      64    60    ASP   .   19273   1
+      65    61    SER   .   19273   1
+      66    62    LEU   .   19273   1
+      67    63    PRO   .   19273   1
+      68    64    GLU   .   19273   1
+      69    65    SER   .   19273   1
+      70    66    SER   .   19273   1
+      71    67    GLU   .   19273   1
+      72    68    GLN   .   19273   1
+      73    69    GLU   .   19273   1
+      74    70    ASP   .   19273   1
+      75    71    ASP   .   19273   1
+      76    72    MET   .   19273   1
+      77    73    LEU   .   19273   1
+      78    74    ASP   .   19273   1
+      79    75    LYS   .   19273   1
+      80    76    ALA   .   19273   1
+      81    77    TRP   .   19273   1
+      82    78    GLY   .   19273   1
+      83    79    LEU   .   19273   1
+      84    80    GLU   .   19273   1
+      85    81    PRO   .   19273   1
+      86    82    GLU   .   19273   1
+      87    83    SER   .   19273   1
+      88    84    ARG   .   19273   1
+      89    85    LEU   .   19273   1
+      90    86    SER   .   19273   1
+      91    87    CYS   .   19273   1
+      92    88    GLN   .   19273   1
+      93    89    ALA   .   19273   1
+      94    90    ARG   .   19273   1
+      95    91    VAL   .   19273   1
+      96    92    THR   .   19273   1
+      97    93    ASP   .   19273   1
+      98    94    GLU   .   19273   1
+      99    95    ASP   .   19273   1
+      100   96    LEU   .   19273   1
+      101   97    VAL   .   19273   1
+      102   98    VAL   .   19273   1
+      103   99    GLU   .   19273   1
+      104   100   ILE   .   19273   1
+      105   101   PRO   .   19273   1
+      106   102   ARG   .   19273   1
+      107   103   TYR   .   19273   1
+      108   104   THR   .   19273   1
+      109   105   ILE   .   19273   1
+      110   106   ASN   .   19273   1
+      111   107   HIS   .   19273   1
+      112   108   ALA   .   19273   1
+      113   109   ARG   .   19273   1
+      114   110   GLU   .   19273   1
+      115   111   HIS   .   19273   1
+   stop_
+
+   loop_
+      _Entity_poly_seq.Hetero
+      _Entity_poly_seq.Mon_ID
+      _Entity_poly_seq.Num
+      _Entity_poly_seq.Comp_index_ID
+      _Entity_poly_seq.Entry_ID
+      _Entity_poly_seq.Entity_ID
+
+      .   GLN   1     1     19273   1
+      .   GLY   2     2     19273   1
+      .   ALA   3     3     19273   1
+      .   MET   4     4     19273   1
+      .   ALA   5     5     19273   1
+      .   PRO   6     6     19273   1
+      .   LYS   7     7     19273   1
+      .   ILE   8     8     19273   1
+      .   VAL   9     9     19273   1
+      .   ILE   10    10    19273   1
+      .   LEU   11    11    19273   1
+      .   PRO   12    12    19273   1
+      .   HIS   13    13    19273   1
+      .   GLN   14    14    19273   1
+      .   ASP   15    15    19273   1
+      .   LEU   16    16    19273   1
+      .   CYS   17    17    19273   1
+      .   PRO   18    18    19273   1
+      .   ASP   19    19    19273   1
+      .   GLY   20    20    19273   1
+      .   ALA   21    21    19273   1
+      .   VAL   22    22    19273   1
+      .   LEU   23    23    19273   1
+      .   GLU   24    24    19273   1
+      .   ALA   25    25    19273   1
+      .   ASN   26    26    19273   1
+      .   SER   27    27    19273   1
+      .   GLY   28    28    19273   1
+      .   GLU   29    29    19273   1
+      .   THR   30    30    19273   1
+      .   ILE   31    31    19273   1
+      .   LEU   32    32    19273   1
+      .   ASP   33    33    19273   1
+      .   ALA   34    34    19273   1
+      .   ALA   35    35    19273   1
+      .   LEU   36    36    19273   1
+      .   ARG   37    37    19273   1
+      .   ASN   38    38    19273   1
+      .   GLY   39    39    19273   1
+      .   ILE   40    40    19273   1
+      .   GLU   41    41    19273   1
+      .   ILE   42    42    19273   1
+      .   GLU   43    43    19273   1
+      .   HIS   44    44    19273   1
+      .   ALA   45    45    19273   1
+      .   CYS   46    46    19273   1
+      .   GLU   47    47    19273   1
+      .   LYS   48    48    19273   1
+      .   SER   49    49    19273   1
+      .   CYS   50    50    19273   1
+      .   ALA   51    51    19273   1
+      .   CYS   52    52    19273   1
+      .   THR   53    53    19273   1
+      .   THR   54    54    19273   1
+      .   CYS   55    55    19273   1
+      .   HIS   56    56    19273   1
+      .   CYS   57    57    19273   1
+      .   ILE   58    58    19273   1
+      .   VAL   59    59    19273   1
+      .   ARG   60    60    19273   1
+      .   GLU   61    61    19273   1
+      .   GLY   62    62    19273   1
+      .   PHE   63    63    19273   1
+      .   ASP   64    64    19273   1
+      .   SER   65    65    19273   1
+      .   LEU   66    66    19273   1
+      .   PRO   67    67    19273   1
+      .   GLU   68    68    19273   1
+      .   SER   69    69    19273   1
+      .   SER   70    70    19273   1
+      .   GLU   71    71    19273   1
+      .   GLN   72    72    19273   1
+      .   GLU   73    73    19273   1
+      .   ASP   74    74    19273   1
+      .   ASP   75    75    19273   1
+      .   MET   76    76    19273   1
+      .   LEU   77    77    19273   1
+      .   ASP   78    78    19273   1
+      .   LYS   79    79    19273   1
+      .   ALA   80    80    19273   1
+      .   TRP   81    81    19273   1
+      .   GLY   82    82    19273   1
+      .   LEU   83    83    19273   1
+      .   GLU   84    84    19273   1
+      .   PRO   85    85    19273   1
+      .   GLU   86    86    19273   1
+      .   SER   87    87    19273   1
+      .   ARG   88    88    19273   1
+      .   LEU   89    89    19273   1
+      .   SER   90    90    19273   1
+      .   CYS   91    91    19273   1
+      .   GLN   92    92    19273   1
+      .   ALA   93    93    19273   1
+      .   ARG   94    94    19273   1
+      .   VAL   95    95    19273   1
+      .   THR   96    96    19273   1
+      .   ASP   97    97    19273   1
+      .   GLU   98    98    19273   1
+      .   ASP   99    99    19273   1
+      .   LEU   100   100   19273   1
+      .   VAL   101   101   19273   1
+      .   VAL   102   102   19273   1
+      .   GLU   103   103   19273   1
+      .   ILE   104   104   19273   1
+      .   PRO   105   105   19273   1
+      .   ARG   106   106   19273   1
+      .   TYR   107   107   19273   1
+      .   THR   108   108   19273   1
+      .   ILE   109   109   19273   1
+      .   ASN   110   110   19273   1
+      .   HIS   111   111   19273   1
+      .   ALA   112   112   19273   1
+      .   ARG   113   113   19273   1
+      .   GLU   114   114   19273   1
+      .   HIS   115   115   19273   1
+   stop_
+save_
+
+save_entity_FES
+   _Entity.Sf_category                       entity
+   _Entity.Sf_framecode                      entity_FES
+   _Entity.Entry_ID                          19273
+   _Entity.ID                                2
+   _Entity.BMRB_code                         FES
+   _Entity.Name                              'FE2/S2 (INORGANIC) CLUSTER'
+   _Entity.Type                              non-polymer
+   _Entity.Polymer_common_type               .
+   _Entity.Polymer_type                      .
+   _Entity.Polymer_type_details              .
+   _Entity.Polymer_strand_ID                 .
+   _Entity.Polymer_seq_one_letter_code_can   .
+   _Entity.Polymer_seq_one_letter_code       .
+   _Entity.Target_identifier                 .
+   _Entity.Polymer_author_defined_seq        .
+   _Entity.Polymer_author_seq_details        .
+   _Entity.Ambiguous_conformational_states   .
+   _Entity.Ambiguous_chem_comp_sites         .
+   _Entity.Nstd_monomer                      .
+   _Entity.Nstd_chirality                    .
+   _Entity.Nstd_linkage                      .
+   _Entity.Nonpolymer_comp_ID                FES
+   _Entity.Nonpolymer_comp_label             $chem_comp_FES
+   _Entity.Number_of_monomers                .
+   _Entity.Number_of_nonpolymer_components   1
+   _Entity.Paramagnetic                      no
+   _Entity.Thiol_state                       'not present'
+   _Entity.Src_method                        .
+   _Entity.Parent_entity_ID                  2
+   _Entity.Fragment                          .
+   _Entity.Mutation                          .
+   _Entity.EC_number                         .
+   _Entity.Calc_isoelectric_point            .
+   _Entity.Formula_weight                    175.820
+   _Entity.Formula_weight_exptl              .
+   _Entity.Formula_weight_exptl_meth         .
+   _Entity.Details                           .
+   _Entity.DB_query_date                     .
+   _Entity.DB_query_revised_last_date        .
+
+   loop_
+      _Entity_common_name.Name
+      _Entity_common_name.Type
+      _Entity_common_name.Entry_ID
+      _Entity_common_name.Entity_ID
+
+      'FE2/S2 (INORGANIC) CLUSTER'   BMRB   19273   2
+   stop_
+
+   loop_
+      _Entity_systematic_name.Name
+      _Entity_systematic_name.Naming_system
+      _Entity_systematic_name.Entry_ID
+      _Entity_systematic_name.Entity_ID
+
+      'FE2/S2 (INORGANIC) CLUSTER'   BMRB                  19273   2
+      FES                            'Three letter code'   19273   2
+   stop_
+
+   loop_
+      _Entity_comp_index.ID
+      _Entity_comp_index.Auth_seq_ID
+      _Entity_comp_index.Comp_ID
+      _Entity_comp_index.Comp_label
+      _Entity_comp_index.Entry_ID
+      _Entity_comp_index.Entity_ID
+
+      1   1   FES   $chem_comp_FES   19273   2
+   stop_
+
+   loop_
+      _Entity_atom_list.ID
+      _Entity_atom_list.Comp_index_ID
+      _Entity_atom_list.Comp_ID
+      _Entity_atom_list.Atom_ID
+      _Entity_atom_list.Entry_ID
+      _Entity_atom_list.Entity_ID
+
+      1   1   FES   FE1   19273   2
+      2   1   FES   FE2   19273   2
+      3   1   FES   S1    19273   2
+      4   1   FES   S2    19273   2
+   stop_
+save_
+
+
+    ####################
+    #  Natural source  #
+    ####################
+save_natural_source
+   _Entity_natural_src_list.Sf_category    natural_source
+   _Entity_natural_src_list.Sf_framecode   natural_source
+   _Entity_natural_src_list.Entry_ID       19273
+   _Entity_natural_src_list.ID             1
+
+   loop_
+      _Entity_natural_src.ID
+      _Entity_natural_src.Entity_ID
+      _Entity_natural_src.Entity_label
+      _Entity_natural_src.Entity_chimera_segment_ID
+      _Entity_natural_src.NCBI_taxonomy_ID
+      _Entity_natural_src.Type
+      _Entity_natural_src.Common
+      _Entity_natural_src.Organism_name_scientific
+      _Entity_natural_src.Organism_name_common
+      _Entity_natural_src.Organism_acronym
+      _Entity_natural_src.ICTVdb_decimal_code
+      _Entity_natural_src.Superkingdom
+      _Entity_natural_src.Kingdom
+      _Entity_natural_src.Genus
+      _Entity_natural_src.Species
+      _Entity_natural_src.Strain
+      _Entity_natural_src.Variant
+      _Entity_natural_src.Organ
+      _Entity_natural_src.Tissue
+      _Entity_natural_src.Tissue_fraction
+      _Entity_natural_src.Cell_line
+      _Entity_natural_src.Cell_type
+      _Entity_natural_src.ATCC_number
+      _Entity_natural_src.Organelle
+      _Entity_natural_src.Secretion
+      _Entity_natural_src.Plasmid
+      _Entity_natural_src.Gene_mnemonic
+      _Entity_natural_src.Details
+      _Entity_natural_src.Entry_ID
+      _Entity_natural_src.Entity_natural_src_list_ID
+
+      1   1   $holo-Ferredoxin   .   562   organism   .   'Escherichia coli'   'E. coli'   .   .   Bacteria   .   Escherichia   coli   .   .   .   .   .   .   .   .   .   .   .   .   .   19273   1
+   stop_
+save_
+
+
+    #########################
+    #  Experimental source  #
+    #########################
+save_experimental_source
+   _Entity_experimental_src_list.Sf_category    experimental_source
+   _Entity_experimental_src_list.Sf_framecode   experimental_source
+   _Entity_experimental_src_list.Entry_ID       19273
+   _Entity_experimental_src_list.ID             1
+
+   loop_
+      _Entity_experimental_src.ID
+      _Entity_experimental_src.Entity_ID
+      _Entity_experimental_src.Entity_label
+      _Entity_experimental_src.Entity_chimera_segment_ID
+      _Entity_experimental_src.Production_method
+      _Entity_experimental_src.Host_org_scientific_name
+      _Entity_experimental_src.Host_org_name_common
+      _Entity_experimental_src.Host_org_details
+      _Entity_experimental_src.Host_org_NCBI_taxonomy_ID
+      _Entity_experimental_src.Host_org_genus
+      _Entity_experimental_src.Host_org_species
+      _Entity_experimental_src.Host_org_strain
+      _Entity_experimental_src.Host_org_variant
+      _Entity_experimental_src.Host_org_ATCC_number
+      _Entity_experimental_src.Vector_type
+      _Entity_experimental_src.PDBview_host_org_vector_name
+      _Entity_experimental_src.PDBview_plasmid_name
+      _Entity_experimental_src.Vector_name
+      _Entity_experimental_src.Vector_details
+      _Entity_experimental_src.Vendor_name
+      _Entity_experimental_src.Details
+      _Entity_experimental_src.Entry_ID
+      _Entity_experimental_src.Entity_experimental_src_list_ID
+
+      1   1   $holo-Ferredoxin   .   'recombinant technology'   'Escherichia coli'   .   .   .   Escherichia   coli   .   .   .   .   .   .   pET-24   .   .   .   19273   1
+   stop_
+save_
+
+
+    #################################
+    #  Polymer residues and ligands #
+    #################################
+save_chem_comp_FES
+   _Chem_comp.Sf_category                       chem_comp
+   _Chem_comp.Sf_framecode                      chem_comp_FES
+   _Chem_comp.Entry_ID                          19273
+   _Chem_comp.ID                                FES
+   _Chem_comp.Provenance                        PDB
+   _Chem_comp.Name                              'FE2/S2 (INORGANIC) CLUSTER'
+   _Chem_comp.Type                              NON-POLYMER
+   _Chem_comp.BMRB_code                         FES
+   _Chem_comp.PDB_code                          FES
+   _Chem_comp.Ambiguous_flag                    no
+   _Chem_comp.Initial_date                      2012-11-20
+   _Chem_comp.Modified_date                     2012-11-20
+   _Chem_comp.Release_status                    REL
+   _Chem_comp.Replaced_by                       .
+   _Chem_comp.Replaces                          .
+   _Chem_comp.One_letter_code                   .
+   _Chem_comp.Three_letter_code                 FES
+   _Chem_comp.Number_atoms_all                  4
+   _Chem_comp.Number_atoms_nh                   4
+   _Chem_comp.Atom_nomenclature_source          .
+   _Chem_comp.PubChem_code                      .
+   _Chem_comp.Subcomponent_list                 .
+   _Chem_comp.InChI_code                        InChI=1S/2Fe.2S
+   _Chem_comp.Mon_nstd_flag                     .
+   _Chem_comp.Mon_nstd_class                    .
+   _Chem_comp.Mon_nstd_details                  .
+   _Chem_comp.Mon_nstd_parent                   .
+   _Chem_comp.Mon_nstd_parent_comp_ID           .
+   _Chem_comp.Std_deriv_one_letter_code         .
+   _Chem_comp.Std_deriv_three_letter_code       .
+   _Chem_comp.Std_deriv_BMRB_code               .
+   _Chem_comp.Std_deriv_PDB_code                .
+   _Chem_comp.Std_deriv_chem_comp_name          .
+   _Chem_comp.Synonyms                          .
+   _Chem_comp.Formal_charge                     0
+   _Chem_comp.Paramagnetic                      no
+   _Chem_comp.Aromatic                          no
+   _Chem_comp.Formula                           'Fe2 S2'
+   _Chem_comp.Formula_weight                    175.820
+   _Chem_comp.Formula_mono_iso_wt_nat           .
+   _Chem_comp.Formula_mono_iso_wt_13C           .
+   _Chem_comp.Formula_mono_iso_wt_15N           .
+   _Chem_comp.Formula_mono_iso_wt_13C_15N       .
+   _Chem_comp.Image_file_name                   .
+   _Chem_comp.Image_file_format                 .
+   _Chem_comp.Topo_file_name                    .
+   _Chem_comp.Topo_file_format                  .
+   _Chem_comp.Struct_file_name                  .
+   _Chem_comp.Struct_file_format                .
+   _Chem_comp.Stereochem_param_file_name        .
+   _Chem_comp.Stereochem_param_file_format      .
+   _Chem_comp.Model_details                     .
+   _Chem_comp.Model_erf                         .
+   _Chem_comp.Model_source                      .
+   _Chem_comp.Model_coordinates_details         .
+   _Chem_comp.Model_coordinates_missing_flag    no
+   _Chem_comp.Ideal_coordinates_details         .
+   _Chem_comp.Ideal_coordinates_missing_flag    no
+   _Chem_comp.Model_coordinates_db_code         1CZP
+   _Chem_comp.Processing_site                   RCSB
+   _Chem_comp.Vendor                            .
+   _Chem_comp.Vendor_product_code               .
+   _Chem_comp.Details                           .
+   _Chem_comp.DB_query_date                     .
+   _Chem_comp.DB_last_query_revised_last_date   .
+
+   loop_
+      _Chem_comp_descriptor.Descriptor
+      _Chem_comp_descriptor.Type
+      _Chem_comp_descriptor.Program
+      _Chem_comp_descriptor.Program_version
+      _Chem_comp_descriptor.Entry_ID
+      _Chem_comp_descriptor.Comp_ID
+
+      InChI=1S/2Fe.2S               InChI              InChI                  1.03    19273   FES
+      NIXDOXVAJZFRNF-UHFFFAOYSA-N   InChIKey           InChI                  1.03    19273   FES
+      S1[Fe]S[Fe]1                  SMILES             CACTVS                 3.341   19273   FES
+      S1[Fe]S[Fe]1                  SMILES             'OpenEye OEToolkits'   1.5.0   19273   FES
+      S1[Fe]S[Fe]1                  SMILES_CANONICAL   CACTVS                 3.341   19273   FES
+      S1[Fe]S[Fe]1                  SMILES_CANONICAL   'OpenEye OEToolkits'   1.5.0   19273   FES
+      [Fe]1S[Fe]S1                  SMILES             ACDLabs                10.04   19273   FES
+   stop_
+
+   loop_
+      _Chem_comp_identifier.Identifier
+      _Chem_comp_identifier.Type
+      _Chem_comp_identifier.Program
+      _Chem_comp_identifier.Program_version
+      _Chem_comp_identifier.Entry_ID
+      _Chem_comp_identifier.Comp_ID
+
+      1,3-dithia-2$l^{2},4$l^{2}-diferracyclobutane   'SYSTEMATIC NAME'   'OpenEye OEToolkits'   1.5.0   19273   FES
+      di-mu-sulfidediiron                             'SYSTEMATIC NAME'   ACDLabs                10.04   19273   FES
+   stop_
+
+   loop_
+      _Chem_comp_atom.Atom_ID
+      _Chem_comp_atom.BMRB_code
+      _Chem_comp_atom.PDB_atom_ID
+      _Chem_comp_atom.Alt_atom_ID
+      _Chem_comp_atom.Auth_atom_ID
+      _Chem_comp_atom.Type_symbol
+      _Chem_comp_atom.Isotope_number
+      _Chem_comp_atom.Chirality
+      _Chem_comp_atom.Stereo_config
+      _Chem_comp_atom.Charge
+      _Chem_comp_atom.Partial_charge
+      _Chem_comp_atom.Oxidation_number
+      _Chem_comp_atom.Unpaired_electron_number
+      _Chem_comp_atom.Align
+      _Chem_comp_atom.Aromatic_flag
+      _Chem_comp_atom.Leaving_atom_flag
+      _Chem_comp_atom.Substruct_code
+      _Chem_comp_atom.Ionizable
+      _Chem_comp_atom.Drawing_2D_coord_x
+      _Chem_comp_atom.Drawing_2D_coord_y
+      _Chem_comp_atom.Model_Cartn_x
+      _Chem_comp_atom.Model_Cartn_x_esd
+      _Chem_comp_atom.Model_Cartn_y
+      _Chem_comp_atom.Model_Cartn_y_esd
+      _Chem_comp_atom.Model_Cartn_z
+      _Chem_comp_atom.Model_Cartn_z_esd
+      _Chem_comp_atom.Model_Cartn_x_ideal
+      _Chem_comp_atom.Model_Cartn_y_ideal
+      _Chem_comp_atom.Model_Cartn_z_ideal
+      _Chem_comp_atom.PDBX_ordinal
+      _Chem_comp_atom.Details
+      _Chem_comp_atom.Entry_ID
+      _Chem_comp_atom.Comp_ID
+
+      FE1   FE1   FE1   FE1   .   FE   .   .   N   0   .   .   .   0   no   no   .   .   .   .   16.237   .   5.409   .   27.398   .   0.000    -0.213   -1.531   1   .   19273   FES
+      FE2   FE2   FE2   FE2   .   FE   .   .   N   0   .   .   .   0   no   no   .   .   .   .   16.361   .   2.666   .   27.488   .   0.000    -0.213   1.531    2   .   19273   FES
+      S1    S1    S1    S1    .   S    .   .   N   0   .   .   .   1   no   no   .   .   .   .   17.422   .   4.079   .   28.829   .   1.461    0.372    0.000    3   .   19273   FES
+      S2    S2    S2    S2    .   S    .   .   N   0   .   .   .   1   no   no   .   .   .   .   15.380   .   3.919   .   25.972   .   -1.461   0.372    0.000    4   .   19273   FES
+   stop_
+
+   loop_
+      _Chem_comp_bond.ID
+      _Chem_comp_bond.Type
+      _Chem_comp_bond.Value_order
+      _Chem_comp_bond.Atom_ID_1
+      _Chem_comp_bond.Atom_ID_2
+      _Chem_comp_bond.Aromatic_flag
+      _Chem_comp_bond.Stereo_config
+      _Chem_comp_bond.Ordinal
+      _Chem_comp_bond.Details
+      _Chem_comp_bond.Entry_ID
+      _Chem_comp_bond.Comp_ID
+
+      1   .   SING   FE1   S1   no   N   1   .   19273   FES
+      2   .   SING   FE1   S2   no   N   2   .   19273   FES
+      3   .   SING   FE2   S1   no   N   3   .   19273   FES
+      4   .   SING   FE2   S2   no   N   4   .   19273   FES
+   stop_
+save_
+
+
+#####################################
+#  Sample contents and methodology  #
+#####################################
+	 
+    ########################
+    #  Sample description  #
+    ########################
+save_sample_1
+   _Sample.Sf_category                      sample
+   _Sample.Sf_framecode                     sample_1
+   _Sample.Entry_ID                         19273
+   _Sample.ID                               1
+   _Sample.Name                             .
+   _Sample.Type                             solution
+   _Sample.Sub_type                         .
+   _Sample.Details                          .
+   _Sample.Aggregate_sample_number          .
+   _Sample.Solvent_system                   '90% H2O/10% D2O'
+   _Sample.Preparation_date                 .
+   _Sample.Preparation_expiration_date      .
+   _Sample.Polycrystallization_protocol     .
+   _Sample.Single_crystal_protocol          .
+   _Sample.Crystal_grow_apparatus           .
+   _Sample.Crystal_grow_atmosphere          .
+   _Sample.Crystal_grow_details             .
+   _Sample.Crystal_grow_method              .
+   _Sample.Crystal_grow_method_cit_ID       .
+   _Sample.Crystal_grow_pH                  .
+   _Sample.Crystal_grow_pH_range            .
+   _Sample.Crystal_grow_pressure            .
+   _Sample.Crystal_grow_pressure_esd        .
+   _Sample.Crystal_grow_seeding             .
+   _Sample.Crystal_grow_seeding_cit_ID      .
+   _Sample.Crystal_grow_temp                .
+   _Sample.Crystal_grow_temp_details        .
+   _Sample.Crystal_grow_temp_esd            .
+   _Sample.Crystal_grow_time                .
+   _Sample.Oriented_sample_prep_protocol    .
+   _Sample.Lyophilization_cryo_protectant   .
+   _Sample.Storage_protocol                 .
+
+   loop_
+      _Sample_component.ID
+      _Sample_component.Mol_common_name
+      _Sample_component.Isotopic_labeling
+      _Sample_component.Assembly_ID
+      _Sample_component.Assembly_label
+      _Sample_component.Entity_ID
+      _Sample_component.Entity_label
+      _Sample_component.Product_ID
+      _Sample_component.Type
+      _Sample_component.Concentration_val
+      _Sample_component.Concentration_val_min
+      _Sample_component.Concentration_val_max
+      _Sample_component.Concentration_val_units
+      _Sample_component.Concentration_val_err
+      _Sample_component.Vendor
+      _Sample_component.Vendor_product_name
+      _Sample_component.Vendor_product_code
+      _Sample_component.Entry_ID
+      _Sample_component.Sample_ID
+
+      1   holo-Ferredoxin     '[U-99% 13C; U-99% 15N]'   .   .   1   $holo-Ferredoxin   .   .   0.5   .   .   mM   .   .   .   .   19273   1
+      2   TRIS                'natural abundance'        .   .   .   .                  .   .   20    .   .   mM   .   .   .   .   19273   1
+      3   'sodium chloride'   'natural abundance'        .   .   .   .                  .   .   500   .   .   mM   .   .   .   .   19273   1
+      4   TCEP                'natural abundance'        .   .   .   .                  .   .   20    .   .   mM   .   .   .   .   19273   1
+      5   H2O                 'natural abundance'        .   .   .   .                  .   .   90    .   .   %    .   .   .   .   19273   1
+      6   D2O                 'natural abundance'        .   .   .   .                  .   .   10    .   .   %    .   .   .   .   19273   1
+   stop_
+save_
+
+
+#######################
+#  Sample conditions  #
+#######################
+save_sample_conditions_1
+   _Sample_condition_list.Sf_category    sample_conditions
+   _Sample_condition_list.Sf_framecode   sample_conditions_1
+   _Sample_condition_list.Entry_ID       19273
+   _Sample_condition_list.ID             1
+   _Sample_condition_list.Name           .
+   _Sample_condition_list.Details        .
+
+   loop_
+      _Sample_condition_variable.Type
+      _Sample_condition_variable.Val
+      _Sample_condition_variable.Val_err
+      _Sample_condition_variable.Val_units
+      _Sample_condition_variable.Entry_ID
+      _Sample_condition_variable.Sample_condition_list_ID
+
+      'ionic strength'   500   .   mM    19273   1
+      pH                 8     .   pH    19273   1
+      pressure           1     .   atm   19273   1
+      temperature        298   .   K     19273   1
+   stop_
+save_
+
+
+############################
+#  Computer software used  #
+############################
+save_NMRView
+   _Software.Sf_category    software
+   _Software.Sf_framecode   NMRView
+   _Software.Entry_ID       19273
+   _Software.ID             1
+   _Software.Type           .
+   _Software.Name           NMRView
+   _Software.Version        .
+   _Software.DOI            .
+   _Software.Details        .
+
+   loop_
+      _Vendor.Name
+      _Vendor.Address
+      _Vendor.Electronic_address
+      _Vendor.Entry_ID
+      _Vendor.Software_ID
+
+      'Johnson, One Moon Scientific'   .   .   19273   1
+   stop_
+
+   loop_
+      _Task.Task
+      _Task.Software_module
+      _Task.Entry_ID
+      _Task.Software_ID
+
+      'data analysis'   .   19273   1
+   stop_
+save_
+
+save_NMRPipe
+   _Software.Sf_category    software
+   _Software.Sf_framecode   NMRPipe
+   _Software.Entry_ID       19273
+   _Software.ID             2
+   _Software.Type           .
+   _Software.Name           NMRPipe
+   _Software.Version        .
+   _Software.DOI            .
+   _Software.Details        .
+
+   loop_
+      _Vendor.Name
+      _Vendor.Address
+      _Vendor.Electronic_address
+      _Vendor.Entry_ID
+      _Vendor.Software_ID
+
+      'Delaglio, Grzesiek, Vuister, Zhu, Pfeifer and Bax'   .   .   19273   2
+   stop_
+
+   loop_
+      _Task.Task
+      _Task.Software_module
+      _Task.Entry_ID
+      _Task.Software_ID
+
+      processing   .   19273   2
+   stop_
+save_
+
+save_TOPSPIN
+   _Software.Sf_category    software
+   _Software.Sf_framecode   TOPSPIN
+   _Software.Entry_ID       19273
+   _Software.ID             3
+   _Software.Type           .
+   _Software.Name           TOPSPIN
+   _Software.Version        .
+   _Software.DOI            .
+   _Software.Details        .
+
+   loop_
+      _Vendor.Name
+      _Vendor.Address
+      _Vendor.Electronic_address
+      _Vendor.Entry_ID
+      _Vendor.Software_ID
+
+      'Bruker Biospin'   .   .   19273   3
+   stop_
+
+   loop_
+      _Task.Task
+      _Task.Software_module
+      _Task.Entry_ID
+      _Task.Software_ID
+
+      collection   .   19273   3
+   stop_
+save_
+
+save_MARS
+   _Software.Sf_category    software
+   _Software.Sf_framecode   MARS
+   _Software.Entry_ID       19273
+   _Software.ID             4
+   _Software.Type           .
+   _Software.Name           MARS
+   _Software.Version        .
+   _Software.DOI            .
+   _Software.Details        .
+
+   loop_
+      _Vendor.Name
+      _Vendor.Address
+      _Vendor.Electronic_address
+      _Vendor.Entry_ID
+      _Vendor.Software_ID
+
+      'oung-sang Jung , Markus Zweckstetter'   .   .   19273   4
+   stop_
+
+   loop_
+      _Task.Task
+      _Task.Software_module
+      _Task.Entry_ID
+      _Task.Software_ID
+
+      'chemical shift assignment'   .   19273   4
+   stop_
+save_
+
+
+#########################
+#  Experimental detail  #
+#########################
+
+    ##################################
+    #  NMR Spectrometer definitions  #
+    ##################################
+save_spectrometer_1
+   _NMR_spectrometer.Sf_category      NMR_spectrometer
+   _NMR_spectrometer.Sf_framecode     spectrometer_1
+   _NMR_spectrometer.Entry_ID         19273
+   _NMR_spectrometer.ID               1
+   _NMR_spectrometer.Name             .
+   _NMR_spectrometer.Details          .
+   _NMR_spectrometer.Manufacturer     Bruker
+   _NMR_spectrometer.Model            'Avance 1'
+   _NMR_spectrometer.Serial_number    .
+   _NMR_spectrometer.Field_strength   600
+save_
+
+save_spectrometer_2
+   _NMR_spectrometer.Sf_category      NMR_spectrometer
+   _NMR_spectrometer.Sf_framecode     spectrometer_2
+   _NMR_spectrometer.Entry_ID         19273
+   _NMR_spectrometer.ID               2
+   _NMR_spectrometer.Name             .
+   _NMR_spectrometer.Details          .
+   _NMR_spectrometer.Manufacturer     Bruker
+   _NMR_spectrometer.Model            Avance3
+   _NMR_spectrometer.Serial_number    .
+   _NMR_spectrometer.Field_strength   700
+save_
+
+save_NMR_spectrometer_list
+   _NMR_spectrometer_list.Sf_category    NMR_spectrometer_list
+   _NMR_spectrometer_list.Sf_framecode   NMR_spectrometer_list
+   _NMR_spectrometer_list.Entry_ID       19273
+   _NMR_spectrometer_list.ID             1
+   _NMR_spectrometer_list.Name           .
+
+   loop_
+      _NMR_spectrometer_view.ID
+      _NMR_spectrometer_view.Name
+      _NMR_spectrometer_view.Manufacturer
+      _NMR_spectrometer_view.Model
+      _NMR_spectrometer_view.Serial_number
+      _NMR_spectrometer_view.Field_strength
+      _NMR_spectrometer_view.Details
+      _NMR_spectrometer_view.Citation_ID
+      _NMR_spectrometer_view.Citation_label
+      _NMR_spectrometer_view.Entry_ID
+      _NMR_spectrometer_view.NMR_spectrometer_list_ID
+
+      1   spectrometer_1   Bruker   'Avance 1'   .   600   .   .   .   19273   1
+      2   spectrometer_2   Bruker   Avance3      .   700   .   .   .   19273   1
+   stop_
+save_
+
+
+    #############################
+    #  NMR applied experiments  #
+    #############################
+save_experiment_list
+   _Experiment_list.Sf_category    experiment_list
+   _Experiment_list.Sf_framecode   experiment_list
+   _Experiment_list.Entry_ID       19273
+   _Experiment_list.ID             1
+   _Experiment_list.Details        .
+
+   loop_
+      _Experiment.ID
+      _Experiment.Name
+      _Experiment.Raw_data_flag
+      _Experiment.NUS_flag
+      _Experiment.Interleaved_flag
+      _Experiment.NMR_spec_expt_ID
+      _Experiment.NMR_spec_expt_label
+      _Experiment.MS_expt_ID
+      _Experiment.MS_expt_label
+      _Experiment.SAXS_expt_ID
+      _Experiment.SAXS_expt_label
+      _Experiment.FRET_expt_ID
+      _Experiment.FRET_expt_label
+      _Experiment.EMR_expt_ID
+      _Experiment.EMR_expt_label
+      _Experiment.Sample_ID
+      _Experiment.Sample_label
+      _Experiment.Sample_state
+      _Experiment.Sample_volume
+      _Experiment.Sample_volume_units
+      _Experiment.Sample_condition_list_ID
+      _Experiment.Sample_condition_list_label
+      _Experiment.Sample_spinning_rate
+      _Experiment.Sample_angle
+      _Experiment.NMR_tube_type
+      _Experiment.NMR_spectrometer_ID
+      _Experiment.NMR_spectrometer_label
+      _Experiment.NMR_spectrometer_probe_ID
+      _Experiment.NMR_spectrometer_probe_label
+      _Experiment.NMR_spectral_processing_ID
+      _Experiment.NMR_spectral_processing_label
+      _Experiment.Mass_spectrometer_ID
+      _Experiment.Mass_spectrometer_label
+      _Experiment.Xray_instrument_ID
+      _Experiment.Xray_instrument_label
+      _Experiment.Fluorescence_instrument_ID
+      _Experiment.Fluorescence_instrument_label
+      _Experiment.EMR_instrument_ID
+      _Experiment.EMR_instrument_label
+      _Experiment.Chromatographic_system_ID
+      _Experiment.Chromatographic_system_label
+      _Experiment.Chromatographic_column_ID
+      _Experiment.Chromatographic_column_label
+      _Experiment.Details
+      _Experiment.Entry_ID
+      _Experiment.Experiment_list_ID
+
+      1   '2D 1H-15N HSQC'   no   .   .   .   .   .   .   .   .   .   .   .   .   1   $sample_1   isotropic   .   .   1   $sample_conditions_1   .   .   .   2   $spectrometer_2   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   19273   1
+      2   '3D CBCA(CO)NH'    no   .   .   .   .   .   .   .   .   .   .   .   .   1   $sample_1   isotropic   .   .   1   $sample_conditions_1   .   .   .   2   $spectrometer_2   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   19273   1
+      3   '3D HNCACB'        no   .   .   .   .   .   .   .   .   .   .   .   .   1   $sample_1   isotropic   .   .   1   $sample_conditions_1   .   .   .   2   $spectrometer_2   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   19273   1
+      4   '3D HNCO'          no   .   .   .   .   .   .   .   .   .   .   .   .   1   $sample_1   isotropic   .   .   1   $sample_conditions_1   .   .   .   1   $spectrometer_1   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   19273   1
+      5   '3D HN(CA)CO'      no   .   .   .   .   .   .   .   .   .   .   .   .   1   $sample_1   isotropic   .   .   1   $sample_conditions_1   .   .   .   1   $spectrometer_1   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   19273   1
+   stop_
+save_
+
+
+####################
+#  NMR parameters  #
+####################
+
+    ##############################
+    #  Assigned chemical shifts  #
+    ##############################
+
+	################################
+	#  Chemical shift referencing  #
+	################################
+save_chemical_shift_reference_1
+   _Chem_shift_reference.Sf_category    chem_shift_reference
+   _Chem_shift_reference.Sf_framecode   chemical_shift_reference_1
+   _Chem_shift_reference.Entry_ID       19273
+   _Chem_shift_reference.ID             1
+   _Chem_shift_reference.Name           .
+   _Chem_shift_reference.Details        .
+
+   loop_
+      _Chem_shift_ref.Atom_type
+      _Chem_shift_ref.Atom_isotope_number
+      _Chem_shift_ref.Mol_common_name
+      _Chem_shift_ref.Atom_group
+      _Chem_shift_ref.Concentration_val
+      _Chem_shift_ref.Concentration_units
+      _Chem_shift_ref.Solvent
+      _Chem_shift_ref.Rank
+      _Chem_shift_ref.Chem_shift_units
+      _Chem_shift_ref.Chem_shift_val
+      _Chem_shift_ref.Ref_method
+      _Chem_shift_ref.Ref_type
+      _Chem_shift_ref.Indirect_shift_ratio
+      _Chem_shift_ref.External_ref_loc
+      _Chem_shift_ref.External_ref_sample_geometry
+      _Chem_shift_ref.External_ref_axis
+      _Chem_shift_ref.Ref_correction_type
+      _Chem_shift_ref.Correction_val
+      _Chem_shift_ref.Entry_ID
+      _Chem_shift_ref.Chem_shift_reference_ID
+
+      C   13   water   water   .   .   .   .   ppm   4.77   na         indirect   0.251449530   .   .   .   .   .   19273   1
+      H   1    water   water   .   .   .   .   ppm   4.77   internal   direct     1.000000000   .   .   .   .   .   19273   1
+      N   15   water   water   .   .   .   .   ppm   4.77   na         indirect   0.101329118   .   .   .   .   .   19273   1
+   stop_
+save_
+
+
+     ###################################
+     #  Assigned chemical shift lists  #
+     ###################################
+
+###################################################################
+#       Chemical Shift Ambiguity Index Value Definitions          #
+#                                                                 #
+# The values other than 1 are used for those atoms with different #
+# chemical shifts that cannot be assigned to stereospecific atoms #
+# or to specific residues or chains.                              #
+#                                                                 #
+#   Index Value            Definition                             #
+#                                                                 #
+#      1             Unique (including isolated methyl protons,   #
+#                         geminal atoms, and geminal methyl       #
+#                         groups with identical chemical shifts)  #
+#                         (e.g. ILE HD11, HD12, HD13 protons)     #
+#      2             Ambiguity of geminal atoms or geminal methyl #
+#                         proton groups (e.g. ASP HB2 and HB3     #
+#                         protons, LEU CD1 and CD2 carbons, or    #
+#                         LEU HD11, HD12, HD13 and HD21, HD22,    #
+#                         HD23 methyl protons)                    #
+#      3             Aromatic atoms on opposite sides of          #
+#                         symmetrical rings (e.g. TYR HE1 and HE2 #
+#                         protons)                                #
+#      4             Intraresidue ambiguities (e.g. LYS HG and    #
+#                         HD protons or TRP HZ2 and HZ3 protons)  #
+#      5             Interresidue ambiguities (LYS 12 vs. LYS 27) #
+#      6             Intermolecular ambiguities (e.g. ASP 31 CA   #
+#                         in monomer 1 and ASP 31 CA in monomer 2 #
+#                         of an asymmetrical homodimer, duplex    #
+#                         DNA assignments, or other assignments   #
+#                         that may apply to atoms in one or more  #
+#                         molecule in the molecular assembly)     #
+#      9             Ambiguous, specific ambiguity not defined    #
+#                                                                 #
+###################################################################
+save_assignments_fdx
+   _Assigned_chem_shift_list.Sf_category                   assigned_chemical_shifts
+   _Assigned_chem_shift_list.Sf_framecode                  assignments_fdx
+   _Assigned_chem_shift_list.Entry_ID                      19273
+   _Assigned_chem_shift_list.ID                            1
+   _Assigned_chem_shift_list.Name                          .
+   _Assigned_chem_shift_list.Sample_condition_list_ID      1
+   _Assigned_chem_shift_list.Sample_condition_list_label   $sample_conditions_1
+   _Assigned_chem_shift_list.Chem_shift_reference_ID       1
+   _Assigned_chem_shift_list.Chem_shift_reference_label    $chemical_shift_reference_1
+   _Assigned_chem_shift_list.Chem_shift_1H_err             .
+   _Assigned_chem_shift_list.Chem_shift_13C_err            .
+   _Assigned_chem_shift_list.Chem_shift_15N_err            .
+   _Assigned_chem_shift_list.Chem_shift_31P_err            .
+   _Assigned_chem_shift_list.Chem_shift_2H_err             .
+   _Assigned_chem_shift_list.Chem_shift_19F_err            .
+   _Assigned_chem_shift_list.Error_derivation_method       .
+   _Assigned_chem_shift_list.Details                       .
+   _Assigned_chem_shift_list.Text_data_format              .
+   _Assigned_chem_shift_list.Text_data                     .
+
+   loop_
+      _Chem_shift_experiment.Experiment_ID
+      _Chem_shift_experiment.Experiment_name
+      _Chem_shift_experiment.Sample_ID
+      _Chem_shift_experiment.Sample_label
+      _Chem_shift_experiment.Sample_state
+      _Chem_shift_experiment.Entry_ID
+      _Chem_shift_experiment.Assigned_chem_shift_list_ID
+
+      1   '2D 1H-15N HSQC'   .   .   .   19273   1
+      2   '3D CBCA(CO)NH'    .   .   .   19273   1
+      3   '3D HNCACB'        .   .   .   19273   1
+      4   '3D HNCO'          .   .   .   19273   1
+      5   '3D HN(CA)CO'      .   .   .   19273   1
+   stop_
+
+   loop_
+      _Atom_chem_shift.ID
+      _Atom_chem_shift.Assembly_atom_ID
+      _Atom_chem_shift.Entity_assembly_ID
+      _Atom_chem_shift.Entity_assembly_asym_ID
+      _Atom_chem_shift.Entity_ID
+      _Atom_chem_shift.Comp_index_ID
+      _Atom_chem_shift.Seq_ID
+      _Atom_chem_shift.Comp_ID
+      _Atom_chem_shift.Atom_ID
+      _Atom_chem_shift.Atom_type
+      _Atom_chem_shift.Atom_isotope_number
+      _Atom_chem_shift.Val
+      _Atom_chem_shift.Val_err
+      _Atom_chem_shift.Assign_fig_of_merit
+      _Atom_chem_shift.Ambiguity_code
+      _Atom_chem_shift.Ambiguity_set_ID
+      _Atom_chem_shift.Occupancy
+      _Atom_chem_shift.Resonance_ID
+      _Atom_chem_shift.Auth_entity_assembly_ID
+      _Atom_chem_shift.Auth_asym_ID
+      _Atom_chem_shift.Auth_seq_ID
+      _Atom_chem_shift.Auth_comp_ID
+      _Atom_chem_shift.Auth_atom_ID
+      _Atom_chem_shift.Details
+      _Atom_chem_shift.Entry_ID
+      _Atom_chem_shift.Assigned_chem_shift_list_ID
+
+      1     .   1   .   1   4     4     MET   H     H   1    8.392     .   .   1   .   .   .   .   .   0     MET   HN    .   19273   1
+      2     .   1   .   1   4     4     MET   C     C   13   175.423   .   .   1   .   .   .   .   .   0     MET   C     .   19273   1
+      3     .   1   .   1   4     4     MET   CA    C   13   55.454    .   .   1   .   .   .   .   .   0     MET   CA    .   19273   1
+      4     .   1   .   1   4     4     MET   CB    C   13   32.864    .   .   1   .   .   .   .   .   0     MET   CB    .   19273   1
+      5     .   1   .   1   4     4     MET   N     N   15   118.968   .   .   1   .   .   .   .   .   0     MET   N     .   19273   1
+      6     .   1   .   1   5     5     ALA   H     H   1    8.213     .   .   1   .   .   .   .   .   1     ALA   HN    .   19273   1
+      7     .   1   .   1   5     5     ALA   C     C   13   174.490   .   .   1   .   .   .   .   .   1     ALA   C     .   19273   1
+      8     .   1   .   1   5     5     ALA   CA    C   13   50.443    .   .   1   .   .   .   .   .   1     ALA   CA    .   19273   1
+      9     .   1   .   1   5     5     ALA   CB    C   13   18.508    .   .   1   .   .   .   .   .   1     ALA   CB    .   19273   1
+      10    .   1   .   1   5     5     ALA   N     N   15   126.540   .   .   1   .   .   .   .   .   1     ALA   N     .   19273   1
+      11    .   1   .   1   7     7     LYS   H     H   1    8.600     .   .   1   .   .   .   .   .   3     LYS   HN    .   19273   1
+      12    .   1   .   1   7     7     LYS   C     C   13   176.112   .   .   1   .   .   .   .   .   3     LYS   C     .   19273   1
+      13    .   1   .   1   7     7     LYS   CA    C   13   54.349    .   .   1   .   .   .   .   .   3     LYS   CA    .   19273   1
+      14    .   1   .   1   7     7     LYS   CB    C   13   34.985    .   .   1   .   .   .   .   .   3     LYS   CB    .   19273   1
+      15    .   1   .   1   7     7     LYS   N     N   15   119.950   .   .   1   .   .   .   .   .   3     LYS   N     .   19273   1
+      16    .   1   .   1   8     8     ILE   H     H   1    8.882     .   .   1   .   .   .   .   .   4     ILE   HN    .   19273   1
+      17    .   1   .   1   8     8     ILE   C     C   13   174.855   .   .   1   .   .   .   .   .   4     ILE   C     .   19273   1
+      18    .   1   .   1   8     8     ILE   CA    C   13   60.549    .   .   1   .   .   .   .   .   4     ILE   CA    .   19273   1
+      19    .   1   .   1   8     8     ILE   CB    C   13   41.015    .   .   1   .   .   .   .   .   4     ILE   CB    .   19273   1
+      20    .   1   .   1   8     8     ILE   N     N   15   118.466   .   .   1   .   .   .   .   .   4     ILE   N     .   19273   1
+      21    .   1   .   1   9     9     VAL   H     H   1    8.780     .   .   1   .   .   .   .   .   5     VAL   HN    .   19273   1
+      22    .   1   .   1   9     9     VAL   C     C   13   174.997   .   .   1   .   .   .   .   .   5     VAL   C     .   19273   1
+      23    .   1   .   1   9     9     VAL   CA    C   13   61.908    .   .   1   .   .   .   .   .   5     VAL   CA    .   19273   1
+      24    .   1   .   1   9     9     VAL   CB    C   13   33.031    .   .   1   .   .   .   .   .   5     VAL   CB    .   19273   1
+      25    .   1   .   1   9     9     VAL   N     N   15   129.371   .   .   1   .   .   .   .   .   5     VAL   N     .   19273   1
+      26    .   1   .   1   10    10    ILE   H     H   1    9.292     .   .   1   .   .   .   .   .   6     ILE   HN    .   19273   1
+      27    .   1   .   1   10    10    ILE   C     C   13   177.268   .   .   1   .   .   .   .   .   6     ILE   C     .   19273   1
+      28    .   1   .   1   10    10    ILE   CA    C   13   58.766    .   .   1   .   .   .   .   .   6     ILE   CA    .   19273   1
+      29    .   1   .   1   10    10    ILE   CB    C   13   37.278    .   .   1   .   .   .   .   .   6     ILE   CB    .   19273   1
+      30    .   1   .   1   10    10    ILE   N     N   15   128.053   .   .   1   .   .   .   .   .   6     ILE   N     .   19273   1
+      31    .   1   .   1   11    11    LEU   H     H   1    8.500     .   .   1   .   .   .   .   .   7     LEU   HN    .   19273   1
+      32    .   1   .   1   11    11    LEU   C     C   13   174.389   .   .   1   .   .   .   .   .   7     LEU   C     .   19273   1
+      33    .   1   .   1   11    11    LEU   CA    C   13   54.434    .   .   1   .   .   .   .   .   7     LEU   CA    .   19273   1
+      34    .   1   .   1   11    11    LEU   CB    C   13   39.826    .   .   1   .   .   .   .   .   7     LEU   CB    .   19273   1
+      35    .   1   .   1   11    11    LEU   N     N   15   128.300   .   .   1   .   .   .   .   .   7     LEU   N     .   19273   1
+      36    .   1   .   1   15    15    ASP   H     H   1    8.439     .   .   1   .   .   .   .   .   11    ASP   HN    .   19273   1
+      37    .   1   .   1   15    15    ASP   C     C   13   177.593   .   .   1   .   .   .   .   .   11    ASP   C     .   19273   1
+      38    .   1   .   1   15    15    ASP   CA    C   13   55.878    .   .   1   .   .   .   .   .   11    ASP   CA    .   19273   1
+      39    .   1   .   1   15    15    ASP   CB    C   13   43.648    .   .   1   .   .   .   .   .   11    ASP   CB    .   19273   1
+      40    .   1   .   1   15    15    ASP   N     N   15   114.940   .   .   1   .   .   .   .   .   11    ASP   N     .   19273   1
+      41    .   1   .   1   16    16    LEU   H     H   1    9.233     .   .   1   .   .   .   .   .   12    LEU   HN    .   19273   1
+      42    .   1   .   1   16    16    LEU   C     C   13   178.749   .   .   1   .   .   .   .   .   12    LEU   C     .   19273   1
+      43    .   1   .   1   16    16    LEU   CA    C   13   56.643    .   .   1   .   .   .   .   .   12    LEU   CA    .   19273   1
+      44    .   1   .   1   16    16    LEU   CB    C   13   44.242    .   .   1   .   .   .   .   .   12    LEU   CB    .   19273   1
+      45    .   1   .   1   16    16    LEU   N     N   15   119.694   .   .   1   .   .   .   .   .   12    LEU   N     .   19273   1
+      46    .   1   .   1   17    17    CYS   H     H   1    8.446     .   .   1   .   .   .   .   .   13    CYS   HN    .   19273   1
+      47    .   1   .   1   17    17    CYS   C     C   13   174.903   .   .   1   .   .   .   .   .   13    CYS   C     .   19273   1
+      48    .   1   .   1   17    17    CYS   CA    C   13   55.266    .   .   1   .   .   .   .   .   13    CYS   CA    .   19273   1
+      49    .   1   .   1   17    17    CYS   CB    C   13   25.370    .   .   1   .   .   .   .   .   13    CYS   CB    .   19273   1
+      50    .   1   .   1   17    17    CYS   N     N   15   109.674   .   .   1   .   .   .   .   .   13    CYS   N     .   19273   1
+      51    .   1   .   1   19    19    ASP   H     H   1    8.701     .   .   1   .   .   .   .   .   15    ASP   HN    .   19273   1
+      52    .   1   .   1   19    19    ASP   C     C   13   177.694   .   .   1   .   .   .   .   .   15    ASP   C     .   19273   1
+      53    .   1   .   1   19    19    ASP   CA    C   13   53.840    .   .   1   .   .   .   .   .   15    ASP   CA    .   19273   1
+      54    .   1   .   1   19    19    ASP   CB    C   13   42.034    .   .   1   .   .   .   .   .   15    ASP   CB    .   19273   1
+      55    .   1   .   1   19    19    ASP   N     N   15   115.044   .   .   1   .   .   .   .   .   15    ASP   N     .   19273   1
+      56    .   1   .   1   20    20    GLY   H     H   1    8.013     .   .   1   .   .   .   .   .   16    GLY   HN    .   19273   1
+      57    .   1   .   1   20    20    GLY   C     C   13   171.671   .   .   1   .   .   .   .   .   16    GLY   C     .   19273   1
+      58    .   1   .   1   20    20    GLY   CA    C   13   44.582    .   .   1   .   .   .   .   .   16    GLY   CA    .   19273   1
+      59    .   1   .   1   20    20    GLY   N     N   15   108.585   .   .   1   .   .   .   .   .   16    GLY   N     .   19273   1
+      60    .   1   .   1   21    21    ALA   H     H   1    8.623     .   .   1   .   .   .   .   .   17    ALA   HN    .   19273   1
+      61    .   1   .   1   21    21    ALA   C     C   13   175.119   .   .   1   .   .   .   .   .   17    ALA   C     .   19273   1
+      62    .   1   .   1   21    21    ALA   CA    C   13   52.566    .   .   1   .   .   .   .   .   17    ALA   CA    .   19273   1
+      63    .   1   .   1   21    21    ALA   CB    C   13   23.006    .   .   1   .   .   .   .   .   17    ALA   CB    .   19273   1
+      64    .   1   .   1   21    21    ALA   N     N   15   120.037   .   .   1   .   .   .   .   .   17    ALA   N     .   19273   1
+      65    .   1   .   1   22    22    VAL   H     H   1    8.453     .   .   1   .   .   .   .   .   18    VAL   HN    .   19273   1
+      66    .   1   .   1   22    22    VAL   C     C   13   174.794   .   .   1   .   .   .   .   .   18    VAL   C     .   19273   1
+      67    .   1   .   1   22    22    VAL   CA    C   13   62.418    .   .   1   .   .   .   .   .   18    VAL   CA    .   19273   1
+      68    .   1   .   1   22    22    VAL   CB    C   13   33.116    .   .   1   .   .   .   .   .   18    VAL   CB    .   19273   1
+      69    .   1   .   1   22    22    VAL   N     N   15   120.477   .   .   1   .   .   .   .   .   18    VAL   N     .   19273   1
+      70    .   1   .   1   23    23    LEU   H     H   1    9.404     .   .   1   .   .   .   .   .   19    LEU   HN    .   19273   1
+      71    .   1   .   1   23    23    LEU   C     C   13   175.894   .   .   1   .   .   .   .   .   19    LEU   C     .   19273   1
+      72    .   1   .   1   23    23    LEU   CA    C   13   52.906    .   .   1   .   .   .   .   .   19    LEU   CA    .   19273   1
+      73    .   1   .   1   23    23    LEU   CB    C   13   43.053    .   .   1   .   .   .   .   .   19    LEU   CB    .   19273   1
+      74    .   1   .   1   23    23    LEU   N     N   15   126.516   .   .   1   .   .   .   .   .   19    LEU   N     .   19273   1
+      75    .   1   .   1   24    24    GLU   H     H   1    8.495     .   .   1   .   .   .   .   .   20    GLU   HN    .   19273   1
+      76    .   1   .   1   24    24    GLU   C     C   13   175.180   .   .   1   .   .   .   .   .   20    GLU   C     .   19273   1
+      77    .   1   .   1   24    24    GLU   CA    C   13   56.218    .   .   1   .   .   .   .   .   20    GLU   CA    .   19273   1
+      78    .   1   .   1   24    24    GLU   CB    C   13   30.144    .   .   1   .   .   .   .   .   20    GLU   CB    .   19273   1
+      79    .   1   .   1   24    24    GLU   N     N   15   121.670   .   .   1   .   .   .   .   .   20    GLU   N     .   19273   1
+      80    .   1   .   1   25    25    ALA   H     H   1    8.591     .   .   1   .   .   .   .   .   21    ALA   HN    .   19273   1
+      81    .   1   .   1   25    25    ALA   C     C   13   174.713   .   .   1   .   .   .   .   .   21    ALA   C     .   19273   1
+      82    .   1   .   1   25    25    ALA   CA    C   13   50.443    .   .   1   .   .   .   .   .   21    ALA   CA    .   19273   1
+      83    .   1   .   1   25    25    ALA   CB    C   13   21.820    .   .   1   .   .   .   .   .   21    ALA   CB    .   19273   1
+      84    .   1   .   1   25    25    ALA   N     N   15   128.511   .   .   1   .   .   .   .   .   21    ALA   N     .   19273   1
+      85    .   1   .   1   26    26    ASN   H     H   1    8.642     .   .   1   .   .   .   .   .   22    ASN   HN    .   19273   1
+      86    .   1   .   1   26    26    ASN   C     C   13   175.038   .   .   1   .   .   .   .   .   22    ASN   C     .   19273   1
+      87    .   1   .   1   26    26    ASN   CA    C   13   51.462    .   .   1   .   .   .   .   .   22    ASN   CA    .   19273   1
+      88    .   1   .   1   26    26    ASN   CB    C   13   40.421    .   .   1   .   .   .   .   .   22    ASN   CB    .   19273   1
+      89    .   1   .   1   26    26    ASN   N     N   15   116.394   .   .   1   .   .   .   .   .   22    ASN   N     .   19273   1
+      90    .   1   .   1   27    27    SER   H     H   1    8.703     .   .   1   .   .   .   .   .   23    SER   HN    .   19273   1
+      91    .   1   .   1   27    27    SER   C     C   13   175.078   .   .   1   .   .   .   .   .   23    SER   C     .   19273   1
+      92    .   1   .   1   27    27    SER   CA    C   13   60.974    .   .   1   .   .   .   .   .   23    SER   CA    .   19273   1
+      93    .   1   .   1   27    27    SER   CB    C   13   62.843    .   .   1   .   .   .   .   .   23    SER   CB    .   19273   1
+      94    .   1   .   1   27    27    SER   N     N   15   116.554   .   .   1   .   .   .   .   .   23    SER   N     .   19273   1
+      95    .   1   .   1   28    28    GLY   H     H   1    9.038     .   .   1   .   .   .   .   .   24    GLY   HN    .   19273   1
+      96    .   1   .   1   28    28    GLY   C     C   13   173.598   .   .   1   .   .   .   .   .   24    GLY   C     .   19273   1
+      97    .   1   .   1   28    28    GLY   CA    C   13   45.432    .   .   1   .   .   .   .   .   24    GLY   CA    .   19273   1
+      98    .   1   .   1   28    28    GLY   N     N   15   116.154   .   .   1   .   .   .   .   .   24    GLY   N     .   19273   1
+      99    .   1   .   1   29    29    GLU   H     H   1    7.910     .   .   1   .   .   .   .   .   25    GLU   HN    .   19273   1
+      100   .   1   .   1   29    29    GLU   C     C   13   175.524   .   .   1   .   .   .   .   .   25    GLU   C     .   19273   1
+      101   .   1   .   1   29    29    GLU   CA    C   13   55.029    .   .   1   .   .   .   .   .   25    GLU   CA    .   19273   1
+      102   .   1   .   1   29    29    GLU   CB    C   13   31.672    .   .   1   .   .   .   .   .   25    GLU   CB    .   19273   1
+      103   .   1   .   1   29    29    GLU   N     N   15   122.813   .   .   1   .   .   .   .   .   25    GLU   N     .   19273   1
+      104   .   1   .   1   30    30    THR   H     H   1    8.648     .   .   1   .   .   .   .   .   26    THR   HN    .   19273   1
+      105   .   1   .   1   30    30    THR   C     C   13   176.052   .   .   1   .   .   .   .   .   26    THR   C     .   19273   1
+      106   .   1   .   1   30    30    THR   CA    C   13   60.804    .   .   1   .   .   .   .   .   26    THR   CA    .   19273   1
+      107   .   1   .   1   30    30    THR   CB    C   13   70.741    .   .   1   .   .   .   .   .   26    THR   CB    .   19273   1
+      108   .   1   .   1   30    30    THR   N     N   15   111.581   .   .   1   .   .   .   .   .   26    THR   N     .   19273   1
+      109   .   1   .   1   31    31    ILE   H     H   1    8.269     .   .   1   .   .   .   .   .   27    ILE   HN    .   19273   1
+      110   .   1   .   1   31    31    ILE   C     C   13   177.086   .   .   1   .   .   .   .   .   27    ILE   C     .   19273   1
+      111   .   1   .   1   31    31    ILE   CA    C   13   65.900    .   .   1   .   .   .   .   .   27    ILE   CA    .   19273   1
+      112   .   1   .   1   31    31    ILE   CB    C   13   38.892    .   .   1   .   .   .   .   .   27    ILE   CB    .   19273   1
+      113   .   1   .   1   31    31    ILE   N     N   15   119.186   .   .   1   .   .   .   .   .   27    ILE   N     .   19273   1
+      114   .   1   .   1   32    32    LEU   H     H   1    7.682     .   .   1   .   .   .   .   .   28    LEU   HN    .   19273   1
+      115   .   1   .   1   32    32    LEU   C     C   13   177.289   .   .   1   .   .   .   .   .   28    LEU   C     .   19273   1
+      116   .   1   .   1   32    32    LEU   CA    C   13   58.002    .   .   1   .   .   .   .   .   28    LEU   CA    .   19273   1
+      117   .   1   .   1   32    32    LEU   CB    C   13   40.505    .   .   1   .   .   .   .   .   28    LEU   CB    .   19273   1
+      118   .   1   .   1   32    32    LEU   N     N   15   116.052   .   .   1   .   .   .   .   .   28    LEU   N     .   19273   1
+      119   .   1   .   1   33    33    ASP   H     H   1    8.230     .   .   1   .   .   .   .   .   29    ASP   HN    .   19273   1
+      120   .   1   .   1   33    33    ASP   C     C   13   179.804   .   .   1   .   .   .   .   .   29    ASP   C     .   19273   1
+      121   .   1   .   1   33    33    ASP   CA    C   13   57.832    .   .   1   .   .   .   .   .   29    ASP   CA    .   19273   1
+      122   .   1   .   1   33    33    ASP   CB    C   13   39.656    .   .   1   .   .   .   .   .   29    ASP   CB    .   19273   1
+      123   .   1   .   1   33    33    ASP   N     N   15   119.395   .   .   1   .   .   .   .   .   29    ASP   N     .   19273   1
+      124   .   1   .   1   34    34    ALA   H     H   1    7.972     .   .   1   .   .   .   .   .   30    ALA   HN    .   19273   1
+      125   .   1   .   1   34    34    ALA   C     C   13   179.743   .   .   1   .   .   .   .   .   30    ALA   C     .   19273   1
+      126   .   1   .   1   34    34    ALA   CA    C   13   55.369    .   .   1   .   .   .   .   .   30    ALA   CA    .   19273   1
+      127   .   1   .   1   34    34    ALA   CB    C   13   17.913    .   .   1   .   .   .   .   .   30    ALA   CB    .   19273   1
+      128   .   1   .   1   34    34    ALA   N     N   15   122.592   .   .   1   .   .   .   .   .   30    ALA   N     .   19273   1
+      129   .   1   .   1   35    35    ALA   H     H   1    8.224     .   .   1   .   .   .   .   .   31    ALA   HN    .   19273   1
+      130   .   1   .   1   35    35    ALA   C     C   13   180.392   .   .   1   .   .   .   .   .   31    ALA   C     .   19273   1
+      131   .   1   .   1   35    35    ALA   CA    C   13   56.133    .   .   1   .   .   .   .   .   31    ALA   CA    .   19273   1
+      132   .   1   .   1   35    35    ALA   CB    C   13   17.489    .   .   1   .   .   .   .   .   31    ALA   CB    .   19273   1
+      133   .   1   .   1   35    35    ALA   N     N   15   122.254   .   .   1   .   .   .   .   .   31    ALA   N     .   19273   1
+      134   .   1   .   1   36    36    LEU   H     H   1    9.252     .   .   1   .   .   .   .   .   32    LEU   HN    .   19273   1
+      135   .   1   .   1   36    36    LEU   C     C   13   182.318   .   .   1   .   .   .   .   .   32    LEU   C     .   19273   1
+      136   .   1   .   1   36    36    LEU   CA    C   13   58.171    .   .   1   .   .   .   .   .   32    LEU   CA    .   19273   1
+      137   .   1   .   1   36    36    LEU   CB    C   13   41.270    .   .   1   .   .   .   .   .   32    LEU   CB    .   19273   1
+      138   .   1   .   1   36    36    LEU   N     N   15   118.715   .   .   1   .   .   .   .   .   32    LEU   N     .   19273   1
+      139   .   1   .   1   37    37    ARG   H     H   1    7.956     .   .   1   .   .   .   .   .   33    ARG   HN    .   19273   1
+      140   .   1   .   1   37    37    ARG   C     C   13   176.579   .   .   1   .   .   .   .   .   33    ARG   C     .   19273   1
+      141   .   1   .   1   37    37    ARG   CA    C   13   58.766    .   .   1   .   .   .   .   .   33    ARG   CA    .   19273   1
+      142   .   1   .   1   37    37    ARG   CB    C   13   29.549    .   .   1   .   .   .   .   .   33    ARG   CB    .   19273   1
+      143   .   1   .   1   37    37    ARG   N     N   15   118.665   .   .   1   .   .   .   .   .   33    ARG   N     .   19273   1
+      144   .   1   .   1   38    38    ASN   H     H   1    7.402     .   .   1   .   .   .   .   .   34    ASN   HN    .   19273   1
+      145   .   1   .   1   38    38    ASN   C     C   13   174.105   .   .   1   .   .   .   .   .   34    ASN   C     .   19273   1
+      146   .   1   .   1   38    38    ASN   CA    C   13   54.180    .   .   1   .   .   .   .   .   34    ASN   CA    .   19273   1
+      147   .   1   .   1   38    38    ASN   CB    C   13   41.694    .   .   1   .   .   .   .   .   34    ASN   CB    .   19273   1
+      148   .   1   .   1   38    38    ASN   N     N   15   116.480   .   .   1   .   .   .   .   .   34    ASN   N     .   19273   1
+      149   .   1   .   1   39    39    GLY   H     H   1    7.745     .   .   1   .   .   .   .   .   35    GLY   HN    .   19273   1
+      150   .   1   .   1   39    39    GLY   C     C   13   173.679   .   .   1   .   .   .   .   .   35    GLY   C     .   19273   1
+      151   .   1   .   1   39    39    GLY   CA    C   13   46.706    .   .   1   .   .   .   .   .   35    GLY   CA    .   19273   1
+      152   .   1   .   1   39    39    GLY   N     N   15   106.647   .   .   1   .   .   .   .   .   35    GLY   N     .   19273   1
+      153   .   1   .   1   40    40    ILE   H     H   1    8.151     .   .   1   .   .   .   .   .   36    ILE   HN    .   19273   1
+      154   .   1   .   1   40    40    ILE   C     C   13   175.200   .   .   1   .   .   .   .   .   36    ILE   C     .   19273   1
+      155   .   1   .   1   40    40    ILE   CA    C   13   59.700    .   .   1   .   .   .   .   .   36    ILE   CA    .   19273   1
+      156   .   1   .   1   40    40    ILE   CB    C   13   36.089    .   .   1   .   .   .   .   .   36    ILE   CB    .   19273   1
+      157   .   1   .   1   40    40    ILE   N     N   15   122.848   .   .   1   .   .   .   .   .   36    ILE   N     .   19273   1
+      158   .   1   .   1   41    41    GLU   H     H   1    8.201     .   .   1   .   .   .   .   .   37    GLU   HN    .   19273   1
+      159   .   1   .   1   41    41    GLU   C     C   13   175.180   .   .   1   .   .   .   .   .   37    GLU   C     .   19273   1
+      160   .   1   .   1   41    41    GLU   CA    C   13   56.048    .   .   1   .   .   .   .   .   37    GLU   CA    .   19273   1
+      161   .   1   .   1   41    41    GLU   CB    C   13   27.341    .   .   1   .   .   .   .   .   37    GLU   CB    .   19273   1
+      162   .   1   .   1   41    41    GLU   N     N   15   127.588   .   .   1   .   .   .   .   .   37    GLU   N     .   19273   1
+      163   .   1   .   1   42    42    ILE   H     H   1    7.441     .   .   1   .   .   .   .   .   38    ILE   HN    .   19273   1
+      164   .   1   .   1   42    42    ILE   C     C   13   176.396   .   .   1   .   .   .   .   .   38    ILE   C     .   19273   1
+      165   .   1   .   1   42    42    ILE   CA    C   13   62.843    .   .   1   .   .   .   .   .   38    ILE   CA    .   19273   1
+      166   .   1   .   1   42    42    ILE   CB    C   13   38.807    .   .   1   .   .   .   .   .   38    ILE   CB    .   19273   1
+      167   .   1   .   1   42    42    ILE   N     N   15   125.117   .   .   1   .   .   .   .   .   38    ILE   N     .   19273   1
+      168   .   1   .   1   43    43    GLU   H     H   1    9.040     .   .   1   .   .   .   .   .   39    GLU   HN    .   19273   1
+      169   .   1   .   1   43    43    GLU   C     C   13   175.484   .   .   1   .   .   .   .   .   39    GLU   C     .   19273   1
+      170   .   1   .   1   43    43    GLU   CA    C   13   58.426    .   .   1   .   .   .   .   .   39    GLU   CA    .   19273   1
+      171   .   1   .   1   43    43    GLU   CB    C   13   30.568    .   .   1   .   .   .   .   .   39    GLU   CB    .   19273   1
+      172   .   1   .   1   43    43    GLU   N     N   15   132.420   .   .   1   .   .   .   .   .   39    GLU   N     .   19273   1
+      173   .   1   .   1   57    57    CYS   H     H   1    9.645     .   .   1   .   .   .   .   .   53    CYS   HN    .   19273   1
+      174   .   1   .   1   57    57    CYS   C     C   13   187.591   .   .   1   .   .   .   .   .   53    CYS   C     .   19273   1
+      175   .   1   .   1   57    57    CYS   CA    C   13   55.793    .   .   1   .   .   .   .   .   53    CYS   CA    .   19273   1
+      176   .   1   .   1   57    57    CYS   CB    C   13   31.842    .   .   1   .   .   .   .   .   53    CYS   CB    .   19273   1
+      177   .   1   .   1   57    57    CYS   N     N   15   122.619   .   .   1   .   .   .   .   .   53    CYS   N     .   19273   1
+      178   .   1   .   1   58    58    ILE   H     H   1    9.344     .   .   1   .   .   .   .   .   54    ILE   HN    .   19273   1
+      179   .   1   .   1   58    58    ILE   C     C   13   187.551   .   .   1   .   .   .   .   .   54    ILE   C     .   19273   1
+      180   .   1   .   1   58    58    ILE   CA    C   13   61.229    .   .   1   .   .   .   .   .   54    ILE   CA    .   19273   1
+      181   .   1   .   1   58    58    ILE   CB    C   13   40.166    .   .   1   .   .   .   .   .   54    ILE   CB    .   19273   1
+      182   .   1   .   1   58    58    ILE   N     N   15   119.605   .   .   1   .   .   .   .   .   54    ILE   N     .   19273   1
+      183   .   1   .   1   59    59    VAL   H     H   1    8.564     .   .   1   .   .   .   .   .   55    VAL   HN    .   19273   1
+      184   .   1   .   1   59    59    VAL   C     C   13   174.084   .   .   1   .   .   .   .   .   55    VAL   C     .   19273   1
+      185   .   1   .   1   59    59    VAL   CA    C   13   62.503    .   .   1   .   .   .   .   .   55    VAL   CA    .   19273   1
+      186   .   1   .   1   59    59    VAL   CB    C   13   30.059    .   .   1   .   .   .   .   .   55    VAL   CB    .   19273   1
+      187   .   1   .   1   59    59    VAL   N     N   15   129.714   .   .   1   .   .   .   .   .   55    VAL   N     .   19273   1
+      188   .   1   .   1   60    60    ARG   H     H   1    7.940     .   .   1   .   .   .   .   .   56    ARG   HN    .   19273   1
+      189   .   1   .   1   60    60    ARG   C     C   13   177.451   .   .   1   .   .   .   .   .   56    ARG   C     .   19273   1
+      190   .   1   .   1   60    60    ARG   CA    C   13   57.832    .   .   1   .   .   .   .   .   56    ARG   CA    .   19273   1
+      191   .   1   .   1   60    60    ARG   CB    C   13   30.229    .   .   1   .   .   .   .   .   56    ARG   CB    .   19273   1
+      192   .   1   .   1   60    60    ARG   N     N   15   126.140   .   .   1   .   .   .   .   .   56    ARG   N     .   19273   1
+      193   .   1   .   1   61    61    GLU   H     H   1    7.951     .   .   1   .   .   .   .   .   57    GLU   HN    .   19273   1
+      194   .   1   .   1   61    61    GLU   C     C   13   176.356   .   .   1   .   .   .   .   .   57    GLU   C     .   19273   1
+      195   .   1   .   1   61    61    GLU   CA    C   13   57.577    .   .   1   .   .   .   .   .   57    GLU   CA    .   19273   1
+      196   .   1   .   1   61    61    GLU   CB    C   13   32.862    .   .   1   .   .   .   .   .   57    GLU   CB    .   19273   1
+      197   .   1   .   1   61    61    GLU   N     N   15   116.202   .   .   1   .   .   .   .   .   57    GLU   N     .   19273   1
+      198   .   1   .   1   62    62    GLY   H     H   1    8.827     .   .   1   .   .   .   .   .   58    GLY   HN    .   19273   1
+      199   .   1   .   1   62    62    GLY   C     C   13   177.066   .   .   1   .   .   .   .   .   58    GLY   C     .   19273   1
+      200   .   1   .   1   62    62    GLY   CA    C   13   45.092    .   .   1   .   .   .   .   .   58    GLY   CA    .   19273   1
+      201   .   1   .   1   62    62    GLY   N     N   15   109.524   .   .   1   .   .   .   .   .   58    GLY   N     .   19273   1
+      202   .   1   .   1   63    63    PHE   H     H   1    9.175     .   .   1   .   .   .   .   .   59    PHE   HN    .   19273   1
+      203   .   1   .   1   63    63    PHE   C     C   13   177.410   .   .   1   .   .   .   .   .   59    PHE   C     .   19273   1
+      204   .   1   .   1   63    63    PHE   CA    C   13   62.843    .   .   1   .   .   .   .   .   59    PHE   CA    .   19273   1
+      205   .   1   .   1   63    63    PHE   CB    C   13   39.826    .   .   1   .   .   .   .   .   59    PHE   CB    .   19273   1
+      206   .   1   .   1   63    63    PHE   N     N   15   125.787   .   .   1   .   .   .   .   .   59    PHE   N     .   19273   1
+      207   .   1   .   1   64    64    ASP   H     H   1    8.942     .   .   1   .   .   .   .   .   60    ASP   HN    .   19273   1
+      208   .   1   .   1   64    64    ASP   C     C   13   176.254   .   .   1   .   .   .   .   .   60    ASP   C     .   19273   1
+      209   .   1   .   1   64    64    ASP   CA    C   13   56.218    .   .   1   .   .   .   .   .   60    ASP   CA    .   19273   1
+      210   .   1   .   1   64    64    ASP   CB    C   13   40.166    .   .   1   .   .   .   .   .   60    ASP   CB    .   19273   1
+      211   .   1   .   1   64    64    ASP   N     N   15   115.934   .   .   1   .   .   .   .   .   60    ASP   N     .   19273   1
+      212   .   1   .   1   65    65    SER   H     H   1    7.922     .   .   1   .   .   .   .   .   61    SER   HN    .   19273   1
+      213   .   1   .   1   65    65    SER   C     C   13   174.936   .   .   1   .   .   .   .   .   61    SER   C     .   19273   1
+      214   .   1   .   1   65    65    SER   CA    C   13   59.530    .   .   1   .   .   .   .   .   61    SER   CA    .   19273   1
+      215   .   1   .   1   65    65    SER   CB    C   13   64.626    .   .   1   .   .   .   .   .   61    SER   CB    .   19273   1
+      216   .   1   .   1   65    65    SER   N     N   15   115.179   .   .   1   .   .   .   .   .   61    SER   N     .   19273   1
+      217   .   1   .   1   66    66    LEU   H     H   1    7.230     .   .   1   .   .   .   .   .   62    LEU   HN    .   19273   1
+      218   .   1   .   1   66    66    LEU   C     C   13   175.159   .   .   1   .   .   .   .   .   62    LEU   C     .   19273   1
+      219   .   1   .   1   66    66    LEU   CA    C   13   52.566    .   .   1   .   .   .   .   .   62    LEU   CA    .   19273   1
+      220   .   1   .   1   66    66    LEU   CB    C   13   40.675    .   .   1   .   .   .   .   .   62    LEU   CB    .   19273   1
+      221   .   1   .   1   66    66    LEU   N     N   15   125.082   .   .   1   .   .   .   .   .   62    LEU   N     .   19273   1
+      222   .   1   .   1   67    67    PRO   C     C   13   176.944   .   .   1   .   .   .   .   .   63    PRO   C     .   19273   1
+      223   .   1   .   1   67    67    PRO   CA    C   13   63.097    .   .   1   .   .   .   .   .   63    PRO   CA    .   19273   1
+      224   .   1   .   1   67    67    PRO   CB    C   13   31.418    .   .   1   .   .   .   .   .   63    PRO   CB    .   19273   1
+      225   .   1   .   1   68    68    GLU   H     H   1    8.695     .   .   1   .   .   .   .   .   64    GLU   HN    .   19273   1
+      226   .   1   .   1   68    68    GLU   C     C   13   177.228   .   .   1   .   .   .   .   .   64    GLU   C     .   19273   1
+      227   .   1   .   1   68    68    GLU   CA    C   13   57.237    .   .   1   .   .   .   .   .   64    GLU   CA    .   19273   1
+      228   .   1   .   1   68    68    GLU   CB    C   13   30.398    .   .   1   .   .   .   .   .   64    GLU   CB    .   19273   1
+      229   .   1   .   1   68    68    GLU   N     N   15   124.269   .   .   1   .   .   .   .   .   64    GLU   N     .   19273   1
+      230   .   1   .   1   69    69    SER   H     H   1    8.586     .   .   1   .   .   .   .   .   65    SER   HN    .   19273   1
+      231   .   1   .   1   69    69    SER   C     C   13   174.977   .   .   1   .   .   .   .   .   65    SER   C     .   19273   1
+      232   .   1   .   1   69    69    SER   CA    C   13   58.936    .   .   1   .   .   .   .   .   65    SER   CA    .   19273   1
+      233   .   1   .   1   69    69    SER   CB    C   13   63.607    .   .   1   .   .   .   .   .   65    SER   CB    .   19273   1
+      234   .   1   .   1   69    69    SER   N     N   15   119.340   .   .   1   .   .   .   .   .   65    SER   N     .   19273   1
+      235   .   1   .   1   70    70    SER   H     H   1    8.479     .   .   1   .   .   .   .   .   66    SER   HN    .   19273   1
+      236   .   1   .   1   70    70    SER   C     C   13   174.267   .   .   1   .   .   .   .   .   66    SER   C     .   19273   1
+      237   .   1   .   1   70    70    SER   CA    C   13   57.152    .   .   1   .   .   .   .   .   66    SER   CA    .   19273   1
+      238   .   1   .   1   70    70    SER   CB    C   13   66.070    .   .   1   .   .   .   .   .   66    SER   CB    .   19273   1
+      239   .   1   .   1   70    70    SER   N     N   15   118.625   .   .   1   .   .   .   .   .   66    SER   N     .   19273   1
+      240   .   1   .   1   71    71    GLU   H     H   1    8.916     .   .   1   .   .   .   .   .   67    GLU   HN    .   19273   1
+      241   .   1   .   1   71    71    GLU   C     C   13   178.485   .   .   1   .   .   .   .   .   67    GLU   C     .   19273   1
+      242   .   1   .   1   71    71    GLU   CA    C   13   59.700    .   .   1   .   .   .   .   .   67    GLU   CA    .   19273   1
+      243   .   1   .   1   71    71    GLU   CB    C   13   29.464    .   .   1   .   .   .   .   .   67    GLU   CB    .   19273   1
+      244   .   1   .   1   71    71    GLU   N     N   15   120.717   .   .   1   .   .   .   .   .   67    GLU   N     .   19273   1
+      245   .   1   .   1   72    72    GLN   H     H   1    8.163     .   .   1   .   .   .   .   .   68    GLN   HN    .   19273   1
+      246   .   1   .   1   72    72    GLN   C     C   13   178.364   .   .   1   .   .   .   .   .   68    GLN   C     .   19273   1
+      247   .   1   .   1   72    72    GLN   CA    C   13   59.360    .   .   1   .   .   .   .   .   68    GLN   CA    .   19273   1
+      248   .   1   .   1   72    72    GLN   CB    C   13   28.105    .   .   1   .   .   .   .   .   68    GLN   CB    .   19273   1
+      249   .   1   .   1   72    72    GLN   N     N   15   118.136   .   .   1   .   .   .   .   .   68    GLN   N     .   19273   1
+      250   .   1   .   1   73    73    GLU   H     H   1    7.781     .   .   1   .   .   .   .   .   69    GLU   HN    .   19273   1
+      251   .   1   .   1   73    73    GLU   C     C   13   177.694   .   .   1   .   .   .   .   .   69    GLU   C     .   19273   1
+      252   .   1   .   1   73    73    GLU   CA    C   13   59.530    .   .   1   .   .   .   .   .   69    GLU   CA    .   19273   1
+      253   .   1   .   1   73    73    GLU   CB    C   13   28.700    .   .   1   .   .   .   .   .   69    GLU   CB    .   19273   1
+      254   .   1   .   1   73    73    GLU   N     N   15   122.580   .   .   1   .   .   .   .   .   69    GLU   N     .   19273   1
+      255   .   1   .   1   74    74    ASP   H     H   1    8.480     .   .   1   .   .   .   .   .   70    ASP   HN    .   19273   1
+      256   .   1   .   1   74    74    ASP   C     C   13   178.769   .   .   1   .   .   .   .   .   70    ASP   C     .   19273   1
+      257   .   1   .   1   74    74    ASP   CA    C   13   58.002    .   .   1   .   .   .   .   .   70    ASP   CA    .   19273   1
+      258   .   1   .   1   74    74    ASP   CB    C   13   39.826    .   .   1   .   .   .   .   .   70    ASP   CB    .   19273   1
+      259   .   1   .   1   74    74    ASP   N     N   15   121.204   .   .   1   .   .   .   .   .   70    ASP   N     .   19273   1
+      260   .   1   .   1   75    75    ASP   H     H   1    8.140     .   .   1   .   .   .   .   .   71    ASP   HN    .   19273   1
+      261   .   1   .   1   75    75    ASP   C     C   13   178.891   .   .   1   .   .   .   .   .   71    ASP   C     .   19273   1
+      262   .   1   .   1   75    75    ASP   CA    C   13   57.322    .   .   1   .   .   .   .   .   71    ASP   CA    .   19273   1
+      263   .   1   .   1   75    75    ASP   CB    C   13   41.100    .   .   1   .   .   .   .   .   71    ASP   CB    .   19273   1
+      264   .   1   .   1   75    75    ASP   N     N   15   119.184   .   .   1   .   .   .   .   .   71    ASP   N     .   19273   1
+      265   .   1   .   1   76    76    MET   H     H   1    7.485     .   .   1   .   .   .   .   .   72    MET   HN    .   19273   1
+      266   .   1   .   1   76    76    MET   C     C   13   179.013   .   .   1   .   .   .   .   .   72    MET   C     .   19273   1
+      267   .   1   .   1   76    76    MET   CA    C   13   56.218    .   .   1   .   .   .   .   .   72    MET   CA    .   19273   1
+      268   .   1   .   1   76    76    MET   CB    C   13   32.267    .   .   1   .   .   .   .   .   72    MET   CB    .   19273   1
+      269   .   1   .   1   76    76    MET   N     N   15   117.937   .   .   1   .   .   .   .   .   72    MET   N     .   19273   1
+      270   .   1   .   1   77    77    LEU   H     H   1    8.774     .   .   1   .   .   .   .   .   73    LEU   HN    .   19273   1
+      271   .   1   .   1   77    77    LEU   C     C   13   177.958   .   .   1   .   .   .   .   .   73    LEU   C     .   19273   1
+      272   .   1   .   1   77    77    LEU   CA    C   13   57.747    .   .   1   .   .   .   .   .   73    LEU   CA    .   19273   1
+      273   .   1   .   1   77    77    LEU   CB    C   13   41.100    .   .   1   .   .   .   .   .   73    LEU   CB    .   19273   1
+      274   .   1   .   1   77    77    LEU   N     N   15   119.926   .   .   1   .   .   .   .   .   73    LEU   N     .   19273   1
+      275   .   1   .   1   78    78    ASP   H     H   1    7.358     .   .   1   .   .   .   .   .   74    ASP   HN    .   19273   1
+      276   .   1   .   1   78    78    ASP   C     C   13   177.532   .   .   1   .   .   .   .   .   74    ASP   C     .   19273   1
+      277   .   1   .   1   78    78    ASP   CA    C   13   57.237    .   .   1   .   .   .   .   .   74    ASP   CA    .   19273   1
+      278   .   1   .   1   78    78    ASP   CB    C   13   42.119    .   .   1   .   .   .   .   .   74    ASP   CB    .   19273   1
+      279   .   1   .   1   78    78    ASP   N     N   15   114.756   .   .   1   .   .   .   .   .   74    ASP   N     .   19273   1
+      280   .   1   .   1   79    79    LYS   H     H   1    7.629     .   .   1   .   .   .   .   .   75    LYS   HN    .   19273   1
+      281   .   1   .   1   79    79    LYS   C     C   13   176.903   .   .   1   .   .   .   .   .   75    LYS   C     .   19273   1
+      282   .   1   .   1   79    79    LYS   CA    C   13   55.284    .   .   1   .   .   .   .   .   75    LYS   CA    .   19273   1
+      283   .   1   .   1   79    79    LYS   CB    C   13   32.522    .   .   1   .   .   .   .   .   75    LYS   CB    .   19273   1
+      284   .   1   .   1   79    79    LYS   N     N   15   115.640   .   .   1   .   .   .   .   .   75    LYS   N     .   19273   1
+      285   .   1   .   1   80    80    ALA   H     H   1    8.059     .   .   1   .   .   .   .   .   76    ALA   HN    .   19273   1
+      286   .   1   .   1   80    80    ALA   C     C   13   177.127   .   .   1   .   .   .   .   .   76    ALA   C     .   19273   1
+      287   .   1   .   1   80    80    ALA   CA    C   13   52.566    .   .   1   .   .   .   .   .   76    ALA   CA    .   19273   1
+      288   .   1   .   1   80    80    ALA   CB    C   13   18.083    .   .   1   .   .   .   .   .   76    ALA   CB    .   19273   1
+      289   .   1   .   1   80    80    ALA   N     N   15   124.747   .   .   1   .   .   .   .   .   76    ALA   N     .   19273   1
+      290   .   1   .   1   81    81    TRP   H     H   1    8.484     .   .   1   .   .   .   .   .   77    TRP   HN    .   19273   1
+      291   .   1   .   1   81    81    TRP   HE1   H   1    10.112    .   .   3   .   .   .   .   .   77    TRP   HE1   .   19273   1
+      292   .   1   .   1   81    81    TRP   C     C   13   177.329   .   .   1   .   .   .   .   .   77    TRP   C     .   19273   1
+      293   .   1   .   1   81    81    TRP   CA    C   13   58.256    .   .   1   .   .   .   .   .   77    TRP   CA    .   19273   1
+      294   .   1   .   1   81    81    TRP   CB    C   13   29.125    .   .   1   .   .   .   .   .   77    TRP   CB    .   19273   1
+      295   .   1   .   1   81    81    TRP   N     N   15   124.359   .   .   1   .   .   .   .   .   77    TRP   N     .   19273   1
+      296   .   1   .   1   81    81    TRP   NE1   N   15   129.453   .   .   1   .   .   .   .   .   77    TRP   NE1   .   19273   1
+      297   .   1   .   1   82    82    GLY   H     H   1    8.222     .   .   1   .   .   .   .   .   78    GLY   HN    .   19273   1
+      298   .   1   .   1   82    82    GLY   C     C   13   174.064   .   .   1   .   .   .   .   .   78    GLY   C     .   19273   1
+      299   .   1   .   1   82    82    GLY   CA    C   13   46.366    .   .   1   .   .   .   .   .   78    GLY   CA    .   19273   1
+      300   .   1   .   1   82    82    GLY   N     N   15   113.596   .   .   1   .   .   .   .   .   78    GLY   N     .   19273   1
+      301   .   1   .   1   83    83    LEU   H     H   1    6.798     .   .   1   .   .   .   .   .   79    LEU   HN    .   19273   1
+      302   .   1   .   1   83    83    LEU   C     C   13   176.275   .   .   1   .   .   .   .   .   79    LEU   C     .   19273   1
+      303   .   1   .   1   83    83    LEU   CA    C   13   56.218    .   .   1   .   .   .   .   .   79    LEU   CA    .   19273   1
+      304   .   1   .   1   83    83    LEU   CB    C   13   43.053    .   .   1   .   .   .   .   .   79    LEU   CB    .   19273   1
+      305   .   1   .   1   83    83    LEU   N     N   15   118.596   .   .   1   .   .   .   .   .   79    LEU   N     .   19273   1
+      306   .   1   .   1   84    84    GLU   H     H   1    9.870     .   .   1   .   .   .   .   .   80    GLU   HN    .   19273   1
+      307   .   1   .   1   84    84    GLU   C     C   13   175.808   .   .   1   .   .   .   .   .   80    GLU   C     .   19273   1
+      308   .   1   .   1   84    84    GLU   CA    C   13   54.859    .   .   1   .   .   .   .   .   80    GLU   CA    .   19273   1
+      309   .   1   .   1   84    84    GLU   CB    C   13   32.267    .   .   1   .   .   .   .   .   80    GLU   CB    .   19273   1
+      310   .   1   .   1   84    84    GLU   N     N   15   128.778   .   .   1   .   .   .   .   .   80    GLU   N     .   19273   1
+      311   .   1   .   1   85    85    PRO   C     C   13   178.283   .   .   1   .   .   .   .   .   81    PRO   C     .   19273   1
+      312   .   1   .   1   85    85    PRO   CA    C   13   65.730    .   .   1   .   .   .   .   .   81    PRO   CA    .   19273   1
+      313   .   1   .   1   85    85    PRO   CB    C   13   31.163    .   .   1   .   .   .   .   .   81    PRO   CB    .   19273   1
+      314   .   1   .   1   86    86    GLU   H     H   1    7.350     .   .   1   .   .   .   .   .   82    GLU   HN    .   19273   1
+      315   .   1   .   1   86    86    GLU   C     C   13   176.133   .   .   1   .   .   .   .   .   82    GLU   C     .   19273   1
+      316   .   1   .   1   86    86    GLU   CA    C   13   56.388    .   .   1   .   .   .   .   .   82    GLU   CA    .   19273   1
+      317   .   1   .   1   86    86    GLU   CB    C   13   27.341    .   .   1   .   .   .   .   .   82    GLU   CB    .   19273   1
+      318   .   1   .   1   86    86    GLU   N     N   15   113.106   .   .   1   .   .   .   .   .   82    GLU   N     .   19273   1
+      319   .   1   .   1   87    87    SER   H     H   1    7.909     .   .   1   .   .   .   .   .   83    SER   HN    .   19273   1
+      320   .   1   .   1   87    87    SER   C     C   13   176.133   .   .   1   .   .   .   .   .   83    SER   C     .   19273   1
+      321   .   1   .   1   87    87    SER   CA    C   13   62.503    .   .   1   .   .   .   .   .   83    SER   CA    .   19273   1
+      322   .   1   .   1   87    87    SER   CB    C   13   64.456    .   .   1   .   .   .   .   .   83    SER   CB    .   19273   1
+      323   .   1   .   1   87    87    SER   N     N   15   120.207   .   .   1   .   .   .   .   .   83    SER   N     .   19273   1
+      324   .   1   .   1   93    93    ALA   H     H   1    7.113     .   .   1   .   .   .   .   .   89    ALA   HN    .   19273   1
+      325   .   1   .   1   93    93    ALA   C     C   13   174.348   .   .   1   .   .   .   .   .   89    ALA   C     .   19273   1
+      326   .   1   .   1   93    93    ALA   CA    C   13   52.056    .   .   1   .   .   .   .   .   89    ALA   CA    .   19273   1
+      327   .   1   .   1   93    93    ALA   CB    C   13   19.612    .   .   1   .   .   .   .   .   89    ALA   CB    .   19273   1
+      328   .   1   .   1   93    93    ALA   N     N   15   122.960   .   .   1   .   .   .   .   .   89    ALA   N     .   19273   1
+      329   .   1   .   1   94    94    ARG   H     H   1    7.761     .   .   1   .   .   .   .   .   90    ARG   HN    .   19273   1
+      330   .   1   .   1   94    94    ARG   C     C   13   173.293   .   .   1   .   .   .   .   .   90    ARG   C     .   19273   1
+      331   .   1   .   1   94    94    ARG   CA    C   13   55.623    .   .   1   .   .   .   .   .   90    ARG   CA    .   19273   1
+      332   .   1   .   1   94    94    ARG   CB    C   13   31.842    .   .   1   .   .   .   .   .   90    ARG   CB    .   19273   1
+      333   .   1   .   1   94    94    ARG   N     N   15   124.452   .   .   1   .   .   .   .   .   90    ARG   N     .   19273   1
+      334   .   1   .   1   95    95    VAL   H     H   1    8.114     .   .   1   .   .   .   .   .   91    VAL   HN    .   19273   1
+      335   .   1   .   1   95    95    VAL   C     C   13   177.593   .   .   1   .   .   .   .   .   91    VAL   C     .   19273   1
+      336   .   1   .   1   95    95    VAL   CA    C   13   62.843    .   .   1   .   .   .   .   .   91    VAL   CA    .   19273   1
+      337   .   1   .   1   95    95    VAL   CB    C   13   32.607    .   .   1   .   .   .   .   .   91    VAL   CB    .   19273   1
+      338   .   1   .   1   95    95    VAL   N     N   15   118.964   .   .   1   .   .   .   .   .   91    VAL   N     .   19273   1
+      339   .   1   .   1   96    96    THR   H     H   1    9.131     .   .   1   .   .   .   .   .   92    THR   HN    .   19273   1
+      340   .   1   .   1   96    96    THR   C     C   13   174.571   .   .   1   .   .   .   .   .   92    THR   C     .   19273   1
+      341   .   1   .   1   96    96    THR   CA    C   13   60.465    .   .   1   .   .   .   .   .   92    THR   CA    .   19273   1
+      342   .   1   .   1   96    96    THR   CB    C   13   68.958    .   .   1   .   .   .   .   .   92    THR   CB    .   19273   1
+      343   .   1   .   1   96    96    THR   N     N   15   119.308   .   .   1   .   .   .   .   .   92    THR   N     .   19273   1
+      344   .   1   .   1   97    97    ASP   H     H   1    8.950     .   .   1   .   .   .   .   .   93    ASP   HN    .   19273   1
+      345   .   1   .   1   97    97    ASP   C     C   13   175.403   .   .   1   .   .   .   .   .   93    ASP   C     .   19273   1
+      346   .   1   .   1   97    97    ASP   CA    C   13   53.075    .   .   1   .   .   .   .   .   93    ASP   CA    .   19273   1
+      347   .   1   .   1   97    97    ASP   CB    C   13   41.864    .   .   1   .   .   .   .   .   93    ASP   CB    .   19273   1
+      348   .   1   .   1   97    97    ASP   N     N   15   121.170   .   .   1   .   .   .   .   .   93    ASP   N     .   19273   1
+      349   .   1   .   1   98    98    GLU   H     H   1    7.798     .   .   1   .   .   .   .   .   94    GLU   HN    .   19273   1
+      350   .   1   .   1   98    98    GLU   C     C   13   174.794   .   .   1   .   .   .   .   .   94    GLU   C     .   19273   1
+      351   .   1   .   1   98    98    GLU   CA    C   13   55.114    .   .   1   .   .   .   .   .   94    GLU   CA    .   19273   1
+      352   .   1   .   1   98    98    GLU   CB    C   13   33.201    .   .   1   .   .   .   .   .   94    GLU   CB    .   19273   1
+      353   .   1   .   1   98    98    GLU   N     N   15   119.795   .   .   1   .   .   .   .   .   94    GLU   N     .   19273   1
+      354   .   1   .   1   99    99    ASP   H     H   1    8.272     .   .   1   .   .   .   .   .   95    ASP   HN    .   19273   1
+      355   .   1   .   1   99    99    ASP   C     C   13   176.133   .   .   1   .   .   .   .   .   95    ASP   C     .   19273   1
+      356   .   1   .   1   99    99    ASP   CA    C   13   54.774    .   .   1   .   .   .   .   .   95    ASP   CA    .   19273   1
+      357   .   1   .   1   99    99    ASP   CB    C   13   41.185    .   .   1   .   .   .   .   .   95    ASP   CB    .   19273   1
+      358   .   1   .   1   99    99    ASP   N     N   15   122.327   .   .   1   .   .   .   .   .   95    ASP   N     .   19273   1
+      359   .   1   .   1   100   100   LEU   H     H   1    8.639     .   .   1   .   .   .   .   .   96    LEU   HN    .   19273   1
+      360   .   1   .   1   100   100   LEU   C     C   13   178.384   .   .   1   .   .   .   .   .   96    LEU   C     .   19273   1
+      361   .   1   .   1   100   100   LEU   CA    C   13   52.906    .   .   1   .   .   .   .   .   96    LEU   CA    .   19273   1
+      362   .   1   .   1   100   100   LEU   CB    C   13   47.979    .   .   1   .   .   .   .   .   96    LEU   CB    .   19273   1
+      363   .   1   .   1   100   100   LEU   N     N   15   116.770   .   .   1   .   .   .   .   .   96    LEU   N     .   19273   1
+      364   .   1   .   1   101   101   VAL   H     H   1    8.206     .   .   1   .   .   .   .   .   97    VAL   HN    .   19273   1
+      365   .   1   .   1   101   101   VAL   C     C   13   175.524   .   .   1   .   .   .   .   .   97    VAL   C     .   19273   1
+      366   .   1   .   1   101   101   VAL   CA    C   13   62.673    .   .   1   .   .   .   .   .   97    VAL   CA    .   19273   1
+      367   .   1   .   1   101   101   VAL   CB    C   13   33.541    .   .   1   .   .   .   .   .   97    VAL   CB    .   19273   1
+      368   .   1   .   1   101   101   VAL   N     N   15   122.292   .   .   1   .   .   .   .   .   97    VAL   N     .   19273   1
+      369   .   1   .   1   102   102   VAL   H     H   1    9.703     .   .   1   .   .   .   .   .   98    VAL   HN    .   19273   1
+      370   .   1   .   1   102   102   VAL   C     C   13   172.462   .   .   1   .   .   .   .   .   98    VAL   C     .   19273   1
+      371   .   1   .   1   102   102   VAL   CA    C   13   60.634    .   .   1   .   .   .   .   .   98    VAL   CA    .   19273   1
+      372   .   1   .   1   102   102   VAL   CB    C   13   35.919    .   .   1   .   .   .   .   .   98    VAL   CB    .   19273   1
+      373   .   1   .   1   102   102   VAL   N     N   15   126.408   .   .   1   .   .   .   .   .   98    VAL   N     .   19273   1
+      374   .   1   .   1   103   103   GLU   H     H   1    9.515     .   .   1   .   .   .   .   .   99    GLU   HN    .   19273   1
+      375   .   1   .   1   103   103   GLU   C     C   13   175.078   .   .   1   .   .   .   .   .   99    GLU   C     .   19273   1
+      376   .   1   .   1   103   103   GLU   CA    C   13   53.755    .   .   1   .   .   .   .   .   99    GLU   CA    .   19273   1
+      377   .   1   .   1   103   103   GLU   CB    C   13   34.136    .   .   1   .   .   .   .   .   99    GLU   CB    .   19273   1
+      378   .   1   .   1   103   103   GLU   N     N   15   126.881   .   .   1   .   .   .   .   .   99    GLU   N     .   19273   1
+      379   .   1   .   1   104   104   ILE   H     H   1    9.703     .   .   1   .   .   .   .   .   100   ILE   HN    .   19273   1
+      380   .   1   .   1   104   104   ILE   C     C   13   174.024   .   .   1   .   .   .   .   .   100   ILE   C     .   19273   1
+      381   .   1   .   1   104   104   ILE   CA    C   13   57.577    .   .   1   .   .   .   .   .   100   ILE   CA    .   19273   1
+      382   .   1   .   1   104   104   ILE   CB    C   13   37.448    .   .   1   .   .   .   .   .   100   ILE   CB    .   19273   1
+      383   .   1   .   1   104   104   ILE   N     N   15   130.573   .   .   1   .   .   .   .   .   100   ILE   N     .   19273   1
+      384   .   1   .   1   112   112   ALA   H     H   1    8.132     .   .   1   .   .   .   .   .   108   ALA   HN    .   19273   1
+      385   .   1   .   1   112   112   ALA   C     C   13   177.532   .   .   1   .   .   .   .   .   108   ALA   C     .   19273   1
+      386   .   1   .   1   112   112   ALA   CA    C   13   52.821    .   .   1   .   .   .   .   .   108   ALA   CA    .   19273   1
+      387   .   1   .   1   112   112   ALA   CB    C   13   19.018    .   .   1   .   .   .   .   .   108   ALA   CB    .   19273   1
+      388   .   1   .   1   112   112   ALA   N     N   15   124.623   .   .   1   .   .   .   .   .   108   ALA   N     .   19273   1
+      389   .   1   .   1   113   113   ARG   H     H   1    8.181     .   .   1   .   .   .   .   .   109   ARG   HN    .   19273   1
+      390   .   1   .   1   113   113   ARG   C     C   13   176.214   .   .   1   .   .   .   .   .   109   ARG   C     .   19273   1
+      391   .   1   .   1   113   113   ARG   CA    C   13   56.218    .   .   1   .   .   .   .   .   109   ARG   CA    .   19273   1
+      392   .   1   .   1   113   113   ARG   CB    C   13   30.908    .   .   1   .   .   .   .   .   109   ARG   CB    .   19273   1
+      393   .   1   .   1   113   113   ARG   N     N   15   120.095   .   .   1   .   .   .   .   .   109   ARG   N     .   19273   1
+      394   .   1   .   1   114   114   GLU   H     H   1    8.386     .   .   1   .   .   .   .   .   110   GLU   HN    .   19273   1
+      395   .   1   .   1   114   114   GLU   C     C   13   175.443   .   .   1   .   .   .   .   .   110   GLU   C     .   19273   1
+      396   .   1   .   1   114   114   GLU   CA    C   13   56.643    .   .   1   .   .   .   .   .   110   GLU   CA    .   19273   1
+      397   .   1   .   1   114   114   GLU   CB    C   13   30.483    .   .   1   .   .   .   .   .   110   GLU   CB    .   19273   1
+      398   .   1   .   1   114   114   GLU   N     N   15   122.307   .   .   1   .   .   .   .   .   110   GLU   N     .   19273   1
+      399   .   1   .   1   115   115   HIS   H     H   1    7.902     .   .   1   .   .   .   .   .   111   HIS   HN    .   19273   1
+      400   .   1   .   1   115   115   HIS   C     C   13   179.641   .   .   1   .   .   .   .   .   111   HIS   C     .   19273   1
+      401   .   1   .   1   115   115   HIS   CA    C   13   57.577    .   .   1   .   .   .   .   .   111   HIS   CA    .   19273   1
+      402   .   1   .   1   115   115   HIS   CB    C   13   30.823    .   .   1   .   .   .   .   .   111   HIS   CB    .   19273   1
+      403   .   1   .   1   115   115   HIS   N     N   15   124.902   .   .   1   .   .   .   .   .   111   HIS   N     .   19273   1
+   stop_
+save_
+

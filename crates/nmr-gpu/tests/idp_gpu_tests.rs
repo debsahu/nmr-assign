@@ -17,7 +17,7 @@ use nmr_core::c13_detected::{
 use nmr_core::evaluate::score as evaluate_metrics;
 use nmr_core::idp_solver::{
     idp_pair_matrix, idp_to_reference, idp_unary_matrix, register_and_build_con_dipeptide_systems,
-    IdpShiftOffsets, IdpSolverConfig,
+    ConDipeptideSystem, IdpShiftOffsets, IdpSolverConfig,
 };
 use nmr_core::nmrstar::{read_star_all_atoms, Reference};
 use nmr_core::qc::{DatasetQcVerdict, ProteinReliabilityCurve};
@@ -301,17 +301,11 @@ fn test_idp_gpu_unary_and_pair_matrix_parity_and_browser_limits() {
     ] {
         let ref_data = read_star_all_atoms(root.join(rel_path), None).unwrap();
         let (picked, _) = simulate_mismatched_bmrb_picked_dataset(&ref_data, 0.08, 0.06, 123);
-        let mut systems = register_and_build_con_dipeptide_systems(&picked);
+        let systems = register_and_build_con_dipeptide_systems(&picked);
         assert!(
             systems.iter().any(|s| !s.has_3d_support()),
             "parity test must include 3D-unsupported spurious 2D CON noise roots"
         );
-        for s in 0..systems.len().saturating_sub(1) {
-            if s % 3 == 0 && systems[s].has_3d_support() {
-                let nxt = systems[s + 1].n_curr;
-                systems[s].n_next.push(nxt);
-            }
-        }
 
         let cfg = IdpSolverConfig {
             temperature_k: temp_k,
@@ -558,4 +552,62 @@ fn test_idp_gpu_1024_sram_kernel_dispatch() {
         .expect("anneal_idp_1024 (>256 slots) must execute cleanly on WebGPU");
     assert!(res.score > 500.0);
     assert_eq!(res.position.len(), systems.len());
+}
+
+#[test]
+fn test_idp_gpu_matrix_size_cap_and_multiplicity_parity_under_3x_noise() {
+    let engine = GpuEngine::new_headless_with_limits(wgpu::Limits::default())
+        .expect("baseline wgpu::Limits::default() device must initialize cleanly");
+
+    // 1. Enforce `S * K <= 25,000,000` (`Err` on overflow) on WebGPU path too
+    let big_systems: Vec<ConDipeptideSystem> = (0..5_001)
+        .map(|i| ConDipeptideSystem::new(i, 174.5, 120.0, 90.0))
+        .collect();
+    let big_seq: Vec<String> = std::iter::repeat_n("ALA".to_string(), 5_001).collect();
+    let cfg = IdpSolverConfig::default();
+    let off0 = IdpShiftOffsets::default();
+    assert!(score_idp_matrices_gpu(&engine, &big_systems, &big_seq, &cfg, &off0).is_err());
+    assert!(assign_idp_13c_gpu(&engine, &big_systems, &big_seq, &cfg).is_err());
+
+    // 2. Verify `< 1e-4` CPU/WebGPU `(U, P)` parity when multi-candidate multiplicity penalties are heavily active
+    let root = repo_root();
+    let p53 = read_star_all_atoms(
+        root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+        None,
+    )
+    .unwrap();
+    let (mut picked, _) = simulate_mismatched_bmrb_picked_dataset(&p53, 0.05, 0.25, 3333);
+    // Boost spurious peak heights so multiple candidates per channel survive and trigger `w_mult`
+    for p in &mut picked.strip_peaks {
+        if p.height.abs() < 50.0 {
+            p.height = p.sign as f64 * 88.0;
+        }
+    }
+    let systems = register_and_build_con_dipeptide_systems(&picked);
+    let u_cpu = idp_unary_matrix(&systems, &p53.sequence, &cfg, &off0);
+    let p_cpu = idp_pair_matrix(&systems, &cfg);
+    let (u_gpu, p_gpu) = score_idp_matrices_gpu(&engine, &systems, &p53.sequence, &cfg, &off0)
+        .expect("GPU scoring must succeed");
+
+    let mut max_du = 0.0f64;
+    let mut max_dp = 0.0f64;
+    for s in 0..systems.len() {
+        for k in 0..p53.sequence.len() {
+            let cu = u_cpu.get(s, k);
+            let gu = u_gpu.get(s, k);
+            if cu > -1e15 || gu > -1e15 {
+                max_du = max_du.max((cu - gu).abs());
+            }
+        }
+        for t in 0..systems.len() {
+            let cp = p_cpu.get(s, t);
+            let gp = p_gpu.get(s, t);
+            if cp > -1e15 || gp > -1e15 {
+                max_dp = max_dp.max((cp - gp).abs());
+            }
+        }
+    }
+    println!("[GPU Multiplicity Stress Parity] max |U_cpu - U_gpu| = {max_du:.2e}, max |P_cpu - P_gpu| = {max_dp:.2e}");
+    assert!(max_du < 1e-4, "max |U_cpu - U_gpu| = {max_du} >= 1e-4");
+    assert!(max_dp < 1e-4, "max |P_cpu - P_gpu| = {max_dp} >= 1e-4");
 }

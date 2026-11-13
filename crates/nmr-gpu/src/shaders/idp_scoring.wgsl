@@ -46,7 +46,7 @@ struct IdpGpuParams {
     sigma_seq_ca: f32,
     sigma_seq_c: f32,
 
-    sigma_seq_n: f32,
+    w_mult: f32,
     t_start: f32,
     t_end: f32,
     score_out_mode: f32,
@@ -63,9 +63,9 @@ struct IdpGpuParams {
 const FORBID: f32 = -1.0e9;
 const FORBID_HALF: f32 = -5.0e8;
 const INV_SQRT_2PI: f32 = 0.3989423;
-const SYS_FLOAT_STRIDE: u32 = 38u;
+const SYS_FLOAT_STRIDE: u32 = 32u;
 const SEQ_FLOAT_STRIDE: u32 = 12u;
-const SYS_INT_STRIDE: u32 = 8u;
+const SYS_INT_STRIDE: u32 = 7u;
 const SEQ_INT_STRIDE: u32 = 2u;
 
 const WG_SLOTS_256: u32 = 256u;
@@ -121,7 +121,8 @@ fn best_cand_llr(
             best = llr;
         }
     }
-    return best;
+    let mult_gate = clamp(best / 1.5, 0.0, 1.0);
+    return best - 0.12 * log(f32(cand_len)) * mult_gate;
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -153,17 +154,15 @@ fn compute_idp_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ca_prev_off = sf + 8u;
     let cb_prev_off = sf + 14u;
     let c_curr_off = sf + 20u;
-    let n_next_off = sf + 26u;
-    let sc_prev_off = sf + 32u;
+    let sc_prev_off = sf + 26u;
 
     let n_ca_curr = ro_ints[si + 0u];
     let n_ca_prev = ro_ints[si + 1u];
     let n_cb_prev = ro_ints[si + 2u];
     let n_c_curr = ro_ints[si + 3u];
-    let n_n_next = ro_ints[si + 4u];
-    let n_sc_prev = ro_ints[si + 5u];
-    let flags = ro_ints[si + 6u];
-    let n_3d_ch = ro_ints[si + 7u];
+    let n_sc_prev = ro_ints[si + 4u];
+    let flags = ro_ints[si + 5u];
+    let n_3d_ch = ro_ints[si + 6u];
 
     let has_cbcacon_ev = (flags & 1u) != 0u;
     let prev_gly_opp = (flags & 2u) != 0u;
@@ -246,17 +245,7 @@ fn compute_idp_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
     }
 
-    // 5. Optional N(k+1)
-    if (n_n_next > 0u && k + 1u < params.k_len) {
-        let nxt_qf = params.off_seq_floats + (k + 1u) * SEQ_FLOAT_STRIDE;
-        let nxt_n_mu = ro_floats[nxt_qf + 0u];
-        let nxt_n_sd = ro_floats[nxt_qf + 1u];
-        total = total + 0.70 * best_cand_llr(
-            n_next_off, n_n_next, nxt_n_mu, nxt_n_sd, bg_n_off, 20u, 1.4, llr_floor,
-        );
-    }
-
-    // 6. Aliphatic sidechain CCC(CO)N peaks of k - 1
+    // 5. Aliphatic sidechain CCC(CO)N peaks of k - 1
     if (n_sc_prev > 0u) {
         if (prv_n_sc == 0u) {
             total = total - 1.25 * f32(min(n_sc_prev, 3u));
@@ -310,7 +299,40 @@ fn pair_channel_llr(
             }
         }
     }
-    return best;
+    let mult_gate = clamp(best / 1.5, 0.0, 1.0);
+    return best - 0.18 * log(f32(a_len * b_len)) * mult_gate;
+}
+
+fn raw_seq_pair(a: u32, b: u32) -> f32 {
+    let sf_a = params.off_sys_floats + a * SYS_FLOAT_STRIDE;
+    let si_a = params.off_sys_ints + a * SYS_INT_STRIDE;
+    let sf_b = params.off_sys_floats + b * SYS_FLOAT_STRIDE;
+    let si_b = params.off_sys_ints + b * SYS_INT_STRIDE;
+
+    let sc_ca = pair_channel_llr(
+        sf_a + 2u,
+        ro_ints[si_a + 0u],
+        sf_b + 8u,
+        ro_ints[si_b + 1u],
+        params.sigma_seq_ca,
+        28.0,
+        params.pair_floor,
+    );
+    let sc_c = pair_channel_llr(
+        sf_a + 20u,
+        ro_ints[si_a + 3u],
+        sf_b + 1u,
+        1u,
+        params.sigma_seq_c,
+        13.0,
+        params.pair_floor,
+    );
+    return sc_ca + sc_c;
+}
+
+fn pair_compat_weight(raw: f32) -> f32 {
+    let u = clamp((raw - 2.10) / 2.40, 0.0, 1.0);
+    return u * u * (3.0 - 2.0 * u);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -328,40 +350,26 @@ fn compute_idp_pair(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let sf_s = params.off_sys_floats + s * SYS_FLOAT_STRIDE;
-    let si_s = params.off_sys_ints + s * SYS_INT_STRIDE;
-    let sf_t = params.off_sys_floats + t * SYS_FLOAT_STRIDE;
-    let si_t = params.off_sys_ints + t * SYS_INT_STRIDE;
+    let raw_st = raw_seq_pair(s, t);
+    var final_st = raw_st;
+    if (raw_st > 0.0 && params.w_mult > 0.0) {
+        var sum_out: f32 = 0.0;
+        var sum_in: f32 = 0.0;
+        for (var u: u32 = 0u; u < params.s_len; u = u + 1u) {
+            if (u != s) {
+                sum_out = sum_out + pair_compat_weight(raw_seq_pair(s, u));
+            }
+            if (u != t) {
+                sum_in = sum_in + pair_compat_weight(raw_seq_pair(u, t));
+            }
+        }
+        let n_out = max(sum_out, 1.0);
+        let n_in = max(sum_in, 1.0);
+        let gate_mult = clamp(raw_st / 2.0, 0.0, 1.0);
+        final_st = raw_st - gate_mult * params.w_mult * 0.5 * (log(n_out) + log(n_in));
+    }
 
-    let sc_ca = pair_channel_llr(
-        sf_s + 2u,
-        ro_ints[si_s + 0u],
-        sf_t + 8u,
-        ro_ints[si_t + 1u],
-        params.sigma_seq_ca,
-        28.0,
-        params.pair_floor,
-    );
-    let sc_c = pair_channel_llr(
-        sf_s + 20u,
-        ro_ints[si_s + 3u],
-        sf_t + 1u,
-        1u,
-        params.sigma_seq_c,
-        13.0,
-        params.pair_floor,
-    );
-    let sc_n = pair_channel_llr(
-        sf_s + 26u,
-        ro_ints[si_s + 4u],
-        sf_t + 0u,
-        1u,
-        params.sigma_seq_n,
-        36.0,
-        params.pair_floor,
-    );
-
-    rw_floats[out_base + flat_idx] = sc_ca + sc_c + sc_n;
+    rw_floats[out_base + flat_idx] = final_st;
 }
 
 // ============================================================================
