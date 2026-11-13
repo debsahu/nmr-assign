@@ -703,3 +703,6 @@ impl From<&octet_render::RenderScene> for octet_mol::ChemDocument {
         }
     }
 }
+
+pub mod idp_propensity;
+pub mod paramagnetic;
