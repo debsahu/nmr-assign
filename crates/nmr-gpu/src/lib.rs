@@ -16,6 +16,7 @@ use std::task::{Context, Poll, Waker};
 
 pub mod methyl_gpu;
 pub mod neural_gpu;
+pub mod rdc_gpu;
 
 use bytemuck::{Pod, Zeroable};
 use nmr_core::priors::{delta_covalent, Priors, ATOMS, STANDARD_RESIDUES};

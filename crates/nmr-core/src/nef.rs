@@ -558,6 +558,58 @@ impl NefDihedralRestraint {
             name: "PSI".to_string(),
         }
     }
+
+    /// Construct a canonical NEF `CHI1` (`N(i) - CA(i) - CB(i) - CG/SG/OG/OG1/CG1(i)`) restraint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn chi1(
+        index: usize,
+        restraint_id: usize,
+        chain_code: &str,
+        seq_code: i32,
+        res_name: &str,
+        target_deg: f64,
+        half_width_deg: f64,
+        weight: f64,
+    ) -> Option<Self> {
+        let gamma_atom = match res_name.trim().to_ascii_uppercase().as_str() {
+            "ARG" | "ASN" | "ASP" | "GLN" | "GLU" | "HIS" | "LEU" | "LYS" | "MET" | "PHE"
+            | "PRO" | "TRP" | "TYR" => "CG",
+            "CYS" => "SG",
+            "SER" => "OG",
+            "THR" => "OG1",
+            "ILE" | "VAL" => "CG1",
+            _ => return None,
+        };
+        Some(Self {
+            index,
+            restraint_id,
+            restraint_combination_id: None,
+            chain_code_1: chain_code.to_string(),
+            sequence_code_1: seq_code,
+            residue_name_1: res_name.to_string(),
+            atom_name_1: "N".to_string(),
+            chain_code_2: chain_code.to_string(),
+            sequence_code_2: seq_code,
+            residue_name_2: res_name.to_string(),
+            atom_name_2: "CA".to_string(),
+            chain_code_3: chain_code.to_string(),
+            sequence_code_3: seq_code,
+            residue_name_3: res_name.to_string(),
+            atom_name_3: "CB".to_string(),
+            chain_code_4: chain_code.to_string(),
+            sequence_code_4: seq_code,
+            residue_name_4: res_name.to_string(),
+            atom_name_4: gamma_atom.to_string(),
+            weight,
+            target_value: target_deg,
+            target_value_uncertainty: Some(half_width_deg),
+            lower_linear_limit: None,
+            lower_limit: wrap_deg(target_deg - half_width_deg),
+            upper_limit: wrap_deg(target_deg + half_width_deg),
+            upper_linear_limit: None,
+            name: "CHI1".to_string(),
+        })
+    }
 }
 
 fn wrap_deg(angle: f64) -> f64 {
@@ -583,6 +635,168 @@ impl Default for NefDihedralRestraintList {
             potential_type: "square-well-parabolic".to_string(),
             restraints: Vec::new(),
         }
+    }
+}
+
+/// Single dipolar restraint row in `_nef_rdc_restraint` (`NEF v1.1` `nef_rdc_restraint_list`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefRdcRestraint {
+    pub index: usize,
+    pub restraint_id: usize,
+    pub restraint_combination_id: Option<usize>,
+    pub chain_code_1: String,
+    pub sequence_code_1: i32,
+    pub residue_name_1: String,
+    pub atom_name_1: String,
+    pub chain_code_2: String,
+    pub sequence_code_2: i32,
+    pub residue_name_2: String,
+    pub atom_name_2: String,
+    pub weight: f64,
+    pub target_value: f64,
+    pub target_value_uncertainty: Option<f64>,
+    pub lower_linear_limit: Option<f64>,
+    pub lower_limit: Option<f64>,
+    pub upper_limit: Option<f64>,
+    pub upper_linear_limit: Option<f64>,
+    pub scale: Option<f64>,
+    pub rdc_bond_length: Option<f64>,
+}
+
+/// `save_nef_rdc_restraint_list_<name>` saveframe (`NEF v1.1`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NefRdcRestraintList {
+    pub name: String,
+    pub potential_type: String,
+    pub tensor_magnitude: Option<f64>,
+    pub tensor_rhombicity: Option<f64>,
+    pub tensor_chain_code: Option<String>,
+    pub restraints: Vec<NefRdcRestraint>,
+}
+
+impl Default for NefRdcRestraintList {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            potential_type: "harmonic".to_string(),
+            tensor_magnitude: None,
+            tensor_rhombicity: None,
+            tensor_chain_code: None,
+            restraints: Vec::new(),
+        }
+    }
+}
+
+impl NefRdcRestraintList {
+    /// Convert an `nmr_core::rdc::RdcMediumSet` into a canonical `NefRdcRestraintList`.
+    pub fn from_rdc_medium(
+        name: &str,
+        chain_code: &str,
+        medium: &crate::rdc::RdcMediumSet,
+    ) -> Self {
+        let mut restraints = Vec::with_capacity(medium.restraints.len());
+        for (i, r) in medium.restraints.iter().enumerate() {
+            restraints.push(NefRdcRestraint {
+                index: i + 1,
+                restraint_id: i + 1,
+                restraint_combination_id: None,
+                chain_code_1: chain_code.to_string(),
+                sequence_code_1: r.seq_id_1,
+                residue_name_1: r.res_name_1.clone(),
+                atom_name_1: r.atom_name_1.clone(),
+                chain_code_2: chain_code.to_string(),
+                sequence_code_2: r.seq_id_2,
+                residue_name_2: r.res_name_2.clone(),
+                atom_name_2: r.atom_name_2.clone(),
+                weight: 1.0,
+                target_value: r.d_obs_hz,
+                target_value_uncertainty: Some(r.sigma_hz),
+                lower_linear_limit: None,
+                lower_limit: Some(r.d_obs_hz - r.sigma_hz),
+                upper_limit: Some(r.d_obs_hz + r.sigma_hz),
+                upper_linear_limit: None,
+                scale: Some(r.d_max_hz),
+                rdc_bond_length: None,
+            });
+        }
+        Self {
+            name: name.to_string(),
+            potential_type: "harmonic".to_string(),
+            tensor_magnitude: None,
+            tensor_rhombicity: None,
+            tensor_chain_code: Some(chain_code.to_string()),
+            restraints,
+        }
+    }
+
+    /// Convert this `NefRdcRestraintList` into an `nmr_core::rdc::RdcMediumSet`.
+    pub fn to_rdc_medium(&self) -> Result<crate::rdc::RdcMediumSet, String> {
+        let mut out = Vec::with_capacity(self.restraints.len());
+        for r in &self.restraints {
+            if !r.target_value.is_finite() || !r.weight.is_finite() || r.weight <= 0.0 {
+                return Err(format!(
+                    "non-finite or non-positive RDC value/weight in nef_rdc_restraint_list_{}",
+                    self.name
+                ));
+            }
+            let bond_type = crate::rdc::RdcBondType::infer_from_atoms(
+                r.sequence_code_1,
+                &r.atom_name_1,
+                r.sequence_code_2,
+                &r.atom_name_2,
+            )?;
+            let sigma_hz = match r.target_value_uncertainty {
+                Some(s) => {
+                    if !s.is_finite() || s <= 0.0 {
+                        return Err(format!(
+                            "invalid target_value_uncertainty ({s}) in nef_rdc_restraint_list_{}; must be finite and > 0",
+                            self.name
+                        ));
+                    }
+                    s
+                }
+                None => bond_type.default_sigma_hz(),
+            };
+            let d_max_hz = match r.scale {
+                Some(sc) => {
+                    if !sc.is_finite() || sc <= 0.0 {
+                        return Err(format!(
+                            "invalid scale ({sc}) in nef_rdc_restraint_list_{}; must be finite and > 0",
+                            self.name
+                        ));
+                    }
+                    sc
+                }
+                None => bond_type.default_d_max_hz(),
+            };
+            let rr = crate::rdc::RdcRestraint {
+                medium_id: self.name.clone(),
+                seq_id_1: r.sequence_code_1,
+                res_name_1: r.residue_name_1.to_ascii_uppercase(),
+                atom_name_1: crate::rdc::normalize_rdc_atom_name(&r.atom_name_1).to_string(),
+                seq_id_2: r.sequence_code_2,
+                res_name_2: r.residue_name_2.to_ascii_uppercase(),
+                atom_name_2: crate::rdc::normalize_rdc_atom_name(&r.atom_name_2).to_string(),
+                bond_type,
+                d_obs_hz: r.target_value,
+                sigma_hz,
+                d_max_hz,
+                is_free: false,
+            };
+            rr.validate()?;
+            out.push(rr);
+        }
+        if out.len() < 6 {
+            return Err(format!(
+                "nef_rdc_restraint_list_{} has {} restraints; require >= 6 per medium",
+                self.name,
+                out.len()
+            ));
+        }
+        Ok(crate::rdc::RdcMediumSet {
+            medium_id: self.name.clone(),
+            restraints: out,
+        })
     }
 }
 
@@ -689,6 +903,8 @@ pub struct NefDocument {
     pub peak_lists: Vec<NefPeakList>,
     pub distance_restraint_lists: Vec<NefDistanceRestraintList>,
     pub dihedral_restraint_lists: Vec<NefDihedralRestraintList>,
+    #[serde(default)]
+    pub rdc_restraint_lists: Vec<NefRdcRestraintList>,
     /// Optional vendor-prefixed `save_nmrassign_workbench` session saveframe (`NEF v1.1` extensibility).
     #[serde(default)]
     pub workbench_session: Option<NefWorkbenchSaveframe>,
@@ -704,8 +920,18 @@ impl NefDocument {
             peak_lists: Vec::new(),
             distance_restraint_lists: Vec::new(),
             dihedral_restraint_lists: Vec::new(),
+            rdc_restraint_lists: Vec::new(),
             workbench_session: None,
         }
+    }
+
+    /// Convert all `rdc_restraint_lists` saveframes into `nmr_core::rdc::RdcMediumSet` entries.
+    pub fn rdc_media(&self) -> Result<Vec<crate::rdc::RdcMediumSet>, String> {
+        let mut out = Vec::with_capacity(self.rdc_restraint_lists.len());
+        for lst in &self.rdc_restraint_lists {
+            out.push(lst.to_rdc_medium()?);
+        }
+        Ok(out)
     }
 
     /// Build a NEF v1.1 document from `nmr-core`'s `Reference` shifts and `Peak` lists.
@@ -1692,9 +1918,47 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                     let (ch3, sq3, rs3, at3) = get_atom(3);
                     let (ch4, sq4, rs4, at4) = get_atom(4);
 
-                    let target = c_tv.and_then(|c| opt_f64(&r[c])).unwrap_or(0.0);
-                    let lower = c_ll.and_then(|c| opt_f64(&r[c])).unwrap_or(target - 20.0);
-                    let upper = c_ul.and_then(|c| opt_f64(&r[c])).unwrap_or(target + 20.0);
+                    let target = match c_tv {
+                        Some(c) => parse_strict_finite_f64(&r[c], "dihedral target_value")?,
+                        None => 0.0,
+                    };
+                    let lower = match c_ll {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            parse_strict_finite_f64(&r[c], "dihedral lower_limit")?
+                        }
+                        _ => target - 20.0,
+                    };
+                    let upper = match c_ul {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            parse_strict_finite_f64(&r[c], "dihedral upper_limit")?
+                        }
+                        _ => target + 20.0,
+                    };
+                    let weight = match c_wt {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            let w = parse_strict_finite_f64(&r[c], "dihedral weight")?;
+                            if w <= 0.0 {
+                                return Err(format!("dihedral weight must be > 0, got {w}"));
+                            }
+                            w
+                        }
+                        _ => 1.0,
+                    };
+                    let tvu = match c_tvu {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            let u = parse_strict_finite_f64(
+                                &r[c],
+                                "dihedral target_value_uncertainty",
+                            )?;
+                            if u <= 0.0 {
+                                return Err(format!(
+                                    "dihedral target_value_uncertainty must be > 0, got {u}"
+                                ));
+                            }
+                            Some(u)
+                        }
+                        _ => None,
+                    };
 
                     restraints.push(NefDihedralRestraint {
                         index: c_idx.and_then(|c| opt_usize(&r[c])).unwrap_or(row_i + 1),
@@ -1716,9 +1980,9 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
                         sequence_code_4: sq4,
                         residue_name_4: rs4,
                         atom_name_4: at4,
-                        weight: c_wt.and_then(|c| opt_f64(&r[c])).unwrap_or(1.0),
+                        weight,
                         target_value: target,
-                        target_value_uncertainty: c_tvu.and_then(|c| opt_f64(&r[c])),
+                        target_value_uncertainty: tvu,
                         lower_linear_limit: c_lll.and_then(|c| opt_f64(&r[c])),
                         lower_limit: lower,
                         upper_limit: upper,
@@ -1733,6 +1997,161 @@ pub fn read_nef_str(text: &str) -> Result<NefDocument, String> {
             doc.dihedral_restraint_lists.push(NefDihedralRestraintList {
                 name,
                 potential_type: pot,
+                restraints,
+            });
+        } else if cat == "nef_rdc_restraint_list"
+            || sf
+                .name
+                .to_ascii_lowercase()
+                .starts_with("nef_rdc_restraint_list")
+        {
+            let name = sf
+                .name
+                .strip_prefix("nef_rdc_restraint_list_")
+                .unwrap_or(&sf.name)
+                .to_string();
+            let pot = sf
+                .tags
+                .get("_nef_rdc_restraint_list.potential_type")
+                .cloned()
+                .unwrap_or_else(|| "harmonic".to_string());
+            let tensor_magnitude = match sf.tags.get("_nef_rdc_restraint_list.tensor_magnitude") {
+                Some(s) if s != "." && s != "?" => {
+                    Some(parse_strict_finite_f64(s, "tensor_magnitude")?)
+                }
+                _ => None,
+            };
+            let tensor_rhombicity = match sf.tags.get("_nef_rdc_restraint_list.tensor_rhombicity") {
+                Some(s) if s != "." && s != "?" => {
+                    Some(parse_strict_finite_f64(s, "tensor_rhombicity")?)
+                }
+                _ => None,
+            };
+            let tensor_chain_code = sf
+                .tags
+                .get("_nef_rdc_restraint_list.tensor_chain_code")
+                .and_then(|s| opt_str(s));
+
+            let mut restraints = Vec::new();
+            for (ltags, rows) in &sf.loops {
+                let Some(c_rid) = col_idx(ltags, "restraint_id") else {
+                    continue;
+                };
+                let c_idx = col_idx(ltags, "index");
+                let c_rcid = col_idx(ltags, "restraint_combination_id");
+                let c_wt = col_idx(ltags, "weight");
+                let c_tv = col_idx(ltags, "target_value");
+                let c_tvu = col_idx(ltags, "target_value_uncertainty");
+                let c_lll = col_idx(ltags, "lower_linear_limit");
+                let c_ll = col_idx(ltags, "lower_limit");
+                let c_ul = col_idx(ltags, "upper_limit");
+                let c_ull = col_idx(ltags, "upper_linear_limit");
+                let c_sc = col_idx(ltags, "scale");
+                let c_bl = col_idx(ltags, "rdc_bond_length");
+
+                for (row_i, r) in rows.iter().enumerate() {
+                    let Some(rid) = opt_usize(&r[c_rid]) else {
+                        continue;
+                    };
+                    let get_atom = |k: usize| -> Result<(String, i32, String, String), String> {
+                        let ch = col_idx(ltags, &format!("chain_code_{k}"))
+                            .map(|c| r[c].clone())
+                            .unwrap_or_else(|| "A".to_string());
+                        let sq = match col_idx(ltags, &format!("sequence_code_{k}")) {
+                            Some(c) => r[c].parse::<i32>().map_err(|e| {
+                                format!("invalid RDC sequence_code_{k} '{}': {e}", r[c])
+                            })?,
+                            None => 1,
+                        };
+                        let rs = col_idx(ltags, &format!("residue_name_{k}"))
+                            .map(|c| r[c].clone())
+                            .unwrap_or_else(|| "UNK".to_string());
+                        let at = col_idx(ltags, &format!("atom_name_{k}"))
+                            .map(|c| r[c].clone())
+                            .unwrap_or_else(|| "N".to_string());
+                        Ok((ch, sq, rs, at))
+                    };
+                    let (ch1, sq1, rs1, at1) = get_atom(1)?;
+                    let (ch2, sq2, rs2, at2) = get_atom(2)?;
+
+                    let target_col = c_tv.ok_or_else(|| {
+                        format!("missing target_value in nef_rdc_restraint_list_{name}")
+                    })?;
+                    let target_value = parse_strict_finite_f64(&r[target_col], "RDC target_value")?;
+                    let weight = match c_wt {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            let w = parse_strict_finite_f64(&r[c], "RDC weight")?;
+                            if w <= 0.0 {
+                                return Err(format!("RDC weight must be > 0, got {w}"));
+                            }
+                            w
+                        }
+                        _ => 1.0,
+                    };
+                    let target_value_uncertainty = match c_tvu {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            let s = parse_strict_finite_f64(&r[c], "RDC target_value_uncertainty")?;
+                            if s <= 0.0 {
+                                return Err(format!(
+                                    "RDC target_value_uncertainty must be > 0, got {s}"
+                                ));
+                            }
+                            Some(s)
+                        }
+                        _ => None,
+                    };
+                    let scale = match c_sc {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            let sc = parse_strict_finite_f64(&r[c], "RDC scale")?;
+                            if sc <= 0.0 {
+                                return Err(format!("RDC scale must be > 0, got {sc}"));
+                            }
+                            Some(sc)
+                        }
+                        _ => None,
+                    };
+                    let rdc_bond_length = match c_bl {
+                        Some(c) if r[c] != "." && r[c] != "?" => {
+                            let bl = parse_strict_finite_f64(&r[c], "RDC rdc_bond_length")?;
+                            if bl <= 0.0 {
+                                return Err(format!("RDC rdc_bond_length must be > 0, got {bl}"));
+                            }
+                            Some(bl)
+                        }
+                        _ => None,
+                    };
+
+                    restraints.push(NefRdcRestraint {
+                        index: c_idx.and_then(|c| opt_usize(&r[c])).unwrap_or(row_i + 1),
+                        restraint_id: rid,
+                        restraint_combination_id: c_rcid.and_then(|c| opt_usize(&r[c])),
+                        chain_code_1: ch1,
+                        sequence_code_1: sq1,
+                        residue_name_1: rs1,
+                        atom_name_1: at1,
+                        chain_code_2: ch2,
+                        sequence_code_2: sq2,
+                        residue_name_2: rs2,
+                        atom_name_2: at2,
+                        weight,
+                        target_value,
+                        target_value_uncertainty,
+                        lower_linear_limit: c_lll.and_then(|c| opt_f64(&r[c])),
+                        lower_limit: c_ll.and_then(|c| opt_f64(&r[c])),
+                        upper_limit: c_ul.and_then(|c| opt_f64(&r[c])),
+                        upper_linear_limit: c_ull.and_then(|c| opt_f64(&r[c])),
+                        scale,
+                        rdc_bond_length,
+                    });
+                }
+            }
+
+            doc.rdc_restraint_lists.push(NefRdcRestraintList {
+                name,
+                potential_type: pot,
+                tensor_magnitude,
+                tensor_rhombicity,
+                tensor_chain_code,
                 restraints,
             });
         } else if cat == "nmrassign_workbench"
@@ -2641,12 +3060,112 @@ pub fn write_nef_str(doc: &NefDocument) -> String {
         out.push_str("save_\n\n");
     }
 
+    // 6b. save_nef_rdc_restraint_list_<name>
+    for rlist in &doc.rdc_restraint_lists {
+        let rname = sanitize_identifier(&rlist.name);
+        let frame = format!("nef_rdc_restraint_list_{rname}");
+        out.push_str(&format!("save_{frame}\n"));
+        out.push_str("   _nef_rdc_restraint_list.sf_category        nef_rdc_restraint_list\n");
+        out.push_str(&format!(
+            "   _nef_rdc_restraint_list.sf_framecode       {frame}\n"
+        ));
+        out.push_str(&format!(
+            "   _nef_rdc_restraint_list.potential_type     {}\n",
+            fmt_val(&rlist.potential_type)
+        ));
+        out.push_str(&format!(
+            "   _nef_rdc_restraint_list.tensor_magnitude   {}\n",
+            fmt_opt_f64(rlist.tensor_magnitude, 3)
+        ));
+        out.push_str(&format!(
+            "   _nef_rdc_restraint_list.tensor_rhombicity  {}\n",
+            fmt_opt_f64(rlist.tensor_rhombicity, 4)
+        ));
+        out.push_str(&format!(
+            "   _nef_rdc_restraint_list.tensor_chain_code  {}\n\n",
+            rlist
+                .tensor_chain_code
+                .as_deref()
+                .map(fmt_val)
+                .unwrap_or_else(|| ".".to_string())
+        ));
+        if !rlist.restraints.is_empty() {
+            out.push_str("   loop_\n");
+            for tag in [
+                "_nef_rdc_restraint.index",
+                "_nef_rdc_restraint.restraint_id",
+                "_nef_rdc_restraint.restraint_combination_id",
+                "_nef_rdc_restraint.chain_code_1",
+                "_nef_rdc_restraint.sequence_code_1",
+                "_nef_rdc_restraint.residue_name_1",
+                "_nef_rdc_restraint.atom_name_1",
+                "_nef_rdc_restraint.chain_code_2",
+                "_nef_rdc_restraint.sequence_code_2",
+                "_nef_rdc_restraint.residue_name_2",
+                "_nef_rdc_restraint.atom_name_2",
+                "_nef_rdc_restraint.weight",
+                "_nef_rdc_restraint.target_value",
+                "_nef_rdc_restraint.target_value_uncertainty",
+                "_nef_rdc_restraint.lower_linear_limit",
+                "_nef_rdc_restraint.lower_limit",
+                "_nef_rdc_restraint.upper_limit",
+                "_nef_rdc_restraint.upper_linear_limit",
+                "_nef_rdc_restraint.scale",
+                "_nef_rdc_restraint.rdc_bond_length",
+            ] {
+                out.push_str(&format!("      {tag}\n"));
+            }
+            out.push('\n');
+            for r in &rlist.restraints {
+                out.push_str(&format!(
+                    "      {:4} {:4} {:3} {:2} {:4} {:4} {:4} {:2} {:4} {:4} {:4} {:5.2} {:9.3} {:7} {:7} {:9} {:9} {:7} {:10} {}\n",
+                    r.index,
+                    r.restraint_id,
+                    fmt_opt_usize(r.restraint_combination_id),
+                    fmt_val(&r.chain_code_1),
+                    r.sequence_code_1,
+                    fmt_val(&r.residue_name_1),
+                    fmt_val(&r.atom_name_1),
+                    fmt_val(&r.chain_code_2),
+                    r.sequence_code_2,
+                    fmt_val(&r.residue_name_2),
+                    fmt_val(&r.atom_name_2),
+                    r.weight,
+                    r.target_value,
+                    fmt_opt_f64(r.target_value_uncertainty, 3),
+                    fmt_opt_f64(r.lower_linear_limit, 3),
+                    fmt_opt_f64(r.lower_limit, 3),
+                    fmt_opt_f64(r.upper_limit, 3),
+                    fmt_opt_f64(r.upper_linear_limit, 3),
+                    fmt_opt_f64(r.scale, 2),
+                    fmt_opt_f64(r.rdc_bond_length, 3),
+                ));
+            }
+            out.push_str("   stop_\n");
+        }
+        out.push_str("save_\n\n");
+    }
+
     // 7. Optional vendor-prefixed `save_nmrassign_workbench` (`NEF v1.1` extensibility)
     if let Some(ref wb) = doc.workbench_session {
         write_workbench_saveframe(&mut out, wb);
     }
 
     out
+}
+
+fn parse_strict_finite_f64(raw: &str, field_name: &str) -> Result<f64, String> {
+    if !raw.as_bytes().is_ascii() {
+        return Err(format!("non-ASCII bytes in {field_name}"));
+    }
+    let v: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid {field_name} '{raw}': {e}"))?;
+    if !v.is_finite() {
+        return Err(format!("non-finite {field_name} '{raw}'"));
+    }
+    Ok(v)
 }
 
 pub(crate) fn fmt_exact_f64(v: f64) -> String {

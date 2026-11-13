@@ -98,6 +98,9 @@ pub struct ReportInput {
     /// (rendered as a dedicated `#section-idp-propensity` SVG panel when `Some`; when `None`,
     /// an inline `<g id="svg-idp-propensity-track">` sub-panel is embedded below secondary shifts).
     pub propensity_report: Option<crate::idp_propensity::PropensityReport>,
+    /// Optional multi-medium Residual Dipolar Coupling (`RDC`) Saupe tensor fit and
+    /// Cornilescu `Q` / `Q_free` `D_calc` vs `D_obs` validation report.
+    pub rdc_report: Option<crate::rdc::RdcValidationSummary>,
 }
 
 impl ReportInput {
@@ -123,6 +126,7 @@ impl ReportInput {
             pdb_coordinates: None,
             structure_summary: None,
             propensity_report: None,
+            rdc_report: None,
         }
     }
 
@@ -131,6 +135,11 @@ impl ReportInput {
         report: crate::idp_propensity::PropensityReport,
     ) -> Self {
         self.propensity_report = Some(report);
+        self
+    }
+
+    pub fn with_rdc_report(mut self, report: crate::rdc::RdcValidationSummary) -> Self {
+        self.rdc_report = Some(report);
         self
     }
 }
@@ -754,6 +763,63 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
     html.push_str("<div class=\"svg-wrap\">");
     html.push_str(&svg_strips);
     html.push_str("</div>\n</section>\n");
+
+    if let Some(ref rdc_rep) = input.rdc_report {
+        let fmt_q = |q: f64| -> String {
+            if q.is_finite() {
+                format!("{q:.4}")
+            } else {
+                "N/A".to_string()
+            }
+        };
+        let svg_rdc = render_rdc_validation_svg(rdc_rep);
+        html.push_str("<section class=\"panel\" id=\"section-rdc-validation\">\n");
+        html.push_str(
+            "<h2>4b. Residual Dipolar Coupling (RDC) Saupe Tensor &amp; Cross-Validation</h2>\n",
+        );
+        html.push_str(&format!(
+            "<p class=\"panel-caption\">5-parameter Losonczi traceless Saupe order matrix SVD fit &bull; Overall Cornilescu <strong>Q = {}</strong> &bull; Held-out cross-validated <strong>Q<sub>free</sub> = {}</strong>.</p>\n",
+            escape_xml(&fmt_q(rdc_rep.overall_q_work)),
+            escape_xml(&fmt_q(rdc_rep.overall_q_free)),
+        ));
+        html.push_str("<div class=\"svg-wrap\">");
+        html.push_str(&svg_rdc);
+        html.push_str("</div>\n");
+        if !rdc_rep.media.is_empty() {
+            html.push_str("<div class=\"table-scroll\" style=\"margin-top:12px;\">\n<table class=\"shift-table\">\n<thead>\n<tr>");
+            for col in [
+                "Medium",
+                "N (work / free)",
+                "Da_NH (Hz)",
+                "Rhombicity R",
+                "Euler ZYZ (deg)",
+                "Cond",
+                "Q (work)",
+                "Q_free",
+            ] {
+                html.push_str(&format!("<th>{col}</th>"));
+            }
+            html.push_str("</tr>\n</thead>\n<tbody>\n");
+            for m in &rdc_rep.media {
+                html.push_str(&format!(
+                    "<tr><td><strong>{}</strong></td><td>{} / {}</td><td>{:.2}</td><td>{:.4}</td><td>({:.1}, {:.1}, {:.1})</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>\n",
+                    escape_xml(&m.medium_id),
+                    m.n_work,
+                    m.n_free,
+                    m.da_nh_hz,
+                    m.rhombicity,
+                    m.euler_zyz_deg[0],
+                    m.euler_zyz_deg[1],
+                    m.euler_zyz_deg[2],
+                    m.condition_number,
+                    escape_xml(&fmt_q(m.q_work)),
+                    escape_xml(&fmt_q(m.q_free)),
+                ));
+            }
+            html.push_str("</tbody>\n</table>\n</div>\n");
+        }
+        html.push_str("</section>\n");
+    }
 
     // 7. Chemical Shift Summary Table
     html.push_str("<section class=\"panel\" id=\"section-table\">\n");
@@ -1885,3 +1951,136 @@ const REPORT_CSS: &str = r#"<style>
   }
 </style>
 "#;
+
+/// Render an inline vector SVG `D_calc` vs `D_obs` correlation scatter plot (normalized to `1D_NH` Hz)
+/// distinguishing working restraints (blue circles) and held-out `Q_free` restraints (amber diamonds).
+pub fn render_rdc_validation_svg(summary: &crate::rdc::RdcValidationSummary) -> String {
+    let width = 560.0f64;
+    let height = 380.0f64;
+    let pad_l = 64.0f64;
+    let pad_r = 28.0f64;
+    let pad_t = 34.0f64;
+    let pad_b = 52.0f64;
+    let plot_w = width - pad_l - pad_r;
+    let plot_h = height - pad_t - pad_b;
+
+    let mut max_abs = 15.0f64;
+    for p in &summary.points {
+        if p.d_obs_norm_nh_hz.is_finite() {
+            max_abs = max_abs.max(p.d_obs_norm_nh_hz.abs());
+        }
+        if p.d_calc_norm_nh_hz.is_finite() {
+            max_abs = max_abs.max(p.d_calc_norm_nh_hz.abs());
+        }
+    }
+    let lim = (max_abs * 1.12).ceil().max(5.0);
+
+    let map_x = |v: f64| -> f64 { pad_l + ((v + lim) / (2.0 * lim)).clamp(0.0, 1.0) * plot_w };
+    let map_y =
+        |v: f64| -> f64 { pad_t + (1.0 - ((v + lim) / (2.0 * lim)).clamp(0.0, 1.0)) * plot_h };
+
+    let fmt_q = |q: f64| -> String {
+        if q.is_finite() {
+            format!("{q:.4}")
+        } else {
+            "N/A".to_string()
+        }
+    };
+
+    let mut svg = String::with_capacity(8192);
+    svg.push_str(&format!(
+        "<svg id=\"svg-rdc-scatter\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" width=\"100%\" role=\"img\">\n"
+    ));
+    svg.push_str("<title>Observed versus back-calculated residual dipolar couplings</title>\n");
+    svg.push_str(&format!(
+        "<rect x=\"{pad_l:.1}\" y=\"{pad_t:.1}\" width=\"{plot_w:.1}\" height=\"{plot_h:.1}\" fill=\"#f8fafc\" stroke=\"#cbd5e1\" stroke-width=\"1\"/>\n"
+    ));
+
+    // Zero axes + y = x identity line
+    let zx = map_x(0.0);
+    let zy = map_y(0.0);
+    svg.push_str(&format!(
+        "<line x1=\"{pad_l:.1}\" y1=\"{zy:.1}\" x2=\"{:.1}\" y2=\"{zy:.1}\" stroke=\"#e2e8f0\" stroke-width=\"1\"/>\n",
+        pad_l + plot_w
+    ));
+    svg.push_str(&format!(
+        "<line x1=\"{zx:.1}\" y1=\"{pad_t:.1}\" x2=\"{zx:.1}\" y2=\"{:.1}\" stroke=\"#e2e8f0\" stroke-width=\"1\"/>\n",
+        pad_t + plot_h
+    ));
+    svg.push_str(&format!(
+        "<line x1=\"{pad_l:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{pad_t:.1}\" stroke=\"#64748b\" stroke-width=\"1.3\" stroke-dasharray=\"5,4\"/>\n",
+        pad_t + plot_h,
+        pad_l + plot_w
+    ));
+
+    // Ticks
+    for frac in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+        let val = frac * lim;
+        let tx = map_x(val);
+        let ty = map_y(val);
+        svg.push_str(&format!(
+            "<text x=\"{tx:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"#475569\" text-anchor=\"middle\">{val:.0}</text>\n",
+            pad_t + plot_h + 16.0
+        ));
+        svg.push_str(&format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10\" fill=\"#475569\" text-anchor=\"end\">{val:.0}</text>\n",
+            pad_l - 8.0,
+            ty + 3.5
+        ));
+    }
+
+    // Header badge
+    svg.push_str(&format!(
+        "<text x=\"{:.1}\" y=\"21\" font-size=\"11.5\" font-weight=\"600\" fill=\"#0f172a\">Q = {}   |   Q_free = {}   (n = {})</text>\n",
+        pad_l,
+        escape_xml(&fmt_q(summary.overall_q_work)),
+        escape_xml(&fmt_q(summary.overall_q_free)),
+        summary.points.len()
+    ));
+
+    // Plot working points first, then free-set points on top
+    for pass_free in [false, true] {
+        for p in &summary.points {
+            if p.is_free != pass_free
+                || !p.d_obs_norm_nh_hz.is_finite()
+                || !p.d_calc_norm_nh_hz.is_finite()
+            {
+                continue;
+            }
+            let cx = map_x(p.d_obs_norm_nh_hz);
+            let cy = map_y(p.d_calc_norm_nh_hz);
+            let tip = format!(
+                "{} {}{} ({}): D_obs={:.2} Hz, D_calc={:.2} Hz{}",
+                escape_xml(&p.medium_id),
+                escape_xml(&p.res_name),
+                p.seq_id,
+                escape_xml(&p.bond_label),
+                p.d_obs_hz,
+                p.d_calc_hz,
+                if p.is_free { " [free]" } else { "" }
+            );
+            if p.is_free {
+                svg.push_str(&format!(
+                    "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"3.8\" fill=\"#f59e0b\" stroke=\"#b45309\" stroke-width=\"0.9\"><title>{tip}</title></circle>\n"
+                ));
+            } else {
+                svg.push_str(&format!(
+                    "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"3.1\" fill=\"#2563eb\" fill-opacity=\"0.78\"><title>{tip}</title></circle>\n"
+                ));
+            }
+        }
+    }
+
+    svg.push_str(&format!(
+        "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"11\" font-weight=\"600\" fill=\"#334155\" text-anchor=\"middle\">D_obs normalized to NH scale (Hz)</text>\n",
+        pad_l + 0.5 * plot_w,
+        height - 12.0
+    ));
+    svg.push_str(&format!(
+        "<text x=\"18\" y=\"{:.1}\" font-size=\"11\" font-weight=\"600\" fill=\"#334155\" text-anchor=\"middle\" transform=\"rotate(-90 18 {:.1})\">D_calc normalized to NH scale (Hz)</text>\n",
+        pad_t + 0.5 * plot_h,
+        pad_t + 0.5 * plot_h
+    ));
+    svg.push_str("</svg>\n");
+    svg
+}
