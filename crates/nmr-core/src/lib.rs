@@ -12,11 +12,14 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod aromatic;
+pub mod c13_detected;
 pub mod classify;
 pub mod dihedrals;
 pub mod evaluate;
 pub mod evo_graph;
 pub mod fid;
+pub mod idp_propensity;
+pub mod idp_solver;
 pub mod methyl_solver;
 pub mod methyl_trosy;
 pub mod nef;
@@ -27,6 +30,7 @@ pub mod octet_analyt;
 pub mod octet_mol;
 pub mod octet_render;
 pub mod ops;
+pub mod paramagnetic;
 pub mod peaks;
 pub mod picker;
 pub mod priors;
@@ -703,6 +707,3 @@ impl From<&octet_render::RenderScene> for octet_mol::ChemDocument {
         }
     }
 }
-
-pub mod c13_detected;
-pub mod idp_solver;

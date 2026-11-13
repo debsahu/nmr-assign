@@ -7,7 +7,10 @@
 //! empirical backbone secondary-shift / torsion correlations follow Spera & Bax,
 //! *J. Am. Chem. Soc.* 113, 5490–5492 (1991); Ramachandran $(\phi, \psi)$ basin definitions
 //! follow Ramachandran, Ramakrishnan & Sasisekharan, *J. Mol. Biol.* 7, 95–99 (1963)
-//! and Lovell et al., *Proteins* 50, 437–450 (2003).
+//! and Lovell et al., *Proteins* 50, 437–450 (2003); disordered ensemble `SSP` and 4-state `δ2D`
+//! conformational population tracks follow Marsh, Singh, Jia & Forman-Kay, *Protein Sci.* 15,
+//! 2795–2804 (2006) and Camilloni, De Simone, Vranken & Vendruscolo, *Biochemistry* 51,
+//! 2224–2231 (2012).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -91,6 +94,10 @@ pub struct ReportInput {
     pub pdb_coordinates: Option<String>,
     /// Optional 3D structure ensemble summary metrics.
     pub structure_summary: Option<StructureReportSummary>,
+    /// Optional explicit IDP/ensemble `SSP` & 4-state `δ2D` conformational propensity report
+    /// (rendered as a dedicated `#section-idp-propensity` SVG panel when `Some`; when `None`,
+    /// an inline `<g id="svg-idp-propensity-track">` sub-panel is embedded below secondary shifts).
+    pub propensity_report: Option<crate::idp_propensity::PropensityReport>,
 }
 
 impl ReportInput {
@@ -115,7 +122,16 @@ impl ReportInput {
             dihedrals: Vec::new(),
             pdb_coordinates: None,
             structure_summary: None,
+            propensity_report: None,
         }
+    }
+
+    pub fn with_propensity_report(
+        mut self,
+        report: crate::idp_propensity::PropensityReport,
+    ) -> Self {
+        self.propensity_report = Some(report);
+        self
     }
 }
 
@@ -503,9 +519,21 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
         Vec::new()
     };
 
+    let auto_propensity;
+    let embedded_propensity = if input.propensity_report.is_none() {
+        auto_propensity = crate::idp_propensity::compute_idp_propensity(
+            ref_data,
+            &crate::idp_propensity::PropensityConfig::default(),
+        );
+        Some(&auto_propensity)
+    } else {
+        None
+    };
+
     let svg_ribbon = render_confidence_ribbon_svg(ref_data, &input.confidence);
     let svg_hist = render_confidence_histogram_svg(ref_data, &input.confidence);
-    let svg_csi = render_secondary_shifts_svg(ref_data, &sec_shifts, &ss_classes);
+    let svg_csi =
+        render_secondary_shifts_svg(ref_data, &sec_shifts, &ss_classes, embedded_propensity);
     let svg_strips = render_strip_connectivity_svg(
         ref_data,
         &input.confidence,
@@ -681,6 +709,16 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
     html.push_str("<div class=\"svg-wrap\">");
     html.push_str(&svg_csi);
     html.push_str("</div>\n</section>\n");
+
+    if let Some(ref prop_rep) = input.propensity_report {
+        let svg_prop = render_idp_propensity_svg(prop_rep);
+        html.push_str("<section class=\"panel\" id=\"section-idp-propensity\">\n");
+        html.push_str("<h2>3b. Ensemble Secondary Structure Propensity (SSP) &amp; 4-State &delta;2D Populations</h2>\n");
+        html.push_str("<p class=\"panel-caption\">Stacked per-residue conformational populations (&alpha;-helix, &beta;-strand, PPII, coil; Camilloni et al. 2012) and 5-residue weighted SSP score (Marsh et al. 2006).</p>\n");
+        html.push_str("<div class=\"svg-wrap\">");
+        html.push_str(&svg_prop);
+        html.push_str("</div>\n</section>\n");
+    }
 
     // 5. Sequential CA/CB Strip Connectivity Summary
     html.push_str("<section class=\"panel\" id=\"section-strips\">\n");
@@ -980,6 +1018,7 @@ fn render_secondary_shifts_svg(
     ref_data: &Reference,
     sec_shifts: &[Option<f64>],
     ss_classes: &[SecondaryStructureClass],
+    embedded_propensity: Option<&crate::idp_propensity::PropensityReport>,
 ) -> String {
     let n = ref_data.sequence.len().max(1);
     let bar_step = (820.0 / (n as f64)).clamp(6.5, 14.0);
@@ -989,8 +1028,13 @@ fn render_secondary_shifts_svg(
     let pad_b = 38.0f64;
     let plot_w = (n as f64) * bar_step;
     let plot_h = 170.0f64;
+    let extra_track_h = if embedded_propensity.is_some() {
+        172.0f64
+    } else {
+        0.0f64
+    };
     let width = pad_l + plot_w + pad_r;
-    let height = pad_t + plot_h + pad_b;
+    let height = pad_t + plot_h + extra_track_h + pad_b;
     let zero_y = pad_t + plot_h * 0.5;
     let max_ppm = 7.0f64;
 
@@ -1046,15 +1090,15 @@ fn render_secondary_shifts_svg(
     }
 
     // Diverging bars
+    let tick_y = pad_t + plot_h + extra_track_h + 15.0;
     for (k, val_opt) in sec_shifts.iter().enumerate() {
         let res = &ref_data.sequence[k];
         let sid = ref_data.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
         let x = pad_l + (k as f64) * bar_step;
         if sid % 10 == 0 || k == 0 {
             svg.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"9.5\" fill=\"#475569\" text-anchor=\"middle\">{sid}</text>\n",
+                "<text x=\"{:.1}\" y=\"{tick_y:.1}\" font-size=\"9.5\" fill=\"#475569\" text-anchor=\"middle\">{sid}</text>\n",
                 x + bar_step * 0.5,
-                pad_t + plot_h + 15.0
             ));
         }
         let Some(v) = val_opt else {
@@ -1083,10 +1127,201 @@ fn render_secondary_shifts_svg(
         ));
     }
 
+    if let Some(prop_rep) = embedded_propensity {
+        svg.push_str(&render_propensity_track_group(
+            prop_rep,
+            pad_l,
+            pad_t + plot_h + 22.0,
+            bar_step,
+            72.0,
+            64.0,
+        ));
+    }
+
     svg.push_str(&format!(
         "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10.5\" fill=\"#334155\" text-anchor=\"middle\">Residue Sequence Number</text>\n",
         pad_l + plot_w * 0.5,
         height - 6.0
+    ));
+    svg.push_str("</svg>\n");
+    svg
+}
+
+/// Render an inline `<g id="svg-idp-propensity-track">` group containing stacked 4-state `δ2D`
+/// conformational population bars (`p_alpha`, `p_beta`, `p_ppii`, `p_coil`) and `Marsh et al. (2006)`
+/// `SSP` curve.
+fn render_propensity_track_group(
+    report: &crate::idp_propensity::PropensityReport,
+    pad_l: f64,
+    y_top: f64,
+    bar_step: f64,
+    pop_h: f64,
+    ssp_h: f64,
+) -> String {
+    let n = report.residues.len().max(1);
+    let plot_w = (n as f64) * bar_step;
+    let mut g = String::with_capacity(n * 340 + 1024);
+    g.push_str("<g id=\"svg-idp-propensity-track\">\n");
+
+    // Mini legend above stacked 4-state bar track
+    let legend_y = y_top - 6.0;
+    let legend_items = [
+        ("#2563eb", "p_alpha"),
+        ("#ea580c", "p_beta"),
+        ("#0d9488", "p_PPII"),
+        ("#cbd5e1", "p_coil"),
+        ("#0f172a", "SSP (-1..+1)"),
+    ];
+    let mut lx = pad_l;
+    for (col, label) in legend_items {
+        g.push_str(&format!(
+            "<rect x=\"{lx:.1}\" y=\"{:.1}\" width=\"9\" height=\"9\" rx=\"1.5\" fill=\"{col}\"/>\
+             <text x=\"{:.1}\" y=\"{legend_y:.1}\" font-size=\"9.2\" fill=\"#334155\">{}</text>\n",
+            legend_y - 8.0,
+            lx + 12.0,
+            escape_xml(label)
+        ));
+        lx += 88.0;
+    }
+
+    // 1. Stacked 4-state conformational population bar panel (0.0 .. 1.0)
+    g.push_str(&format!(
+        "<rect x=\"{pad_l:.1}\" y=\"{y_top:.1}\" width=\"{plot_w:.1}\" height=\"{pop_h:.1}\" fill=\"#f8fafc\" stroke=\"#cbd5e1\" stroke-width=\"0.9\"/>\n\
+         <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"8.8\" fill=\"#64748b\" text-anchor=\"end\">1.0</text>\n\
+         <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"8.8\" fill=\"#64748b\" text-anchor=\"end\">0.5</text>\n\
+         <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"8.8\" fill=\"#64748b\" text-anchor=\"end\">0.0</text>\n",
+        pad_l - 5.0,
+        y_top + 7.0,
+        pad_l - 5.0,
+        y_top + pop_h * 0.5 + 3.0,
+        pad_l - 5.0,
+        y_top + pop_h
+    ));
+
+    let bar_w = (bar_step - 1.0).max(1.8);
+    for (k, r) in report.residues.iter().enumerate() {
+        let x = pad_l + (k as f64) * bar_step + 0.5;
+        let opacity = if r.has_data { "0.95" } else { "0.35" };
+        let ssp_txt = r
+            .ssp_score
+            .map(|v| format!("{v:+.2}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let data_tag = if r.has_data {
+            "assigned"
+        } else {
+            "unassigned prior"
+        };
+        let tip = format!(
+            "{}{} ({}): SSP={} | p_alpha={:.2}, p_beta={:.2}, p_PPII={:.2}, p_coil={:.2}",
+            r.residue, r.seq_id, data_tag, ssp_txt, r.p_alpha, r.p_beta, r.p_ppii, r.p_coil
+        );
+
+        let segments = [
+            (r.p_alpha, "#2563eb"),
+            (r.p_beta, "#ea580c"),
+            (r.p_ppii, "#0d9488"),
+            (r.p_coil, "#cbd5e1"),
+        ];
+        let mut y_cur = y_top + pop_h;
+        g.push_str(&format!(
+            "<g class=\"d2d-col\" fill-opacity=\"{opacity}\"><title>{}</title>",
+            escape_xml(&tip)
+        ));
+        for (prob, color) in segments {
+            let h = (prob.clamp(0.0, 1.0) * pop_h).max(0.0);
+            if h > 0.05 {
+                y_cur -= h;
+                g.push_str(&format!(
+                    "<rect x=\"{x:.1}\" y=\"{y_cur:.2}\" width=\"{bar_w:.1}\" height=\"{h:.2}\" fill=\"{color}\"/>"
+                ));
+            }
+        }
+        g.push_str("</g>\n");
+    }
+
+    // 2. Marsh et al. (2006) SSP curve sub-track (-1.0 .. +1.0)
+    let ssp_top = y_top + pop_h + 10.0;
+    let ssp_zero = ssp_top + ssp_h * 0.5;
+    g.push_str(&format!(
+        "<rect x=\"{pad_l:.1}\" y=\"{ssp_top:.1}\" width=\"{plot_w:.1}\" height=\"{ssp_h:.1}\" fill=\"#ffffff\" stroke=\"#cbd5e1\" stroke-width=\"0.9\"/>\n\
+         <line x1=\"{pad_l:.1}\" y1=\"{ssp_zero:.1}\" x2=\"{:.1}\" y2=\"{ssp_zero:.1}\" stroke=\"#64748b\" stroke-width=\"1.0\" stroke-dasharray=\"3,2\"/>\n\
+         <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"8.8\" fill=\"#64748b\" text-anchor=\"end\">+1</text>\n\
+         <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"8.8\" fill=\"#64748b\" text-anchor=\"end\">SSP</text>\n\
+         <text x=\"{:.1}\" y=\"{:.1}\" font-size=\"8.8\" fill=\"#64748b\" text-anchor=\"end\">-1</text>\n",
+        pad_l + plot_w,
+        pad_l - 5.0,
+        ssp_top + 8.0,
+        pad_l - 5.0,
+        ssp_zero + 3.0,
+        pad_l - 5.0,
+        ssp_top + ssp_h
+    ));
+
+    // Render contiguous SSP polyline segments across residues with data
+    let mut poly_pts = String::new();
+    for (k, r) in report.residues.iter().enumerate() {
+        if let Some(ssp) = r.ssp_score {
+            let cx = pad_l + ((k as f64) + 0.5) * bar_step;
+            let cy = ssp_zero - ssp.clamp(-1.0, 1.0) * (ssp_h * 0.46);
+            if !poly_pts.is_empty() {
+                poly_pts.push(' ');
+            }
+            poly_pts.push_str(&format!("{cx:.1},{cy:.1}"));
+        } else if !poly_pts.is_empty() {
+            g.push_str(&format!(
+                "<polyline fill=\"none\" stroke=\"#0f172a\" stroke-width=\"1.6\" points=\"{poly_pts}\"/>\n"
+            ));
+            poly_pts.clear();
+        }
+    }
+    if !poly_pts.is_empty() {
+        g.push_str(&format!(
+            "<polyline fill=\"none\" stroke=\"#0f172a\" stroke-width=\"1.6\" points=\"{poly_pts}\"/>\n"
+        ));
+    }
+
+    g.push_str("</g>\n");
+    g
+}
+
+/// Render a standalone vector SVG panel (`<svg id="svg-idp-propensity">`) displaying stacked
+/// 4-state `δ2D` conformational populations (`p_alpha`, `p_beta`, `p_ppii`, `p_coil`) and the
+/// `Marsh et al. (2006)` `SSP` curve across the protein sequence.
+pub fn render_idp_propensity_svg(report: &crate::idp_propensity::PropensityReport) -> String {
+    let n = report.residues.len().max(1);
+    let bar_step = (820.0 / (n as f64)).clamp(6.5, 14.0);
+    let pad_l = 52.0f64;
+    let pad_r = 24.0f64;
+    let pad_t = 26.0f64;
+    let pad_b = 34.0f64;
+    let pop_h = 96.0f64;
+    let ssp_h = 80.0f64;
+    let plot_w = (n as f64) * bar_step;
+    let width = pad_l + plot_w + pad_r;
+    let height = pad_t + pop_h + 10.0 + ssp_h + pad_b;
+
+    let mut svg = format!(
+        "<svg id=\"svg-idp-propensity\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" width=\"100%\" role=\"img\">\n\
+         <title>IDP SSP and d2D conformational population track</title>\n"
+    );
+    svg.push_str(&render_propensity_track_group(
+        report, pad_l, pad_t, bar_step, pop_h, ssp_h,
+    ));
+
+    let tick_y = pad_t + pop_h + 10.0 + ssp_h + 14.0;
+    for (k, r) in report.residues.iter().enumerate() {
+        if r.seq_id % 10 == 0 || k == 0 {
+            let cx = pad_l + ((k as f64) + 0.5) * bar_step;
+            svg.push_str(&format!(
+                "<text x=\"{cx:.1}\" y=\"{tick_y:.1}\" font-size=\"9.5\" fill=\"#475569\" text-anchor=\"middle\">{}</text>\n",
+                r.seq_id
+            ));
+        }
+    }
+    svg.push_str(&format!(
+        "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"10.5\" fill=\"#334155\" text-anchor=\"middle\">Residue Sequence Number</text>\n",
+        pad_l + plot_w * 0.5,
+        height - 5.0
     ));
     svg.push_str("</svg>\n");
     svg
