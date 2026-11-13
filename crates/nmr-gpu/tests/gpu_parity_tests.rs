@@ -14,11 +14,13 @@ use nmr_core::neural_picker::{
 use nmr_core::nmrstar::read_star;
 use nmr_core::peaks::Peak;
 use nmr_core::priors::Priors;
+use nmr_core::qc::STANDARD_GPU_CALIBRATION_KNOTS;
 use nmr_core::rng::Rng;
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::solver::{
-    assign_from_matrices, calibrate_standard_confidence, consensus_from_runs, pair_matrix,
-    resolve_locked_assignments, unary_matrix, AnnealConfig, Matrix2D, ScoreConfig, FORBID,
+    assign_from_matrices, assign_uncalibrated, calibrate_standard_gpu_confidence,
+    consensus_from_runs, pair_matrix, resolve_locked_assignments, unary_matrix, AnnealConfig,
+    Matrix2D, ScoreConfig, FORBID,
 };
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d, AxisPpm, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
@@ -834,9 +836,18 @@ fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
             },
         )
         .expect("single-replica GPU anneal");
+    let gpu_ceiling = STANDARD_GPU_CALIBRATION_KNOTS
+        .last()
+        .expect("non-empty STANDARD_GPU_CALIBRATION_KNOTS")
+        .1;
+    assert!(
+        (0.90..1.0).contains(&gpu_ceiling),
+        "expected WebGPU calibration ceiling in [0.90, 1.0), got {gpu_ceiling}"
+    );
+
     let single_positions = vec![res_single.position.clone()];
     let mut expected_single = consensus_from_runs(&single_positions, res_single.run_scores.clone());
-    calibrate_standard_confidence(&mut expected_single, Some(&single_positions), &u, &p);
+    calibrate_standard_gpu_confidence(&mut expected_single, Some(&single_positions), &u, &p);
     assert_eq!(
         res_single.confidence.len(),
         expected_single.confidence.len()
@@ -891,7 +902,7 @@ fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
         .expect("heptapeptide 16-replica GPU anneal");
     let pep_positions = vec![res_pep_gpu.position.clone(); 16];
     let mut expected_pep = consensus_from_runs(&pep_positions, res_pep_gpu.run_scores.clone());
-    calibrate_standard_confidence(&mut expected_pep, Some(&pep_positions), &u_pep, &p_pep);
+    calibrate_standard_gpu_confidence(&mut expected_pep, Some(&pep_positions), &u_pep, &p_pep);
     for (s, (&got, &exp)) in res_pep_gpu
         .confidence
         .iter()
@@ -902,7 +913,10 @@ fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
             (got - exp).abs() < 1e-12,
             "16-replica converged confidence mismatch at spin {s}: gpu={got} vs expected={exp}"
         );
-        assert!(got < 0.95, "unlocked calibrated confidence must be < 0.95");
+        assert!(
+            got <= gpu_ceiling + 1e-9,
+            "unlocked calibrated confidence must not exceed STANDARD_GPU_CALIBRATION_KNOTS ceiling ({gpu_ceiling}): got {got}"
+        );
     }
 
     let multi_cfg = AnnealConfig {
@@ -921,8 +935,8 @@ fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
             n_assigned_unlocked += 1;
             let c = res_multi_gpu.confidence[s];
             assert!(
-                (0.0..=0.9462 + 1e-9).contains(&c),
-                "unlocked GPU confidence at spin {s} escaped STANDARD_CALIBRATION_KNOTS ceiling: {c}"
+                (0.0..=gpu_ceiling + 1e-9).contains(&c),
+                "unlocked GPU confidence at spin {s} escaped STANDARD_GPU_CALIBRATION_KNOTS ceiling ({gpu_ceiling}): {c}"
             );
         } else {
             assert_eq!(res_multi_gpu.confidence[s], 0.0);
@@ -930,17 +944,45 @@ fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
     }
     assert!(n_assigned_unlocked >= 60);
     assert_eq!(res_multi_gpu.position, res_multi_cpu.position);
-    let mean_abs_conf_diff = res_multi_gpu
+
+    // Uncalibrated physical `T = 1.0` posteriors between WebGPU and CPU agree within `< 0.05` on
+    // clean Ubiquitin, and `assign_gpu` equals `apply_standard_gpu_calibration_map(assign_gpu_uncalibrated)`
+    // to machine precision (`< 1e-12`).
+    let res_cal_gpu = gpu
+        .assign_gpu(&systems, &ref_data.sequence, &priors, &scfg, &multi_cfg)
+        .expect("calibrated multi-replica GPU assign");
+    let res_raw_gpu = gpu
+        .assign_gpu_uncalibrated(&systems, &ref_data.sequence, &priors, &scfg, &multi_cfg)
+        .expect("uncalibrated multi-replica GPU assign");
+    let res_raw_cpu = assign_uncalibrated(&systems, &ref_data.sequence, &priors, &scfg, &multi_cfg);
+    assert_eq!(res_cal_gpu.position, res_raw_gpu.position);
+    let mean_abs_raw_diff = res_raw_gpu
         .confidence
         .iter()
-        .zip(res_multi_cpu.confidence.iter())
+        .zip(res_raw_cpu.confidence.iter())
         .map(|(a, b)| (a - b).abs())
         .sum::<f64>()
         / (systems.len() as f64);
     assert!(
-        mean_abs_conf_diff < 0.025,
-        "GPU vs CPU 32-replica mean calibrated confidence diff too large: {mean_abs_conf_diff:.4}"
+        mean_abs_raw_diff < 0.05,
+        "GPU vs CPU 32-replica mean uncalibrated p_raw diff too large: {mean_abs_raw_diff:.4}"
     );
+    for (s, (&raw_p, &cal_p)) in res_raw_gpu
+        .confidence
+        .iter()
+        .zip(res_cal_gpu.confidence.iter())
+        .enumerate()
+    {
+        let expected_cal = if res_cal_gpu.position[s] >= 0 {
+            nmr_core::qc::apply_standard_gpu_calibration_map(raw_p)
+        } else {
+            0.0
+        };
+        assert!(
+            (cal_p - expected_cal).abs() < 1e-12,
+            "spin {s} calibrated WebGPU confidence {cal_p} != map({raw_p}) = {expected_cal}"
+        );
+    }
 
     // 3. Locked spins still pin strictly to `1.0` after calibration while unlocked spins stay calibrated.
     let raw_locks = vec![(0usize, 1usize), (3usize, 4usize)];
@@ -967,10 +1009,98 @@ fn test_gpu_standard_confidence_calibration_and_lock_pinning() {
     for (s, &k) in res_locked.position.iter().enumerate() {
         if k >= 0 && !locked_spins.contains(&s) {
             assert!(
-                res_locked.confidence[s] <= 0.9462 + 1e-9,
+                res_locked.confidence[s] <= gpu_ceiling + 1e-9,
                 "unlocked spin {s} in locked GPU run must remain calibrated (got {})",
                 res_locked.confidence[s]
             );
         }
     }
+}
+
+#[test]
+fn test_read_buffer_vec_async_nonblocking_and_edge_cases() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use wgpu::util::DeviceExt;
+
+    struct CountingWaker(AtomicUsize);
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn drive_future_with_waker<F: Future>(fut: F) -> (F::Output, usize) {
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(fut);
+        for _ in 0..100_000 {
+            match Pin::as_mut(&mut pinned).poll(&mut cx) {
+                Poll::Ready(val) => return (val, counter.0.load(Ordering::SeqCst)),
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+        panic!("read_buffer_vec_async future did not resolve within poll budget");
+    }
+
+    let Ok(gpu) = GpuEngine::new_headless() else {
+        return;
+    };
+
+    // 1. Roundtrip f32 vector readback via custom Future + Waker executor
+    let src_vals: Vec<f32> = (0..257).map(|i| (i as f32) * 0.25 - 12.5).collect();
+    let src_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("async-read-test-f32"),
+            contents: bytemuck::cast_slice(&src_vals),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+        });
+    let (got_full, _wakes) =
+        drive_future_with_waker(gpu.read_buffer_vec_async::<f32>(&src_buf, src_vals.len()));
+    assert_eq!(got_full.expect("async f32 full readback"), src_vals);
+
+    // Partial prefix readback (`count < len`)
+    let (got_prefix, _) = drive_future_with_waker(gpu.read_buffer_vec_async::<f32>(&src_buf, 19));
+    assert_eq!(
+        got_prefix.expect("async f32 prefix readback"),
+        &src_vals[..19]
+    );
+
+    // 2. Sub-word (`u8`, `count = 3`, `byte_len = 3`) readback exercises COPY_BUFFER_ALIGNMENT slicing
+    let byte_src = [11u8, 22, 33, 44, 55, 66, 77, 88];
+    let byte_buf = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("async-read-test-u8"),
+            contents: &byte_src,
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+    let (got_u8, _) = drive_future_with_waker(gpu.read_buffer_vec_async::<u8>(&byte_buf, 3));
+    assert_eq!(
+        got_u8.expect("async u8 unaligned count readback"),
+        vec![11u8, 22, 33]
+    );
+
+    // 3. Empty (`count == 0`) and ZST (`()`) readback succeed without buffer map errors
+    let (got_empty, _) = drive_future_with_waker(gpu.read_buffer_vec_async::<f32>(&src_buf, 0));
+    assert_eq!(got_empty.expect("empty count readback"), Vec::<f32>::new());
+    let (got_zst, _) = drive_future_with_waker(gpu.read_buffer_vec_async::<()>(&src_buf, 5));
+    assert_eq!(got_zst.expect("zst readback").len(), 5);
+
+    // 4. Out-of-bounds `count` returns explicit `Err` instead of panicking inside wgpu
+    let (oob_res, _) =
+        drive_future_with_waker(gpu.read_buffer_vec_async::<f32>(&src_buf, src_vals.len() + 10));
+    let err_msg = oob_res.expect_err("out-of-bounds count must return Err");
+    assert!(
+        err_msg.contains("exceeding source buffer size"),
+        "unexpected OOB error message: {err_msg}"
+    );
 }

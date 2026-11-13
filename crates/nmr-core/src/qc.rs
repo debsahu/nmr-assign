@@ -214,6 +214,42 @@ pub fn check_offset_consistency(offsets: &DetailedReferenceOffsets) -> (bool, Ve
     (issues.is_empty(), issues)
 }
 
+/// Fixed per-spin belief threshold (`>= 0.65`) defining the fraction of strongly supported
+/// placements (`solution_margin`) in [`evaluate_dataset_qc`].
+pub const QC_STRONG_BELIEF_THRESHOLD: f64 = 0.65;
+
+/// Minimum number of assigned spin systems (`>= 12`) required before applying the ensemble
+/// convergence (`solution_margin`) abstention gate in [`evaluate_dataset_qc`].
+pub const QC_MIN_ASSIGNED_FOR_MARGIN_GATE: usize = 12;
+
+/// Minimum `solution_margin` (`0.07`) required for ensemble convergence on normal-multiplicity
+/// spectra (`hsqc_multiplicity_ratio <= QC_CROWDED_MULTIPLICITY_RATIO`).
+pub const QC_MIN_SOLUTION_MARGIN: f64 = 0.07;
+
+/// Amide `HSQC` multiplicity ratio (`1.60`) above which a spectrum is treated as severely
+/// multi-conformer crowded in [`is_unconverged_solution_margin`].
+pub const QC_CROWDED_MULTIPLICITY_RATIO: f64 = 1.60;
+
+/// Minimum `solution_margin` (`0.16`) required for ensemble convergence on crowded spectra
+/// (`hsqc_multiplicity_ratio > QC_CROWDED_MULTIPLICITY_RATIO`).
+pub const QC_CROWDED_MIN_SOLUTION_MARGIN: f64 = 0.16;
+
+/// Fixed ensemble-convergence specification predicate (`(0.65, 0.07, 1.60, 0.16)`) shared by
+/// [`evaluate_dataset_qc`] and Leave-One-Protein-Out (LOPO) calibration training-pool filtering:
+/// returns `true` when `assigned_count >= 12` and either `solution_margin < 0.07` or
+/// `(hsqc_multiplicity_ratio > 1.60 && solution_margin < 0.16)`.
+#[inline]
+pub fn is_unconverged_solution_margin(
+    assigned_count: usize,
+    solution_margin: f64,
+    hsqc_multiplicity_ratio: f64,
+) -> bool {
+    assigned_count >= QC_MIN_ASSIGNED_FOR_MARGIN_GATE
+        && (solution_margin < QC_MIN_SOLUTION_MARGIN
+            || (hsqc_multiplicity_ratio > QC_CROWDED_MULTIPLICITY_RATIO
+                && solution_margin < QC_CROWDED_MIN_SOLUTION_MARGIN))
+}
+
 /// Evaluate unlabelled per-dataset quality-control metrics and compute `DatasetQcVerdict` (`Pass`,
 /// `Warn`, `Abstain`) + conservative confidence calibration scale.
 pub fn evaluate_dataset_qc(
@@ -518,7 +554,7 @@ pub fn evaluate_dataset_qc(
         if pos >= 0 && (pos as usize) < k_len {
             at[pos as usize] = s as i32;
             assigned_count += 1;
-            if result.confidence.get(s).copied().unwrap_or(0.0) >= 0.65 {
+            if result.confidence.get(s).copied().unwrap_or(0.0) >= QC_STRONG_BELIEF_THRESHOLD {
                 strong_belief_count += 1;
             }
         }
@@ -581,9 +617,7 @@ pub fn evaluate_dataset_qc(
             connectivity_frac * 100.0
         ));
     }
-    if assigned_count >= 12
-        && (solution_margin < 0.07 || (hsqc_multiplicity_ratio > 1.60 && solution_margin < 0.16))
-    {
+    if is_unconverged_solution_margin(assigned_count, solution_margin, hsqc_multiplicity_ratio) {
         abstain_reasons.push(format!(
             "solver ensemble failed to converge (solution margin {:.1}%, multiplicity {:.2}x)",
             solution_margin * 100.0,
@@ -884,14 +918,32 @@ pub fn eval_monotone_calibration_map(p_raw: f64, knots: &[(f64, f64)]) -> f64 {
     last.1.clamp(0.0, 1.0)
 }
 
+/// Canonical 12-bin (`13`-edge, `g12`) probability partition used across all solver and engine
+/// isotonic PAV calibration fits (`0.0 = g_0 < g_1 < ... < g_12 = 1.0`).
+///
+/// Fixed a priori with zero grid search: wider `0.15`-spaced bins in `[0.0, 0.45]` prevent small-sample
+/// overfitting in the sparse low-belief region, while geometrically narrower upper-tail intervals
+/// (`0.83, 0.89, 0.94, 0.975, 0.992, 1.0`) resolve the steep empirical accuracy gradient around the
+/// `0.80` high-confidence threshold where unit-temperature (`T = 1.0` nat) Boltzmann posteriors pile up.
+pub const CANONICAL_CALIBRATION_GRID_12: &[f64] = &[
+    0.0, 0.15, 0.30, 0.45, 0.58, 0.68, 0.76, 0.83, 0.89, 0.94, 0.975, 0.992, 1.0,
+];
+
+/// Canonical total pseudocount (`laplace_prior = 0.5`) per `CANONICAL_CALIBRATION_GRID_12` interval,
+/// corresponding to a symmetric `Beta(0.25, 0.25)` prior (`0.25` positive + `0.25` negative
+/// pseudocounts, i.e., `Beta(laplace_prior / 2, laplace_prior / 2)`).
+pub const CANONICAL_CALIBRATION_LAPLACE_PRIOR: f64 = 0.5;
+
 /// Fit a monotone piecewise-linear calibration knot table on `grid` (`0.0 = g_0 < ... < g_m = 1.0`)
-/// using Laplace-regularized Pool-Adjacent-Violators (PAV) isotonic regression (Ayer et al. 1955;
+/// using Beta-smoothed Pool-Adjacent-Violators (PAV) isotonic regression (Ayer et al. 1955;
 /// Zadrozny & Elkan 2002).
 ///
 /// Each interval `[g_b, g_{b+1})` accumulates empirical `(correct, count)` plus a symmetric
-/// neutral Beta(`laplace_prior / 2`, `laplace_prior / 2`) pseudocount (`0.5 * laplace_prior`) so
-/// sparse bins shrink toward `0.5` rather than collapsing to `0.0`/`1.0` or inheriting raw
-/// `T = 1.0` overconfidence.
+/// `Beta(laplace_prior / 2, laplace_prior / 2)` prior (`laplace_prior` total pseudocount:
+/// `0.5 * laplace_prior` positive + `0.5 * laplace_prior` negative; for
+/// [`CANONICAL_CALIBRATION_LAPLACE_PRIOR`] `= 0.5`, this is symmetric `Beta(0.25, 0.25)` with
+/// `0.25` positive + `0.25` negative pseudocounts) so sparse bins shrink gently toward `0.5`
+/// rather than collapsing to `0.0`/`1.0` or inheriting raw `T = 1.0` overconfidence.
 pub fn fit_isotonic_monotone_knots(
     samples: &[(f64, bool)],
     grid: &[f64],
@@ -903,12 +955,13 @@ pub fn fit_isotonic_monotone_knots(
     let n_bins = grid.len() - 1;
     let mut weights = vec![0.0_f64; n_bins];
     let mut pos_sums = vec![0.0_f64; n_bins];
-    let mut x_mids = vec![0.0_f64; n_bins];
+    let mut x_sums = vec![0.0_f64; n_bins];
     for b in 0..n_bins {
         let mid = 0.5 * (grid[b] + grid[b + 1]);
-        x_mids[b] = mid;
-        weights[b] = laplace_prior.max(1e-6);
-        pos_sums[b] = 0.5 * weights[b];
+        let prior_w = laplace_prior.max(1e-6);
+        weights[b] = prior_w;
+        pos_sums[b] = 0.5 * prior_w;
+        x_sums[b] = prior_w * mid;
     }
 
     for &(raw_p, is_ok) in samples {
@@ -921,9 +974,15 @@ pub fn fit_isotonic_monotone_knots(
             }
         }
         weights[idx] += 1.0;
+        x_sums[idx] += p;
         if is_ok {
             pos_sums[idx] += 1.0;
         }
+    }
+
+    let mut x_knots = vec![0.0_f64; n_bins];
+    for b in 0..n_bins {
+        x_knots[b] = (x_sums[b] / weights[b]).clamp(grid[b], grid[b + 1]);
     }
 
     // Pool-Adjacent-Violators (PAV) stack of `(start_bin, end_bin, sum_pos, sum_weight)`
@@ -954,56 +1013,91 @@ pub fn fit_isotonic_monotone_knots(
         }
     }
 
-    let mut knots = Vec::with_capacity(n_bins + 2);
+    // Anchor `f(0.0) = 0.0` strictly for zero-belief / unplaced entries, place a positive-belief
+    // left-boundary midpoint shoulder `(x_left, 0.5 * bin_vals[0])` so positive sub-centroid
+    // beliefs in `(0, x_knots[0])` neither collapse toward `0.0` nor over-extrapolate `bin_vals[0]`,
+    // and extrapolate flat `(1.0, y_end)` above the top bin centroid.
+    let mut knots = Vec::with_capacity(n_bins + 3);
     knots.push((0.0, 0.0));
+    let x_left = (0.5 * x_knots[0]).min(1e-4);
+    if x_left > 0.0 {
+        knots.push((x_left, 0.5 * bin_vals[0]));
+    }
     for b in 0..n_bins {
-        knots.push((x_mids[b], bin_vals[b]));
+        knots.push((x_knots[b], bin_vals[b]));
     }
     let y_end = bin_vals[n_bins - 1].max(0.0);
     knots.push((1.0, y_end));
     knots
 }
 
-/// Monotone calibration knot table for `evo-graph` (`P1-2`), fitted via isotonic PAV on the
-/// canonical 12-bin grid (`g12`) with Jeffreys `laplace = 0.5` smoothing across the 10-entry
-/// `dev` split (zero hyperparameter search; validated via strict 10-fold Leave-One-Protein-Out
-/// cross-validation over physical `T = 1.0` marginal posteriors).
+/// Monotone calibration knot table for `evo-graph` (`P1-2` / `P1-7`), fitted via isotonic PAV on
+/// [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with symmetric `Beta(0.25, 0.25)` smoothing
+/// (`laplace_prior = 0.5` total pseudocount: `0.25` positive + `0.25` negative) across the
+/// 10-entry `dev` split (zero hyperparameter search; validated via strict 10-fold
+/// Leave-One-Protein-Out cross-validation with zero empirical knot tables upstream of Pass 2).
 pub const EVO_GRAPH_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.0000, 0.0000),
-    (0.0750, 0.1917),
-    (0.2250, 0.2909),
-    (0.3750, 0.4567),
-    (0.5150, 0.6230),
-    (0.6300, 0.6230),
-    (0.7200, 0.6603),
-    (0.7950, 0.6976),
-    (0.8600, 0.6976),
-    (0.9150, 0.8224),
-    (0.9575, 0.8224),
-    (0.9835, 0.8717),
-    (0.9960, 0.9757),
-    (1.0000, 0.9757),
+    (0.0001, 0.0895),
+    (0.0449, 0.1790),
+    (0.2256, 0.2729),
+    (0.3782, 0.3612),
+    (0.5075, 0.6415),
+    (0.6258, 0.6415),
+    (0.7254, 0.6415),
+    (0.7993, 0.7053),
+    (0.8676, 0.7121),
+    (0.9301, 0.7694),
+    (0.9577, 0.7694),
+    (0.9869, 0.8514),
+    (0.9998, 0.9763),
+    (1.0000, 0.9763),
 ];
 
-/// Monotone calibration knot table for `standard` (`P1-6`), fitted via isotonic PAV on the
-/// identical canonical 12-bin grid (`g12`) with Jeffreys `laplace = 0.5` smoothing across the
-/// 10-entry `dev` split (zero hyperparameter search; validated via strict 10-fold
+/// Monotone calibration knot table for CPU `standard` (`runs = 16`, `P1-6` / `P1-8`), fitted via
+/// isotonic PAV on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with symmetric `Beta(0.25, 0.25)`
+/// smoothing (`laplace_prior = 0.5` total pseudocount: `0.25` positive + `0.25` negative) across
+/// the 10-entry `dev` split (zero hyperparameter search; validated via strict 10-fold
 /// Leave-One-Protein-Out cross-validation over physical `T = 1.0` marginal posteriors).
 pub const STANDARD_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.0000, 0.0000),
-    (0.0750, 0.2411),
-    (0.2250, 0.5080),
-    (0.3750, 0.5080),
-    (0.5150, 0.5745),
-    (0.6300, 0.5925),
-    (0.7200, 0.7721),
-    (0.7950, 0.7721),
-    (0.8600, 0.8966),
-    (0.9150, 0.9348),
-    (0.9575, 0.9444),
-    (0.9835, 0.9462),
-    (0.9960, 0.9462),
+    (0.0001, 0.1205),
+    (0.0543, 0.2411),
+    (0.2159, 0.5080),
+    (0.3791, 0.5080),
+    (0.5077, 0.5745),
+    (0.6237, 0.5925),
+    (0.7230, 0.7721),
+    (0.8024, 0.7721),
+    (0.8687, 0.8966),
+    (0.9326, 0.9348),
+    (0.9596, 0.9444),
+    (0.9832, 0.9462),
+    (0.9994, 0.9462),
     (1.0000, 0.9462),
+];
+
+/// Monotone calibration knot table for WebGPU `standard` (`runs = 64` `f32` multi-replica elite
+/// consensus, `P1-8`), fitted via isotonic PAV on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`) with
+/// symmetric `Beta(0.25, 0.25)` smoothing (`laplace_prior = 0.5` total pseudocount: `0.25`
+/// positive + `0.25` negative) across the 10-entry `dev` split (zero hyperparameter search;
+/// validated via strict 10-fold Leave-One-Protein-Out cross-validation).
+pub const STANDARD_GPU_CALIBRATION_KNOTS: &[(f64, f64)] = &[
+    (0.0000, 0.0000),
+    (0.0001, 0.1050),
+    (0.0491, 0.2100),
+    (0.2222, 0.3977),
+    (0.3808, 0.4860),
+    (0.5143, 0.6881),
+    (0.6289, 0.6881),
+    (0.7194, 0.8492),
+    (0.7951, 0.8822),
+    (0.8611, 0.9327),
+    (0.9175, 0.9497),
+    (0.9587, 0.9497),
+    (0.9844, 0.9497),
+    (0.9995, 0.9497),
+    (1.0000, 0.9497),
 ];
 
 /// Map raw physical (`T = 1.0`) `evo-graph` marginal belief into calibrated probability.
@@ -1012,8 +1106,14 @@ pub fn apply_evo_graph_calibration_map(p_raw: f64) -> f64 {
     eval_monotone_calibration_map(p_raw, EVO_GRAPH_CALIBRATION_KNOTS)
 }
 
-/// Map raw physical (`T = 1.0`) `standard` marginal belief into calibrated probability.
+/// Map raw physical (`T = 1.0`) CPU `standard` marginal belief into calibrated probability.
 #[inline]
 pub fn apply_standard_calibration_map(p_raw: f64) -> f64 {
     eval_monotone_calibration_map(p_raw, STANDARD_CALIBRATION_KNOTS)
+}
+
+/// Map raw physical (`T = 1.0`) WebGPU `standard` marginal belief into calibrated probability.
+#[inline]
+pub fn apply_standard_gpu_calibration_map(p_raw: f64) -> f64 {
+    eval_monotone_calibration_map(p_raw, STANDARD_GPU_CALIBRATION_KNOTS)
 }

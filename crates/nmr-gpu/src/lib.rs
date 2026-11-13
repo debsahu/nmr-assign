@@ -7,7 +7,12 @@
 //! sequential connectivity `P(s, t)`, and massively parallel Metropolis-Hastings simulated
 //! annealing replicas on Metal / Vulkan / DX12 / WebGPU.
 
+use std::future::Future;
+use std::pin::Pin;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 pub mod methyl_gpu;
 pub mod neural_gpu;
@@ -16,9 +21,9 @@ use bytemuck::{Pod, Zeroable};
 use nmr_core::priors::{delta_covalent, Priors, ATOMS, STANDARD_RESIDUES};
 use nmr_core::rng::Rng;
 use nmr_core::solver::{
-    apply_locked_assignments_to_unary, calibrate_standard_confidence, consensus_from_runs,
-    prepare_scoring_priors, resolve_locked_assignments, AnnealConfig, AssignResult, Matrix2D,
-    ScoreConfig, FORBID,
+    apply_locked_assignments_to_unary, calibrate_standard_confidence_uncalibrated,
+    calibrate_standard_gpu_confidence, consensus_from_runs, prepare_scoring_priors,
+    resolve_locked_assignments, AnnealConfig, AssignResult, Matrix2D, ScoreConfig, FORBID,
 };
 use nmr_core::spinsystems::SpinSystem;
 use wgpu::util::DeviceExt;
@@ -85,6 +90,55 @@ struct AnnealParamsGpu {
     t_start: f32,
     t_end: f32,
     _pad2: [f32; 2],
+}
+
+struct BufferMapState {
+    result: Option<Result<(), wgpu::BufferAsyncError>>,
+    waker: Option<Waker>,
+}
+
+struct BufferMapFuture<'a> {
+    device: &'a wgpu::Device,
+    state: Arc<Mutex<BufferMapState>>,
+}
+
+impl Future for BufferMapFuture<'_> {
+    type Output = Result<(), String>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "GPU map state mutex poisoned".to_string())?;
+            if let Some(res) = guard.result.take() {
+                return Poll::Ready(res.map_err(|e| format!("GPU buffer map failed: {e}")));
+            }
+            guard.waker = Some(cx.waker().clone());
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| "GPU map state mutex poisoned".to_string())?;
+            if let Some(res) = guard.result.take() {
+                guard.waker = None;
+                return Poll::Ready(res.map_err(|e| format!("GPU buffer map failed: {e}")));
+            }
+            let waker = cx.waker().clone();
+            drop(guard);
+            std::thread::yield_now();
+            waker.wake();
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        let _ = self.device;
+
+        Poll::Pending
+    }
 }
 
 /// Safely upgrade baseline `wgpu::Limits` with the hardware adapter's buffer and binding
@@ -337,6 +391,19 @@ impl GpuEngine {
         lim.max_storage_buffer_binding_size.min(lim.max_buffer_size)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn read_buffer_vec<T: Pod>(
+        &self,
+        _src: &wgpu::Buffer,
+        _byte_len: u64,
+    ) -> Result<Vec<T>, String> {
+        Err(
+            "synchronous read_buffer_vec is unsupported on wasm32; use read_buffer_vec_async"
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn read_buffer_vec<T: Pod>(&self, src: &wgpu::Buffer, byte_len: u64) -> Result<Vec<T>, String> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("nmr-staging-read"),
@@ -366,6 +433,85 @@ impl GpuEngine {
             .get_mapped_range()
             .map_err(|e| format!("GPU mapped range failed: {e}"))?;
         let out: Vec<T> = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// Non-blocking asynchronous GPU buffer readback (`wasm32`-compatible via `Future` + `Waker`
+    /// around `wgpu::BufferSlice::map_async`, with non-blocking `PollType::Poll` driving on native).
+    pub async fn read_buffer_vec_async<T: Pod>(
+        &self,
+        src: &wgpu::Buffer,
+        count: usize,
+    ) -> Result<Vec<T>, String> {
+        let elem_size = std::mem::size_of::<T>();
+        if elem_size == 0 {
+            return Ok(vec![T::zeroed(); count]);
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_len_usize = count
+            .checked_mul(elem_size)
+            .ok_or_else(|| "GPU async readback byte length overflow".to_string())?;
+        let byte_len = u64::try_from(byte_len_usize)
+            .map_err(|_| "GPU async readback byte length overflow".to_string())?;
+        if byte_len > src.size() {
+            return Err(format!(
+                "GPU async readback requested {byte_len} B ({count} elements), exceeding source buffer size ({} B)",
+                src.size()
+            ));
+        }
+        let aligned_bytes =
+            byte_len.div_ceil(wgpu::COPY_BUFFER_ALIGNMENT) * wgpu::COPY_BUFFER_ALIGNMENT;
+        if aligned_bytes > src.size() {
+            return Err(format!(
+                "GPU async readback aligned copy size ({aligned_bytes} B) exceeds unaligned source buffer size ({} B)",
+                src.size()
+            ));
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nmr-staging-read-async"),
+            size: aligned_bytes.max(wgpu::COPY_BUFFER_ALIGNMENT),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nmr-readback-async-enc"),
+            });
+        encoder.copy_buffer_to_buffer(src, 0, &staging, 0, aligned_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(0..aligned_bytes);
+        let state = Arc::new(Mutex::new(BufferMapState {
+            result: None,
+            waker: None,
+        }));
+        let state_cb = Arc::clone(&state);
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            if let Ok(mut guard) = state_cb.lock() {
+                guard.result = Some(res);
+                if let Some(waker) = guard.waker.take() {
+                    drop(guard);
+                    waker.wake();
+                }
+            }
+        });
+
+        BufferMapFuture {
+            device: &self.device,
+            state,
+        }
+        .await?;
+
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|e| format!("GPU mapped range failed: {e}"))?;
+        let out: Vec<T> = bytemuck::cast_slice(&mapped[..byte_len_usize]).to_vec();
         drop(mapped);
         staging.unmap();
         Ok(out)
@@ -670,6 +816,22 @@ impl GpuEngine {
         self.anneal_from_matrices_with_locks_gpu(&u, &p, cfg, &locks)
     }
 
+    /// Run `assign_gpu` returning raw physical (`T = 1.0` nat) marginal posteriors BEFORE applying
+    /// `STANDARD_GPU_CALIBRATION_KNOTS`, used by Leave-One-Protein-Out (LOPO) cross-validation.
+    pub fn assign_gpu_uncalibrated(
+        &self,
+        systems: &[SpinSystem],
+        sequence: &[String],
+        priors: &Priors,
+        score_cfg: &ScoreConfig,
+        cfg: &AnnealConfig,
+    ) -> Result<AssignResult, String> {
+        let (u, p) = self.score_matrices_gpu(systems, sequence, priors, score_cfg)?;
+        let locks =
+            resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
+        self.anneal_from_matrices_with_locks_gpu_opts(&u, &p, cfg, &locks, false)
+    }
+
     /// Run GPU simulated annealing directly from precomputed `(U, P)` matrices.
     ///
     /// Automatically selects:
@@ -695,6 +857,17 @@ impl GpuEngine {
         p: &Matrix2D,
         cfg: &AnnealConfig,
         locks: &[(usize, usize)],
+    ) -> Result<AssignResult, String> {
+        self.anneal_from_matrices_with_locks_gpu_opts(u, p, cfg, locks, true)
+    }
+
+    fn anneal_from_matrices_with_locks_gpu_opts(
+        &self,
+        u: &Matrix2D,
+        p: &Matrix2D,
+        cfg: &AnnealConfig,
+        locks: &[(usize, usize)],
+        apply_calibration_map: bool,
     ) -> Result<AssignResult, String> {
         let s_len = u.rows;
         let k_len = u.cols;
@@ -973,7 +1146,11 @@ impl GpuEngine {
         }
 
         let mut result = consensus_from_runs(&positions, exact_scores);
-        calibrate_standard_confidence(&mut result, Some(&positions), u, p);
+        if apply_calibration_map {
+            calibrate_standard_gpu_confidence(&mut result, Some(&positions), u, p);
+        } else {
+            calibrate_standard_confidence_uncalibrated(&mut result, Some(&positions), u, p);
+        }
         for &(s_lock, k_lock) in locks {
             if s_lock < result.position.len() && k_lock < k_len {
                 result.position[s_lock] = k_lock as i32;

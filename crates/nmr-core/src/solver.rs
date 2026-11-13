@@ -19,7 +19,7 @@ pub use crate::priors::{
     covalent_atom_offset, delta_covalent, estimate_reference_offsets,
     expected_covalent_atom_offset, Priors, ShiftOffsets, COVALENT_COIL_WEIGHT,
 };
-use crate::qc::apply_standard_calibration_map;
+use crate::qc::{apply_standard_calibration_map, apply_standard_gpu_calibration_map};
 use crate::rng::Rng;
 use crate::spinsystems::SpinSystem;
 
@@ -1310,17 +1310,64 @@ pub fn consensus_from_runs(positions: &[Vec<i32>], scores: Vec<f64>) -> AssignRe
     }
 }
 
-/// Calibrate `standard` multi-replica consensus (`agree / n_runs`) via parameter-free physical
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StandardCalibrationMode {
+    Uncalibrated,
+    Cpu,
+    Gpu,
+}
+
+impl StandardCalibrationMode {
+    #[inline]
+    fn map_raw(self, p_raw: f64) -> f64 {
+        match self {
+            Self::Uncalibrated => p_raw.clamp(0.0, 1.0),
+            Self::Cpu => apply_standard_calibration_map(p_raw),
+            Self::Gpu => apply_standard_gpu_calibration_map(p_raw),
+        }
+    }
+}
+
+/// Calibrate CPU `standard` multi-replica consensus (`agree / n_runs`) via parameter-free physical
 /// (`T = 1.0` nat) conditional Boltzmann + score-weighted elite-basin replica consensus +
 /// full connected-stretch register-translation marginal damping, followed by the 10-fold
-/// LOPO-validated monotonic calibration map (`P1-6`).
+/// LOPO-validated CPU monotonic calibration map (`STANDARD_CALIBRATION_KNOTS`, `P1-6` / `P1-8`).
 pub fn calibrate_standard_confidence(
     result: &mut AssignResult,
     positions: Option<&[Vec<i32>]>,
     u: &Matrix2D,
     p: &Matrix2D,
 ) {
-    calibrate_standard_confidence_impl(result, positions, u, p, true);
+    calibrate_standard_confidence_impl(result, positions, u, p, StandardCalibrationMode::Cpu);
+}
+
+/// Calibrate WebGPU `standard` (`f32` scoring + `runs = 64` elite-basin replica consensus) via the
+/// identical physical (`T = 1.0` nat) marginal damping followed by the dedicated 10-fold
+/// LOPO-validated WebGPU monotonic calibration map (`STANDARD_GPU_CALIBRATION_KNOTS`, `P1-8`).
+pub fn calibrate_standard_gpu_confidence(
+    result: &mut AssignResult,
+    positions: Option<&[Vec<i32>]>,
+    u: &Matrix2D,
+    p: &Matrix2D,
+) {
+    calibrate_standard_confidence_impl(result, positions, u, p, StandardCalibrationMode::Gpu);
+}
+
+/// Compute raw physical (`T = 1.0` nat) `standard` marginal posteriors BEFORE applying any
+/// isotonic knot table, used for strict Leave-One-Protein-Out (LOPO) calibration on CPU or WebGPU.
+pub fn calibrate_standard_confidence_uncalibrated(
+    result: &mut AssignResult,
+    positions: Option<&[Vec<i32>]>,
+    u: &Matrix2D,
+    p: &Matrix2D,
+) {
+    calibrate_standard_confidence_impl(
+        result,
+        positions,
+        u,
+        p,
+        StandardCalibrationMode::Uncalibrated,
+    );
 }
 
 fn calibrate_standard_confidence_impl(
@@ -1328,7 +1375,7 @@ fn calibrate_standard_confidence_impl(
     positions: Option<&[Vec<i32>]>,
     u: &Matrix2D,
     p: &Matrix2D,
-    apply_calibration_map: bool,
+    cal_mode: StandardCalibrationMode,
 ) {
     let s_len = u.rows;
     let k_len = u.cols;
@@ -1546,7 +1593,7 @@ fn calibrate_standard_confidence_impl(
     if k_len <= 1 {
         for s in 0..s_len {
             if result.position[s] >= 0 && c0[s] > 0.0 {
-                result.confidence[s] = apply_standard_calibration_map(b1[s]);
+                result.confidence[s] = cal_mode.map_raw(b1[s]);
             }
         }
         return;
@@ -1905,11 +1952,7 @@ fn calibrate_standard_confidence_impl(
         };
         let p_upper = c0[s].min(p_bp).min(p_boltz1);
         let p_raw = (0.5 * (p_prod + p_upper)).clamp(0.0, 1.0);
-        result.confidence[s] = if apply_calibration_map {
-            apply_standard_calibration_map(p_raw)
-        } else {
-            p_raw
-        };
+        result.confidence[s] = cal_mode.map_raw(p_raw);
     }
 }
 
@@ -1925,7 +1968,7 @@ pub fn assign_uncalibrated(
     let u = unary_matrix(systems, sequence, priors, score_cfg);
     let p = pair_matrix(systems, score_cfg);
     let locks = resolve_locked_assignments(systems.len(), sequence, &score_cfg.locked_assignments);
-    assign_from_matrices_with_locks_opts(&u, &p, cfg, &locks, false)
+    assign_from_matrices_with_locks_opts(&u, &p, cfg, &locks, StandardCalibrationMode::Uncalibrated)
 }
 
 pub fn assign(
@@ -1951,7 +1994,7 @@ pub fn assign_from_matrices_with_locks(
     cfg: &AnnealConfig,
     locks: &[(usize, usize)],
 ) -> AssignResult {
-    assign_from_matrices_with_locks_opts(u, p, cfg, locks, true)
+    assign_from_matrices_with_locks_opts(u, p, cfg, locks, StandardCalibrationMode::Cpu)
 }
 
 fn assign_from_matrices_with_locks_opts(
@@ -1959,7 +2002,7 @@ fn assign_from_matrices_with_locks_opts(
     p: &Matrix2D,
     cfg: &AnnealConfig,
     locks: &[(usize, usize)],
-    apply_calibration_map: bool,
+    cal_mode: StandardCalibrationMode,
 ) -> AssignResult {
     let mut master_rng = Rng::new(cfg.seed);
     let steps = cfg.steps_per_system * u.rows;
@@ -2015,7 +2058,7 @@ fn assign_from_matrices_with_locks_opts(
     };
     let mut result = consensus_from_runs(&positions, scores);
 
-    calibrate_standard_confidence_impl(&mut result, Some(&positions), u, p, apply_calibration_map);
+    calibrate_standard_confidence_impl(&mut result, Some(&positions), u, p, cal_mode);
 
     for &(s_lock, k_lock) in locks {
         if s_lock < result.position.len() && k_lock < u.cols {

@@ -16,9 +16,13 @@ use nmr_core::priors::{
 };
 use nmr_core::qc::{
     apply_dataset_qc_to_assignments, apply_evo_graph_calibration_map,
-    apply_standard_calibration_map, check_offset_consistency, eval_monotone_calibration_map,
-    evaluate_dataset_qc, fit_isotonic_monotone_knots, DatasetQcVerdict, ProteinReliabilityCurve,
-    EVO_GRAPH_CALIBRATION_KNOTS, STANDARD_CALIBRATION_KNOTS,
+    apply_standard_calibration_map, apply_standard_gpu_calibration_map, check_offset_consistency,
+    eval_monotone_calibration_map, evaluate_dataset_qc, fit_isotonic_monotone_knots,
+    is_unconverged_solution_margin, DatasetQcVerdict, ProteinReliabilityCurve,
+    CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+    EVO_GRAPH_CALIBRATION_KNOTS, QC_CROWDED_MIN_SOLUTION_MARGIN, QC_CROWDED_MULTIPLICITY_RATIO,
+    QC_MIN_ASSIGNED_FOR_MARGIN_GATE, QC_MIN_SOLUTION_MARGIN, QC_STRONG_BELIEF_THRESHOLD,
+    STANDARD_CALIBRATION_KNOTS, STANDARD_GPU_CALIBRATION_KNOTS,
 };
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::solver::{AssignResult, ScoreConfig};
@@ -497,12 +501,47 @@ fn tms_shifted_all_helix_and_all_sheet_proteins_pass_joint_offset_qc() {
 
 #[test]
 fn monotone_calibration_maps_isotonic_pav_and_unconverged_margin_abstention() {
-    // 1. Both committed LOPO knot tables must be strictly non-decreasing in both x and y,
+    // 1. Canonical grid (`g12`) and symmetric Beta(0.25, 0.25) prior (`laplace_prior = 0.5`)
+    assert_eq!(CANONICAL_CALIBRATION_GRID_12.len(), 13);
+    assert_eq!(CANONICAL_CALIBRATION_GRID_12.first().copied(), Some(0.0));
+    assert_eq!(CANONICAL_CALIBRATION_GRID_12.last().copied(), Some(1.0));
+    assert!((CANONICAL_CALIBRATION_LAPLACE_PRIOR - 0.5).abs() < 1e-12);
+    // Empty sample set under symmetric Beta(0.25, 0.25) (`0.25 / 0.50 = 0.50`) must shrink every bin to 0.50
+    let neutral_knots = fit_isotonic_monotone_knots(
+        &[],
+        CANONICAL_CALIBRATION_GRID_12,
+        CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+    );
+    assert_eq!(neutral_knots.len(), 15);
+    assert_eq!(neutral_knots[0], (0.0, 0.0));
+    assert!((neutral_knots[1].1 - 0.25).abs() < 1e-12);
+    for &(_, y) in &neutral_knots[2..] {
+        assert!(
+            (y - 0.5).abs() < 1e-12,
+            "expected neutral Beta(0.25, 0.25) mean 0.5, got {y}"
+        );
+    }
+
+    // Fixed convergence specification constants `(0.65, 0.07, 1.60, 0.16)` with `>= 12` assigned gate
+    assert!((QC_STRONG_BELIEF_THRESHOLD - 0.65).abs() < 1e-12);
+    assert_eq!(QC_MIN_ASSIGNED_FOR_MARGIN_GATE, 12);
+    assert!((QC_MIN_SOLUTION_MARGIN - 0.07).abs() < 1e-12);
+    assert!((QC_CROWDED_MULTIPLICITY_RATIO - 1.60).abs() < 1e-12);
+    assert!((QC_CROWDED_MIN_SOLUTION_MARGIN - 0.16).abs() < 1e-12);
+    assert!(!is_unconverged_solution_margin(11, 0.0, 2.0));
+    assert!(is_unconverged_solution_margin(12, 0.069, 1.0));
+    assert!(!is_unconverged_solution_margin(12, 0.071, 1.60));
+    assert!(is_unconverged_solution_margin(12, 0.159, 1.61));
+    assert!(!is_unconverged_solution_margin(12, 0.161, 1.61));
+
+    // All three committed LOPO knot tables must be strictly non-decreasing in both x and y,
     // anchored at (0.0, 0.0) and ending at x = 1.0 with y >= 0.90.
     for (name, knots) in [
         ("evo_graph", EVO_GRAPH_CALIBRATION_KNOTS),
-        ("standard", STANDARD_CALIBRATION_KNOTS),
+        ("standard_cpu", STANDARD_CALIBRATION_KNOTS),
+        ("standard_gpu", STANDARD_GPU_CALIBRATION_KNOTS),
     ] {
+        assert_eq!(knots.len(), 15, "{name} expected 15 g12 knots");
         assert_eq!(
             knots.first().copied(),
             Some((0.0, 0.0)),
@@ -523,14 +562,18 @@ fn monotone_calibration_maps_isotonic_pav_and_unconverged_margin_abstention() {
     // 2. Piecewise-linear evaluation & isotonic PAV regression preserve monotonicity
     let mut prev_evo = 0.0;
     let mut prev_std = 0.0;
+    let mut prev_gpu = 0.0;
     for step in 0..=200 {
         let p = (step as f64) / 200.0;
         let ce = apply_evo_graph_calibration_map(p);
         let cs = apply_standard_calibration_map(p);
+        let cg = apply_standard_gpu_calibration_map(p);
         assert!(ce + 1e-12 >= prev_evo && (0.0..=1.0).contains(&ce));
         assert!(cs + 1e-12 >= prev_std && (0.0..=1.0).contains(&cs));
+        assert!(cg + 1e-12 >= prev_gpu && (0.0..=1.0).contains(&cg));
         prev_evo = ce;
         prev_std = cs;
+        prev_gpu = cg;
     }
 
     let synth_samples = vec![

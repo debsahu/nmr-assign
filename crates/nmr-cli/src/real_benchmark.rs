@@ -3654,10 +3654,16 @@ mod tests {
         use nmr_core::evo_graph::{assign_evo_graph_from_peaks_with_minor_damping, EvoGraphConfig};
         use nmr_core::priors::sync_detailed_reference_offsets;
         use nmr_core::qc::{
-            eval_monotone_calibration_map, fit_isotonic_monotone_knots, DatasetQcVerdict,
-            ProteinReliabilityCurve,
+            eval_monotone_calibration_map, fit_isotonic_monotone_knots,
+            is_unconverged_solution_margin, DatasetQcVerdict, ProteinReliabilityCurve,
+            CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+            QC_STRONG_BELIEF_THRESHOLD,
         };
         use nmr_core::solver::{assign_uncalibrated, prepare_scoring_priors, AnnealConfig};
+        use nmr_gpu::GpuEngine;
+
+        let gpu_engine = GpuEngine::new_headless()
+            .expect("WebGPU headless adapter required for STANDARD_GPU LOPO calibration");
 
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         env::set_current_dir(&repo_root).expect("chdir repo_root");
@@ -3688,44 +3694,62 @@ mod tests {
             is_ok: bool,
         }
 
-        let apply_qc_with_knots = |samps: &[RawPredSample],
-                                   knots: Option<&[(f64, f64)]>|
-         -> Vec<(f64, bool)> {
-            let mut out = Vec::with_capacity(samps.len());
-            for seed in 0..5u64 {
-                let seed_samps: Vec<&RawPredSample> =
-                    samps.iter().filter(|s| s.seed == seed).collect();
-                if seed_samps.is_empty() {
-                    continue;
+        let apply_qc_with_knots =
+            |samps: &[RawPredSample], knots: Option<&[(f64, f64)]>| -> Vec<(f64, bool)> {
+                let mut out = Vec::with_capacity(samps.len());
+                for seed in 0..5u64 {
+                    let seed_samps: Vec<&RawPredSample> =
+                        samps.iter().filter(|s| s.seed == seed).collect();
+                    if seed_samps.is_empty() {
+                        continue;
+                    }
+                    let cals: Vec<f64> = seed_samps
+                        .iter()
+                        .map(|s| match knots {
+                            Some(k) => eval_monotone_calibration_map(s.p_raw, k),
+                            None => s.p_raw.clamp(0.0, 1.0),
+                        })
+                        .collect();
+                    let n_ass = cals.len();
+                    let strong = cals
+                        .iter()
+                        .filter(|&&c| c >= QC_STRONG_BELIEF_THRESHOLD)
+                        .count();
+                    let margin = (strong as f64) / (n_ass as f64);
+                    let s0 = seed_samps[0];
+                    let is_abstain = s0.hard_abstain
+                        || is_unconverged_solution_margin(n_ass, margin, s0.hsqc_mult);
+                    for (&p_cal, s) in cals.iter().zip(seed_samps.iter()) {
+                        let p_final = if is_abstain {
+                            p_cal.clamp(0.0, 0.45)
+                        } else {
+                            (p_cal * s.warn_scale).clamp(0.0, 1.0)
+                        };
+                        out.push((p_final, s.is_ok));
+                    }
                 }
-                let cals: Vec<f64> = seed_samps
+                out
+            };
+
+        // Fixed dataset convergence specification (`(0.65, 0.07, 1.60, 0.16)`) identical to
+        // `nmr_core::qc::is_unconverged_solution_margin` / `evaluate_dataset_qc`: excludes
+        // datasets whose solver ensemble failed to converge (`Abstain`) from the PAV training pool.
+        let is_unconverged_prot = |samps: &[RawPredSample]| -> bool {
+            samps.first().is_some_and(|s0| {
+                let m = (samps
                     .iter()
-                    .map(|s| match knots {
-                        Some(k) => eval_monotone_calibration_map(s.p_raw, k),
-                        None => s.p_raw.clamp(0.0, 1.0),
-                    })
-                    .collect();
-                let n_ass = cals.len();
-                let strong = cals.iter().filter(|&&c| c >= 0.65).count();
-                let margin = (strong as f64) / (n_ass as f64);
-                let s0 = seed_samps[0];
-                let is_abstain = s0.hard_abstain
-                    || (n_ass >= 12 && (margin < 0.07 || (s0.hsqc_mult > 1.60 && margin < 0.16)));
-                for (&p_cal, s) in cals.iter().zip(seed_samps.iter()) {
-                    let p_final = if is_abstain {
-                        p_cal.clamp(0.0, 0.45)
-                    } else {
-                        (p_cal * s.warn_scale).clamp(0.0, 1.0)
-                    };
-                    out.push((p_final, s.is_ok));
-                }
-            }
-            out
+                    .filter(|x| x.p_raw >= QC_STRONG_BELIEF_THRESHOLD)
+                    .count() as f64)
+                    / (samps.len().max(1) as f64);
+                s0.hard_abstain || is_unconverged_solution_margin(samps.len(), m, s0.hsqc_mult)
+            })
         };
 
         let mut evo_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
             Vec::new();
         let mut std_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
+            Vec::new();
+        let mut std_gpu_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
             Vec::new();
 
         // P1-5 minor-conformer audit accumulators across all 10 dev proteins
@@ -3794,8 +3818,10 @@ mod tests {
 
             let mut evo_samples = Vec::new();
             let mut std_samples = Vec::new();
+            let mut std_gpu_samples = Vec::new();
             let mut evo_verdict = DatasetQcVerdict::Pass;
             let mut std_verdict = DatasetQcVerdict::Pass;
+            let mut std_gpu_verdict = DatasetQcVerdict::Pass;
             let mut evo_qc_reasons = String::new();
             let mut std_qc_reasons = String::new();
 
@@ -3821,173 +3847,171 @@ mod tests {
             );
             let std_synced_det = sync_detailed_reference_offsets(&std_offs, &std_base_det);
 
-            let fast_std_only = env::var("FAST_STD_ONLY").is_ok();
             for seed in 0..5u64 {
-                if !fast_std_only {
-                    // 1. Evo-graph WITH minor-conformer damping (`apply_qc_calibration = false` to get raw p_raw!)
-                    let evo_cfg_raw = EvoGraphConfig {
-                        score_cfg: score_cfg.clone(),
-                        auto_reference: true,
-                        apply_qc_calibration: false,
+                // 1. Evo-graph WITH minor-conformer damping (`apply_qc_calibration = false`;
+                // zero empirical knot tables exist upstream of Pass 2!)
+                let evo_cfg_raw = EvoGraphConfig {
+                    score_cfg: score_cfg.clone(),
+                    auto_reference: true,
+                    apply_qc_calibration: false,
+                    seed,
+                    ..EvoGraphConfig::default()
+                };
+                let (evo_sys, evo_res_raw, evo_rep) =
+                    assign_evo_graph_from_peaks_with_minor_damping(
+                        &all_peaks,
+                        &truth_ref.sequence,
+                        &priors,
+                        &evo_cfg_raw,
+                        true,
+                    );
+                let qc_evo = &evo_rep.qc_report;
+                if seed == 0 {
+                    evo_verdict = qc_evo.verdict;
+                    evo_qc_reasons = qc_evo.reasons.join("; ");
+                }
+                let eff_evo_priors = evo_rep.shifted_priors(&priors);
+                let (pred_evo, conf_k_evo) = to_reference(
+                    &evo_res_raw,
+                    &evo_sys,
+                    &truth_ref.sequence,
+                    &truth_ref.seq_ids,
+                    0.0,
+                    Some(&eff_evo_priors),
+                );
+                let mut conf_seq_evo = BTreeMap::new();
+                for (k, c) in conf_k_evo {
+                    conf_seq_evo.insert(truth_ref.seq_ids[k], c);
+                }
+                let eval_evo = evaluate_prediction_against_truth(
+                    &pred_evo,
+                    &truth_ref,
+                    &conf_seq_evo,
+                    Some(&all_systems_for_eval),
+                    0.80,
+                    true,
+                );
+                let evo_hard_abstain = qc_evo.verdict == DatasetQcVerdict::Abstain
+                    && qc_evo
+                        .reasons
+                        .iter()
+                        .any(|r| !r.contains("solution margin"));
+                let evo_warn_scale = if qc_evo.verdict == DatasetQcVerdict::Warn {
+                    qc_evo.confidence_scale
+                } else {
+                    1.0
+                };
+                for &(p_raw, is_ok) in &eval_evo.placed_predictions {
+                    evo_samples.push(RawPredSample {
                         seed,
-                        ..EvoGraphConfig::default()
-                    };
-                    let (evo_sys, evo_res_raw, evo_rep) =
-                        assign_evo_graph_from_peaks_with_minor_damping(
-                            &all_peaks,
-                            &truth_ref.sequence,
-                            &priors,
-                            &evo_cfg_raw,
-                            true,
-                        );
-                    let qc_evo = &evo_rep.qc_report;
+                        p_raw,
+                        hard_abstain: evo_hard_abstain,
+                        hsqc_mult: qc_evo.hsqc_multiplicity_ratio,
+                        warn_scale: evo_warn_scale,
+                        is_ok,
+                    });
+                }
+                all_with_assigned += eval_evo.assigned;
+                all_with_correct += eval_evo.correct;
+
+                // Map `evo_sys` 1-to-1 to `eval_evo.truth_for_cmp` (`tol_h = 0.05, tol_n = 0.50`)
+                let mut true_roots = Vec::new();
+                for k in 1..eval_evo.truth_for_cmp.sequence.len() {
+                    if eval_evo.truth_for_cmp.sequence[k] == "PRO" {
+                        continue;
+                    }
+                    if let (Some(&th), Some(&tn)) = (
+                        eval_evo.truth_for_cmp.shifts.get(&(k, "H".to_string())),
+                        eval_evo.truth_for_cmp.shifts.get(&(k, "N".to_string())),
+                    ) {
+                        true_roots.push((k, th, tn));
+                    }
+                }
+                let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+                for (si, ss) in evo_sys.iter().enumerate() {
+                    for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
+                        let dh = (ss.h - th).abs();
+                        let dn = (ss.n - tn).abs();
+                        if dh <= 0.05 && dn <= 0.50 {
+                            pairs.push(((dh / 0.05).powi(2) + (dn / 0.50).powi(2), si, ti));
+                        }
+                    }
+                }
+                pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut used_s = vec![false; evo_sys.len()];
+                let mut used_t = vec![false; true_roots.len()];
+                let mut evo_ss_truth = vec![-1i32; evo_sys.len()];
+                for &(_, si, ti) in &pairs {
+                    if !used_s[si] && !used_t[ti] {
+                        used_s[si] = true;
+                        used_t[ti] = true;
+                        evo_ss_truth[si] = true_roots[ti].0 as i32;
+                    }
+                }
+
+                // 2. Evo-graph WITHOUT minor-conformer damping (`enable_minor_damping = false`)
+                let (_evo_sys_no, evo_res_no, evo_rep_no) =
+                    assign_evo_graph_from_peaks_with_minor_damping(
+                        &all_peaks,
+                        &truth_ref.sequence,
+                        &priors,
+                        &evo_cfg_raw,
+                        false,
+                    );
+                let eff_no_priors = evo_rep_no.shifted_priors(&priors);
+                let (pred_no, conf_k_no) = to_reference(
+                    &evo_res_no,
+                    &evo_sys,
+                    &truth_ref.sequence,
+                    &truth_ref.seq_ids,
+                    0.0,
+                    Some(&eff_no_priors),
+                );
+                let mut conf_seq_no = BTreeMap::new();
+                for (k, c) in conf_k_no {
+                    conf_seq_no.insert(truth_ref.seq_ids[k], c);
+                }
+                let eval_no = evaluate_prediction_against_truth(
+                    &pred_no,
+                    &truth_ref,
+                    &conf_seq_no,
+                    Some(&all_systems_for_eval),
+                    0.80,
+                    true,
+                );
+                all_without_assigned += eval_no.assigned;
+                all_without_correct += eval_no.correct;
+
+                for (si, ss) in evo_sys.iter().enumerate() {
+                    let tk = evo_ss_truth[si];
+                    if tk < 0 {
+                        continue;
+                    }
                     if seed == 0 {
-                        evo_verdict = qc_evo.verdict;
-                        evo_qc_reasons = qc_evo.reasons.join("; ");
-                    }
-                    let eff_evo_priors = evo_rep.shifted_priors(&priors);
-                    let (pred_evo, conf_k_evo) = to_reference(
-                        &evo_res_raw,
-                        &evo_sys,
-                        &truth_ref.sequence,
-                        &truth_ref.seq_ids,
-                        0.0,
-                        Some(&eff_evo_priors),
-                    );
-                    let mut conf_seq_evo = BTreeMap::new();
-                    for (k, c) in conf_k_evo {
-                        conf_seq_evo.insert(truth_ref.seq_ids[k], c);
-                    }
-                    let eval_evo = evaluate_prediction_against_truth(
-                        &pred_evo,
-                        &truth_ref,
-                        &conf_seq_evo,
-                        Some(&all_systems_for_eval),
-                        0.80,
-                        true,
-                    );
-                    let evo_hard_abstain = qc_evo.verdict == DatasetQcVerdict::Abstain
-                        && qc_evo
-                            .reasons
-                            .iter()
-                            .any(|r| !r.contains("solution margin"));
-                    let evo_warn_scale = if qc_evo.verdict == DatasetQcVerdict::Warn {
-                        qc_evo.confidence_scale
-                    } else {
-                        1.0
-                    };
-                    for &(p_raw, is_ok) in &eval_evo.placed_predictions {
-                        evo_samples.push(RawPredSample {
-                            seed,
-                            p_raw,
-                            hard_abstain: evo_hard_abstain,
-                            hsqc_mult: qc_evo.hsqc_multiplicity_ratio,
-                            warn_scale: evo_warn_scale,
-                            is_ok,
-                        });
-                    }
-                    all_with_assigned += eval_evo.assigned;
-                    all_with_correct += eval_evo.correct;
-
-                    // Map `evo_sys` 1-to-1 to `eval_evo.truth_for_cmp` (`tol_h = 0.05, tol_n = 0.50`)
-                    let mut true_roots = Vec::new();
-                    for k in 1..eval_evo.truth_for_cmp.sequence.len() {
-                        if eval_evo.truth_for_cmp.sequence[k] == "PRO" {
-                            continue;
-                        }
-                        if let (Some(&th), Some(&tn)) = (
-                            eval_evo.truth_for_cmp.shifts.get(&(k, "H".to_string())),
-                            eval_evo.truth_for_cmp.shifts.get(&(k, "N".to_string())),
-                        ) {
-                            true_roots.push((k, th, tn));
+                        p_true_1seed += 1;
+                        if ss.rel_root_height.is_some_and(|rh| rh < 0.15) {
+                            p_weak_ht_1seed += 1;
                         }
                     }
-                    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
-                    for (si, ss) in evo_sys.iter().enumerate() {
-                        for (ti, &(_, th, tn)) in true_roots.iter().enumerate() {
-                            let dh = (ss.h - th).abs();
-                            let dn = (ss.n - tn).abs();
-                            if dh <= 0.05 && dn <= 0.50 {
-                                pairs.push(((dh / 0.05).powi(2) + (dn / 0.50).powi(2), si, ti));
-                            }
-                        }
-                    }
-                    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let mut used_s = vec![false; evo_sys.len()];
-                    let mut used_t = vec![false; true_roots.len()];
-                    let mut evo_ss_truth = vec![-1i32; evo_sys.len()];
-                    for &(_, si, ti) in &pairs {
-                        if !used_s[si] && !used_t[ti] {
-                            used_s[si] = true;
-                            used_t[ti] = true;
-                            evo_ss_truth[si] = true_roots[ti].0 as i32;
-                        }
-                    }
-
-                    // 2. Evo-graph WITHOUT minor-conformer damping (`enable_minor_damping = false`)
-                    let (_evo_sys_no, evo_res_no, evo_rep_no) =
-                        assign_evo_graph_from_peaks_with_minor_damping(
-                            &all_peaks,
-                            &truth_ref.sequence,
-                            &priors,
-                            &evo_cfg_raw,
-                            false,
-                        );
-                    let eff_no_priors = evo_rep_no.shifted_priors(&priors);
-                    let (pred_no, conf_k_no) = to_reference(
-                        &evo_res_no,
-                        &evo_sys,
-                        &truth_ref.sequence,
-                        &truth_ref.seq_ids,
-                        0.0,
-                        Some(&eff_no_priors),
-                    );
-                    let mut conf_seq_no = BTreeMap::new();
-                    for (k, c) in conf_k_no {
-                        conf_seq_no.insert(truth_ref.seq_ids[k], c);
-                    }
-                    let eval_no = evaluate_prediction_against_truth(
-                        &pred_no,
-                        &truth_ref,
-                        &conf_seq_no,
-                        Some(&all_systems_for_eval),
-                        0.80,
-                        true,
-                    );
-                    all_without_assigned += eval_no.assigned;
-                    all_without_correct += eval_no.correct;
-
-                    for (si, ss) in evo_sys.iter().enumerate() {
-                        let tk = evo_ss_truth[si];
-                        if tk < 0 {
-                            continue;
-                        }
+                    if ss
+                        .rel_root_intensity
+                        .or(ss.rel_root_height)
+                        .is_some_and(|r| r < 0.15)
+                    {
                         if seed == 0 {
-                            p_true_1seed += 1;
-                            if ss.rel_root_height.is_some_and(|rh| rh < 0.15) {
-                                p_weak_ht_1seed += 1;
+                            p_weak_1seed += 1;
+                        }
+                        weak_total_5seed += 1;
+                        if evo_res_raw.position[si] >= 0 {
+                            p_weak_w_ass += 1;
+                            if evo_res_raw.position[si] == tk {
+                                p_weak_w_cor += 1;
                             }
                         }
-                        if ss
-                            .rel_root_intensity
-                            .or(ss.rel_root_height)
-                            .is_some_and(|r| r < 0.15)
-                        {
-                            if seed == 0 {
-                                p_weak_1seed += 1;
-                            }
-                            weak_total_5seed += 1;
-                            if evo_res_raw.position[si] >= 0 {
-                                p_weak_w_ass += 1;
-                                if evo_res_raw.position[si] == tk {
-                                    p_weak_w_cor += 1;
-                                }
-                            }
-                            if evo_res_no.position[si] >= 0 {
-                                p_weak_wo_ass += 1;
-                                if evo_res_no.position[si] == tk {
-                                    p_weak_wo_cor += 1;
-                                }
+                        if evo_res_no.position[si] >= 0 {
+                            p_weak_wo_ass += 1;
+                            if evo_res_no.position[si] == tk {
+                                p_weak_wo_cor += 1;
                             }
                         }
                     }
@@ -4097,6 +4121,87 @@ mod tests {
                         n_hi_bad,
                     );
                 }
+                // 4. Standard WebGPU (`runs = 64`, matching `execute_assignment_workflow` on GPU)
+                let gpu_anneal_cfg = AnnealConfig {
+                    runs: 64,
+                    steps_per_system: 1500,
+                    seed,
+                    ..AnnealConfig::default()
+                };
+                let std_gpu_res_raw = gpu_engine
+                    .assign_gpu_uncalibrated(
+                        &all_systems_for_eval,
+                        &truth_ref.sequence,
+                        &priors,
+                        &score_cfg,
+                        &gpu_anneal_cfg,
+                    )
+                    .expect("assign_gpu_uncalibrated");
+                let qc_std_gpu = nmr_core::qc::evaluate_dataset_qc(
+                    Some(&all_peaks),
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                    &std_gpu_res_raw,
+                    Some(&std_synced_det),
+                );
+                if seed == 0 {
+                    std_gpu_verdict = qc_std_gpu.verdict;
+                }
+                let (pred_std_gpu, conf_k_std_gpu) = to_reference(
+                    &std_gpu_res_raw,
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &truth_ref.seq_ids,
+                    0.0,
+                    Some(&std_eff_priors),
+                );
+                let mut conf_seq_std_gpu = BTreeMap::new();
+                for (k, c) in conf_k_std_gpu {
+                    conf_seq_std_gpu.insert(truth_ref.seq_ids[k], c);
+                }
+                let eval_std_gpu = evaluate_prediction_against_truth(
+                    &pred_std_gpu,
+                    &truth_ref,
+                    &conf_seq_std_gpu,
+                    Some(&all_systems_for_eval),
+                    0.80,
+                    true,
+                );
+                let mut probe_gpu_res = std_gpu_res_raw.clone();
+                for c in &mut probe_gpu_res.confidence {
+                    if *c > 0.0 {
+                        *c = 0.90;
+                    }
+                }
+                let qc_std_gpu_non_margin = nmr_core::qc::evaluate_dataset_qc(
+                    Some(&all_peaks),
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                    &probe_gpu_res,
+                    Some(&std_synced_det),
+                );
+                let std_gpu_hard_abstain =
+                    qc_std_gpu_non_margin.verdict == DatasetQcVerdict::Abstain;
+                let std_gpu_warn_scale = if qc_std_gpu_non_margin.verdict == DatasetQcVerdict::Warn
+                {
+                    qc_std_gpu_non_margin.confidence_scale
+                } else {
+                    1.0
+                };
+                for &(p_raw, is_ok) in &eval_std_gpu.placed_predictions {
+                    std_gpu_samples.push(RawPredSample {
+                        seed,
+                        p_raw,
+                        hard_abstain: std_gpu_hard_abstain,
+                        hsqc_mult: qc_std_gpu.hsqc_multiplicity_ratio,
+                        warn_scale: std_gpu_warn_scale,
+                        is_ok,
+                    });
+                }
             }
 
             tot_true_roots_1seed += p_true_1seed;
@@ -4138,6 +4243,12 @@ mod tests {
                 std_verdict,
                 std_samples,
             ));
+            std_gpu_by_prot.push((
+                entry.bmrb_id.clone(),
+                entry.protein.clone(),
+                std_gpu_verdict,
+                std_gpu_samples,
+            ));
         }
 
         println!("\n================ P1-5 MINOR-CONFORMER (< 0.15) 10-PROTEIN DEV AUDIT ================");
@@ -4178,33 +4289,30 @@ mod tests {
             all_without_assigned,
         );
 
+        struct LopoGateCheck {
+            solver_name: String,
+            oof_mean_ece: f64,
+            oof_pool_ece: f64,
+            oof_macro_hcp: f64,
+            full_knots: Vec<(f64, f64)>,
+        }
+        let mut gate_checks: Vec<LopoGateCheck> = Vec::new();
+
         // Helper to evaluate strict zero-search 10-fold Leave-One-Protein-Out (LOPO) cross-validation
-        // using a single canonical a priori isotonic PAV specification (`CANONICAL_GRID_12`, Jeffreys
-        // `CANONICAL_LAPLACE = 0.5`) shared identically across BOTH `evo-graph` and `standard`
-        // (zero outer-loop or inner-loop hyperparameter search).
-        let run_lopo_calibration = |solver_name: &str,
-                                    by_prot: &[(
+        // using a single canonical a priori isotonic PAV specification (`CANONICAL_CALIBRATION_GRID_12`
+        // `g12`, symmetric `Beta(0.25, 0.25)` prior with `CANONICAL_CALIBRATION_LAPLACE_PRIOR = 0.5`
+        // total pseudocount: `0.25` positive + `0.25` negative) shared identically across `evo-graph`,
+        // CPU `standard`, and WebGPU `standard` (zero outer-loop or inner-loop hyperparameter search).
+        let mut run_lopo_calibration = |solver_name: &str,
+                                        by_prot: &[(
             String,
             String,
             DatasetQcVerdict,
             Vec<RawPredSample>,
         )]| {
             const CANONICAL_GRID_NAME: &str = "g12";
-            const CANONICAL_GRID: &[f64] = &[
-                0.0, 0.15, 0.30, 0.45, 0.58, 0.68, 0.76, 0.83, 0.89, 0.94, 0.975, 0.992, 1.0,
-            ];
-            const CANONICAL_LAPLACE: f64 = 0.5;
-
-            let is_unconverged_prot = |samps: &[RawPredSample]| -> bool {
-                samps.first().is_some_and(|s0| {
-                    s0.hard_abstain
-                        || (samps.len() >= 12 && {
-                            let m = (samps.iter().filter(|x| x.p_raw >= 0.65).count() as f64)
-                                / (samps.len() as f64);
-                            m < 0.07 || (s0.hsqc_mult > 1.60 && m < 0.16)
-                        })
-                })
-            };
+            let canonical_grid = CANONICAL_CALIBRATION_GRID_12;
+            let canonical_laplace = CANONICAL_CALIBRATION_LAPLACE_PRIOR;
 
             let collect_train_pairs =
                 |subset: &[&(String, String, DatasetQcVerdict, Vec<RawPredSample>)],
@@ -4257,8 +4365,9 @@ mod tests {
             }
 
             // 2. Strict zero-search 10-fold LOPO: for each held-out protein `hold_idx`, fit the
-            // canonical (`CANONICAL_GRID`, `CANONICAL_LAPLACE = 0.5`) isotonic PAV map exclusively
-            // on the 9 training proteins `j != hold_idx`, and evaluate once on `by_prot[hold_idx]`.
+            // canonical (`CANONICAL_CALIBRATION_GRID_12`, symmetric `Beta(0.25, 0.25)` with
+            // `laplace_prior = 0.5`) isotonic PAV map exclusively on the 9 training proteins
+            // `j != hold_idx`, and evaluate once on `by_prot[hold_idx]`.
             let all_refs: Vec<&(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
                 by_prot.iter().collect();
             let mut oof_eces = Vec::with_capacity(by_prot.len());
@@ -4268,7 +4377,7 @@ mod tests {
             for (hold_idx, (_, _, _, held_samps)) in by_prot.iter().enumerate() {
                 let train_pairs = collect_train_pairs(&all_refs, Some(hold_idx));
                 let fold_knots =
-                    fit_isotonic_monotone_knots(&train_pairs, CANONICAL_GRID, CANONICAL_LAPLACE);
+                    fit_isotonic_monotone_knots(&train_pairs, canonical_grid, canonical_laplace);
                 let held_preds = apply_qc_with_knots(held_samps, Some(&fold_knots));
                 let rel = ProteinReliabilityCurve::from_predictions(&held_preds, 0.80);
                 oof_eces.push(rel.ece);
@@ -4284,7 +4393,7 @@ mod tests {
             // 3. Fit the identical canonical estimator on all 10 dev proteins for deployment.
             let all_train = collect_train_pairs(&all_refs, None);
             let full_knots =
-                fit_isotonic_monotone_knots(&all_train, CANONICAL_GRID, CANONICAL_LAPLACE);
+                fit_isotonic_monotone_knots(&all_train, canonical_grid, canonical_laplace);
 
             {
                 // Evaluate full_knots in-sample on the 10 dev proteins
@@ -4305,7 +4414,7 @@ mod tests {
                 let ins_macro_hcp = ins_hcps.iter().sum::<f64>() / (ins_hcps.len().max(1) as f64);
 
                 println!(
-                    "\n  >>> CANONICAL ZERO-SEARCH LOPO {solver_name} (grid={CANONICAL_GRID_NAME}, laplace={CANONICAL_LAPLACE:.1})"
+                    "\n  >>> CANONICAL ZERO-SEARCH LOPO {solver_name} (grid={CANONICAL_GRID_NAME}, laplace={canonical_laplace:.1})"
                 );
                 println!(
                     "  OOF LOPO: mean_ECE={oof_mean_ece:.4}, pooled_ECE={:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
@@ -4368,45 +4477,60 @@ mod tests {
                     print!("({x:.4}, {y:.4})");
                 }
                 println!("];");
-
-                if only_filter.is_none() {
-                    assert!(
-                        oof_mean_ece <= 0.060,
-                        "{solver_name} OOF mean_ECE {oof_mean_ece:.4} exceeded 0.060 gate"
-                    );
-                    assert!(
-                        oof_pool.ece <= 0.050,
-                        "{solver_name} OOF pooled_ECE {:.4} exceeded 0.050 gate",
-                        oof_pool.ece
-                    );
-                    assert!(
-                        oof_macro_hcp >= 0.90,
-                        "{solver_name} OOF macro_HCP {:.2}% fell below 90.0% gate",
-                        oof_macro_hcp * 100.0
-                    );
-                    let committed = if solver_name == "EVO_GRAPH" {
-                        nmr_core::qc::EVO_GRAPH_CALIBRATION_KNOTS
-                    } else {
-                        nmr_core::qc::STANDARD_CALIBRATION_KNOTS
-                    };
-                    assert_eq!(
-                        committed.len(),
-                        full_knots.len(),
-                        "{solver_name} committed knot count mismatch"
-                    );
-                    for ((cx, cy), (fx, fy)) in committed.iter().zip(full_knots.iter()) {
-                        assert!(
-                            (cx - fx).abs() <= 2e-4 && (cy - fy).abs() <= 2e-4,
-                            "{solver_name} committed knot ({cx:.4}, {cy:.4}) drifted from fitted ({fx:.4}, {fy:.4})"
-                        );
-                    }
-                }
+                gate_checks.push(LopoGateCheck {
+                    solver_name: solver_name.to_string(),
+                    oof_mean_ece,
+                    oof_pool_ece: oof_pool.ece,
+                    oof_macro_hcp,
+                    full_knots,
+                });
             }
         };
 
-        if env::var("FAST_STD_ONLY").is_err() {
-            run_lopo_calibration("EVO_GRAPH", &evo_by_prot);
-        }
+        run_lopo_calibration("EVO_GRAPH", &evo_by_prot);
         run_lopo_calibration("STANDARD_CPU", &std_by_prot);
+        run_lopo_calibration("STANDARD_GPU", &std_gpu_by_prot);
+
+        if only_filter.is_none() {
+            for LopoGateCheck {
+                solver_name,
+                oof_mean_ece,
+                oof_pool_ece,
+                oof_macro_hcp,
+                full_knots,
+            } in gate_checks
+            {
+                assert!(
+                    oof_mean_ece <= 0.060,
+                    "{solver_name} OOF mean_ECE {oof_mean_ece:.4} exceeded 0.060 gate"
+                );
+                assert!(
+                    oof_pool_ece <= 0.050,
+                    "{solver_name} OOF pooled_ECE {oof_pool_ece:.4} exceeded 0.050 gate"
+                );
+                assert!(
+                    oof_macro_hcp >= 0.94,
+                    "{solver_name} OOF macro_HCP {:.2}% fell below 94.0% gate",
+                    oof_macro_hcp * 100.0
+                );
+                let committed = match solver_name.as_str() {
+                    "EVO_GRAPH" => nmr_core::qc::EVO_GRAPH_CALIBRATION_KNOTS,
+                    "STANDARD_CPU" => nmr_core::qc::STANDARD_CALIBRATION_KNOTS,
+                    "STANDARD_GPU" => nmr_core::qc::STANDARD_GPU_CALIBRATION_KNOTS,
+                    other => panic!("unexpected solver_name {other}"),
+                };
+                assert_eq!(
+                    committed.len(),
+                    full_knots.len(),
+                    "{solver_name} committed knot count mismatch"
+                );
+                for ((cx, cy), (fx, fy)) in committed.iter().zip(full_knots.iter()) {
+                    assert!(
+                        (cx - fx).abs() <= 2e-4 && (cy - fy).abs() <= 2e-4,
+                        "{solver_name} committed knot ({cx:.4}, {cy:.4}) drifted from fitted ({fx:.4}, {fy:.4})"
+                    );
+                }
+            }
+        }
     }
 }

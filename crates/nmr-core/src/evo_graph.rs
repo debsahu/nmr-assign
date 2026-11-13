@@ -4088,29 +4088,10 @@ fn assign_evo_graph_core(
     let mut master_rng = Rng::new(cfg.seed);
     let (pos1, scores1) = run_parallel_islands(&u1, &p, &u1, cfg, locks, None, &mut master_rng);
     let mut res1 = consensus_from_runs(&pos1, scores1);
+    // Parameter-free unit-temperature (`T = 1.0` nat) single-spin Pass-1 Boltzmann margin with
+    // zero empirical knot tables upstream of Pass 2 (`P1-7(a)`): guarantees zero cross-fold LOPO
+    // leakage and aligns directly with the physical `0.70..0.85` Pass-2 anchor gates.
     calibrate_boltzmann_confidence(&mut res1, &u1, &p);
-    // Map undamped Pass-1 single-spin `T = 1.0` Boltzmann margins through a fixed monotone
-    // single-spin reliability curve (decoupled from the Pass-2 output calibration table so
-    // re-fitting Pass-2 knots never perturbs Pass-1 -> Pass-2 anchor or GNN pruning behavior).
-    const PASS1_SINGLE_SPIN_KNOTS: &[(f64, f64)] = &[
-        (0.0000, 0.0000),
-        (0.0750, 0.1690),
-        (0.2250, 0.3275),
-        (0.3750, 0.4004),
-        (0.5150, 0.6579),
-        (0.6300, 0.6579),
-        (0.7200, 0.6579),
-        (0.7950, 0.7282),
-        (0.8600, 0.7291),
-        (0.9150, 0.7815),
-        (0.9575, 0.7815),
-        (0.9835, 0.8121),
-        (0.9960, 0.9740),
-        (1.0000, 0.9740),
-    ];
-    for c in &mut res1.confidence {
-        *c = crate::qc::eval_monotone_calibration_map(*c, PASS1_SINGLE_SPIN_KNOTS);
-    }
     apply_locked_result_overrides(&mut res1, norm_seq.len(), locks);
     report.pass1_best_score = res1.score;
 
