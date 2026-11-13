@@ -15,13 +15,23 @@ use std::time::Instant;
 
 use eframe::{egui, egui_wgpu};
 use nmr_core::aromatic::{
-    assign_aromatic_rings, AromaticSolverConfig, HisTautomer, AROMATIC_EXPERIMENTS,
+    assign_aromatic_rings, merge_aromatic_assignments_preserving_existing, AromaticSolverConfig,
+    AROMATIC_EXPERIMENTS,
+};
+use nmr_core::c13_detected::{
+    pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
+    C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
+    IdpCubeSimConfig,
 };
 use nmr_core::classify::DataState;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::classify::{ExperimentDimensionality, ExperimentVendor};
 use nmr_core::evaluate::{score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
+use nmr_core::idp_propensity::{compute_idp_propensity, PropensityConfig, PropensityReport};
+use nmr_core::idp_solver::{
+    assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems, IdpSolverConfig,
+};
 use nmr_core::nef::read_nef_str;
 use nmr_core::neural_picker::{pick_hsqc_2d_neural, NeuralPickerConfig};
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,6 +54,10 @@ use nmr_core::octet_mol::{
 };
 use nmr_core::octet_render::{
     render_scene_svg, DocumentStyle, RenderScene, SceneSpectrum1D, SpectrumSignal1D,
+};
+use nmr_core::paramagnetic::{
+    assign_paramagnetic_backbone, assign_paramagnetic_from_peaks, parse_metal_ligands,
+    ParamagneticAssignConfig, ParamagneticSolverMode,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::peaks::read_peaks;
@@ -80,7 +94,7 @@ use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
 use nmr_core::stereospec::{
     assign_stereospecific_dataset, StereospecConfig, StereospecDatasetInput,
 };
-use nmr_core::topology::{ResidueVariant, SidechainPriors};
+use nmr_core::topology::SidechainPriors;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
 #[cfg(not(target_arch = "wasm32"))]
@@ -267,6 +281,207 @@ impl GuiSolverKind {
             Self::Standard => "Standard",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GuiRegimeKind {
+    #[default]
+    Globular,
+    Idp13C,
+    Paramagnetic,
+}
+
+impl GuiRegimeKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Globular => "Globular",
+            Self::Idp13C => "13C-IDP",
+            Self::Paramagnetic => "Paramagnetic",
+        }
+    }
+}
+
+fn parse_gui_c13_tsv_str(text: &str) -> Option<C13PickedDataset> {
+    let mut ds = C13PickedDataset::default();
+    let mut saw_c13_row = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let cols: Vec<&str> = if cols.len() <= 1 {
+            line.split_whitespace().collect()
+        } else {
+            cols
+        };
+        if cols.len() < 3 {
+            continue;
+        }
+        if matches!(
+            cols[0].to_ascii_lowercase().as_str(),
+            "experiment" | "exp" | "spectrum" | "peak_id"
+        ) {
+            continue;
+        }
+        let exp = C13DetectedExp::from_name(cols[0])?;
+        saw_c13_row = true;
+        let rem = &cols[1..];
+        let opt_f64 = |s: &str| -> Option<f64> {
+            let t = s.trim();
+            if t.is_empty() || t == "." || t == "-" {
+                None
+            } else {
+                t.parse::<f64>().ok()
+            }
+        };
+        match exp {
+            C13DetectedExp::Con2D => {
+                let c_prev = opt_f64(rem.first().copied()?)?;
+                let n_curr = opt_f64(rem.get(1).copied()?)?;
+                ds.con_roots.push(Con2DPeak {
+                    c_prev_ppm: c_prev,
+                    n_curr_ppm: n_curr,
+                    height: 1.0e5,
+                    volume: 1.0e5,
+                    is_proline_imino_region: n_curr >= 131.5,
+                    deconvolved_from_cluster: false,
+                });
+            }
+            C13DetectedExp::Caco2D => {
+                let f0 = opt_f64(rem.first().copied()?)?;
+                let ca = opt_f64(rem.get(1).copied()?).or_else(|| opt_f64(rem.get(2).copied()?))?;
+                let (c_curr_ppm, ca_curr_ppm) = if f0 < 100.0 && ca > 140.0 {
+                    (ca, f0)
+                } else {
+                    (f0, ca)
+                };
+                let kind = if ca_curr_ppm <= 47.8 {
+                    CacoPeakKind::GlyRegion
+                } else if ca_curr_ppm >= 58.0 {
+                    CacoPeakKind::SerThrProDownfield
+                } else {
+                    CacoPeakKind::GeneralAliphatic
+                };
+                ds.caco_peaks.push(Caco2DPeak {
+                    c_curr_ppm,
+                    ca_curr_ppm,
+                    sign: 1,
+                    height: 1.0e5,
+                    volume: 1.0e5,
+                    kind,
+                });
+            }
+            _ => {
+                let c_prime_ppm = opt_f64(rem.first().copied()?)?;
+                let n_ppm = opt_f64(rem.get(1).copied()?)?;
+                let c_indirect_ppm = opt_f64(rem.get(2).copied()?)?;
+                let sign = rem.get(3).and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                let anchor_root_idx = rem.get(6).and_then(|s| s.parse::<usize>().ok());
+                ds.strip_peaks.push(C13Strip3DPeak {
+                    exp,
+                    c_prime_ppm,
+                    n_ppm,
+                    c_indirect_ppm,
+                    sign,
+                    height: 1.0e5,
+                    volume: 1.0e5,
+                    anchor_root_idx,
+                });
+            }
+        }
+    }
+    if !saw_c13_row || ds.con_roots.is_empty() {
+        return None;
+    }
+    // Anchor any unanchored CANCO/CBCACON/CCCON peaks onto nearest CON root
+    for p in &mut ds.strip_peaks {
+        if p.anchor_root_idx.is_none() && p.exp != C13DetectedExp::Ncaco3D {
+            let mut best: Option<(usize, f64)> = None;
+            for (r_idx, r) in ds.con_roots.iter().enumerate() {
+                let dc = (p.c_prime_ppm - r.c_prev_ppm).abs();
+                let dn = (p.n_ppm - r.n_curr_ppm).abs();
+                if dc <= 0.25 && dn <= 0.65 {
+                    let d2 = (dc / 0.06).powi(2) + (dn / 0.25).powi(2);
+                    if best.is_none_or(|(_, b)| d2 < b) {
+                        best = Some((r_idx, d2));
+                    }
+                }
+            }
+            p.anchor_root_idx = best.map(|(i, _)| i);
+        }
+    }
+    Some(ds)
+}
+
+fn merge_gui_aromatic_preserving_user_rings(
+    working_ref: &Reference,
+    prior_user_ref: Option<&Reference>,
+    prior_amb: &BTreeMap<(usize, String), u8>,
+    pred_conf: Option<&BTreeMap<usize, f64>>,
+    arom_peaks: &[Peak],
+    sc_priors: &SidechainPriors,
+) -> Reference {
+    const RING_ATOMS: &[&str] = &[
+        "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3", "CZ2",
+        "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
+    ];
+    let is_arom_ring_key = |r: &Reference, k: usize, atom: &str| -> bool {
+        matches!(
+            r.sequence.get(k).map(String::as_str),
+            Some("PHE" | "TYR" | "TRP" | "HIS")
+        ) && RING_ATOMS.contains(&atom)
+    };
+
+    let mut backbone_for_arom = working_ref.clone();
+    backbone_for_arom
+        .shifts
+        .retain(|&(k, ref atom), _| !is_arom_ring_key(working_ref, k, atom));
+    backbone_for_arom
+        .ambiguity_codes
+        .retain(|&(k, ref atom), _| !is_arom_ring_key(working_ref, k, atom));
+
+    let mut existing_for_merge = backbone_for_arom.clone();
+    if let Some(user_ref) = prior_user_ref {
+        for (&(k, ref atom), &v) in &user_ref.shifts {
+            if is_arom_ring_key(user_ref, k, atom) {
+                existing_for_merge.shifts.insert((k, atom.clone()), v);
+            }
+        }
+        for (&(k, ref atom), &code) in &user_ref.ambiguity_codes {
+            if is_arom_ring_key(user_ref, k, atom) {
+                existing_for_merge
+                    .ambiguity_codes
+                    .insert((k, atom.clone()), code);
+            }
+        }
+    }
+    for (&(k, ref atom), &code) in prior_amb {
+        if is_arom_ring_key(&existing_for_merge, k, atom) {
+            existing_for_merge
+                .ambiguity_codes
+                .insert((k, atom.clone()), code);
+        }
+    }
+
+    let arom_res = assign_aromatic_rings(
+        &backbone_for_arom,
+        pred_conf,
+        arom_peaks,
+        sc_priors,
+        &AromaticSolverConfig::default(),
+    );
+    let mut merged = merge_aromatic_assignments_preserving_existing(
+        &existing_for_merge,
+        &arom_res.reference,
+        &arom_res.atom_confidence,
+    );
+    for (k, atom) in arom_res.atom_confidence.keys() {
+        let res_name = merged.sequence.get(*k).map(String::as_str).unwrap_or("");
+        let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
+        merged.ambiguity_codes.insert((*k, atom.clone()), code);
+    }
+    merged
 }
 
 struct CoreOctetBackendAdapter;
@@ -767,6 +982,13 @@ struct NmrWorkbenchApp {
     gpu_engine: Option<GpuEngine>,
     adapter_label: Option<String>,
     solver_kind: GuiSolverKind,
+    regime_kind: GuiRegimeKind,
+    metal_ligands_input: String,
+    idp_temp_k: f64,
+    idp_ph_input: String,
+    c13_picked_dataset: Option<C13PickedDataset>,
+    propensity_report: Option<PropensityReport>,
+    show_propensity_panel: bool,
     #[cfg(not(target_arch = "wasm32"))]
     use_gpu: bool,
     use_neural_picker: bool,
@@ -912,6 +1134,13 @@ impl NmrWorkbenchApp {
             workspace_mode: WorkspaceMode::ProteinNmr,
             octet_app,
             solver_kind: GuiSolverKind::default(),
+            regime_kind: GuiRegimeKind::default(),
+            metal_ligands_input: String::new(),
+            idp_temp_k: 298.15,
+            idp_ph_input: "6.5".to_string(),
+            c13_picked_dataset: None,
+            propensity_report: None,
+            show_propensity_panel: false,
             #[cfg(not(target_arch = "wasm32"))]
             use_gpu: gpu_engine.is_some(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1220,8 +1449,30 @@ impl NmrWorkbenchApp {
         } else {
             self.assign_res = None;
         }
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&pred);
         self.pred_ref = Some(pred);
         self.pred_conf = conf;
+        self.refresh_propensity_report();
+    }
+
+    fn refresh_propensity_report(&mut self) {
+        let Some(src_ref) = self.pred_ref.as_ref().or(self.reference.as_ref()) else {
+            self.propensity_report = None;
+            return;
+        };
+        if src_ref.sequence.is_empty() {
+            self.propensity_report = None;
+            return;
+        }
+        let temp_k = self.idp_temp_k.clamp(250.0, 360.0);
+        let mut cfg = PropensityConfig::default().with_temperature_kelvin(temp_k);
+        if let Ok(ph) = self.idp_ph_input.trim().parse::<f64>() {
+            if (1.0..=12.0).contains(&ph) {
+                cfg = cfg.with_sample_ph(ph);
+            }
+        }
+        self.propensity_report = Some(compute_idp_propensity(src_ref, &cfg));
     }
 
     fn raw_hsqc_locks_for_peaks(&self) -> Vec<(usize, usize)> {
@@ -1278,14 +1529,17 @@ impl NmrWorkbenchApp {
         self.seq_ids = ref_data.seq_ids.clone();
         self.octet_app
             .set_loaded_protein_sequence(self.sequence.clone());
+        self.sidechain_ribbon_state = SequenceRibbonState::new();
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&ref_data);
         self.reference = Some(ref_data);
+        self.c13_picked_dataset = None;
         self.peaks = peaks;
         self.truth = Some(truth);
         self.assign_res = None;
         self.pred_ref = None;
         self.pred_conf.clear();
         self.pred_ambiguity_codes.clear();
-        self.sidechain_ribbon_state.variant_overrides.clear();
         self.metrics = None;
         self.qc_report = None;
         self.raw_fids_total = 0;
@@ -1295,6 +1549,7 @@ impl NmrWorkbenchApp {
         self.regenerate_synthetic_spectra();
         self.sync_session_from_app_fresh("Ubiquitin");
         self.rebuild_systems_and_matrices();
+        self.refresh_propensity_report();
         self.status_msg = format!(
             "Simulated {} peaks & {} spin systems ({} aa) + 2D HSQC / 3D HNCACB & HNCO spectra",
             self.peaks.len(),
@@ -1303,7 +1558,309 @@ impl NmrWorkbenchApp {
         );
     }
 
+    fn run_idp_13c_assignment(&mut self) {
+        if self.sequence.is_empty() {
+            self.status_msg =
+                "Load an IDP sequence or NMR-STAR entry before 13C-IDP assignment".to_string();
+            return;
+        }
+        if self.c13_picked_dataset.is_none() {
+            if let Some(ref r) = self.reference {
+                let ph_val = self
+                    .idp_ph_input
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|p| (1.0..=12.0).contains(p))
+                    .unwrap_or(6.5);
+                let cubes = simulate_idp_13c_cubes(
+                    r,
+                    &IdpCubeSimConfig {
+                        temperature_k: self.idp_temp_k.clamp(250.0, 360.0),
+                        ph: ph_val,
+                        con_grid: (512, 512),
+                        caco_grid: (256, 256),
+                        cube_3d_grid: (128, 128, 128),
+                        seed: self.sim_seed.wrapping_add(42),
+                        ..IdpCubeSimConfig::default()
+                    },
+                );
+                let pcfg = C13PickerConfig::default();
+                let con_roots = pick_con_2d(&cubes.con_2d, &pcfg);
+                let caco_peaks = cubes
+                    .caco_2d
+                    .as_ref()
+                    .map(|sp| pick_caco_2d(sp, &pcfg))
+                    .unwrap_or_default();
+                let mut strip_peaks = Vec::new();
+                for (exp, ref sp3) in &cubes.cubes_3d {
+                    strip_peaks.extend(pick_con_anchored_3d(sp3, *exp, &con_roots, &pcfg));
+                }
+                self.hsqc_arc = Arc::new(cubes.con_2d.data.clone());
+                self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
+                self.hsqc_spec = Some(cubes.con_2d);
+                self.reset_view_to_spec();
+                self.c13_picked_dataset = Some(C13PickedDataset {
+                    con_roots,
+                    caco_peaks,
+                    strip_peaks,
+                });
+            }
+        }
+
+        let Some(ref ds) = self.c13_picked_dataset else {
+            self.status_msg =
+                "Load a 13C-detected peak TSV (CON/CACO/CANCO/CBCACON) or NMR-STAR entry first"
+                    .to_string();
+            return;
+        };
+        let systems = register_and_build_con_dipeptide_systems(ds);
+        if systems.is_empty() {
+            self.status_msg =
+                "No CON dipeptide spin systems could be built from 13C-detected peaks".to_string();
+            return;
+        }
+
+        let timer = PerfTimer::start();
+        let ph_val = self
+            .idp_ph_input
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|p| (1.0..=12.0).contains(p))
+            .unwrap_or(6.5);
+        #[allow(unused_mut)]
+        let mut idp_cfg = IdpSolverConfig {
+            temperature_k: self.idp_temp_k.clamp(250.0, 360.0),
+            ph: ph_val,
+            replicas: self.replicas.max(8),
+            steps_per_system: self.steps_per_sys.max(400),
+            seed: self.sim_seed,
+            ..IdpSolverConfig::default()
+        };
+        #[cfg(target_arch = "wasm32")]
+        {
+            idp_cfg.replicas = idp_cfg.replicas.min(16);
+            idp_cfg.generations = 2;
+            idp_cfg.steps_per_system = idp_cfg.steps_per_system.min(1000);
+        }
+
+        #[allow(unused_mut)]
+        let mut gpu_out: Option<(nmr_core::idp_solver::IdpAssignResult, &'static str)> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.use_gpu {
+            if let Some(ref gpu) = self.gpu_engine {
+                match nmr_gpu::idp_gpu::assign_idp_13c_gpu(gpu, &systems, &self.sequence, &idp_cfg)
+                {
+                    Ok(res) => gpu_out = Some((res, "13C-IDP WebGPU")),
+                    Err(e) => {
+                        self.status_msg =
+                            format!("13C-IDP WebGPU error ({e}), falling back to CPU");
+                    }
+                }
+            }
+        }
+
+        let default_tag = if cfg!(target_arch = "wasm32") {
+            "13C-IDP WASM"
+        } else {
+            "13C-IDP CPU"
+        };
+        let (idp_res, tag) = gpu_out.unwrap_or_else(|| {
+            (
+                assign_idp_13c_cpu(&systems, &self.sequence, &idp_cfg),
+                default_tag,
+            )
+        });
+        let dt_ms = timer.elapsed_ms();
+        self.last_solve_ms = Some(dt_ms);
+
+        let (pred, conf) = idp_to_reference(
+            &idp_res,
+            &systems,
+            &self.sequence,
+            &self.seq_ids,
+            0.0,
+            false,
+        );
+        let n_pro = self
+            .sequence
+            .iter()
+            .enumerate()
+            .filter(|&(k, r)| {
+                r == "PRO"
+                    && (pred.shifts.contains_key(&(k, "N".to_string()))
+                        || pred.shifts.contains_key(&(k, "CA".to_string())))
+            })
+            .count();
+        let n_pro_tot = self.sequence.iter().filter(|r| r.as_str() == "PRO").count();
+        let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&pred);
+        self.pred_ref = Some(pred);
+        self.pred_conf = conf;
+        self.assign_res = Some(idp_res.as_assign_result());
+        self.metrics = None;
+        self.refresh_propensity_report();
+        self.show_propensity_panel = true;
+        self.sync_session_assignments_from_solver();
+        self.status_msg = format!(
+            "[{tag}] Assigned {}/{} residues ({n_hc} >=0.8, {n_pro}/{n_pro_tot} Pro) from {} CON systems in {dt_ms:.0} ms",
+            self.pred_conf.len(),
+            self.sequence.len(),
+            systems.len()
+        );
+    }
+
+    fn run_paramagnetic_assignment(&mut self) {
+        if self.sequence.is_empty()
+            || (self.solver_kind == GuiSolverKind::EvoGraph && self.peaks.is_empty())
+            || (self.solver_kind == GuiSolverKind::Standard && self.systems.is_empty())
+        {
+            self.status_msg =
+                "Need peaks/spin systems and sequence to run paramagnetic assignment".to_string();
+            return;
+        }
+        let explicit_ligands = if self.metal_ligands_input.trim().is_empty() {
+            Vec::new()
+        } else {
+            match parse_metal_ligands(
+                self.metal_ligands_input.trim(),
+                &self.sequence,
+                &self.seq_ids,
+            ) {
+                Ok(idxs) => idxs,
+                Err(e) => {
+                    self.status_msg = format!("Invalid metal ligands: {e}");
+                    return;
+                }
+            }
+        };
+
+        let timer = PerfTimer::start();
+        let scfg = ScoreConfig {
+            assign_cost: self.assign_cost,
+            locked_assignments: self.session.state.locked_assignments_vec(),
+            ..ScoreConfig::default()
+        };
+        let acfg = AnnealConfig {
+            runs: self.replicas.max(4),
+            steps_per_system: self.steps_per_sys.max(300),
+            seed: self.sim_seed,
+            ..AnnealConfig::default()
+        };
+        let mode = match self.solver_kind {
+            GuiSolverKind::Standard => ParamagneticSolverMode::Standard,
+            GuiSolverKind::EvoGraph => ParamagneticSolverMode::EvoGraph,
+        };
+        let para_cfg = ParamagneticAssignConfig {
+            mode,
+            explicit_ligand_indices: explicit_ligands.clone(),
+            auto_detect_motifs: explicit_ligands.is_empty(),
+            score_cfg: scfg.clone(),
+            anneal_cfg: acfg,
+            seed: self.sim_seed,
+            ..ParamagneticAssignConfig::default()
+        };
+
+        let (res, para_rep, eff_priors, tag) = match self.solver_kind {
+            GuiSolverKind::Standard => {
+                if let Ok(sys) = build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
+                    if !sys.is_empty() {
+                        self.systems = sys;
+                    }
+                }
+                let (r, rep) = assign_paramagnetic_backbone(
+                    &self.systems,
+                    &self.sequence,
+                    &self.priors,
+                    &para_cfg,
+                );
+                let lbl = if cfg!(target_arch = "wasm32") {
+                    "Paramagnetic WASM-SA"
+                } else {
+                    "Paramagnetic CPU-SA"
+                };
+                (r, rep, self.priors.clone(), lbl)
+            }
+            GuiSolverKind::EvoGraph => {
+                let (sys, r, rep) = assign_paramagnetic_from_peaks(
+                    &self.peaks,
+                    &self.sequence,
+                    &self.priors,
+                    &para_cfg,
+                );
+                let eff = rep
+                    .evo_report
+                    .as_ref()
+                    .map(|er| er.shifted_priors(&self.priors))
+                    .unwrap_or_else(|| self.priors.clone());
+                self.systems = sys;
+                let lbl = if cfg!(target_arch = "wasm32") {
+                    "Paramagnetic WASM-Evo"
+                } else {
+                    "Paramagnetic CPU-Evo"
+                };
+                (r, rep, eff, lbl)
+            }
+        };
+
+        self.u_mat = Some(unary_matrix(
+            &self.systems,
+            &self.sequence,
+            &eff_priors,
+            &scfg,
+        ));
+        self.p_mat = Some(pair_matrix(&self.systems, &scfg));
+        let dt_ms = timer.elapsed_ms();
+        self.last_solve_ms = Some(dt_ms);
+
+        let (pred, conf) = to_reference(
+            &res,
+            &self.systems,
+            &self.sequence,
+            &self.seq_ids,
+            0.0,
+            Some(&eff_priors),
+        );
+        if let Some(truth) = &self.truth {
+            if truth.len() == res.position.len() {
+                self.metrics = Some(score(&res, truth, 0.8));
+            } else {
+                self.metrics = None;
+            }
+        }
+        let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&pred);
+        self.pred_ref = Some(pred);
+        self.pred_conf = conf;
+        self.assign_res = Some(res);
+        self.refresh_propensity_report();
+        self.sync_session_assignments_from_solver();
+        self.status_msg = format!(
+            "[{tag}] Assigned {}/{} residues ({n_hc} >=0.8 | {} metal cluster(s), {} blind-zone aa, {} abstained) in {dt_ms:.0} ms",
+            self.pred_conf.len(),
+            self.sequence.len(),
+            para_rep.detected_clusters.len(),
+            para_rep.blind_zone_residues.len(),
+            para_rep.n_blind_zone_abstentions,
+        );
+    }
+
     fn run_assignment(&mut self) {
+        match self.regime_kind {
+            GuiRegimeKind::Idp13C => {
+                self.run_idp_13c_assignment();
+                return;
+            }
+            GuiRegimeKind::Paramagnetic => {
+                self.run_paramagnetic_assignment();
+                return;
+            }
+            GuiRegimeKind::Globular => {}
+        }
         if self.sequence.is_empty()
             || (self.solver_kind == GuiSolverKind::EvoGraph && self.peaks.is_empty())
             || (self.solver_kind == GuiSolverKind::Standard && self.systems.is_empty())
@@ -1529,9 +2086,12 @@ impl NmrWorkbenchApp {
                 }
             }
         }
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&pred);
         self.pred_ref = Some(pred);
         self.pred_conf = conf;
         self.assign_res = Some(res);
+        self.refresh_propensity_report();
         self.sync_session_assignments_from_solver();
     }
 
@@ -1678,7 +2238,24 @@ impl NmrWorkbenchApp {
                         self.peaks.len()
                     );
                 }
-                Err(e) => self.status_msg = format!("Peak TSV parse error ({source_label}): {e}"),
+                Err(e) => {
+                    if let Some(ds) = parse_gui_c13_tsv_str(trimmed) {
+                        let n_con = ds.con_roots.len();
+                        let n_strip = ds.strip_peaks.len();
+                        self.c13_picked_dataset = Some(ds);
+                        self.regime_kind = GuiRegimeKind::Idp13C;
+                        self.workspace_mode = WorkspaceMode::ProteinNmr;
+                        if !self.sequence.is_empty() {
+                            self.run_assignment();
+                        } else {
+                            self.status_msg = format!(
+                                "Loaded 13C-IDP TSV ({n_con} CON roots, {n_strip} 3D peaks) — load sequence/.str to assign"
+                            );
+                        }
+                    } else {
+                        self.status_msg = format!("Peak TSV parse error ({source_label}): {e}");
+                    }
+                }
             }
         }
     }
@@ -1794,7 +2371,23 @@ impl NmrWorkbenchApp {
                     self.status_msg =
                         format!("Loaded {} peaks from {}", self.peaks.len(), p.display());
                 }
-                Err(e) => self.status_msg = format!("Peak TSV error: {e}"),
+                Err(e) => {
+                    if let Ok(raw_txt) = std::fs::read_to_string(p) {
+                        if let Some(ds) = parse_gui_c13_tsv_str(&raw_txt) {
+                            let n_con = ds.con_roots.len();
+                            let n_strip = ds.strip_peaks.len();
+                            self.c13_picked_dataset = Some(ds);
+                            self.regime_kind = GuiRegimeKind::Idp13C;
+                            self.workspace_mode = WorkspaceMode::ProteinNmr;
+                            self.status_msg = format!(
+                                "Loaded 13C-IDP TSV from {} ({n_con} CON roots, {n_strip} 3D peaks)",
+                                p.display()
+                            );
+                            return;
+                        }
+                    }
+                    self.status_msg = format!("Peak TSV error: {e}");
+                }
             },
             "ucsf" => match read_ucsf_2d(p) {
                 Ok(spec) => {
@@ -2173,28 +2766,82 @@ impl NmrWorkbenchApp {
             }
 
             ui.separator();
-            egui::ComboBox::from_id_salt("gui_solver_kind")
-                .selected_text(format!("Solver: {}", self.solver_kind.label()))
+            egui::ComboBox::from_id_salt("gui_regime_kind")
+                .selected_text(format!("Regime: {}", self.regime_kind.label()))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
-                        &mut self.solver_kind,
-                        GuiSolverKind::EvoGraph,
-                        "Evo-Graph (CPU f64, default)",
+                        &mut self.regime_kind,
+                        GuiRegimeKind::Globular,
+                        "Globular (¹H–¹⁵N HSQC + 3D)",
                     );
                     ui.selectable_value(
-                        &mut self.solver_kind,
-                        GuiSolverKind::Standard,
-                        "Standard SA (GPU / CPU)",
+                        &mut self.regime_kind,
+                        GuiRegimeKind::Idp13C,
+                        "13C-IDP (CON / CACO / CANCO + Pro)",
+                    );
+                    ui.selectable_value(
+                        &mut self.regime_kind,
+                        GuiRegimeKind::Paramagnetic,
+                        "Paramagnetic (PRE Blind-Zone + Metal)",
                     );
                 });
+            if self.regime_kind == GuiRegimeKind::Paramagnetic {
+                ui.label(egui::RichText::new("Ligands:").small());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.metal_ligands_input)
+                        .hint_text("auto motif or CYS26,HIS41")
+                        .desired_width(135.0),
+                );
+            } else if self.regime_kind == GuiRegimeKind::Idp13C {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.idp_temp_k)
+                            .speed(0.5)
+                            .range(265.0..=335.0)
+                            .prefix("T ")
+                            .suffix(" K"),
+                    )
+                    .changed()
+                {
+                    self.refresh_propensity_report();
+                }
+                ui.label(egui::RichText::new("pH:").small());
+                if ui
+                    .add(egui::TextEdit::singleline(&mut self.idp_ph_input).desired_width(38.0))
+                    .changed()
+                {
+                    self.refresh_propensity_report();
+                }
+            }
+            if self.regime_kind != GuiRegimeKind::Idp13C {
+                egui::ComboBox::from_id_salt("gui_solver_kind")
+                    .selected_text(format!("Solver: {}", self.solver_kind.label()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.solver_kind,
+                            GuiSolverKind::EvoGraph,
+                            "Evo-Graph (CPU f64, default)",
+                        );
+                        ui.selectable_value(
+                            &mut self.solver_kind,
+                            GuiSolverKind::Standard,
+                            "Standard SA (GPU / CPU)",
+                        );
+                    });
+            }
             #[cfg(not(target_arch = "wasm32"))]
-            ui.add_enabled(
-                self.solver_kind == GuiSolverKind::Standard,
-                egui::Checkbox::new(&mut self.use_gpu, "WebGPU Compute"),
-            )
-            .on_disabled_hover_text(
-                "Evo-Graph runs in f64 on CPU; switch Solver to Standard SA to use WebGPU Compute",
-            );
+            {
+                let gpu_supported = (self.regime_kind == GuiRegimeKind::Globular
+                    && self.solver_kind == GuiSolverKind::Standard)
+                    || self.regime_kind == GuiRegimeKind::Idp13C;
+                ui.add_enabled(
+                    gpu_supported,
+                    egui::Checkbox::new(&mut self.use_gpu, "WebGPU Compute"),
+                )
+                .on_disabled_hover_text(
+                    "WebGPU Compute accelerates Standard SA and 13C-IDP multi-replica annealing; Evo-Graph and Paramagnetic run in f64 on CPU",
+                );
+            }
             ui.add(egui::Slider::new(&mut self.replicas, 8..=256).text("Replicas"));
             ui.add(egui::Slider::new(&mut self.steps_per_sys, 400..=4000).text("Steps/SS"));
             if ui
@@ -2329,17 +2976,52 @@ impl NmrWorkbenchApp {
                             self.selected_res = Some(0);
                         }
                     }
+                    let prop_btn = egui::Button::new(
+                        egui::RichText::new("📊 SSP / δ2D")
+                            .size(11.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if self.show_propensity_panel {
+                        egui::Color32::from_rgb(104, 48, 136)
+                    } else {
+                        egui::Color32::from_rgb(32, 42, 58)
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.2,
+                        if self.show_propensity_panel {
+                            egui::Color32::from_rgb(214, 165, 255)
+                        } else {
+                            egui::Color32::from_rgb(76, 92, 118)
+                        },
+                    ))
+                    .min_size(egui::vec2(78.0, 28.0));
+                    if ui
+                        .add(prop_btn)
+                        .on_hover_text(
+                            "Toggle per-residue Marsh SSP & Camilloni 4-state δ2D (α / β / PPII / coil) ensemble track",
+                        )
+                        .clicked()
+                    {
+                        self.show_propensity_panel = !self.show_propensity_panel;
+                        if self.show_propensity_panel {
+                            self.refresh_propensity_report();
+                            if self.selected_res.is_none() {
+                                self.selected_res = Some(0);
+                            }
+                        }
+                    }
                     ui.add_space(4.0);
                     for (k, three) in self.sequence.iter().enumerate() {
                         let one = three_to_one(three);
                         let seq_id = self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
                         let is_pro_or_nterm = k == 0 || three == "PRO";
                         let assigned = res_to_ss.get(&k).copied();
+                        let direct_conf = assigned
+                            .map(|(_, c)| c)
+                            .or_else(|| self.pred_conf.get(&k).copied());
                         let is_selected = self.selected_res == Some(k);
 
-                        let fill = if is_pro_or_nterm {
-                            egui::Color32::from_rgb(38, 43, 54)
-                        } else if let Some((_, conf)) = assigned {
+                        let fill = if let Some(conf) = direct_conf {
                             if conf >= 0.80 {
                                 egui::Color32::from_rgb(28, 125, 82)
                             } else if conf >= 0.50 {
@@ -2347,6 +3029,8 @@ impl NmrWorkbenchApp {
                             } else {
                                 egui::Color32::from_rgb(145, 68, 42)
                             }
+                        } else if is_pro_or_nterm {
+                            egui::Color32::from_rgb(38, 43, 54)
                         } else {
                             egui::Color32::from_rgb(48, 56, 74)
                         };
@@ -2392,6 +3076,13 @@ impl NmrWorkbenchApp {
                             if let Some((ss_idx, conf)) = assigned {
                                 ui.label(format!(
                                     "Spin system #{ss_idx} (conf {:.0}%{})",
+                                    conf * 100.0,
+                                    if is_locked { ", LOCKED" } else { "" }
+                                ));
+                            } else if let Some(conf) = direct_conf {
+                                ui.label(format!(
+                                    "Assigned ({}) — conf {:.0}%{}",
+                                    self.regime_kind.label(),
                                     conf * 100.0,
                                     if is_locked { ", LOCKED" } else { "" }
                                 ));
@@ -2726,6 +3417,8 @@ impl NmrWorkbenchApp {
         }
         let timer = PerfTimer::start();
         let seed = self.sim_seed.wrapping_add(2026);
+        let prior_user_ref = self.pred_ref.clone().or_else(|| self.reference.clone());
+        let prior_amb = self.pred_ambiguity_codes.clone();
         let mut loaded_sc_peaks = Vec::new();
         let mut loaded_arom_peaks = Vec::new();
         for p in &self.peaks {
@@ -2784,8 +3477,7 @@ impl NmrWorkbenchApp {
                 self.assign_res = Some(joint.backbone_result);
                 self.pred_conf = bb_conf;
                 joint.sidechain_result.reference
-            } else if let Some(base_ref) = self.pred_ref.clone().or_else(|| self.reference.clone())
-            {
+            } else if let Some(base_ref) = prior_user_ref.clone() {
                 let sc_res = assign_sidechains(
                     &base_ref,
                     (!self.pred_conf.is_empty()).then_some(&self.pred_conf),
@@ -2817,58 +3509,17 @@ impl NmrWorkbenchApp {
         };
 
         if !loaded_arom_peaks.is_empty() {
-            const RING_ATOMS: &[&str] = &[
-                "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
-                "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
-            ];
-            working_ref.shifts.retain(|&(k, ref atom), _| {
-                let is_arom_res = matches!(
-                    working_ref.sequence.get(k).map(String::as_str),
-                    Some("PHE" | "TYR" | "TRP" | "HIS")
-                );
-                !(is_arom_res && RING_ATOMS.contains(&atom.as_str()))
-            });
-            let arom_res = assign_aromatic_rings(
+            working_ref = merge_gui_aromatic_preserving_user_rings(
                 &working_ref,
+                prior_user_ref.as_ref(),
+                &prior_amb,
                 (!self.pred_conf.is_empty()).then_some(&self.pred_conf),
                 &loaded_arom_peaks,
                 &self.sidechain_priors,
-                &AromaticSolverConfig::default(),
             );
-            for ring in &arom_res.rings {
-                if let Some((taut, _)) = ring.his_tautomer {
-                    let var = match taut {
-                        HisTautomer::Nd1H => ResidueVariant::HisNd1H,
-                        HisTautomer::Ne2H => ResidueVariant::HisNe2H,
-                        HisTautomer::DoublyProtonated => ResidueVariant::HisDoublyProtonated,
-                    };
-                    self.sidechain_ribbon_state
-                        .variant_overrides
-                        .entry(ring.residue_idx)
-                        .or_insert(var);
-                }
-            }
-            working_ref = arom_res.reference;
         }
 
-        // Auto-infer Cys redox variant from CB shift when user hasn't explicitly overridden it
-        for (k, rname) in working_ref.sequence.iter().enumerate() {
-            if rname == "CYS" {
-                if let Some(&cb) = working_ref.shifts.get(&(k, "CB".to_string())) {
-                    let var = if cb >= 35.5 {
-                        ResidueVariant::CysOxidized
-                    } else {
-                        ResidueVariant::CysReduced
-                    };
-                    self.sidechain_ribbon_state
-                        .variant_overrides
-                        .entry(k)
-                        .or_insert(var);
-                }
-            }
-        }
-
-        let mut amb_codes = BTreeMap::new();
+        let mut amb_codes = working_ref.ambiguity_codes.clone();
         if let Ok(stereo_out) = assign_stereospecific_dataset(&StereospecDatasetInput {
             reference: &working_ref,
             j_couplings_tsv: None,
@@ -2876,9 +3527,19 @@ impl NmrWorkbenchApp {
             pdb_path: None,
             config: StereospecConfig::default(),
         }) {
+            let preserved_amb = working_ref.ambiguity_codes.clone();
             working_ref = stereo_out.reference;
             amb_codes = stereo_out.ambiguity_codes;
+            for (key, code) in preserved_amb {
+                amb_codes.entry(key).or_insert(code);
+            }
+            working_ref.ambiguity_codes = amb_codes.clone();
         }
+
+        // P2: Sync auto-inferred Cys redox & His Pelton tautomer variants cleanly without
+        // clobbering user_variant_overrides or leaving stale auto-inferred states.
+        self.sidechain_ribbon_state
+            .sync_inferred_variants_from_reference(&working_ref);
 
         let n_shifts = working_ref.shifts.len();
         let dt_ms = timer.elapsed_ms();
@@ -2891,6 +3552,7 @@ impl NmrWorkbenchApp {
         if self.selected_res.is_none() && !self.sequence.is_empty() {
             self.select_residue_and_sync_strip(0);
         }
+        self.refresh_propensity_report();
         self.sync_session_assignments_from_solver();
         self.status_msg = if !loaded_sc_peaks.is_empty() && !loaded_arom_peaks.is_empty() {
             format!("Assigned {n_shifts} backbone + aliphatic + aromatic shifts in {dt_ms:.0} ms")
@@ -3016,6 +3678,201 @@ impl NmrWorkbenchApp {
         }
     }
 
+    fn draw_propensity_inspector_drawer(&mut self, ui: &mut egui::Ui) {
+        if self.propensity_report.is_none() && (self.pred_ref.is_some() || self.reference.is_some())
+        {
+            self.refresh_propensity_report();
+        }
+        let Some(rep) = self.propensity_report.clone() else {
+            ui.label(
+                "Load an NMR-STAR shift file or run assignment to compute Marsh SSP & Camilloni 4-state δ2D populations.",
+            );
+            return;
+        };
+        if rep.residues.is_empty() {
+            ui.label("No residues available for SSP / δ2D conformational analysis.");
+            return;
+        }
+
+        let sel_k = self
+            .selected_res
+            .unwrap_or(0)
+            .min(rep.residues.len().saturating_sub(1));
+
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(20, 26, 37))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("SSP & 4-State δ2D Ensemble")
+                            .strong()
+                            .color(egui::Color32::from_rgb(220, 195, 255)),
+                    );
+                    let badge = if rep.is_predominantly_disordered {
+                        ("IDP / Disordered", egui::Color32::from_rgb(186, 132, 255))
+                    } else {
+                        ("Folded / Structured", egui::Color32::from_rgb(92, 225, 175))
+                    };
+                    ui.label(egui::RichText::new(badge.0).small().color(badge.1));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Hide SSP / δ2D propensity drawer")
+                            .clicked()
+                        {
+                            self.show_propensity_panel = false;
+                        }
+                        if ui
+                            .small_button("↻")
+                            .on_hover_text("Recompute SSP / δ2D with current T(K) & pH")
+                            .clicked()
+                        {
+                            self.refresh_propensity_report();
+                        }
+                    });
+                });
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "T={:.1} K, pH={:.2} | α {:.0}% · β {:.0}% · PPII {:.0}% · Coil {:.0}% | <|SSP|> {:.2}",
+                        rep.temperature_kelvin,
+                        rep.effective_ph,
+                        rep.mean_p_alpha * 100.0,
+                        rep.mean_p_beta * 100.0,
+                        rep.mean_p_ppii * 100.0,
+                        rep.mean_p_coil * 100.0,
+                        rep.mean_abs_ssp
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(egui::Color32::from_rgb(175, 192, 218)),
+                );
+
+                ui.add_space(4.0);
+                let avail_w = ui.available_width().max(220.0);
+                let n = rep.residues.len().max(1);
+                let col_w = (avail_w / (n as f32)).clamp(2.0, 14.0);
+                let plot_w = (col_w * (n as f32)).max(avail_w);
+
+                egui::ScrollArea::horizontal()
+                    .id_salt("ssp_d2d_scroll_canvas")
+                    .show(ui, |ui| {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(plot_w, 114.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let painter = ui.painter_at(rect);
+                        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(14, 18, 26));
+
+                        let ssp_top = rect.top() + 4.0;
+                        let ssp_mid = rect.top() + 34.0;
+                        let ssp_bot = rect.top() + 64.0;
+                        let pop_top = rect.top() + 72.0;
+                        let pop_bot = rect.bottom() - 4.0;
+                        let pop_h = (pop_bot - pop_top).max(12.0);
+
+                        painter.line_segment(
+                            [egui::pos2(rect.left(), ssp_mid), egui::pos2(rect.right(), ssp_mid)],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(62, 74, 96)),
+                        );
+
+                        for (k, r) in rep.residues.iter().enumerate() {
+                            let x0 = rect.left() + (k as f32) * col_w;
+                            let x1 = (x0 + col_w - 0.8).max(x0 + 1.0);
+                            if k == sel_k {
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(x0, rect.top()),
+                                        egui::pos2(x0 + col_w, rect.bottom()),
+                                    ),
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(120, 215, 255, 28),
+                                );
+                            }
+
+                            if let Some(ssp) = r.ssp_score {
+                                let clamped = (ssp as f32).clamp(-1.0, 1.0);
+                                let half_h = (ssp_bot - ssp_mid).max(8.0);
+                                let (y_min, y_max, col) = if clamped >= 0.0 {
+                                    (
+                                        ssp_mid - clamped * (ssp_mid - ssp_top),
+                                        ssp_mid,
+                                        egui::Color32::from_rgb(56, 189, 248),
+                                    )
+                                } else {
+                                    (
+                                        ssp_mid,
+                                        ssp_mid + (-clamped) * half_h,
+                                        egui::Color32::from_rgb(245, 158, 11),
+                                    )
+                                };
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(x0, y_min),
+                                        egui::pos2(x1, y_max.max(y_min + 1.0)),
+                                    ),
+                                    1.0,
+                                    col,
+                                );
+                            }
+
+                            // Stacked 4-state δ2D bar: Alpha (cyan), Beta (amber), PPII (violet), Coil (slate)
+                            let mut y_cur = pop_bot;
+                            for (frac, col) in [
+                                (r.p_alpha as f32, egui::Color32::from_rgb(56, 189, 248)),
+                                (r.p_beta as f32, egui::Color32::from_rgb(245, 158, 11)),
+                                (r.p_ppii as f32, egui::Color32::from_rgb(168, 85, 247)),
+                                (r.p_coil as f32, egui::Color32::from_rgb(71, 85, 105)),
+                            ] {
+                                let h = (frac.clamp(0.0, 1.0) * pop_h).max(0.0);
+                                if h > 0.3 {
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(x0, (y_cur - h).max(pop_top)),
+                                            egui::pos2(x1, y_cur),
+                                        ),
+                                        0.0,
+                                        col,
+                                    );
+                                    y_cur = (y_cur - h).max(pop_top);
+                                }
+                            }
+                        }
+
+                        if resp.clicked() || resp.dragged() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let idx = (((pos.x - rect.left()) / col_w).floor() as isize)
+                                    .clamp(0, (n as isize) - 1) as usize;
+                                self.select_residue_and_sync_strip(idx);
+                            }
+                        }
+                    });
+
+                if let Some(cur) = rep.residues.get(sel_k) {
+                    let ssp_txt = cur
+                        .ssp_score
+                        .map(|v| format!("{v:+.3}"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {} ({}) | SSP {} | α {:.0}% β {:.0}% PPII {:.0}% coil {:.0}%",
+                            cur.residue,
+                            cur.seq_id,
+                            cur.dominant_state.label(),
+                            ssp_txt,
+                            cur.p_alpha * 100.0,
+                            cur.p_beta * 100.0,
+                            cur.p_ppii * 100.0,
+                            cur.p_coil * 100.0,
+                        ))
+                        .monospace()
+                        .size(10.5)
+                        .color(egui::Color32::from_rgb(215, 232, 252)),
+                    );
+                }
+            });
+    }
+
     fn draw_right_inspector(&mut self, ui: &mut egui::Ui) {
         // 1. Metrics summary card if reference truth is present
         if let Some(m) = &self.metrics {
@@ -3096,10 +3953,40 @@ impl NmrWorkbenchApp {
                     self.selected_res = Some(0);
                 }
             }
+            let prop_btn = egui::Button::new(
+                egui::RichText::new("📊 SSP / δ2D")
+                    .size(12.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if self.show_propensity_panel {
+                egui::Color32::from_rgb(104, 48, 136)
+            } else {
+                egui::Color32::from_rgb(34, 42, 58)
+            });
+            if ui
+                .add(prop_btn)
+                .on_hover_text("Inspect Marsh SSP & Camilloni 4-state δ2D populations")
+                .clicked()
+            {
+                self.show_propensity_panel = !self.show_propensity_panel;
+                if self.show_propensity_panel {
+                    self.refresh_propensity_report();
+                    if self.selected_res.is_none() {
+                        self.selected_res = Some(0);
+                    }
+                }
+            }
             if ui.small_button("📌 Assign/Lock (at)").clicked() {
                 self.show_assign_popover = true;
             }
         });
+
+        if self.show_propensity_panel {
+            ui.add_space(4.0);
+            self.draw_propensity_inspector_drawer(ui);
+            ui.add_space(6.0);
+            ui.separator();
+        }
 
         if self.show_sidechain_inspector {
             ui.add_space(4.0);
@@ -3988,7 +4875,12 @@ impl NmrWorkbenchApp {
                 self.export_results(ctx);
             }
             WorkbenchAction::ExportQualityReportHtml => {
-                if let Some(pred) = self.pred_ref.clone() {
+                if let Some(pred) = self.pred_ref.clone().or_else(|| self.reference.clone()) {
+                    if (self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel)
+                        && self.propensity_report.is_none()
+                    {
+                        self.refresh_propensity_report();
+                    }
                     let mut inp = ReportInput::new(
                         self.session.state.protein_name.clone(),
                         pred.clone(),
@@ -4000,6 +4892,9 @@ impl NmrWorkbenchApp {
                     if let Some(res) = &self.assign_res {
                         inp.solver_score = Some(res.score);
                         inp.systems_and_assignment = Some((self.systems.clone(), res.clone()));
+                    }
+                    if self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel {
+                        inp.propensity_report = self.propensity_report.clone();
                     }
                     let html = generate_quality_report_html(&inp);
                     self.export_text_buf = html.clone();
@@ -4029,6 +4924,10 @@ impl NmrWorkbenchApp {
                 self.assign_res = None;
                 self.pred_ref = None;
                 self.pred_conf.clear();
+                self.pred_ambiguity_codes.clear();
+                self.sidechain_ribbon_state = SequenceRibbonState::new();
+                self.c13_picked_dataset = None;
+                self.propensity_report = None;
                 self.metrics = None;
                 self.qc_report = None;
                 self.overlay_layers.clear();
@@ -4898,11 +5797,177 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::GuiSolverKind;
+    use std::collections::BTreeMap;
+
+    use nmr_core::aromatic::{
+        default_his_tautomer_map, simulate_aromatic_peaks, synthesize_aromatic_reference,
+        AromaticSimConfig,
+    };
+    use nmr_core::idp_propensity::{compute_idp_propensity, PropensityConfig};
+    use nmr_core::nmrstar::Reference;
+    use nmr_core::sidechain::synthesize_all_atom_reference;
+    use nmr_core::topology::{ResidueVariant, SidechainPriors};
+    use nmr_gui::sidechain_widget::SequenceRibbonState;
+
+    use super::{
+        build_synthetic_ubiquitin, merge_gui_aromatic_preserving_user_rings, parse_gui_c13_tsv_str,
+        GuiRegimeKind, GuiSolverKind,
+    };
 
     #[test]
     fn test_gui_default_solver_is_evo_graph() {
         assert_eq!(GuiSolverKind::default(), GuiSolverKind::EvoGraph);
         assert_eq!(GuiSolverKind::default().label(), "Evo-Graph");
+    }
+
+    #[test]
+    fn test_gui_p2_variant_state_separation_across_resolves() {
+        let seq = vec!["CYS".to_string(), "HIS".to_string(), "ALA".to_string()];
+        let seq_ids = vec![1, 2, 3];
+        let mut r1 = Reference::new(seq.clone(), seq_ids.clone());
+        r1.shifts.insert((0, "CB".to_string()), 41.2); // Oxidized Cys
+        r1.shifts.insert((1, "ND1".to_string()), 249.5); // Ne2H His
+        r1.shifts.insert((1, "NE2".to_string()), 167.8);
+
+        let mut state = SequenceRibbonState::new();
+        state.set_variant(0, ResidueVariant::CysReduced); // Explicit user override on Cys 1
+        state.sync_inferred_variants_from_reference(&r1);
+
+        // User override wins on Cys 1 while auto-inferred state is recorded cleanly underneath
+        assert_eq!(
+            state.auto_inferred_variants.get(&0),
+            Some(&ResidueVariant::CysOxidized)
+        );
+        assert_eq!(state.variant_for(0), ResidueVariant::CysReduced);
+        assert_eq!(state.variant_for(1), ResidueVariant::HisNe2H);
+
+        // Re-solve where His 2 has no ring shifts anymore -> stale auto-inferred His variant clears!
+        let mut r2 = Reference::new(seq, seq_ids);
+        r2.shifts.insert((0, "CB".to_string()), 28.0);
+        state.sync_inferred_variants_from_reference(&r2);
+        assert_eq!(state.variant_for(1), ResidueVariant::Canonical);
+        assert_eq!(state.variant_for(0), ResidueVariant::CysReduced);
+    }
+
+    #[test]
+    fn test_gui_p1_12_aromatic_merge_preserves_unassigned_user_rings() {
+        let seq = vec![
+            "ALA".to_string(),
+            "PHE".to_string(),
+            "GLY".to_string(),
+            "PHE".to_string(),
+            "HIS".to_string(),
+        ];
+        let seq_ids = vec![1, 2, 3, 4, 5];
+        let mut base = Reference::new(seq.clone(), seq_ids);
+        for (k, ca, cb) in [
+            (0, 52.5, 19.1),
+            (1, 57.8, 39.4),
+            (2, 45.2, 0.0),
+            (3, 56.1, 42.3),
+            (4, 55.4, 29.8),
+        ] {
+            base.shifts.insert((k, "CA".to_string()), ca);
+            if cb > 0.0 {
+                base.shifts.insert((k, "CB".to_string()), cb);
+            }
+        }
+        let sc_priors = SidechainPriors::empirical_bmrb();
+        let all_ref = synthesize_all_atom_reference(&base, &sc_priors, 77);
+        let his_map = default_his_tautomer_map(&seq, 77);
+        let truth_ref = synthesize_aromatic_reference(&all_ref, &sc_priors, &his_map, 77);
+
+        // Simulate peaks ONLY for PHE at index 1 (drop peaks belonging to PHE index 3 and HIS index 4)
+        let mut solve_source = truth_ref.clone();
+        solve_source.shifts.retain(|&(k, ref a), _| {
+            !(k >= 3 && !matches!(a.as_str(), "CA" | "CB" | "HA" | "HB2" | "HB3"))
+        });
+        let (arom_peaks, _) = simulate_aromatic_peaks(
+            &solve_source,
+            &BTreeMap::new(),
+            &AromaticSimConfig::default(),
+        );
+
+        // User-curated shifts on unassigned PHE (idx 3) and HIS (idx 4)
+        let mut user_ref = base.clone();
+        user_ref.shifts.insert(
+            (1, "HB2".to_string()),
+            truth_ref.shifts[&(1, "HB2".to_string())],
+        );
+        user_ref.shifts.insert(
+            (1, "HB3".to_string()),
+            truth_ref.shifts[&(1, "HB3".to_string())],
+        );
+        user_ref.shifts.insert((3, "CD1".to_string()), 131.42);
+        user_ref.shifts.insert((3, "HD1".to_string()), 7.26);
+        user_ref.shifts.insert((4, "CE1".to_string()), 137.85);
+        user_ref.shifts.insert((4, "HE1".to_string()), 8.14);
+        let mut prior_amb = BTreeMap::new();
+        prior_amb.insert((3, "CD1".to_string()), 2u8);
+        prior_amb.insert((4, "CE1".to_string()), 1u8);
+
+        let merged = merge_gui_aromatic_preserving_user_rings(
+            &user_ref,
+            Some(&user_ref),
+            &prior_amb,
+            None,
+            &arom_peaks,
+            &sc_priors,
+        );
+
+        // Observed PHE 2 is solved, while unobserved PHE 4 and HIS 5 preserve user ring shifts & ambiguity codes!
+        assert!(merged.shifts.contains_key(&(1, "CD1".to_string())));
+        assert_eq!(
+            merged.shifts.get(&(3, "CD1".to_string())).copied(),
+            Some(131.42)
+        );
+        assert_eq!(
+            merged.shifts.get(&(3, "HD1".to_string())).copied(),
+            Some(7.26)
+        );
+        assert_eq!(
+            merged.shifts.get(&(4, "CE1".to_string())).copied(),
+            Some(137.85)
+        );
+        assert_eq!(
+            merged.shifts.get(&(4, "HE1".to_string())).copied(),
+            Some(8.14)
+        );
+        assert_eq!(
+            merged.ambiguity_codes.get(&(3, "CD1".to_string())).copied(),
+            Some(2)
+        );
+        assert_eq!(
+            merged.ambiguity_codes.get(&(4, "CE1".to_string())).copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_gui_phase11_regimes_c13_tsv_and_propensity_track() {
+        assert_eq!(GuiRegimeKind::default(), GuiRegimeKind::Globular);
+        assert_eq!(GuiRegimeKind::Idp13C.label(), "13C-IDP");
+        assert_eq!(GuiRegimeKind::Paramagnetic.label(), "Paramagnetic");
+
+        let tsv = "\
+# exp\tdim1\tdim2\tdim3\tsign\theight
+CON\t175.40\t122.10\t.\t1\t1200.0
+CACO\t175.42\t55.10\t.\t1\t950.0
+CANCO\t175.40\t122.11\t55.08\t1\t600.0
+CBCACON\t175.41\t122.09\t30.40\t1\t520.0
+";
+        let ds = parse_gui_c13_tsv_str(tsv).expect("valid 13C-detected TSV");
+        assert_eq!(ds.con_roots.len(), 1);
+        assert_eq!(ds.caco_peaks.len(), 1);
+        assert_eq!(ds.strip_peaks.len(), 2);
+        assert_eq!(ds.strip_peaks[0].anchor_root_idx, Some(0));
+        assert_eq!(ds.strip_peaks[1].anchor_root_idx, Some(0));
+
+        let ubiq = build_synthetic_ubiquitin();
+        let rep = compute_idp_propensity(&ubiq, &PropensityConfig::default());
+        assert_eq!(rep.residues.len(), ubiq.sequence.len());
+        for r in &rep.residues {
+            assert!((r.population_sum() - 1.0).abs() < 1e-6);
+        }
     }
 }
