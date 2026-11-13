@@ -15,7 +15,7 @@ use nmr_core::c13_detected::{
 use nmr_core::evaluate::score as evaluate_metrics;
 use nmr_core::idp_solver::{
     assign_idp_13c_cpu, assign_idp_13c_from_picked, estimate_idp_reference_offsets,
-    evaluate_idp_lopo_calibration, idp_to_reference, invert_idp_calibration, predict_ncidp_shifts,
+    evaluate_idp_lopo_calibration, idp_to_reference, predict_ncidp_shifts,
     register_and_build_con_dipeptide_systems, try_assign_idp_13c_cpu, try_idp_pair_matrix,
     try_idp_unary_matrix, ConDipeptideSystem, IdpShiftOffsets, IdpSolverConfig,
     IDP_CALIBRATION_KNOTS, MAX_IDP_CB_CANDS, MAX_IDP_MATRIX_CELLS,
@@ -1146,10 +1146,7 @@ fn test_idp_5fold_leave_one_protein_out_calibration_across_low_and_3x_realistic_
         assert_eq!(res_1x.qc_verdict, DatasetQcVerdict::Pass);
         for (s, &pos) in res_1x.position.iter().enumerate() {
             if pos >= 0 {
-                per_protein_raw[idx].push((
-                    invert_idp_calibration(res_1x.confidence[s]),
-                    pos == truth_1x[s],
-                ));
+                per_protein_raw[idx].push((res_1x.raw_posterior[s], pos == truth_1x[s]));
             }
         }
 
@@ -1199,7 +1196,7 @@ fn test_idp_5fold_leave_one_protein_out_calibration_across_low_and_3x_realistic_
                 if pos >= 0 {
                     let ok = pos == truth_3x[s];
                     noisy_pooled_cal.push((res_3x.confidence[s], ok));
-                    per_protein_raw[idx].push((invert_idp_calibration(res_3x.confidence[s]), ok));
+                    per_protein_raw[idx].push((res_3x.raw_posterior[s], ok));
                 }
             }
 
@@ -1635,5 +1632,530 @@ fn test_idp_p2_cb_multi_candidate_size_cap_and_carrier_drift_clamp_warnings() {
         res_clamp.qc_reasons.iter().any(|r| r.contains("clamp")),
         "QC reasons must report clamped carrier drift: {:?}",
         res_clamp.qc_reasons
+    );
+}
+
+fn simulate_realistic_noise_bmrb_dataset_custom(
+    ref_data: &Reference,
+    sigma_obs_ca: f64,
+    p_missing_3d: f64,
+    spurious_rate: f64,
+    spurious_height: f64,
+    include_cccon: bool,
+    seed: u64,
+) -> (C13PickedDataset, Vec<i32>) {
+    let mut rng = Rng::new(seed ^ 0x55AA_CC33_9911_77EE);
+    let seq_len = ref_data.sequence.len();
+    let sigma_obs_c = (sigma_obs_ca * 0.58).max(0.018);
+    let sigma_obs_n = (sigma_obs_ca * 1.25).max(0.035);
+    let sigma_obs_cb = (sigma_obs_ca * 1.18).max(0.030);
+
+    let glob_dn = -0.42;
+    let glob_dc = 0.21;
+    let glob_dca = -0.27;
+
+    let off_con = (glob_dc + 0.07, glob_dn - 0.11);
+    let off_caco = (glob_dc - 0.10, glob_dca + 0.13);
+    let off_canco_ca = glob_dca - 0.08;
+    let off_cbca_aliph = glob_dca + 0.11;
+    let off_cccon_aliph = glob_dca - 0.13;
+    let off_ncaco = (glob_dc + 0.15, glob_dn + 0.09, glob_dca + 0.08);
+
+    let true_bonds: Vec<usize> = (1..seq_len)
+        .filter(|&k| {
+            ref_data.shifts.contains_key(&(k - 1, "C".to_string()))
+                && ref_data.shifts.contains_key(&(k, "N".to_string()))
+        })
+        .collect();
+    let n_spur_con = ((true_bonds.len() as f64) * 0.03).round().max(2.0) as usize;
+    let mut root_specs: Vec<Option<usize>> = true_bonds.into_iter().map(Some).collect();
+    root_specs.extend(std::iter::repeat_n(None, n_spur_con));
+
+    for i in (1..root_specs.len()).rev() {
+        let j = rng.usize(i + 1);
+        root_specs.swap(i, j);
+    }
+
+    let mut con_roots = Vec::with_capacity(root_specs.len());
+    let mut truth = Vec::with_capacity(root_specs.len());
+    let mut strip_peaks = Vec::new();
+    let sc_atoms = ["CG", "CG1", "CG2", "CD", "CD1", "CD2", "CE"];
+
+    for (r_idx, spec) in root_specs.iter().copied().enumerate() {
+        let Some(k) = spec else {
+            let cp_spur = 169.5 + rng.f64() * 9.5;
+            let nc_spur = 107.5 + rng.f64() * 31.0;
+            con_roots.push(Con2DPeak {
+                c_prev_ppm: cp_spur,
+                n_curr_ppm: nc_spur,
+                height: 30.0,
+                volume: 30.0,
+                is_proline_imino_region: nc_spur >= 131.5,
+                deconvolved_from_cluster: false,
+            });
+            truth.push(-1);
+            continue;
+        };
+        let cp_true = ref_data.shifts[&(k - 1, "C".to_string())];
+        let nc_true = ref_data.shifts[&(k, "N".to_string())];
+        let cp_obs = cp_true + off_con.0 + rng.normal(0.0, sigma_obs_c);
+        let nc_obs = nc_true + off_con.1 + rng.normal(0.0, sigma_obs_n);
+
+        con_roots.push(Con2DPeak {
+            c_prev_ppm: cp_obs,
+            n_curr_ppm: nc_obs,
+            height: 100.0 * (1.0 + rng.normal(0.0, 0.10)).clamp(0.65, 1.35),
+            volume: 100.0,
+            is_proline_imino_region: nc_obs >= 131.5,
+            deconvolved_from_cluster: false,
+        });
+        truth.push(k as i32);
+
+        if let Some(&ca_k) = ref_data.shifts.get(&(k, "CA".to_string())) {
+            if rng.f64() >= p_missing_3d {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Canco3D,
+                    c_prime_ppm: cp_obs,
+                    n_ppm: nc_obs,
+                    c_indirect_ppm: ca_k + off_canco_ca + rng.normal(0.0, sigma_obs_ca),
+                    sign: 1,
+                    height: 92.0,
+                    volume: 92.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+        }
+        if let Some(&ca_km1) = ref_data.shifts.get(&(k - 1, "CA".to_string())) {
+            if rng.f64() >= p_missing_3d {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Canco3D,
+                    c_prime_ppm: cp_obs,
+                    n_ppm: nc_obs,
+                    c_indirect_ppm: ca_km1 + off_canco_ca + rng.normal(0.0, sigma_obs_ca),
+                    sign: 1,
+                    height: 70.0,
+                    volume: 70.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+        }
+        if let Some(&ca_km1) = ref_data.shifts.get(&(k - 1, "CA".to_string())) {
+            if rng.f64() >= p_missing_3d {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Cbcaco3D,
+                    c_prime_ppm: cp_obs,
+                    n_ppm: nc_obs,
+                    c_indirect_ppm: ca_km1 + off_cbca_aliph + rng.normal(0.0, sigma_obs_ca),
+                    sign: 1,
+                    height: 88.0,
+                    volume: 88.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+        }
+        if !ref_data.sequence[k - 1].eq_ignore_ascii_case("GLY") {
+            if let Some(&cb_km1) = ref_data.shifts.get(&(k - 1, "CB".to_string())) {
+                if rng.f64() >= p_missing_3d {
+                    strip_peaks.push(C13Strip3DPeak {
+                        exp: C13DetectedExp::Cbcaco3D,
+                        c_prime_ppm: cp_obs,
+                        n_ppm: nc_obs,
+                        c_indirect_ppm: cb_km1 + off_cbca_aliph + rng.normal(0.0, sigma_obs_cb),
+                        sign: -1,
+                        height: -82.0,
+                        volume: -82.0,
+                        anchor_root_idx: Some(r_idx),
+                    });
+                }
+            }
+        }
+        if include_cccon {
+            let sc_preds = predict_ncidp_shifts(&ref_data.sequence, &IdpSolverConfig::default());
+            let mut emitted_any = false;
+            for &aname in &sc_atoms {
+                if let Some(&sc_v) = ref_data.shifts.get(&(k - 1, aname.to_string())) {
+                    if (10.0..=56.0).contains(&sc_v) && rng.f64() >= p_missing_3d {
+                        strip_peaks.push(C13Strip3DPeak {
+                            exp: C13DetectedExp::Cccon3D,
+                            c_prime_ppm: cp_obs,
+                            n_ppm: nc_obs,
+                            c_indirect_ppm: sc_v + off_cccon_aliph + rng.normal(0.0, sigma_obs_cb),
+                            sign: 1,
+                            height: 60.0,
+                            volume: 60.0,
+                            anchor_root_idx: Some(r_idx),
+                        });
+                        emitted_any = true;
+                    }
+                }
+            }
+            if !emitted_any {
+                for &sc_mu in &sc_preds[k - 1].sidechain_c {
+                    let sc_v = sc_mu + rng.normal(0.0, 0.35);
+                    if (10.0..=56.0).contains(&sc_v) && rng.f64() >= p_missing_3d {
+                        strip_peaks.push(C13Strip3DPeak {
+                            exp: C13DetectedExp::Cccon3D,
+                            c_prime_ppm: cp_obs,
+                            n_ppm: nc_obs,
+                            c_indirect_ppm: sc_v + off_cccon_aliph + rng.normal(0.0, sigma_obs_cb),
+                            sign: 1,
+                            height: 60.0,
+                            volume: 60.0,
+                            anchor_root_idx: Some(r_idx),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for k in 1..seq_len {
+        let (Some(&nc), Some(&ca_k), Some(&c_k)) = (
+            ref_data.shifts.get(&(k, "N".to_string())),
+            ref_data.shifts.get(&(k, "CA".to_string())),
+            ref_data.shifts.get(&(k, "C".to_string())),
+        ) else {
+            continue;
+        };
+        if rng.f64() >= p_missing_3d {
+            strip_peaks.push(C13Strip3DPeak {
+                exp: C13DetectedExp::Ncaco3D,
+                c_prime_ppm: c_k + off_ncaco.0 + rng.normal(0.0, sigma_obs_c),
+                n_ppm: nc + off_ncaco.1 + rng.normal(0.0, sigma_obs_n),
+                c_indirect_ppm: ca_k + off_ncaco.2 + rng.normal(0.0, sigma_obs_ca),
+                sign: 1,
+                height: 88.0,
+                volume: 88.0,
+                anchor_root_idx: None,
+            });
+        }
+    }
+
+    let mut caco_peaks = Vec::new();
+    for i in 0..seq_len {
+        let (Some(&c_i), Some(&ca_i)) = (
+            ref_data.shifts.get(&(i, "C".to_string())),
+            ref_data.shifts.get(&(i, "CA".to_string())),
+        ) else {
+            continue;
+        };
+        let is_gly = ref_data.sequence[i].eq_ignore_ascii_case("GLY");
+        let sign = if is_gly { -1 } else { 1 };
+        let ca_obs = ca_i + off_caco.1 + rng.normal(0.0, sigma_obs_ca * 0.90);
+        let kind = if is_gly {
+            CacoPeakKind::GlyOppositePhase
+        } else if ca_obs >= 58.0 {
+            CacoPeakKind::SerThrProDownfield
+        } else {
+            CacoPeakKind::GeneralAliphatic
+        };
+        caco_peaks.push(Caco2DPeak {
+            c_curr_ppm: c_i + off_caco.0 + rng.normal(0.0, sigma_obs_c),
+            ca_curr_ppm: ca_obs,
+            sign,
+            height: 95.0 * (sign as f64),
+            volume: 95.0 * (sign as f64),
+            kind,
+        });
+    }
+
+    let n_spurious_3d = ((strip_peaks.len() as f64) * spurious_rate).round() as usize;
+    let true_root_indices: Vec<usize> = truth
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &t)| (t >= 1).then_some(idx))
+        .collect();
+    let exps_3d = [
+        C13DetectedExp::Canco3D,
+        C13DetectedExp::Cbcaco3D,
+        C13DetectedExp::Ncaco3D,
+    ];
+    for i in 0..n_spurious_3d {
+        let r_idx = true_root_indices[rng.usize(true_root_indices.len())];
+        let exp = exps_3d[i % exps_3d.len()];
+        let (c_p, c_ind, sgn) = match exp {
+            C13DetectedExp::Canco3D => (con_roots[r_idx].c_prev_ppm, 50.0 + rng.f64() * 14.0, 1),
+            C13DetectedExp::Cbcaco3D => {
+                let is_neg = rng.f64() < 0.5;
+                (
+                    con_roots[r_idx].c_prev_ppm,
+                    if is_neg {
+                        24.0 + rng.f64() * 40.0
+                    } else {
+                        50.0 + rng.f64() * 14.0
+                    },
+                    if is_neg { -1 } else { 1 },
+                )
+            }
+            _ => (171.5 + rng.f64() * 6.0, 50.0 + rng.f64() * 14.0, 1),
+        };
+        let anchor_root_idx = if exp == C13DetectedExp::Ncaco3D {
+            None
+        } else {
+            Some(r_idx)
+        };
+        let n_val = if exp == C13DetectedExp::Ncaco3D {
+            con_roots[r_idx].n_curr_ppm + rng.normal(0.0, 0.05)
+        } else {
+            con_roots[r_idx].n_curr_ppm
+        };
+        strip_peaks.push(C13Strip3DPeak {
+            exp,
+            c_prime_ppm: c_p,
+            n_ppm: n_val,
+            c_indirect_ppm: c_ind,
+            sign: sgn,
+            height: spurious_height * (sgn as f64),
+            volume: spurious_height * (sgn as f64),
+            anchor_root_idx,
+        });
+    }
+
+    (
+        C13PickedDataset {
+            con_roots,
+            caco_peaks,
+            strip_peaks,
+        },
+        truth,
+    )
+}
+
+#[test]
+fn test_no_cccon_5spectrum_3x_noise_and_midband_0_054_ppm_qc_triggers() {
+    let root = workspace_root();
+    let entries = [
+        (
+            root.join("data/benchmark/bmr6968.str"),
+            "bmr6968",
+            288.15,
+            6.5,
+        ),
+        (
+            root.join("data/benchmark/bmr15176.str"),
+            "bmr15176",
+            298.15,
+            6.5,
+        ),
+        (
+            root.join("data/benchmark/bmr4375.str"),
+            "bmr4375",
+            298.15,
+            2.0,
+        ),
+        (
+            root.join("data/fixtures/bmr26639_idp_cbp_id4.str"),
+            "bmr26639",
+            308.15,
+            6.5,
+        ),
+        (
+            root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+            "bmr51984",
+            298.15,
+            6.0,
+        ),
+    ];
+
+    // Part A1: 5-spectrum `{CON, CACO, CANCO, CBCACON, NCACO}` WITHOUT `3D CCC(CO)N` TOCSY
+    // (`include_cccon = false` before 18% spurious injection) on fresh seeds (`99000+`)
+    let mut noccc_corr = 0usize;
+    let mut noccc_ass = 0usize;
+    let mut noccc_hc_c = 0usize;
+    let mut noccc_hc_a = 0usize;
+    let mut noccc_warn = 0usize;
+    let mut noccc_runs = 0usize;
+    let mut noccc_cal: Vec<(f64, bool)> = Vec::new();
+
+    // Part A2: Harder stripped-`CCC(CO)N` stress (`include_cccon = true` during 18% ht=95.0
+    // spurious injection -> ~30% spurious backbone 3D density, then `Cccon3D` stripped!)
+    let mut strip_corr = 0usize;
+    let mut strip_ass = 0usize;
+    let mut strip_hc_c = 0usize;
+    let mut strip_hc_a = 0usize;
+    let mut strip_warn = 0usize;
+    let mut strip_cal: Vec<(f64, bool)> = Vec::new();
+
+    // Part B: Lower-band `[0.05, 0.08] ppm` realistic matching noise (`sigma_obs_CA = 0.038 ppm`
+    // -> `true sigma_seq_CA = 0.054 ppm`) + `15%` equal-height (`95.0`) spurious 3D peaks
+    let mut mid_warn = 0usize;
+    let mut mid_runs = 0usize;
+
+    for (idx, (path, label, temp_k, ph)) in entries.iter().enumerate() {
+        let ref_data = read_star_all_atoms(path, None).unwrap();
+        for sd in 0..2u64 {
+            let seed_a = 99_000 + (idx as u64) * 37 + sd;
+            let (picked_no_cccon, truth_no_cccon) = simulate_realistic_noise_bmrb_dataset_custom(
+                &ref_data, 0.055, 0.10, 0.18, 95.0, false, seed_a,
+            );
+            let cfg_a = IdpSolverConfig {
+                temperature_k: *temp_k,
+                ph: *ph,
+                replicas: 36,
+                islands: 4,
+                generations: 3,
+                steps_per_system: 2_200,
+                seed: seed_a,
+                ..IdpSolverConfig::default()
+            };
+            let (sys_a, res_a) =
+                assign_idp_13c_from_picked(&picked_no_cccon, &ref_data.sequence, &cfg_a);
+            assert!(
+                sys_a.iter().all(|s| s.sidechain_c_prev.is_empty()),
+                "no-CCCON simulation must have empty sidechain_c_prev"
+            );
+            noccc_runs += 1;
+            if res_a.qc_verdict != DatasetQcVerdict::Pass {
+                noccc_warn += 1;
+            }
+            let ma = evaluate_metrics(&res_a.as_assign_result(), &truth_no_cccon, 0.80);
+            noccc_corr += ma.correct;
+            noccc_ass += ma.assigned;
+            noccc_hc_c += ma.hc_correct;
+            noccc_hc_a += ma.hc_assigned;
+            for (s, &pos) in res_a.position.iter().enumerate() {
+                if pos >= 0 {
+                    noccc_cal.push((res_a.confidence[s], pos == truth_no_cccon[s]));
+                }
+            }
+
+            // Stripped-CCCON + noisy-CACO heavy stress (`Cccon3D` synthesized then stripped so
+            // ~30% spurious backbone 3D density + 15% CACO dropout + 15% spurious CACO drives
+            // accuracy down into the ~70-78% regime without CCC(CO)N!)
+            let (mut picked_strip, truth_strip) = simulate_realistic_noise_bmrb_dataset_custom(
+                &ref_data, 0.068, 0.14, 0.18, 95.0, true, seed_a,
+            );
+            assert!(
+                picked_strip
+                    .strip_peaks
+                    .iter()
+                    .any(|p| p.exp == C13DetectedExp::Cccon3D),
+                "include_cccon=true must emit Cccon3D peaks"
+            );
+            // Also verify 6-spectrum WITH-CCCON stays calibrated on the same dataset!
+            let (sys_with_ccc, res_with_ccc) =
+                assign_idp_13c_from_picked(&picked_strip, &ref_data.sequence, &cfg_a);
+            assert!(
+                sys_with_ccc.iter().any(|s| !s.sidechain_c_prev.is_empty()),
+                "with-CCCON systems must populate sidechain_c_prev"
+            );
+            assert_ne!(res_with_ccc.qc_verdict, DatasetQcVerdict::Pass);
+
+            // Now strip Cccon3D and add 15% equal-height spurious 2D CACO peaks to stress ~70-78% acc!
+            picked_strip
+                .strip_peaks
+                .retain(|p| p.exp != C13DetectedExp::Cccon3D);
+            let mut rng_st = Rng::new(seed_a ^ 0xDEAD_BEEF);
+            picked_strip.caco_peaks.retain(|_| rng_st.f64() >= 0.12);
+            let n_spur_caco = ((picked_strip.caco_peaks.len() as f64) * 0.15).round() as usize;
+            for _ in 0..n_spur_caco {
+                picked_strip.caco_peaks.push(Caco2DPeak {
+                    c_curr_ppm: 171.5 + rng_st.f64() * 6.0,
+                    ca_curr_ppm: 50.0 + rng_st.f64() * 14.0,
+                    sign: 1,
+                    height: 95.0,
+                    volume: 95.0,
+                    kind: CacoPeakKind::GeneralAliphatic,
+                });
+            }
+            let (sys_st, res_st) =
+                assign_idp_13c_from_picked(&picked_strip, &ref_data.sequence, &cfg_a);
+            assert!(sys_st.iter().all(|s| s.sidechain_c_prev.is_empty()));
+            if res_st.qc_verdict != DatasetQcVerdict::Pass {
+                strip_warn += 1;
+            }
+            let mst = evaluate_metrics(&res_st.as_assign_result(), &truth_strip, 0.80);
+            strip_corr += mst.correct;
+            strip_ass += mst.assigned;
+            strip_hc_c += mst.hc_correct;
+            strip_hc_a += mst.hc_assigned;
+            for (s, &pos) in res_st.position.iter().enumerate() {
+                if pos >= 0 {
+                    strip_cal.push((res_st.confidence[s], pos == truth_strip[s]));
+                }
+            }
+
+            let seed_b = 88_000 + (idx as u64) * 29 + sd;
+            let (picked_mid, _) = simulate_realistic_noise_bmrb_dataset_custom(
+                &ref_data, 0.038, 0.10, 0.15, 95.0, true, seed_b,
+            );
+            let cfg_b = IdpSolverConfig {
+                temperature_k: *temp_k,
+                ph: *ph,
+                replicas: 36,
+                islands: 4,
+                generations: 3,
+                steps_per_system: 2_200,
+                seed: seed_b,
+                ..IdpSolverConfig::default()
+            };
+            let (_, res_b) = assign_idp_13c_from_picked(&picked_mid, &ref_data.sequence, &cfg_b);
+            mid_runs += 1;
+            if res_b.qc_verdict != DatasetQcVerdict::Pass {
+                mid_warn += 1;
+            } else {
+                println!(
+                    "MISSED MID-BAND QC WARN on {label} seed={sd}: reasons={:?}",
+                    res_b.qc_reasons
+                );
+            }
+        }
+    }
+
+    let noccc_acc = (noccc_corr as f64) / (noccc_ass.max(1) as f64);
+    let noccc_hc = if noccc_hc_a > 0 {
+        (noccc_hc_c as f64) / (noccc_hc_a as f64)
+    } else {
+        1.0
+    };
+    let noccc_ece = ProteinReliabilityCurve::from_predictions(&noccc_cal, 0.80).ece;
+    let strip_acc = (strip_corr as f64) / (strip_ass.max(1) as f64);
+    let strip_hc = if strip_hc_a > 0 {
+        (strip_hc_c as f64) / (strip_hc_a as f64)
+    } else {
+        1.0
+    };
+    let strip_ece = ProteinReliabilityCurve::from_predictions(&strip_cal, 0.80).ece;
+    println!(
+        "[No-CCCON 5-Spectrum 3x Noise (18% ht=95 spur)] Acc={:.2}% ({noccc_corr}/{noccc_ass}) HC_prec={:.2}% ({noccc_hc_c}/{noccc_hc_a}) ECE={noccc_ece:.4} QC_warn={noccc_warn}/{noccc_runs}",
+        noccc_acc * 100.0,
+        noccc_hc * 100.0,
+    );
+    println!(
+        "[Stripped-CCCON Heavy-Spur 5-Spectrum 3x Noise] Acc={:.2}% ({strip_corr}/{strip_ass}) HC_prec={:.2}% ({strip_hc_c}/{strip_hc_a}) ECE={strip_ece:.4} QC_warn={strip_warn}/{noccc_runs}",
+        strip_acc * 100.0,
+        strip_hc * 100.0,
+    );
+    println!("[Mid-Band sigma_seq_CA=0.054 ppm + 15% ht=95 spur] QC_warn={mid_warn}/{mid_runs}");
+
+    assert_eq!(
+        noccc_warn, noccc_runs,
+        "All {noccc_runs} no-CCCON 3x realistic-noise runs must trigger QC Warn!"
+    );
+    assert_eq!(
+        strip_warn, noccc_runs,
+        "All {noccc_runs} stripped-CCCON heavy-spurious runs must trigger QC Warn!"
+    );
+    assert!(
+        noccc_hc >= 0.94,
+        "No-CCCON 5-spectrum 3x realistic-noise HC precision {:.2}% < 94.0%!",
+        noccc_hc * 100.0
+    );
+    assert!(
+        noccc_ece <= 0.06,
+        "No-CCCON 5-spectrum 3x realistic-noise ECE {noccc_ece:.4} > 0.06!"
+    );
+    assert!(
+        strip_hc >= 0.94,
+        "Stripped-CCCON heavy-spurious 3x realistic-noise HC precision {:.2}% < 94.0%!",
+        strip_hc * 100.0
+    );
+    assert!(
+        strip_ece <= 0.06,
+        "Stripped-CCCON heavy-spurious 3x realistic-noise ECE {strip_ece:.4} > 0.06!"
+    );
+    assert_eq!(
+        mid_warn, mid_runs,
+        "All {mid_runs}/{mid_runs} sigma_seq_CA=0.054 ppm + 15% equal-height spurious runs must trigger QC Warn (got {mid_warn}/{mid_runs})!"
     );
 }

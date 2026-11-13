@@ -1198,6 +1198,10 @@ fn align_parsed_paramagnetic_pdb(
 /// Extract aligned per-residue backbone amide `1H^N` (fallback `15N` for `Pro` / N-terminus)
 /// coordinates from a parsed [`PdbChain`] and estimate cluster metal coordinates from 3D
 /// single-linkage (`<= 6.4 Å`) ligand donor centroids whenever `cluster.metal_coord` is `None`.
+///
+/// Note: this convenience helper applies a uniform `r_bleach_angstrom` across paramagnetic sites;
+/// callers requiring per-metal `r_bleach` across heterogeneous multi-metal PDB cofactors should
+/// call [`compute_bleaching_probabilities_3d_per_site`] or [`assign_paramagnetic_backbone`].
 pub fn compute_bleaching_probabilities_from_pdb(
     sequence: &[String],
     pdb_chain: &PdbChain,
@@ -2967,8 +2971,10 @@ pub fn fit_pcs_tensor_paramagnetic(
 }
 
 /// Variable-projection (`VarPro`) 3D metal-position and 5-parameter $\Delta\boldsymbol{\chi}$-tensor
-/// refinement (`Schmitz et al. 2008`): coarse 3D grid search around `initial_metal_pos` followed by
-/// 3D Nelder–Mead simplex optimization, solving exact 5-component linear SVD at every candidate site.
+/// refinement (`Schmitz et al. 2008`) strictly bounded to the ball
+/// $\|\mathbf{x}_{\text{M}} - \text{initial\_metal\_pos}\|_2 \le \text{search\_radius\_angstrom}$:
+/// coarse 3D grid search around `initial_metal_pos` followed by constrained 3D Nelder–Mead simplex
+/// optimization, solving exact 5-component linear SVD at every candidate site.
 pub fn refine_metal_position_and_tensor(
     obs: &[PcsObservation],
     initial_metal_pos: Vec3,
@@ -2983,6 +2989,11 @@ pub fn refine_metal_position_and_tensor(
             "non-finite initial_metal_pos or grid parameter in VarPro PCS refinement".to_string(),
         );
     }
+    if search_radius_angstrom < 0.0 {
+        return Err(format!(
+            "negative search_radius_angstrom ({search_radius_angstrom}) in VarPro PCS refinement"
+        ));
+    }
     validate_pcs_observation_slice(obs, 8)?;
     if obs.len() < 8 {
         return Err(format!(
@@ -2990,8 +3001,15 @@ pub fn refine_metal_position_and_tensor(
             obs.len()
         ));
     }
+    if search_radius_angstrom == 0.0 {
+        return fit_pcs_tensor_svd(obs, initial_metal_pos);
+    }
 
+    let rad = search_radius_angstrom;
     let eval_chi2 = |m: Vec3| -> f64 {
+        if v_dist(m, initial_metal_pos) > rad + 1e-12 {
+            return 1e30;
+        }
         for o in obs {
             if v_dist(o.coord_angstrom, m) < 2.0 {
                 return 1e30;
@@ -3012,45 +3030,45 @@ pub fn refine_metal_position_and_tensor(
         }
     };
 
-    // Stage 1: Coarse 3D grid search
+    // Stage 1: Coarse 3D grid search inside ||dm||_2 <= rad
     let mut best_m = initial_metal_pos;
     let mut best_f = eval_chi2(initial_metal_pos);
-    let rad = search_radius_angstrom.max(0.0);
     let step = grid_step_angstrom.max(0.25);
-    if rad > 0.0 {
-        let n_steps = (rad / step).ceil() as isize;
-        for ix in -n_steps..=n_steps {
-            for iy in -n_steps..=n_steps {
-                for iz in -n_steps..=n_steps {
-                    let dm = [(ix as f64) * step, (iy as f64) * step, (iz as f64) * step];
-                    if dm[0] * dm[0] + dm[1] * dm[1] + dm[2] * dm[2] > rad * rad * 1.01 {
-                        continue;
-                    }
-                    let cand = [
-                        initial_metal_pos[0] + dm[0],
-                        initial_metal_pos[1] + dm[1],
-                        initial_metal_pos[2] + dm[2],
-                    ];
-                    let f = eval_chi2(cand);
-                    if f < best_f {
-                        best_f = f;
-                        best_m = cand;
-                    }
+    let n_steps = (rad / step).ceil() as isize;
+    for ix in -n_steps..=n_steps {
+        for iy in -n_steps..=n_steps {
+            for iz in -n_steps..=n_steps {
+                let dm = [(ix as f64) * step, (iy as f64) * step, (iz as f64) * step];
+                if dm[0] * dm[0] + dm[1] * dm[1] + dm[2] * dm[2] > rad * rad {
+                    continue;
+                }
+                let cand = [
+                    initial_metal_pos[0] + dm[0],
+                    initial_metal_pos[1] + dm[1],
+                    initial_metal_pos[2] + dm[2],
+                ];
+                let f = eval_chi2(cand);
+                if f < best_f {
+                    best_f = f;
+                    best_m = cand;
                 }
             }
         }
     }
 
-    // Stage 2: 3D Nelder-Mead simplex refinement
-    let init_delta = (step * 0.45).clamp(0.05, 0.6);
-    let mut simplex: [(Vec3, f64); 4] = [
-        (best_m, best_f),
-        ([best_m[0] + init_delta, best_m[1], best_m[2]], 0.0),
-        ([best_m[0], best_m[1] + init_delta, best_m[2]], 0.0),
-        ([best_m[0], best_m[1], best_m[2] + init_delta], 0.0),
-    ];
-    for item in simplex.iter_mut().skip(1) {
-        item.1 = eval_chi2(item.0);
+    // Stage 2: Constrained 3D Nelder-Mead simplex refinement inside ||m - initial_metal_pos||_2 <= rad
+    let init_delta = (step * 0.45).clamp(0.02, 0.6).min(0.5 * rad);
+    let mut simplex: [(Vec3, f64); 4] = [(best_m, best_f); 4];
+    for axis in 0..3 {
+        let mut v = best_m;
+        v[axis] += init_delta;
+        if v_dist(v, initial_metal_pos) > rad {
+            v[axis] = best_m[axis] - init_delta;
+            if v_dist(v, initial_metal_pos) > rad {
+                v[axis] = 0.5 * (best_m[axis] + initial_metal_pos[axis]);
+            }
+        }
+        simplex[axis + 1] = (v, eval_chi2(v));
     }
 
     for _iter in 0..200 {

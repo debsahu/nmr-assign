@@ -1759,6 +1759,18 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
     let svd_at_la = fit_pcs_tensor_svd(&filtered_obs, la_metal_pos).expect("Calbindin SVD at LA");
     let huber_at_la =
         fit_pcs_tensor_robust(&filtered_obs, la_metal_pos, 1.65, 25).expect("Calbindin Huber IRLS");
+    let zero_rad = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 0.0, 0.5)
+        .expect("Calbindin zero-radius VarPro must pin initial metal position");
+    assert!(
+        v_dist(zero_rad.metal_pos_angstrom, la_metal_pos) <= 1e-12
+            && (zero_rad.dchi_ax - svd_at_la.dchi_ax).abs() <= 1e-12,
+        "search_radius_angstrom=0.0 must keep metal_pos exact (got shift={:.6} Å)",
+        v_dist(zero_rad.metal_pos_angstrom, la_metal_pos)
+    );
+    assert!(
+        refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, -0.5, 0.5).is_err(),
+        "negative search_radius_angstrom must return Err"
+    );
     let refined_yb = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 1.5, 0.5)
         .expect("Calbindin VarPro metal + DeltaChi refinement");
     let metal_shift_ang = v_dist(refined_yb.metal_pos_angstrom, la_metal_pos);
@@ -1790,8 +1802,13 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
         huber_at_la.q_factor
     );
     assert!(
-        svd_at_la.dchi_ax > 7.5 && svd_at_la.dchi_ax < 10.5 && metal_shift_ang <= 3.5,
-        "expected literature Yb3+ dchi_ax ~ +8.5..9.0e-32 m^3 and bounded EF-hand II position (got ax={:.3}, shift={metal_shift_ang:.3} Å)",
-        svd_at_la.dchi_ax
+        svd_at_la.dchi_ax > 7.5
+            && svd_at_la.dchi_ax < 10.5
+            && refined_yb.dchi_ax > 7.0
+            && refined_yb.dchi_ax < 11.5
+            && metal_shift_ang <= 1.5001,
+        "expected literature Yb3+ dchi_ax ~ +8.5..9.0e-32 m^3 and strictly bounded |d_metal| <= 1.5001 Å (got svd_ax={:.3}, varpro_ax={:.3}, shift={metal_shift_ang:.4} Å)",
+        svd_at_la.dchi_ax,
+        refined_yb.dchi_ax
     );
 }

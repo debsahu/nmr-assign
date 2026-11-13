@@ -180,7 +180,7 @@ pub struct IdpSolverConfig {
     pub sigma_seq_ca: f64,
     pub sigma_seq_c: f64,
     /// Candidate-multiplicity ambiguity penalty weight `w_mult` (`-w_mult * ln(n_compatible)` in
-    /// sequential `P(s, t)` on both CPU and WebGPU, `default = 0.65`).
+    /// sequential `P(s, t)` on both CPU and WebGPU, `default = 0.35`).
     pub w_mult: f64,
     /// Optional upstream 3D picker carrier-drift clamp warnings propagated into `IdpAssignResult` QC.
     pub picker_warnings: Vec<String>,
@@ -240,6 +240,10 @@ pub struct IdpAssignResult {
     pub position: Vec<i32>,
     /// Monotone calibrated posterior confidence in `[0.0, 1.0]` for each `ConDipeptideSystem`.
     pub confidence: Vec<f64>,
+    /// Pre-calibration combined Boltzmann specificity + replica consensus score in `[0.0, 1.0]`
+    /// before monotone `IDP_CALIBRATION_KNOTS` mapping and post-calibration QC `Warn`/`Abstain` damping.
+    #[serde(default)]
+    pub raw_posterior: Vec<f64>,
     pub score: f64,
     pub run_scores: Vec<f64>,
     pub fitted_offsets: IdpShiftOffsets,
@@ -2786,15 +2790,16 @@ pub fn crossover_idp_states(
 ///   8% spurious) and `3x` realistic-noise (`sigma_seq ~ 0.065–0.085 ppm CA`, 16% equal-height
 ///   spurious 3D peaks) regimes (`N = 2,402` out-of-fold assigned spin systems; locked by
 ///   `test_idp_5fold_leave_one_protein_out_calibration_across_low_and_3x_realistic_noise`).
-/// - Exact 5-fold Leave-One-Protein-Out out-of-fold calibration metrics:
-///   * Pooled 5-fold OOF `ECE = 0.0118` (`<= 0.06` gate),
-///   * Per-protein OOF `ECE = [0.0175, 0.0180, 0.0494, 0.0253, 0.0137]`.
+/// - Exact 5-fold Leave-One-Protein-Out out-of-fold calibration metrics (`raw_posterior`):
+///   * Pooled 5-fold OOF `ECE = 0.0105` (`<= 0.055` gate),
+///   * Per-protein OOF `ECE = [0.0281, 0.0394, 0.0358, 0.0351, 0.0190]`.
 /// - Hyperparameter provenance:
 ///   * `TAU_ENS = 6.5`: multi-island Boltzmann ensemble consensus temperature (~2 multi-channel
 ///     LLR standard deviations across polished island elites).
-///   * `TAU_LOCAL = 1.95` (scaled adaptively by empirical sequential `CA` RMS and per-channel
-///     candidate multiplicity under realistic noise): single-swap / motif-swap Boltzmann temperature
-///     minimizing 5-fold LOPO out-of-fold log-loss & ECE.
+///   * `TAU_LOCAL = 1.95` (scaled adaptively by empirical sequential `CA` RMS, per-channel
+///     candidate multiplicity, and missing-`CCC(CO)N` sidechain degeneracy under realistic noise):
+///     single-swap, `>= 3`-cycle relocation, and motif-swap Boltzmann temperature minimizing
+///     5-fold LOPO out-of-fold log-loss & ECE.
 ///   * `MAX_ALT_COMPETITORS = 8`: top-8 single-slot / 2-swap competitors retained in the local
 ///     partition sum so `p_local` is invariant to sequence length `K` (`76..207+ aa`) rather than
 ///     diluted by `O(K)` incompatible random-coil tail slots (`exp(-12) * 200`).
@@ -2804,14 +2809,14 @@ pub fn crossover_idp_states(
 ///     at least one `CANCO`/`CBCACON`/`NCACO` peak vs `< 0.2%` of 3D-empty thermal spikes).
 pub const IDP_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.00, 0.0000),
-    (0.10, 0.0699),
-    (0.25, 0.2441),
-    (0.45, 0.4669),
-    (0.65, 0.7087),
-    (0.80, 0.8567),
-    (0.90, 0.9510),
-    (0.96, 0.9740),
-    (1.00, 0.9816),
+    (0.10, 0.2308),
+    (0.25, 0.3984),
+    (0.45, 0.6529),
+    (0.65, 0.8369),
+    (0.80, 0.9491),
+    (0.90, 0.9827),
+    (0.96, 0.9906),
+    (1.00, 0.9935),
 ];
 
 #[inline]
@@ -3045,6 +3050,7 @@ pub fn consensus_and_calibrate_idp(
         return IdpAssignResult {
             position: vec![-1; s_len],
             confidence: vec![0.0; s_len],
+            raw_posterior: vec![0.0; s_len],
             score: 0.0,
             run_scores: replica_scores.to_vec(),
             fitted_offsets,
@@ -3205,47 +3211,77 @@ pub fn consensus_and_calibrate_idp(
     let seq_low_comp_warn =
         k_len >= 16 && (h_aa_bits < 2.60 || max_aa_frac >= 0.35 || top3_dipep_frac >= 0.35);
 
-    // 2. Length-invariant local-swap + motif-swap Boltzmann specificity `p_local[s]`
+    let mut n_assigned = 0usize;
+    let mut n_connected = 0usize;
+    for (s, &k_i) in cons_pos.iter().enumerate() {
+        if k_i >= 1 {
+            n_assigned += 1;
+            let k = k_i as usize;
+            let prev_ok =
+                k > 1 && cons_at[k - 1] >= 0 && p_mat.get(cons_at[k - 1] as usize, s) >= 1.0;
+            let next_ok = k + 1 < k_len
+                && cons_at[k + 1] >= 0
+                && p_mat.get(s, cons_at[k + 1] as usize) >= 1.0;
+            if prev_ok || next_ok {
+                n_connected += 1;
+            }
+        }
+    }
+    let connectivity_frac = if n_assigned > 0 {
+        (n_connected as f64) / (n_assigned as f64)
+    } else {
+        0.0
+    };
+
+    // 2. Length-invariant local-swap + multi-way cycle + motif-swap Boltzmann specificity `p_local[s]`
     const TAU_LOCAL: f64 = 1.95;
     const MAX_ALT_COMPETITORS: usize = 8;
-    let rms_scale = if emp_rms_seq_ca > 0.042 {
-        (emp_rms_seq_ca / 0.038).clamp(1.0, 2.50)
-    } else {
-        1.0
-    };
-    let cand_scale = if mean_cands_per_ch > 1.54 {
-        (mean_cands_per_ch / 1.48).clamp(1.0, 1.60)
-    } else {
-        1.0
-    };
-    let repeat_scale = if seq_low_comp_warn { 1.85 } else { 1.0 };
-    let tau_local_eff = TAU_LOCAL * rms_scale * cand_scale * repeat_scale;
+    let any_cccon = systems.iter().any(|s| !s.sidechain_c_prev.is_empty());
+    let walk_pair_weight = if any_cccon { 0.76 } else { 0.66 };
+    let walk_base_margin = if any_cccon { 1.95 } else { 1.55 };
 
-    let mut confidence = vec![0.0f64; s_len];
     let mut work_at = cons_at.clone();
     let mut single_deltas = Vec::with_capacity(k_len);
+    let mut cycle_deltas = Vec::with_capacity(k_len);
+    let mut sys_base_1 = vec![0.0f64; s_len];
+    let mut sys_top_deltas: Vec<Vec<f64>> = vec![Vec::new(); s_len];
+    let mut sys_top_cycle_deltas: Vec<Vec<f64>> = vec![Vec::new(); s_len];
+    let mut sys_best_blk = vec![f64::NEG_INFINITY; s_len];
     let mut n_ambig_placements = 0usize;
 
     for s in 0..s_len {
         let k_i = cons_pos[s];
         if k_i < 0 {
-            confidence[s] = 0.0;
             continue;
         }
         let k_star = k_i as usize;
-        let mut alt_sum = 0.0f64;
+        sys_base_1[s] = eval_1_slot(&work_at, u_mat, p_mat, k_star);
 
-        // (a) Unassigning `s -> -1`
-        let base_1 = eval_1_slot(&work_at, u_mat, p_mat, k_star);
-        alt_sum += ((-base_1 - 2.0) / tau_local_eff).clamp(-35.0, 20.0).exp();
+        let pair_prev = if k_star > 1 && cons_at[k_star - 1] >= 0 {
+            p_mat.get(cons_at[k_star - 1] as usize, s).max(0.0)
+        } else {
+            0.0
+        };
+        let pair_next = if k_star + 1 < k_len && cons_at[k_star + 1] >= 0 {
+            p_mat.get(s, cons_at[k_star + 1] as usize).max(0.0)
+        } else {
+            0.0
+        };
+        let u_star = u_mat.get(s, k_star);
+        // Multi-way (`>= 3`-cycle) relocation bound: a 2-swap `k_star <-> k_alt` freezes the
+        // occupant `t = work_at[k_alt]` into `k_star` even when the true error is a `>= 3`-cycle
+        // `s -> k_alt -> k_2 -> k_star`; `cycle_deltas` measures unary preference for `k_alt`
+        // minus the sequential walk support anchoring `s` at `k_star`.
+        let walk_anchor = walk_pair_weight * (pair_prev + pair_next) + walk_base_margin;
 
-        // (b) Top-K single-slot relocations / 2-swaps `k_star <-> k_alt`
         single_deltas.clear();
+        cycle_deltas.clear();
         for &k_alt_u in &slots[s] {
             let k_alt = k_alt_u as usize;
             if k_alt == k_star {
                 continue;
             }
+            cycle_deltas.push((u_mat.get(s, k_alt) - u_star) - walk_anchor);
             let t = work_at[k_alt];
             if t >= 0 && u_mat.get(t as usize, k_star) <= (IDP_FORBID_HALF as f64) {
                 continue;
@@ -3259,11 +3295,10 @@ pub fn consensus_and_calibrate_idp(
             single_deltas.push(delta);
         }
         single_deltas.sort_by(|a, b| b.total_cmp(a));
-        for &delta in single_deltas.iter().take(MAX_ALT_COMPETITORS) {
-            alt_sum += (delta / tau_local_eff).clamp(-35.0, 20.0).exp();
-        }
+        sys_top_deltas[s].extend(single_deltas.iter().copied().take(MAX_ALT_COMPETITORS));
+        cycle_deltas.sort_by(|a, b| b.total_cmp(a));
+        sys_top_cycle_deltas[s].extend(cycle_deltas.iter().copied().take(3));
 
-        // (c) Best contiguous `2..=5`-residue motif swap containing `k_star`
         let mut best_blk_delta = f64::NEG_INFINITY;
         for blen in 2..=5usize.min(k_len.saturating_sub(1)) {
             let win_lo = k_star.saturating_sub(blen - 1).max(1);
@@ -3306,18 +3341,83 @@ pub fn consensus_and_calibrate_idp(
                 }
             }
         }
-        let best_single_delta = single_deltas.first().copied().unwrap_or(f64::NEG_INFINITY);
+        sys_best_blk[s] = best_blk_delta;
+        let best_single_delta = sys_top_deltas[s]
+            .first()
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
         if best_single_delta.max(best_blk_delta) >= -1.75 {
             n_ambig_placements += 1;
         }
+    }
+
+    let ambig_placement_frac = if n_assigned > 0 {
+        (n_ambig_placements as f64) / (n_assigned as f64)
+    } else {
+        1.0
+    };
+
+    let rms_scale = if emp_rms_seq_ca > 0.042 {
+        (emp_rms_seq_ca / 0.038).clamp(1.0, 2.50)
+    } else {
+        1.0
+    };
+    let cand_scale = if mean_cands_per_ch > 1.54 {
+        (mean_cands_per_ch / 1.48).clamp(1.0, 1.60)
+    } else {
+        1.0
+    };
+    let no_cccon_scale = if !any_cccon
+        && emp_rms_seq_ca >= 0.034
+        && (ambig_placement_frac >= 0.12 || connectivity_frac < 0.92)
+        && (mean_cands_per_ch > 1.52 || ambig_placement_frac >= 0.22 || connectivity_frac < 0.90)
+    {
+        // Without 3D CCC(CO)N TOCSY sidechain carbons, amino acids sharing overlapping `(CA, CB)`
+        // random-coil basins (`Glu/Gln/Lys/Arg/Met`, `Leu/Phe/Tyr/Asp/Asn`) lack CG/CD/CE
+        // disambiguation; under elevated matching noise + low-margin swap ambiguity + spurious
+        // candidate multiplicity, widen `tau_local_eff` proportionally.
+        let ambig_excess = (ambig_placement_frac - 0.20).max(0.0);
+        let mult_excess = (mean_cands_per_ch - 1.54).max(0.0);
+        let conn_deficit = (0.90 - connectivity_frac).max(0.0);
+        let rms_excess = (emp_rms_seq_ca - 0.055).max(0.0);
+        (1.0 + 1.85 * ambig_excess + 0.95 * mult_excess + 4.40 * conn_deficit + 12.5 * rms_excess)
+            .clamp(1.0, 2.05)
+    } else {
+        1.0
+    };
+    let repeat_scale = if seq_low_comp_warn { 1.85 } else { 1.0 };
+    let tau_local_base = TAU_LOCAL * rms_scale * cand_scale * no_cccon_scale * repeat_scale;
+    let w_ens = if !any_cccon && emp_rms_seq_ca >= 0.038 {
+        0.28
+    } else {
+        0.34
+    };
+
+    let mut raw_posterior = vec![0.0f64; s_len];
+    let mut confidence = vec![0.0f64; s_len];
+
+    for s in 0..s_len {
+        if cons_pos[s] < 0 {
+            raw_posterior[s] = 0.0;
+            confidence[s] = 0.0;
+            continue;
+        }
+        let tau_s = tau_local_base;
+        let mut alt_sum = ((-sys_base_1[s] - 2.0) / tau_s).clamp(-35.0, 20.0).exp();
+        for &delta in &sys_top_deltas[s] {
+            alt_sum += (delta / tau_s).clamp(-35.0, 20.0).exp();
+        }
+        for &cdelta in &sys_top_cycle_deltas[s] {
+            alt_sum += (cdelta / (1.15 * tau_s)).clamp(-35.0, 20.0).exp();
+        }
+        let best_blk_delta = sys_best_blk[s];
         if best_blk_delta > -4.0 {
-            alt_sum += (best_blk_delta / (1.15 * tau_local_eff))
-                .clamp(-35.0, 20.0)
-                .exp();
+            alt_sum += (best_blk_delta / (1.15 * tau_s)).clamp(-35.0, 20.0).exp();
         }
 
         let p_local = 1.0 / (1.0 + alt_sum);
-        let p_combined = 0.64 * p_local + 0.36 * (p_local * p_ens[s]).sqrt();
+        let p_combined = (1.0 - w_ens) * p_local + w_ens * (p_local * p_ens[s]).sqrt();
+        raw_posterior[s] = p_combined;
         confidence[s] = eval_idp_calibration(p_combined);
     }
 
@@ -3325,39 +3425,12 @@ pub fn consensus_and_calibrate_idp(
     let n_3d_sup = systems.iter().filter(|s| s.has_3d_support()).count();
     let support_3d_frac = (n_3d_sup as f64) / (s_len as f64);
 
-    let mut n_assigned = 0usize;
-    let mut n_connected = 0usize;
-    for (s, &k_i) in cons_pos.iter().enumerate() {
-        if k_i >= 1 {
-            n_assigned += 1;
-            let k = k_i as usize;
-            let prev_ok =
-                k > 1 && cons_at[k - 1] >= 0 && p_mat.get(cons_at[k - 1] as usize, s) >= 1.0;
-            let next_ok = k + 1 < k_len
-                && cons_at[k + 1] >= 0
-                && p_mat.get(s, cons_at[k + 1] as usize) >= 1.0;
-            if prev_ok || next_ok {
-                n_connected += 1;
-            }
-        }
-    }
-    let connectivity_frac = if n_assigned > 0 {
-        (n_connected as f64) / (n_assigned as f64)
-    } else {
-        0.0
-    };
-
     let n_expected_con = k_len.saturating_sub(1).max(1);
     let root_ratio = (s_len as f64) / (n_expected_con as f64);
     let mean_compat_2d_out = if margin_eval_2d_roots > 0 {
         compat_2d_out_sum / (margin_eval_2d_roots as f64)
     } else {
         0.0
-    };
-    let ambig_placement_frac = if n_assigned > 0 {
-        (n_ambig_placements as f64) / (n_assigned as f64)
-    } else {
-        1.0
     };
 
     let mut qc_reasons: Vec<String> = Vec::new();
@@ -3430,9 +3503,9 @@ pub fn consensus_and_calibrate_idp(
         0.0
     };
     if n_3d_sup >= 8
-        && (emp_rms_seq_ca >= 0.048
-            || mean_cands_per_ch >= 1.60
-            || ambig_placement_frac >= 0.24
+        && (emp_rms_seq_ca >= 0.034
+            || mean_cands_per_ch >= 1.47
+            || ambig_placement_frac >= 0.22
             || compat_2d_density >= 0.14)
     {
         qc_reasons.push(format!(
@@ -3507,6 +3580,7 @@ pub fn consensus_and_calibrate_idp(
     IdpAssignResult {
         position: cons_pos,
         confidence,
+        raw_posterior,
         score: final_sc,
         run_scores,
         fitted_offsets,
@@ -3726,6 +3800,7 @@ pub fn assign_idp_13c_cpu(
         Err(msg) => IdpAssignResult {
             position: vec![-1; systems.len()],
             confidence: vec![0.0; systems.len()],
+            raw_posterior: vec![0.0; systems.len()],
             score: 0.0,
             run_scores: Vec::new(),
             fitted_offsets: cfg.manual_offsets,
