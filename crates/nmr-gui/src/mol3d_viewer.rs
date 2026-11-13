@@ -250,7 +250,7 @@ pub struct StructureEnsemble3d {
     pub center: [f64; 3],
     /// Bounding sphere radius (`Å`) around `center`.
     pub bounding_radius: f64,
-    /// Fast coordinate index on conformer `0` for `< 0.5 ms` NOE/PRE restraint evaluation.
+    /// Multi-conformer (`0..M`) coordinate index for `< 2.0 ms` `<r^-6>^(-1/6)` NOE/PRE restraint evaluation.
     pub coord_lookup: AtomCoordLookup,
 }
 
@@ -306,32 +306,38 @@ impl StructureEnsemble3d {
     }
 
     fn rebuild_coord_lookup(&mut self) {
-        if let Some(m0) = self.models.first() {
-            let polymer_iter = m0.chains.iter().flat_map(|c| {
-                c.residues.iter().flat_map(move |r| {
-                    r.atoms.iter().map(move |a| {
-                        (
-                            c.chain_id,
-                            r.seq_id,
-                            r.sequence_idx,
-                            r.res_name.as_str(),
-                            a.atom_name.as_str(),
-                            a.pos,
-                        )
+        if !self.models.is_empty() {
+            let num_models = self.models.len();
+            let all_iter = self.models.iter().enumerate().flat_map(|(m_idx, m)| {
+                let polymer_iter = m.chains.iter().flat_map(move |c| {
+                    c.residues.iter().flat_map(move |r| {
+                        r.atoms.iter().map(move |a| {
+                            (
+                                m_idx,
+                                c.chain_id,
+                                r.seq_id,
+                                r.sequence_idx,
+                                r.res_name.as_str(),
+                                a.atom_name.as_str(),
+                                a.pos,
+                            )
+                        })
                     })
-                })
+                });
+                let het_iter = m.het_atoms.iter().map(move |a| {
+                    (
+                        m_idx,
+                        a.chain_id,
+                        a.seq_id,
+                        None,
+                        a.res_name.as_str(),
+                        a.atom_name.as_str(),
+                        a.pos,
+                    )
+                });
+                polymer_iter.chain(het_iter)
             });
-            let het_iter = m0.het_atoms.iter().map(|a| {
-                (
-                    a.chain_id,
-                    a.seq_id,
-                    None,
-                    a.res_name.as_str(),
-                    a.atom_name.as_str(),
-                    a.pos,
-                )
-            });
-            self.coord_lookup = AtomCoordLookup::from_atom_tuples(polymer_iter.chain(het_iter));
+            self.coord_lookup = AtomCoordLookup::from_ensemble_atom_tuples(num_models, all_iter);
         }
     }
 }
@@ -701,8 +707,26 @@ pub fn parse_pdb_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
     finalize_structure_ensemble(title, raw_atoms, &ss_spans)
 }
 
-/// Tokenize a single mmCIF line using Unicode `chars()` iteration (zero byte-offset slicing).
-fn tokenize_cif_line(line: &str, out: &mut Vec<String>) {
+#[derive(Clone, Debug)]
+struct CifToken {
+    text: String,
+    is_quoted: bool,
+}
+
+#[inline]
+fn is_cif_control_token(tok: &CifToken) -> bool {
+    !tok.is_quoted
+        && (tok.text.starts_with('_')
+            || tok.text.eq_ignore_ascii_case("loop_")
+            || tok.text.starts_with("data_")
+            || tok.text.eq_ignore_ascii_case("stop_")
+            || tok.text.starts_with("save_"))
+}
+
+/// Tokenize a single mmCIF line using Unicode `chars()` iteration (zero byte-offset slicing),
+/// preserving `is_quoted` so quoted values starting with `'_'`, `'loop_'`, or `'data_'` can never
+/// be mistaken for CIF tags or block/loop keywords.
+fn tokenize_cif_line(line: &str, out: &mut Vec<CifToken>) {
     let mut chars = line.chars().peekable();
     while let Some(&ch) = chars.peek() {
         if ch.is_whitespace() {
@@ -722,7 +746,10 @@ fn tokenize_cif_line(line: &str, out: &mut Vec<String>) {
                 }
                 buf.push(c);
             }
-            out.push(buf);
+            out.push(CifToken {
+                text: buf,
+                is_quoted: true,
+            });
         } else {
             let mut buf = String::new();
             while let Some(&c) = chars.peek() {
@@ -732,7 +759,10 @@ fn tokenize_cif_line(line: &str, out: &mut Vec<String>) {
                 buf.push(c);
                 chars.next();
             }
-            out.push(buf);
+            out.push(CifToken {
+                text: buf,
+                is_quoted: false,
+            });
         }
     }
 }
@@ -740,14 +770,17 @@ fn tokenize_cif_line(line: &str, out: &mut Vec<String>) {
 /// Parse a Macromolecular Crystallographic Information File (`.cif` / `.mmcif`) `_atom_site` loop
 /// into a superposed [`StructureEnsemble3d`] using safe Unicode tokenization.
 pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
-    let mut tokens: Vec<String> = Vec::new();
+    let mut tokens: Vec<CifToken> = Vec::new();
     let mut in_semicolon_block = false;
     let mut semi_buf = String::new();
 
     for line in text.lines() {
         if in_semicolon_block {
             if line.starts_with(';') {
-                tokens.push(semi_buf.trim().to_string());
+                tokens.push(CifToken {
+                    text: semi_buf.trim().to_string(),
+                    is_quoted: true,
+                });
                 semi_buf.clear();
                 in_semicolon_block = false;
                 let rest: String = line.chars().skip(1).collect();
@@ -775,24 +808,25 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
 
     while idx < tokens.len() {
         let tok = &tokens[idx];
-        if title.is_empty() && tok.starts_with("data_") {
-            title = tok.chars().skip(5).collect();
+        if !tok.is_quoted && title.is_empty() && tok.text.starts_with("data_") {
+            title = tok.text.chars().skip(5).collect();
             idx += 1;
             continue;
         }
-        if tok == "_struct.title" && idx + 1 < tokens.len() {
-            let t = tokens[idx + 1].trim();
-            if !t.is_empty() && t != "." && t != "?" {
+        if !tok.is_quoted && tok.text == "_struct.title" && idx + 1 < tokens.len() {
+            let t = tokens[idx + 1].text.trim();
+            if !t.is_empty() && (tokens[idx + 1].is_quoted || (t != "." && t != "?")) {
                 title = t.to_string();
             }
             idx += 2;
             continue;
         }
-        if tok.eq_ignore_ascii_case("loop_") {
+        if !tok.is_quoted && tok.text.eq_ignore_ascii_case("loop_") {
             idx += 1;
             let mut headers: Vec<String> = Vec::new();
-            while idx < tokens.len() && tokens[idx].starts_with('_') {
-                headers.push(tokens[idx].to_ascii_lowercase());
+            while idx < tokens.len() && !tokens[idx].is_quoted && tokens[idx].text.starts_with('_')
+            {
+                headers.push(tokens[idx].text.to_ascii_lowercase());
                 idx += 1;
             }
             let ncols = headers.len();
@@ -801,11 +835,7 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             }
             let is_atom_site = headers.iter().any(|h| h.starts_with("_atom_site."));
             if !is_atom_site {
-                while idx < tokens.len()
-                    && !tokens[idx].starts_with('_')
-                    && !tokens[idx].eq_ignore_ascii_case("loop_")
-                    && !tokens[idx].starts_with("data_")
-                {
+                while idx < tokens.len() && !is_cif_control_token(&tokens[idx]) {
                     idx += 1;
                 }
                 continue;
@@ -842,10 +872,7 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
             let mut row_num = 0usize;
             while idx + ncols <= tokens.len() {
                 let first = &tokens[idx];
-                if first.starts_with('_')
-                    || first.eq_ignore_ascii_case("loop_")
-                    || first.starts_with("data_")
-                {
+                if is_cif_control_token(first) {
                     break;
                 }
                 row_num += 1;
@@ -853,30 +880,30 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
                 idx += ncols;
 
                 let ctx = format!("mmCIF _atom_site row {row_num}");
-                let group = c_group.map(|c| row[c].as_str()).unwrap_or("ATOM");
+                let group = c_group.map(|c| row[c].text.as_str()).unwrap_or("ATOM");
                 let is_hetatm = group.eq_ignore_ascii_case("HETATM");
                 let serial = c_serial
-                    .and_then(|c| row[c].parse::<u32>().ok())
+                    .and_then(|c| row[c].text.parse::<u32>().ok())
                     .unwrap_or(row_num as u32);
-                let atom_name = row[c_atom].trim().to_ascii_uppercase();
+                let atom_name = row[c_atom].text.trim().to_ascii_uppercase();
                 let alt_loc = c_alt
-                    .and_then(|c| row[c].chars().next())
+                    .and_then(|c| row[c].text.chars().next())
                     .map(|ch| if ch == '.' || ch == '?' { ' ' } else { ch })
                     .unwrap_or(' ');
-                let res_name = row[c_comp].trim().to_ascii_uppercase();
+                let res_name = row[c_comp].text.trim().to_ascii_uppercase();
                 let chain_id = c_asym
-                    .and_then(|c| row[c].chars().next())
+                    .and_then(|c| row[c].text.chars().next())
                     .filter(|&ch| ch != '.' && ch != '?')
                     .unwrap_or('A');
-                let seq_id: i32 = row[c_seq].parse::<i32>().unwrap_or(row_num as i32);
+                let seq_id: i32 = row[c_seq].text.parse::<i32>().unwrap_or(row_num as i32);
                 let ins_code = c_ins
-                    .and_then(|c| row[c].chars().next())
+                    .and_then(|c| row[c].text.chars().next())
                     .map(|ch| if ch == '.' || ch == '?' { ' ' } else { ch })
                     .unwrap_or(' ');
 
-                let x_val = parse_finite_f64_token(&row[c_x], "Cartn_x", &ctx)?;
-                let y_val = parse_finite_f64_token(&row[c_y], "Cartn_y", &ctx)?;
-                let z_val = parse_finite_f64_token(&row[c_z], "Cartn_z", &ctx)?;
+                let x_val = parse_finite_f64_token(&row[c_x].text, "Cartn_x", &ctx)?;
+                let y_val = parse_finite_f64_token(&row[c_y].text, "Cartn_y", &ctx)?;
+                let z_val = parse_finite_f64_token(&row[c_z].text, "Cartn_z", &ctx)?;
                 let pos = [
                     validate_finite_coord(x_val, 'X', &ctx)?,
                     validate_finite_coord(y_val, 'Y', &ctx)?,
@@ -884,19 +911,19 @@ pub fn parse_mmcif_ensemble(text: &str) -> Result<StructureEnsemble3d, String> {
                 ];
 
                 let occupancy = c_occ
-                    .and_then(|c| row[c].parse::<f32>().ok())
+                    .and_then(|c| row[c].text.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                     .unwrap_or(1.0);
                 let b_factor = c_bfac
-                    .and_then(|c| row[c].parse::<f32>().ok())
+                    .and_then(|c| row[c].text.parse::<f32>().ok())
                     .filter(|v| v.is_finite())
                     .unwrap_or(0.0);
                 let model_num = c_model
-                    .and_then(|c| row[c].parse::<usize>().ok())
+                    .and_then(|c| row[c].text.parse::<usize>().ok())
                     .filter(|&m| m > 0)
                     .unwrap_or(1);
                 let raw_sym = c_symbol
-                    .map(|c| row[c].as_str())
+                    .map(|c| row[c].text.as_str())
                     .filter(|&s| s != "." && s != "?")
                     .unwrap_or("");
                 let element = infer_clean_element(raw_sym, &atom_name, &res_name, is_hetatm);

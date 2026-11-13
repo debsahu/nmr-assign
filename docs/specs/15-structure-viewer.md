@@ -35,15 +35,16 @@
 `parse_pdb_ensemble`, `parse_mmcif_ensemble`, and `parse_structure_auto` ingest single-structure X-ray/AlphaFold coordinates and multi-model NMR ensembles (`MODEL` / `ENDMDL` or `_atom_site.pdbx_PDB_model_num`) via toolbar load, clipboard paste, or drag-and-drop:
 
 1. **Multibyte UTF-8 Byte-Slice Safety**: Fixed-column `.pdb` records (`ATOM`, `HETATM`, `HELIX`, `SHEET`, `MODEL`, `ENDMDL`, `TER`) are parsed **exclusively** on `&[u8]` via `line.as_bytes().get(start..end)` followed by `.is_ascii()` validation before ASCII-to-`&str` conversion. Multibyte UTF-8 characters anywhere in a record or comment never trigger Rust char-boundary panics.
-2. **Coordinate Sanity Gate**: Every parsed $(x, y, z)$, occupancy, and isotropic $B$-factor is validated with `.is_finite()` (`|coord| <= 10^6\text{ Å}`); `NaN`, `Inf`, and `-Inf` coordinates return a structured `Err(...)`.
+2. **Coordinate Sanity Gate**: Every parsed $(x, y, z)$ coordinate is strictly validated with `.is_finite()` (`|coord| <= 10^6\text{ Å}`); `NaN`, `Inf`, and `-Inf` coordinates return a structured `Err(...)`, while missing or non-finite `occupancy` and isotropic $B$-factor fields fall back cleanly to `1.0` and `0.0`.
 3. **Chemical & Altloc Normalization**:
    - Selenomethionine `MSE` `HETATM` polymer residues are normalized to canonical `MET` (mapping `SE` $\to$ `SD`) so selenomethionine crystal references form unbroken backbone splines and bind directly to NMR sequence positions.
    - Alternate-location conformers (`altLoc` column 17 / `_atom_site.label_alt_id`) retain blank/`' '`/`'.'`/`'?'` or `'A'` when present, **and** retain `'B'`-only (first-seen altloc) atoms when a disordered residue omits `'A'` altogether, avoiding missing-atom gaps.
+   - Quoted mmCIF values (`'...'`, `"..."`, and `;...;` multiline blocks) carry an explicit `is_quoted` token flag so literal strings starting with `'_'`, `'loop_'`, or `'data_'` never prematurely terminate loop skipping or trigger control keywords.
    - Non-water metal ions (`ZN`, `FE`, `CU`, `MN`, `MG`, `CA`, `CO`, `NI`, `CD`, `HG`) and iron–sulfur cluster atoms are retained as `MetalSite3d` spheres with automatic coordination-bond cylinders (`d <= 2.75\text{ Å}`) to ligating `CYS SG`, `HIS ND1/NE2`, `ASP OD1/OD2`, `GLU OE1/OE2`, and `MET SD` donors.
 
 ### 1.3 Kabsch–Sander Secondary Structure & Kabsch Ensemble Superposition
 1. **Intrinsic Secondary Structure (`compute_kabsch_sander_secondary_structure`)**:
-   - Reconstructs ideal planar trans-peptide amide proton coordinates $\mathbf{r}_{\text{H}_i} = \mathbf{r}_{\text{N}_i} + 1.01\text{ Å}\cdot\widehat{(\mathbf{r}_{\text{N}_i} - \mathbf{r}_{\text{C}_{i-1}}) + (\mathbf{r}_{\text{N}_i} - \mathbf{r}_{\text{C}\alpha_i})}$ on non-Proline residues when explicit `H` atoms are absent.
+   - Reconstructs ideal trans-peptide amide proton coordinates $\mathbf{r}_{\text{H}_i} = \mathbf{r}_{\text{N}_i} + 1.00\text{ Å}\cdot\widehat{(\mathbf{r}_{\text{C}_{i-1}} - \mathbf{r}_{\text{O}_{i-1}})}$ (`d(C_{i-1}, N_i) <= 2.2 Å`, Kabsch & Sander 1983, p. 2580) on non-Proline residues when explicit `H`/`HN` atoms are absent.
    - Evaluates Kabsch–Sander electrostatic backbone hydrogen-bond energies
      $$E(i, j) = 0.42 \cdot 0.20 \cdot 332 \left(\frac{1}{r_{\text{ON}}} + \frac{1}{r_{\text{CH}}} - \frac{1}{r_{\text{OH}}} - \frac{1}{r_{\text{CN}}}\right)\text{ kcal mol}^{-1}$$
      identifying H-bonds where $E(i, j) < -0.5\text{ kcal mol}^{-1}$.
@@ -55,11 +56,11 @@
      for structural putty scaling and disorder inspection.
 
 ### 1.4 Carson–Bugg Cubic Ribbon Extrusion, Instanced Atoms & Camera/Export Pipeline
-- **Peptide-Plane Cubic Splines**: Consecutive polypeptide segments ($d(\text{C}\alpha_i, \text{C}\alpha_{i+1}) \le 4.6\text{ Å}$) are subdivided (`6` subdivisions/residue on conformer $0$, `3` on bundle conformers) using Catmull–Rom / cubic Hermite guide tangents $\mathbf{T}(t)$ and peptide-plane normal vectors $\mathbf{B}_i = \text{normalize}((\mathbf{r}_{\text{C}\alpha_{i+1}} - \mathbf{r}_{\text{C}\alpha_i}) \times (\mathbf{r}_{\text{O}_i} - \mathbf{r}_{\text{C}\alpha_i}))$ with $\mathbf{B}_i \cdot \mathbf{B}_{i-1} < 0 \implies \mathbf{B}_i \leftarrow -\mathbf{B}_i$ sign-flip suppression across $\beta$-strands.
+- **Peptide-Plane Cubic Splines**: Consecutive polypeptide segments ($d(\text{C}\alpha_i, \text{C}\alpha_{i+1}) \le 4.8\text{ Å}$) are subdivided (`RIBBON_SUBDIVS = 4` subdivisions/residue, `RIBBON_RING_VERTS = 8` elliptical ring vertices) using Catmull–Rom / cubic Hermite guide tangents $\mathbf{T}(t)$ and peptide-plane normal vectors $\mathbf{B}_i = \text{normalize}((\mathbf{r}_{\text{C}\alpha_{i+1}} - \mathbf{r}_{\text{C}\alpha_{i-1}}) \times (\mathbf{r}_{\text{O}_i} - \mathbf{r}_{\text{C}\alpha_i}))$ with $\mathbf{B}_i \cdot \mathbf{B}_{i-1} < 0 \implies \mathbf{B}_i \leftarrow -\mathbf{B}_i$ sign-flip suppression across $\beta$-strands.
 - **Secondary-Structure Cross-Sections**:
-  - `Helix`: wide elliptical ribbon ($w = 1.15\text{ Å},\ h = 0.22\text{ Å}$) with smooth terminal taper.
-  - `Sheet`: flat $\beta$-ribbon ($w = 1.25\text{ Å},\ h = 0.20\text{ Å}$) flaring into a $1.95\text{ Å}$ triangular arrowhead over the C-terminal residue of each strand.
-  - `Coil`: circular tube ($r = 0.26\text{ Å}$), smoothly modulated by putty radius multipliers.
+  - `Helix`: wide elliptical ribbon (half-axes $1.12\text{ Å} \times 0.22\text{ Å}$) with smooth terminal taper.
+  - `Sheet`: flat $\beta$-ribbon (half-axes $1.18\text{ Å} \times 0.20\text{ Å}$) flaring into a $1.95\text{ Å}$ triangular arrowhead over the C-terminal residue of each strand.
+  - `Coil`: circular tube ($r = 0.28\text{ Å}$), smoothly modulated by putty radius multipliers.
 - **Instanced Sidechains, CPK Half-Bonds & Metal Cofactors**: Heavy/polar atoms render via 42-vertex `Subdiv-1` icosphere instances (`SphereInstance`), while covalent bonds render via unit cylinder instances (`CylinderInstance`) split at `v_end.y = 0.5` in `fs_cylinder` for crisp two-tone CPK half-bonds (`C` slate-gray, `N` royal-blue, `O` crimson, `S` gold, `Zn`/`Fe` metallic).
 - **Camera, Slab & Export**:
   - Shoemake quaternion arcball rotation, right/shift-drag pan, scroll zoom, `Perspective` / `Orthographic` projection toggle, and view-space front/back Z-slab clipping (`discard` in `fs_lit` / `fs_cylinder` when $-z_{\text{view}} \notin [z_{\text{slab,near}}, z_{\text{slab,far}}]$).
@@ -84,21 +85,21 @@ Viewport clicks `(local_x, local_y)` unproject through $\mathbf{M}_{\text{VP}}^{
 
 | Quantitative Track (`QuantitativeTrack`) | Physical Domain & Normalization | Putty Radius Law | Colormaps (`ColormapKind`) |
 |---|---|---|---|
-| `AssignmentConfidence` | Solver posterior $p_k \in [0, 1]$ | Swells on uncertain/unassigned regions ($1 - p_k$) or direct $p_k$ | `Viridis`, `Cividis`, `BlueWhiteRed` |
-| `ChemicalShiftIndex` | Wishart `CSI` consensus $\in [-1, +1]$ ($\beta \leftrightarrow \alpha$) | Diverging around $0.0$ | `BlueWhiteRed` (default), `Viridis`, `Cividis` |
+| `AssignmentConfidence` | Solver posterior $p_k \in [0, 1]$ | Linear scaling $r_{\min} + p_k (r_{\max} - r_{\min})$ (unassigned residues render in slate at $r_{\min}$) | `Viridis`, `Cividis`, `BlueWhiteRed` |
+| `ChemicalShiftIndex` | Wishart `CSI` consensus $\in [-1, +1]$ ($\beta \leftrightarrow \alpha$) | Diverging around $0.0$ ($r_{\min} + |\text{CSI}_k|(r_{\max} - r_{\min})$) | `BlueWhiteRed` (default), `Viridis`, `Cividis` |
 | `LipariSzaboS2` | Picosecond–nanosecond order parameter $S^2_k \in [0, 1]$ | Flexible loops ($1 - S^2_k$) swell (`putty` mobility representation) | `Viridis`, `Cividis`, `BlueWhiteRed` |
 | `ChemicalExchangeRex` | $\mu\text{s–ms}$ CPMG/CEST exchange $R_{\text{ex},k}\ (\text{s}^{-1})$ | Proportional to normalized $R_{\text{ex},k} / R_{\text{ex,max}}$ | `Viridis`, `Cividis`, `BlueWhiteRed` |
 | `LigandCsp` | Combined titration shift $\Delta\delta_{\text{comb},k}\ (\text{ppm})$ | Proportional to binding-site $\Delta\delta_{\text{comb},k} / \Delta\delta_{\text{max}}$ | `Viridis`, `Cividis`, `BlueWhiteRed` |
 | `EnsembleRmsd` | Superposed conformer $\text{C}\alpha\ \text{RMSD}_k\ (\text{Å})$ | Proportional to conformational spread | `Viridis`, `Cividis`, `BlueWhiteRed` |
 
 ### 2.3 3D NOE / PRE Distance Restraint & Violation Cylinders (`< 2.0 ms` at `1,500` Cylinders)
-`AtomCoordLookup::evaluate_restraints` indexes all conformer coordinates and degenerate prochiral/methyl/aromatic pseudoatom groups (`HB*`, `HG*`, `HD*`, `HE*`, `MG*`, `MD*`, `QR`, `QB`) once at structure load so filtering or toggling `1,500+` NOE/PRE restraints completes in `< 2.0 ms`:
+`AtomCoordLookup::evaluate_restraints` indexes all conformer coordinates (`0..M`) and expands degenerate prochiral/methyl/aromatic wildcards & pseudoatoms (`HB*`, `HG1*`, `HG2*`, `HD1*`, `HD2*`, `HE*`, `HZ*`, `QB`, `QG*`, `QD*`, `QE*`, `MG*`, `MD*`, `QR`, falling back to heavy parent atoms `CB`/`CG*`/`CD*`/`CE*`/`CZ` only when explicit protons are absent) so filtering or toggling `1,500+` NOE/PRE restraints completes in `< 2.0 ms`:
 
-- **Ensemble $\langle r^{-6} \rangle^{-1/6}$ Effective Distance**: Across all conformers $m \in \{0, \dots, M-1\}$ and ambiguous atom pairs $(a \in A_1, b \in A_2)$,
-  $$r_{\text{eff}} = \left(\frac{1}{M}\sum_{m=0}^{M-1}\sum_{a \in A_1}\sum_{b \in A_2} \left\|\mathbf{r}^{(m)}_a - \mathbf{r}^{(m)}_b\right\|^{-6}\right)^{-1/6}$$
+- **Ensemble $\langle r^{-6} \rangle^{-1/6}$ Effective Distance**: Across all valid conformers $m \in \{0, \dots, M-1\}$ and expanded intra-conformer atom pairs $(a \in A_{1,m}, b \in A_{2,m})$,
+  $$r_{\text{eff}} = \left(\frac{1}{M_{\text{valid}}}\sum_{m}\sum_{a \in A_{1,m}}\sum_{b \in A_{2,m}} \left\|\mathbf{r}^{(m)}_a - \mathbf{r}^{(m)}_b\right\|^{-6}\right)^{-1/6}$$
 - **Upper / Lower Bound Violation Classification**:
   $$\Delta_{\text{viol}} = \max\!\bigl(0,\ r_{\text{eff}} - d_{\text{upper}},\ d_{\text{lower}} - r_{\text{eff}}\bigr)$$
-  - **Satisfied ($\Delta_{\text{viol}} \le 0.0\text{ Å}$)**: Green translucent cylinder (`#33db7a`), thin radius (`0.065 Å`).
-  - **Minor Violation ($0.0\text{ Å} < \Delta_{\text{viol}} < 0.5\text{ Å}$)**: Amber dashed cylinder (`#fabb2e`), medium radius (`0.105 Å`).
-  - **Severe Violation ($\Delta_{\text{viol}} \ge 0.5\text{ Å}$)**: Crimson dashed cylinder (`#f53d47`), thick radius (`0.145 Å`).
-- Interactive filters toggle all restraints, violations-only ($\Delta_{\text{viol}} > 0$), severe-only ($\Delta_{\text{viol}} \ge 0.5\text{ Å}$), sequence-separation range ($|i - j|$), or active-residue-only contacts.
+  - **Satisfied ($\Delta_{\text{viol}} \le 0.0\text{ Å}$)**: Emerald green cylinder (`[0.16, 0.84, 0.46, 0.90]`), thin radius (`0.075 Å`).
+  - **Minor Violation ($0.0\text{ Å} < \Delta_{\text{viol}} < 0.5\text{ Å}$)**: Warm amber cylinder (`[0.96, 0.68, 0.14, 0.95]`), medium radius (`0.105 Å`).
+  - **Severe Violation ($\Delta_{\text{viol}} \ge 0.5\text{ Å}$)**: Crimson red cylinder (`[0.94, 0.22, 0.24, 0.98]`), thick radius (`0.135 Å`).
+- Interactive filters (`RestraintFilterConfig`, solid cylinders by default with toggleable `dashed_cylinders`) toggle all restraints, satisfied/minor/severe bands, or active-residue-only contacts.

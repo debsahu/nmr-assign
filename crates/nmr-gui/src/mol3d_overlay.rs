@@ -465,9 +465,7 @@ impl QuantitativeTrackData {
                     };
                 };
                 let t = (conf as f32).clamp(0.0, 1.0);
-                // Putty radius highlights uncertainty (`1 - conf`) or confidence directly:
-                // wider putty on low-confidence / uncertain regions aids rapid visual triage,
-                // while keeping well-bounded `[min_r, max_r]` scaling proportional to `t`!
+                // Putty radius scales linearly in `[min_r, max_r]` with posterior confidence `t`:
                 let r = if self.putty_enabled {
                     min_r + t * (max_r - min_r)
                 } else {
@@ -1174,36 +1172,273 @@ pub struct RestraintOverlayBuild {
     pub rms_violation_angstrom: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct IndexedAtomEntry {
     chain_id: char,
     seq_id: i32,
     residue_idx: Option<usize>,
     res_name_idx: u16,
-    atom_name: String,
+    name_len: u8,
+    name_bytes: [u8; 6],
     pos: [f32; 3],
 }
 
-/// Compact pre-sorted `(seq_id)` atom coordinate index enabling `< 0.5 ms` evaluation across `1,500+`
-/// NOE/PRE restraints without per-frame hash-map string allocations.
+impl IndexedAtomEntry {
+    #[inline]
+    fn from_parts(
+        chain_id: char,
+        seq_id: i32,
+        residue_idx: Option<usize>,
+        res_name_idx: u16,
+        atom_name: &str,
+        pos: [f32; 3],
+    ) -> Self {
+        let mut name_bytes = [0u8; 6];
+        let mut len = 0usize;
+        for b in atom_name.bytes().take(6) {
+            if b.is_ascii() {
+                name_bytes[len] = b.to_ascii_uppercase();
+                len += 1;
+            }
+        }
+        Self {
+            chain_id,
+            seq_id,
+            residue_idx,
+            res_name_idx,
+            name_len: len as u8,
+            name_bytes,
+            pos,
+        }
+    }
+
+    #[inline]
+    fn atom_name_str(&self) -> &str {
+        std::str::from_utf8(&self.name_bytes[..(self.name_len as usize)]).unwrap_or("")
+    }
+
+    #[inline]
+    fn same_atom_key(&self, other: &Self) -> bool {
+        self.name_len == other.name_len
+            && self.name_bytes == other.name_bytes
+            && self.chain_id == other.chain_id
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModelCoordSlice {
+    atoms: Vec<IndexedAtomEntry>,
+    min_seq_id: i32,
+    /// Optional O(1) `(start, end)` range table indexed by `(seq_id - min_seq_id) as usize`
+    /// when `max_seq_id - min_seq_id <= 16_384`.
+    seq_ranges: Vec<(u32, u32)>,
+}
+
+impl ModelCoordSlice {
+    fn from_entries(mut atoms: Vec<IndexedAtomEntry>) -> Self {
+        atoms.sort_by_key(|e| e.seq_id);
+        let mut seq_ranges = Vec::new();
+        let mut min_seq_id = 0i32;
+        if let (Some(first), Some(last)) = (atoms.first(), atoms.last()) {
+            min_seq_id = first.seq_id;
+            let span = (last.seq_id as i64) - (first.seq_id as i64);
+            if (0..=16_384).contains(&span) {
+                let len = (span as usize) + 1;
+                seq_ranges = vec![(0u32, 0u32); len];
+                let mut i = 0usize;
+                while i < atoms.len() {
+                    let sid = atoms[i].seq_id;
+                    let start = i;
+                    while i < atoms.len() && atoms[i].seq_id == sid {
+                        i += 1;
+                    }
+                    let slot = (sid - min_seq_id) as usize;
+                    seq_ranges[slot] = (start as u32, i as u32);
+                }
+            }
+        }
+        Self {
+            atoms,
+            min_seq_id,
+            seq_ranges,
+        }
+    }
+
+    #[inline]
+    fn atoms_for_seq_id(&self, seq_id: i32) -> &[IndexedAtomEntry] {
+        if !self.seq_ranges.is_empty() {
+            let off = (seq_id as i64) - (self.min_seq_id as i64);
+            if off < 0 || (off as usize) >= self.seq_ranges.len() {
+                return &[];
+            }
+            let (s, e) = self.seq_ranges[off as usize];
+            return &self.atoms[(s as usize)..(e as usize)];
+        }
+        let s = self.atoms.partition_point(|e| e.seq_id < seq_id);
+        let mut e = s;
+        while e < self.atoms.len() && self.atoms[e].seq_id == seq_id {
+            e += 1;
+        }
+        &self.atoms[s..e]
+    }
+}
+
+#[inline]
+fn is_proton_prefix(atom_name: &str, prefix: &str) -> bool {
+    if atom_name.starts_with(prefix) {
+        return true;
+    }
+    // Support legacy PDB digit-prefixed proton names such as `1HG1`, `2HD2`, `3HB`
+    let bytes = atom_name.as_bytes();
+    bytes.len() > prefix.len()
+        && bytes[0].is_ascii_digit()
+        && bytes[1..].starts_with(prefix.as_bytes())
+}
+
+#[inline]
+fn matches_primary_or_pseudoatom(target: &str, atom_name: &str) -> bool {
+    if atom_name == target
+        || (target == "HN" && atom_name == "H")
+        || (target == "H" && atom_name == "HN")
+    {
+        return true;
+    }
+    let stem = target.trim_end_matches(['*', '%', '#']);
+    if stem.len() < target.len() && !stem.is_empty() {
+        return is_proton_prefix(atom_name, stem);
+    }
+    match target {
+        "QA" => is_proton_prefix(atom_name, "HA"),
+        "QB" | "MB" => is_proton_prefix(atom_name, "HB"),
+        "QG" | "MG" => is_proton_prefix(atom_name, "HG"),
+        "QG1" | "MG1" => is_proton_prefix(atom_name, "HG1"),
+        "QG2" | "MG2" => is_proton_prefix(atom_name, "HG2"),
+        "QQG" => is_proton_prefix(atom_name, "HG1") || is_proton_prefix(atom_name, "HG2"),
+        "QD" | "MD" => is_proton_prefix(atom_name, "HD"),
+        "QD1" | "MD1" => is_proton_prefix(atom_name, "HD1"),
+        "QD2" | "MD2" => is_proton_prefix(atom_name, "HD2"),
+        "QQD" => is_proton_prefix(atom_name, "HD1") || is_proton_prefix(atom_name, "HD2"),
+        "QE" | "ME" => is_proton_prefix(atom_name, "HE"),
+        "QE1" => is_proton_prefix(atom_name, "HE1"),
+        "QE2" => is_proton_prefix(atom_name, "HE2"),
+        "QZ" | "MZ" => is_proton_prefix(atom_name, "HZ"),
+        "QH1" => is_proton_prefix(atom_name, "HH1"),
+        "QH2" => is_proton_prefix(atom_name, "HH2"),
+        "QR" => matches!(
+            atom_name,
+            "HD1" | "HD2" | "HE1" | "HE2" | "HE3" | "HZ" | "HZ2" | "HZ3" | "HH2"
+        ),
+        _ => false,
+    }
+}
+
+#[inline]
+fn matches_heavy_parent_fallback(target: &str, atom_name: &str) -> bool {
+    let stem = target.trim_end_matches(['*', '%', '#']);
+    if target == "H" || target == "HN" {
+        return atom_name == "N";
+    }
+    if target == "QA" || stem.starts_with("HA") {
+        return atom_name == "CA";
+    }
+    if target == "QB" || target == "MB" || stem.starts_with("HB") {
+        return atom_name == "CB";
+    }
+    if target == "QG1" || target == "MG1" || stem.starts_with("HG1") {
+        return matches!(atom_name, "CG1" | "CG" | "OG1" | "SG");
+    }
+    if target == "QG2" || target == "MG2" || stem.starts_with("HG2") {
+        return matches!(atom_name, "CG2" | "CG");
+    }
+    if matches!(target, "QG" | "QQG" | "MG") || stem.starts_with("HG") {
+        return matches!(atom_name, "CG" | "CG1" | "CG2" | "OG" | "OG1" | "SG");
+    }
+    if target == "QD1" || target == "MD1" || stem.starts_with("HD1") {
+        return matches!(atom_name, "CD1" | "CD" | "ND1" | "OD1");
+    }
+    if target == "QD2" || target == "MD2" || stem.starts_with("HD2") {
+        return matches!(atom_name, "CD2" | "CD" | "ND2" | "OD2");
+    }
+    if matches!(target, "QD" | "QQD" | "MD") || stem.starts_with("HD") {
+        return matches!(
+            atom_name,
+            "CD" | "CD1" | "CD2" | "ND1" | "ND2" | "OD1" | "OD2"
+        );
+    }
+    if target == "QE1" || stem.starts_with("HE1") {
+        return matches!(atom_name, "CE1" | "CE" | "NE1" | "OE1");
+    }
+    if target == "QE2" || stem.starts_with("HE2") {
+        return matches!(atom_name, "CE2" | "CE" | "NE2" | "OE2");
+    }
+    if stem.starts_with("HE3") {
+        return atom_name == "CE3";
+    }
+    if matches!(target, "QE" | "ME") || stem.starts_with("HE") {
+        return matches!(
+            atom_name,
+            "CE" | "CE1" | "CE2" | "CE3" | "NE" | "NE1" | "NE2" | "OE1" | "OE2"
+        );
+    }
+    if matches!(target, "QZ" | "MZ") || stem.starts_with("HZ") {
+        return matches!(atom_name, "CZ" | "CZ2" | "CZ3" | "NZ");
+    }
+    if target == "QH1" || stem.starts_with("HH1") {
+        return atom_name == "NH1";
+    }
+    if target == "QH2" || stem.starts_with("HH2") {
+        return matches!(atom_name, "NH2" | "CH2");
+    }
+    if stem.starts_with("HH") {
+        return matches!(atom_name, "OH" | "NH1" | "NH2" | "CH2");
+    }
+    if target == "QR" {
+        return matches!(
+            atom_name,
+            "CD1" | "CD2" | "CE1" | "CE2" | "CE3" | "CZ" | "CZ2" | "CZ3" | "CH2"
+        );
+    }
+    false
+}
+
+/// Compact pre-sorted multi-conformer `(model, seq_id)` atom coordinate index enabling `< 2.0 ms`
+/// `<r^-6>^(-1/6)` ensemble + pseudoatom evaluation across `1,500+` NOE/PRE restraints without
+/// per-frame heap allocations.
 #[derive(Clone, Debug, Default)]
 pub struct AtomCoordLookup {
     res_names: Vec<String>,
-    /// Sorted by `seq_id` for O(log N) range lookup + tiny linear scan over `~8-20` atoms in residue.
-    atoms: Vec<IndexedAtomEntry>,
+    models: Vec<ModelCoordSlice>,
 }
 
 impl AtomCoordLookup {
-    /// Construct a fast coordinate lookup index from `(chain_id, seq_id, residue_idx, res_name, atom_name, pos)` tuples.
+    /// Construct a single-model coordinate lookup index from `(chain_id, seq_id, residue_idx, res_name, atom_name, pos)` tuples.
     pub fn from_atom_tuples<'a, I>(iter: I) -> Self
     where
         I: IntoIterator<Item = (char, i32, Option<usize>, &'a str, &'a str, [f32; 3])>,
     {
+        Self::from_ensemble_atom_tuples(
+            1,
+            iter.into_iter().map(|(ch, sid, ridx, rname, aname, pos)| {
+                (0usize, ch, sid, ridx, rname, aname, pos)
+            }),
+        )
+    }
+
+    /// Construct a multi-conformer (`0..num_models`) coordinate lookup index from
+    /// `(model_idx, chain_id, seq_id, residue_idx, res_name, atom_name, pos)` tuples.
+    pub fn from_ensemble_atom_tuples<'a, I>(num_models: usize, iter: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, char, i32, Option<usize>, &'a str, &'a str, [f32; 3])>,
+    {
+        let n_m = num_models.max(1);
         let mut res_names: Vec<String> = Vec::new();
         let mut res_map: BTreeMap<String, u16> = BTreeMap::new();
-        let mut atoms = Vec::new();
+        let mut per_model: Vec<Vec<IndexedAtomEntry>> = vec![Vec::new(); n_m];
 
-        for (chain_id, seq_id, residue_idx, res_name, atom_name, pos) in iter {
+        for (model_idx, chain_id, seq_id, residue_idx, res_name, atom_name, pos) in iter {
+            if model_idx >= n_m {
+                continue;
+            }
             let r_idx = if let Some(&id) = res_map.get(res_name) {
                 id
             } else {
@@ -1212,57 +1447,92 @@ impl AtomCoordLookup {
                 res_map.insert(res_name.to_string(), id);
                 id
             };
-            atoms.push(IndexedAtomEntry {
+            per_model[model_idx].push(IndexedAtomEntry::from_parts(
                 chain_id,
                 seq_id,
                 residue_idx,
-                res_name_idx: r_idx,
-                atom_name: atom_name.to_string(),
+                r_idx,
+                atom_name,
                 pos,
-            });
+            ));
         }
-        atoms.sort_by_key(|e| e.seq_id);
-        Self { res_names, atoms }
+        let models = per_model
+            .into_iter()
+            .map(ModelCoordSlice::from_entries)
+            .collect();
+        Self { res_names, models }
     }
 
-    #[inline]
-    fn find_atom(&self, sel: &RestraintAtomSelector) -> Option<&IndexedAtomEntry> {
-        let start = self.atoms.partition_point(|e| e.seq_id < sel.seq_id);
-        let target = sel.atom_name.as_str();
-        let mut fallback_ca: Option<&IndexedAtomEntry> = None;
+    /// Number of indexed structure conformers (`M >= 1`).
+    pub fn model_count(&self) -> usize {
+        self.models.len()
+    }
 
-        for entry in &self.atoms[start..] {
-            if entry.seq_id != sel.seq_id {
-                break;
-            }
+    /// Resolve `sel` in conformer `model_idx` into a stack buffer `out_rel` (`<= 24` relative indices
+    /// into `atoms_for_seq_id(sel.seq_id)`), expanding wildcards (`HB*`, `HG1*`, `HD1*`, `HE*`, `HZ*`)
+    /// and NMR/IUPAC pseudoatoms (`QB`, `QG*`, `QD*`, `QE*`, `MG*`, `MD*`, `QR`), falling back to
+    /// heavy parent atoms (`CB`, `CG*`, `CD*`, `CE*`, `CZ`) ONLY when explicit protons are absent.
+    #[inline]
+    fn resolve_rel_indices_in_slice(
+        candidates: &[IndexedAtomEntry],
+        sel: &RestraintAtomSelector,
+        out_rel: &mut [u16; 24],
+    ) -> usize {
+        if candidates.is_empty() {
+            return 0;
+        }
+        let target = sel.atom_name.as_str();
+        let mut count = 0usize;
+        let mut heavy_count = 0usize;
+        let mut heavy_rel = [0u16; 12];
+        let mut fallback_ca_rel: Option<u16> = None;
+
+        for (rel_i, entry) in candidates.iter().enumerate() {
             if let Some(ch) = sel.chain_id {
                 if !entry.chain_id.eq_ignore_ascii_case(&ch) {
                     continue;
                 }
             }
-            if entry.atom_name == target
-                || (target == "HN" && entry.atom_name == "H")
-                || (target == "H" && entry.atom_name == "HN")
-            {
-                return Some(entry);
-            }
-            if ((target == "QB" || target.starts_with("HB")) && entry.atom_name == "CB")
-                || (fallback_ca.is_none() && entry.atom_name == "CA")
-            {
-                fallback_ca = Some(entry);
+            let aname = entry.atom_name_str();
+            if matches_primary_or_pseudoatom(target, aname) {
+                if count < out_rel.len() {
+                    out_rel[count] = rel_i as u16;
+                    count += 1;
+                }
+            } else if count == 0 {
+                if matches_heavy_parent_fallback(target, aname) && heavy_count < heavy_rel.len() {
+                    heavy_rel[heavy_count] = rel_i as u16;
+                    heavy_count += 1;
+                } else if fallback_ca_rel.is_none() && aname == "CA" {
+                    fallback_ca_rel = Some(rel_i as u16);
+                }
             }
         }
-        fallback_ca
+
+        if count > 0 {
+            return count;
+        }
+        if heavy_count > 0 {
+            out_rel[..heavy_count].copy_from_slice(&heavy_rel[..heavy_count]);
+            return heavy_count;
+        }
+        if let Some(ca_i) = fallback_ca_rel {
+            out_rel[0] = ca_i;
+            return 1;
+        }
+        0
     }
 
-    /// Evaluate `restraints` against this coordinate index and emit filtered GPU [`CylinderInstance`]s.
+    /// Evaluate `restraints` across all indexed conformers (`0..M`) using Nilges (`J. Mol. Biol.` 1995)
+    /// ensemble + intra-conformer `<r^-6>^(-1/6)` effective distance averaging and emit filtered GPU
+    /// [`CylinderInstance`]s in `< 2.0 ms`.
     pub fn evaluate_restraints(
         &self,
         restraints: &[DistanceRestraint3d],
         filter: &RestraintFilterConfig,
     ) -> RestraintOverlayBuild {
         let mut out = RestraintOverlayBuild::default();
-        if restraints.is_empty() {
+        if restraints.is_empty() || self.models.is_empty() {
             return out;
         }
         out.cylinders.reserve(restraints.len());
@@ -1271,6 +1541,22 @@ impl AtomCoordLookup {
         let dash_flag = if filter.dashed_cylinders { 6.0 } else { 0.0 };
         let mut sq_viol_sum = 0.0f64;
         let mut n_eval = 0usize;
+        let n_models = self.models.len();
+
+        let mut rel_a0 = [0u16; 24];
+        let mut rel_b0 = [0u16; 24];
+        let mut rel_am = [0u16; 24];
+        let mut rel_bm = [0u16; 24];
+        let mut model_contrib = vec![0.0f64; n_models];
+
+        #[derive(Clone, Copy)]
+        struct AnchorCandidate {
+            first_a: IndexedAtomEntry,
+            p0: [f32; 3],
+            p1: [f32; 3],
+            model_idx: usize,
+            score: f64,
+        }
 
         for r in restraints {
             if filter.selected_residue_only {
@@ -1285,28 +1571,145 @@ impl AtomCoordLookup {
                 }
             }
 
-            let mut r_inv6_sum = 0.0f64;
-            let mut primary_pair: Option<(&IndexedAtomEntry, &IndexedAtomEntry, f64)> = None;
+            model_contrib.fill(0.0);
+            let mut anchor_best: Option<AnchorCandidate> = None;
 
             for (sa, sb) in &r.members {
-                let (Some(ea), Some(eb)) = (self.find_atom(sa), self.find_atom(sb)) else {
-                    continue;
-                };
-                let dx = (ea.pos[0] - eb.pos[0]) as f64;
-                let dy = (ea.pos[1] - eb.pos[1]) as f64;
-                let dz = (ea.pos[2] - eb.pos[2]) as f64;
-                let d2 = (dx * dx + dy * dy + dz * dz).max(1e-6);
-                let d = d2.sqrt();
-                r_inv6_sum += d2.powi(-3);
-                if primary_pair.is_none_or(|(_, _, bd)| d < bd) {
-                    primary_pair = Some((ea, eb, d));
+                // Fast path: resolve relative offsets once on conformer 0 and reuse directly on
+                // conformers `1..M-1` whenever atom slots match (`same_atom_key`), falling back
+                // to full per-conformer scan only for heterogeneous conformers!
+                let cand_a0 = self.models[0].atoms_for_seq_id(sa.seq_id);
+                let cand_b0 = self.models[0].atoms_for_seq_id(sb.seq_id);
+                let na0 = Self::resolve_rel_indices_in_slice(cand_a0, sa, &mut rel_a0);
+                let nb0 = Self::resolve_rel_indices_in_slice(cand_b0, sb, &mut rel_b0);
+
+                for (m_idx, m_slice) in self.models.iter().enumerate() {
+                    let cand_am = if m_idx == 0 {
+                        cand_a0
+                    } else {
+                        m_slice.atoms_for_seq_id(sa.seq_id)
+                    };
+                    if cand_am.is_empty() {
+                        continue;
+                    }
+                    let cand_bm = if m_idx == 0 {
+                        cand_b0
+                    } else {
+                        m_slice.atoms_for_seq_id(sb.seq_id)
+                    };
+                    if cand_bm.is_empty() {
+                        continue;
+                    }
+
+                    let (use_a, na): (&[u16], usize) = if m_idx == 0
+                        || (na0 > 0
+                            && cand_am.len() == cand_a0.len()
+                            && rel_a0[..na0].iter().all(|&ri| {
+                                cand_am[ri as usize].same_atom_key(&cand_a0[ri as usize])
+                            })) {
+                        (&rel_a0, na0)
+                    } else {
+                        let c = Self::resolve_rel_indices_in_slice(cand_am, sa, &mut rel_am);
+                        (&rel_am, c)
+                    };
+                    if na == 0 {
+                        continue;
+                    }
+
+                    let (use_b, nb): (&[u16], usize) = if m_idx == 0
+                        || (nb0 > 0
+                            && cand_bm.len() == cand_b0.len()
+                            && rel_b0[..nb0].iter().all(|&ri| {
+                                cand_bm[ri as usize].same_atom_key(&cand_b0[ri as usize])
+                            })) {
+                        (&rel_b0, nb0)
+                    } else {
+                        let c = Self::resolve_rel_indices_in_slice(cand_bm, sb, &mut rel_bm);
+                        (&rel_bm, c)
+                    };
+                    if nb == 0 {
+                        continue;
+                    }
+
+                    let mut member_inv6 = 0.0f64;
+                    for &ia in &use_a[..na] {
+                        let pa = cand_am[ia as usize].pos;
+                        for &ib in &use_b[..nb] {
+                            let pb = cand_bm[ib as usize].pos;
+                            let dx = (pa[0] - pb[0]) as f64;
+                            let dy = (pa[1] - pb[1]) as f64;
+                            let dz = (pa[2] - pb[2]) as f64;
+                            let d2 = (dx * dx + dy * dy + dz * dz).max(1e-6);
+                            let inv_d2 = 1.0 / d2;
+                            member_inv6 += inv_d2 * inv_d2 * inv_d2;
+                        }
+                    }
+                    model_contrib[m_idx] += member_inv6;
+
+                    // Prefer conformer 0 (primary opaque conformer) for cylinder endpoints
+                    let replace_anchor = match anchor_best {
+                        None => true,
+                        Some(best) => m_idx == best.model_idx && member_inv6 > best.score,
+                    };
+                    if replace_anchor {
+                        let first_a = cand_am[use_a[0] as usize];
+                        let mut ca = [0.0f32; 3];
+                        for &ia in &use_a[..na] {
+                            let p = cand_am[ia as usize].pos;
+                            ca[0] += p[0];
+                            ca[1] += p[1];
+                            ca[2] += p[2];
+                        }
+                        let inv_na = 1.0 / (na as f32);
+                        ca[0] *= inv_na;
+                        ca[1] *= inv_na;
+                        ca[2] *= inv_na;
+
+                        let mut cb = [0.0f32; 3];
+                        for &ib in &use_b[..nb] {
+                            let p = cand_bm[ib as usize].pos;
+                            cb[0] += p[0];
+                            cb[1] += p[1];
+                            cb[2] += p[2];
+                        }
+                        let inv_nb = 1.0 / (nb as f32);
+                        cb[0] *= inv_nb;
+                        cb[1] *= inv_nb;
+                        cb[2] *= inv_nb;
+
+                        anchor_best = Some(AnchorCandidate {
+                            first_a,
+                            p0: ca,
+                            p1: cb,
+                            model_idx: m_idx,
+                            score: member_inv6,
+                        });
+                    }
                 }
             }
 
-            let Some((ea, eb, _)) = primary_pair else {
+            let Some(AnchorCandidate {
+                first_a: ea,
+                p0,
+                p1,
+                ..
+            }) = anchor_best
+            else {
                 continue;
             };
-            let d_eff = r_inv6_sum.powf(-1.0 / 6.0);
+            let mut ensemble_inv6_sum = 0.0f64;
+            let mut valid_models = 0usize;
+            for &mc in &model_contrib {
+                if mc > 0.0 {
+                    ensemble_inv6_sum += mc;
+                    valid_models += 1;
+                }
+            }
+            if valid_models == 0 || ensemble_inv6_sum <= 0.0 {
+                continue;
+            }
+            let mean_inv6 = ensemble_inv6_sum / (valid_models as f64);
+            let d_eff = mean_inv6.powf(-1.0 / 6.0);
             let viol = if d_eff > r.upper_angstrom {
                 d_eff - r.upper_angstrom
             } else if d_eff < r.lower_angstrom {
@@ -1330,6 +1733,7 @@ impl AtomCoordLookup {
                 .get(ea.res_name_idx as usize)
                 .cloned()
                 .unwrap_or_default();
+            let ea_atom_name = ea.atom_name_str().to_string();
 
             let visible = filter.enabled
                 && match status {
@@ -1341,8 +1745,8 @@ impl AtomCoordLookup {
             if visible {
                 let rad = status.radius_angstrom();
                 out.cylinders.push(CylinderInstance::uniform(
-                    ea.pos,
-                    eb.pos,
+                    p0,
+                    p1,
                     rad,
                     status.rgba(),
                     dash_flag,
@@ -1353,9 +1757,9 @@ impl AtomCoordLookup {
                     seq_id: ea.seq_id,
                     residue_idx: ea.residue_idx,
                     residue_name: res_name.clone(),
-                    atom_name: ea.atom_name.clone(),
-                    p0: [ea.pos[0] as f64, ea.pos[1] as f64, ea.pos[2] as f64],
-                    p1: [eb.pos[0] as f64, eb.pos[1] as f64, eb.pos[2] as f64],
+                    atom_name: ea_atom_name.clone(),
+                    p0: [p0[0] as f64, p0[1] as f64, p0[2] as f64],
+                    p1: [p1[0] as f64, p1[1] as f64, p1[2] as f64],
                     pick_radius: (rad as f64).max(0.14),
                 });
             }
@@ -1363,13 +1767,13 @@ impl AtomCoordLookup {
             out.evaluated.push(EvaluatedRestraint3d {
                 id: r.id,
                 kind: r.kind,
-                p0: ea.pos,
-                p1: eb.pos,
+                p0,
+                p1,
                 anchor_chain: ea.chain_id,
                 anchor_seq_id: ea.seq_id,
                 anchor_res_idx: ea.residue_idx,
                 anchor_res_name: res_name,
-                anchor_atom: ea.atom_name.clone(),
+                anchor_atom: ea_atom_name,
                 effective_distance: d_eff,
                 upper_angstrom: r.upper_angstrom,
                 violation_angstrom: viol,

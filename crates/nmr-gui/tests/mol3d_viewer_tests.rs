@@ -164,10 +164,21 @@ fn test_pdb_and_mmcif_parsing_mse_altloc_and_hostile_utf8_safety() {
     assert!(ubiq.total_atom_count() >= 600);
     assert!(ubiq.bounding_radius > 10.0 && ubiq.bounding_radius < 40.0);
 
-    // 2. Multi-model mmCIF with MSE -> MET normalization, B-only altloc retention, A+B altloc deduplication, and ZN cofactor
+    // 2. Multi-model mmCIF with quoted-token CIF control-keyword traps ('_...', 'data_...', "loop_", ';...;'),
+    //    MSE -> MET normalization, B-only altloc retention, A+B altloc deduplication, and ZN cofactor
     let mmcif = "\
 data_test_mse_altloc_zn
 _entry.id 'TEST_MMCIF'
+loop_
+_audit_author.name
+_audit_author.pdbx_ordinal
+_audit_author.note
+'_quoted_underscore_not_a_tag' 1 'data_fake_block_inside_quotes'
+\"loop_\" 2
+; _multiline_quoted_note
+data_fake_multiline
+loop_
+;
 loop_
 _atom_site.group_PDB
 _atom_site.id
@@ -726,6 +737,205 @@ fn test_1500_noe_pre_restraint_cylinders_under_2ms() {
     assert!(
         toggle_ms < 2.0,
         "Toggling 1,500 restraint cylinders took {toggle_ms:.3} ms (gate: < 2.0 ms)"
+    );
+
+    // Also verify 1,500 restraints across a full 20-conformer 150-residue ensemble stay < 2.0 ms!
+    let pdb_20x150 = synthesize_nmr_ensemble_pdb(20, 150);
+    let ens_20 = parse_pdb_ensemble(&pdb_20x150).expect("20x150 parses");
+    assert_eq!(ens_20.coord_lookup.model_count(), 20);
+    let _ = ens_20
+        .coord_lookup
+        .evaluate_restraints(&restraints, &filter_all);
+    let t_ens = Instant::now();
+    let ov_20 = ens_20
+        .coord_lookup
+        .evaluate_restraints(&restraints, &filter_all);
+    let ens_ms = t_ens.elapsed().as_secs_f64() * 1000.0;
+    println!("[mol3d 20-model restraint bench] models=20 n=1500 eval={ens_ms:.3} ms");
+    assert_eq!(ov_20.evaluated.len(), 1_500);
+    assert!(
+        ens_ms < 2.0,
+        "20-conformer 1,500-restraint <r^-6> evaluation took {ens_ms:.3} ms (gate: < 2.0 ms)"
+    );
+}
+
+#[test]
+fn test_multi_conformer_r_inv6_and_pseudoatom_hd1_hg1_qr_expansion() {
+    // 1. Build a 4-conformer PDB with identical CA backbone (so Kabsch superposition is exact identity),
+    //    where conformer 1 has LEU 1 HD1* far from VAL 2 HG1* (~5.8 A), while conformers 2..4 pack
+    //    LEU 1 HD1* against VAL 2 HG1* (~3.2 A) and PHE 3 QR (~3.4 A), while CA-CA distances are >= 9.2 A!
+    let mut pdb = String::new();
+    for model_num in 1..=4 {
+        pdb.push_str(&format!("MODEL     {model_num:>4}\n"));
+        // LEU 1 (CA at x = 0.0, y = 0.0, z = 0.0; methyl HD1* flips x = 0.2 in model 1 vs x = 3.2 in models 2..4)
+        let hd1_x = if model_num == 1 { 0.20 } else { 3.20 };
+        let leu_atoms: &[(&str, &str, f64, f64, f64)] = &[
+            ("N", "N", -1.20, 0.40, 0.00),
+            ("CA", "C", 0.00, 0.00, 0.00),
+            ("C", "C", 1.25, 0.60, 0.00),
+            ("O", "O", 1.35, 1.82, 0.00),
+            ("CB", "C", 0.30, -1.50, 0.00),
+            ("CG", "C", 1.60, -2.10, 0.00),
+            ("CD1", "C", hd1_x - 0.35, -2.50, 0.00),
+            ("HD11", "H", hd1_x, -2.30, 0.25),
+            ("HD12", "H", hd1_x, -2.70, 0.00),
+            ("HD13", "H", hd1_x, -2.50, -0.25),
+        ];
+        let mut serial = 1;
+        for &(aname, elem, x, y, z) in leu_atoms {
+            pdb.push_str(&format!(
+                "ATOM  {:>5} {:<4} LEU A   1    {:>8.3}{:>8.3}{:>8.3}  1.00 12.00          {:>2}\n",
+                serial, aname, x, y, z, elem
+            ));
+            serial += 1;
+        }
+
+        // VAL 2 (CA at x = 9.20 -> CA(1)-CA(2) = 9.20 A! Methyl HG1* at x = 6.10, y = -2.50)
+        // In model 1: |6.10 - 0.20| = 5.90 A; in models 2..4: |6.10 - 3.20| = 2.90 A!
+        let val_atoms: &[(&str, &str, f64, f64, f64)] = &[
+            ("N", "N", 8.00, 0.40, 0.00),
+            ("CA", "C", 9.20, 0.00, 0.00),
+            ("C", "C", 10.45, 0.60, 0.00),
+            ("O", "O", 10.55, 1.82, 0.00),
+            ("CB", "C", 8.60, -1.50, 0.00),
+            ("CG1", "C", 7.10, -2.30, 0.00),
+            ("HG11", "H", 6.10, -2.30, 0.25),
+            ("HG12", "H", 6.10, -2.70, 0.00),
+            ("HG13", "H", 6.10, -2.50, -0.25),
+        ];
+        for &(aname, elem, x, y, z) in val_atoms {
+            pdb.push_str(&format!(
+                "ATOM  {:>5} {:<4} VAL A   2    {:>8.3}{:>8.3}{:>8.3}  1.00 12.00          {:>2}\n",
+                serial, aname, x, y, z, elem
+            ));
+            serial += 1;
+        }
+
+        // PHE 3 (CA at x = 3.20, y = 7.40 -> CA(1)-CA(3) = 8.06 A; aromatic ring protons near y = 0.70..1.20,
+        // so ~3.3..3.8 A from LEU 1 HD1* in models 2..4!)
+        let phe_atoms: &[(&str, &str, f64, f64, f64)] = &[
+            ("N", "N", 2.10, 7.80, 0.00),
+            ("CA", "C", 3.20, 7.40, 0.00),
+            ("C", "C", 4.45, 7.95, 0.00),
+            ("O", "O", 4.60, 9.15, 0.00),
+            ("CB", "C", 3.20, 5.88, 0.00),
+            ("CG", "C", 3.20, 4.38, 0.00),
+            ("CD1", "C", 2.05, 3.62, 0.00),
+            ("CD2", "C", 4.35, 3.62, 0.00),
+            ("CE1", "C", 2.05, 2.24, 0.00),
+            ("CE2", "C", 4.35, 2.24, 0.00),
+            ("CZ", "C", 3.20, 1.54, 0.00),
+            ("HD1", "H", 1.12, 4.15, 0.00),
+            ("HD2", "H", 5.28, 4.15, 0.00),
+            ("HE1", "H", 1.12, 1.70, 0.00),
+            ("HE2", "H", 5.28, 1.70, 0.00),
+            ("HZ", "H", 3.20, 0.46, 0.00),
+        ];
+        for &(aname, elem, x, y, z) in phe_atoms {
+            pdb.push_str(&format!(
+                "ATOM  {:>5} {:<4} PHE A   3    {:>8.3}{:>8.3}{:>8.3}  1.00 12.00          {:>2}\n",
+                serial, aname, x, y, z, elem
+            ));
+            serial += 1;
+        }
+        pdb.push_str("ENDMDL\n");
+    }
+    pdb.push_str("END\n");
+
+    let ens = parse_pdb_ensemble(&pdb).expect("4-model methyl/aromatic ensemble parses");
+    assert_eq!(ens.models.len(), 4);
+    assert_eq!(ens.coord_lookup.model_count(), 4);
+
+    // Unambiguous single-atom check across 4 conformers: LEU 1 CD1 to VAL 2 CG1
+    // Model 1: |(0.20 - 0.35) - 7.10| = 7.25 A, dy = 0.20 -> d1 = sqrt(7.25^2 + 0.04) = 7.252758 A
+    // Models 2..4: |(3.20 - 0.35) - 7.10| = 4.25 A, dy = 0.20 -> d2 = sqrt(4.25^2 + 0.04) = 4.254703 A
+    // Conformer-0-only would give 7.253 A; true 4-conformer <r^-6>^(-1/6) gives ~4.456 A!
+    let d1_sq: f64 = 7.25_f64.powi(2) + 0.20_f64.powi(2);
+    let d2_sq: f64 = 4.25_f64.powi(2) + 0.20_f64.powi(2);
+    let expected_cd1_cg1 = (0.25 * d1_sq.powi(-3) + 0.75 * d2_sq.powi(-3)).powf(-1.0 / 6.0);
+
+    let restraints = vec![
+        DistanceRestraint3d::pair(
+            1,
+            RestraintKind::Noe,
+            RestraintAtomSelector::new(Some('A'), 1, "CD1"),
+            RestraintAtomSelector::new(Some('A'), 2, "CG1"),
+            1.8,
+            4.80,
+        ),
+        // Methyl wildcard `HD1*` to `HG1*`: satisfied (~2.1-2.9 A), whereas CA-CA fallback (9.20 A) would be MajorViolation!
+        DistanceRestraint3d::pair(
+            2,
+            RestraintKind::Noe,
+            RestraintAtomSelector::new(Some('A'), 1, "HD1*"),
+            RestraintAtomSelector::new(Some('A'), 2, "HG1*"),
+            1.5,
+            3.50,
+        ),
+        // Methyl pseudoatom `MD1` to aromatic ring pseudoatom `QR`: satisfied (< 4.0 A), whereas CA-CA (8.06 A) would be MajorViolation!
+        DistanceRestraint3d::pair(
+            3,
+            RestraintKind::Noe,
+            RestraintAtomSelector::new(Some('A'), 1, "MD1"),
+            RestraintAtomSelector::new(Some('A'), 3, "QR"),
+            1.5,
+            4.00,
+        ),
+    ];
+
+    let ov = ens
+        .coord_lookup
+        .evaluate_restraints(&restraints, &RestraintFilterConfig::default());
+    assert_eq!(ov.evaluated.len(), 3);
+    assert!(
+        (ov.evaluated[0].effective_distance - expected_cd1_cg1).abs() < 1e-3,
+        "Expected 4-conformer <r^-6>^(-1/6) = {expected_cd1_cg1:.4} A, got {:.4} A",
+        ov.evaluated[0].effective_distance
+    );
+    assert_eq!(ov.evaluated[0].status, RestraintStatus::Satisfied);
+    assert_eq!(
+        ov.evaluated[1].status,
+        RestraintStatus::Satisfied,
+        "HD1* - HG1* methyl NOE must expand methyl protons (not fall back to CA=9.2A): got d_eff={:.3}",
+        ov.evaluated[1].effective_distance
+    );
+    assert_eq!(
+        ov.evaluated[2].status,
+        RestraintStatus::Satisfied,
+        "MD1 - QR methyl-aromatic NOE must expand ring protons (not fall back to CA=8.06A): got d_eff={:.3}",
+        ov.evaluated[2].effective_distance
+    );
+
+    // 2. Heavy-atom-only X-ray structure (1UBQ lacks protons): verify `HD1*` / `HG1*` / `QR` fall back
+    //    to sidechain heavy parents (`CD1`, `CG1`, aromatic carbons `CD1..CZ`) rather than `CA`!
+    let ubiq = parse_pdb_ensemble(UBIQUITIN_1UBQ_PDB).expect("1UBQ parses");
+    let ca_ile3 = ubiq.models[0].chains[0].residues[2].atom_pos("CA").unwrap();
+    let cg1_ile3 = ubiq.models[0].chains[0].residues[2]
+        .atom_pos("CG1")
+        .unwrap();
+    let ca_phe4 = ubiq.models[0].chains[0].residues[3].atom_pos("CA").unwrap();
+    let r_heavy = vec![DistanceRestraint3d::pair(
+        10,
+        RestraintKind::Noe,
+        RestraintAtomSelector::new(Some('A'), 3, "HG1*"),
+        RestraintAtomSelector::new(Some('A'), 4, "QR"),
+        1.5,
+        8.0,
+    )];
+    let ov_heavy = ubiq
+        .coord_lookup
+        .evaluate_restraints(&r_heavy, &RestraintFilterConfig::default());
+    assert_eq!(ov_heavy.evaluated.len(), 1);
+    let ev_h = &ov_heavy.evaluated[0];
+    // Endpoint p0 must equal ILE 3 CG1 (NOT ILE 3 CA!) and p1 must NOT equal PHE 4 CA!
+    assert!((ev_h.p0[0] - cg1_ile3[0]).abs() < 1e-4 && (ev_h.p0[1] - cg1_ile3[1]).abs() < 1e-4);
+    assert!(
+        (ev_h.p0[0] - ca_ile3[0]).abs() + (ev_h.p0[1] - ca_ile3[1]).abs() > 0.5,
+        "HG1* without protons must fall back to CG1, not CA"
+    );
+    assert!(
+        (ev_h.p1[0] - ca_phe4[0]).abs() + (ev_h.p1[1] - ca_phe4[1]).abs() > 0.5,
+        "QR without protons must fall back to aromatic ring carbons, not CA"
     );
 }
 

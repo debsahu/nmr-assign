@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use eframe::{egui, egui_wgpu};
 use nmr_core::aromatic::{
-    assign_aromatic_rings, merge_aromatic_assignments_preserving_existing, AromaticRingCluster,
-    AromaticSolverConfig, AROMATIC_EXPERIMENTS,
+    assign_aromatic_rings, estimate_unlabelled_yamazaki_cb_offset,
+    merge_aromatic_assignments_preserving_existing, AromaticRingCluster, AromaticSolverConfig,
+    AROMATIC_EXPERIMENTS,
 };
 use nmr_core::c13_detected::{
     pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
@@ -563,9 +564,55 @@ fn eval_cluster_vs_curated_residue(
     out
 }
 
+fn cluster_belongs_to_curated(ev: &ClusterCuratedEval) -> bool {
+    if ev.cb_contradicts || ev.total_clu_obs == 0 {
+        return false;
+    }
+    let min_corroborate = ev.total_cur_obs.clamp(1, 2);
+    if ev.conflict_obs == 0 {
+        ev.shared_obs == ev.total_clu_obs || ev.shared_obs >= min_corroborate
+    } else {
+        ev.conflict_obs <= 1 && ev.shared_obs >= 2 && ev.shared_obs > ev.conflict_obs
+    }
+}
+
+fn compute_yamazaki_cb_offsets(
+    backbone_ref: &Reference,
+    backbone_conf: Option<&BTreeMap<usize, f64>>,
+    aromatic_peaks: &[Peak],
+    cfg: &AromaticSolverConfig,
+) -> (f64, f64) {
+    let d_joint = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        None,
+        cfg.min_backbone_conf,
+    );
+    let d_hd_raw = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        Some("HBCBCGCDHD"),
+        cfg.min_backbone_conf,
+    );
+    let d_he_raw = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        Some("HBCBCGCDCEHE"),
+        cfg.min_backbone_conf,
+    );
+    let d_hd = if d_hd_raw != 0.0 { d_hd_raw } else { d_joint };
+    let d_he = if d_he_raw != 0.0 { d_he_raw } else { d_joint };
+    (d_hd, d_he)
+}
+
 fn peak_matches_aromatic_cluster(
     p: &Peak,
     clu: &AromaticRingCluster,
+    cb_offset_hd: f64,
+    cb_offset_he: f64,
     cfg: &AromaticSolverConfig,
 ) -> bool {
     let tol_h = (cfg.tol_h * 1.5).max(0.045);
@@ -589,18 +636,24 @@ fn peak_matches_aromatic_cluster(
                 .get("CD1")
                 .or_else(|| clu.ch_slots.get("CD2"))
                 .is_some_and(|s| (p.h - s.h_ppm).abs() <= tol_h * 1.25)
-                && clu
-                    .cb_hd
-                    .is_some_and(|cb| p.c.is_some_and(|c| (c - cb).abs() <= cfg.tol_cb * 1.15))
+                && clu.cb_hd.is_some_and(|cb| {
+                    p.c.is_some_and(|c| {
+                        ((c - cb_offset_hd) - cb).abs() <= cfg.tol_cb * 1.15
+                            || (c - cb).abs() <= cfg.tol_cb * 1.15
+                    })
+                })
         }
         "HBCBCGCDCEHE" => {
             clu.ch_slots
                 .get("CE1")
                 .or_else(|| clu.ch_slots.get("CE3"))
                 .is_some_and(|s| (p.h - s.h_ppm).abs() <= tol_h * 1.25)
-                && clu
-                    .cb_he
-                    .is_some_and(|cb| p.c.is_some_and(|c| (c - cb).abs() <= cfg.tol_cb * 1.15))
+                && clu.cb_he.is_some_and(|cb| {
+                    p.c.is_some_and(|c| {
+                        ((c - cb_offset_he) - cb).abs() <= cfg.tol_cb * 1.15
+                            || (c - cb).abs() <= cfg.tol_cb * 1.15
+                    })
+                })
         }
         "TRP_IND_N15HSQC" => clu
             .trp_indole
@@ -840,7 +893,10 @@ fn merge_gui_aromatic_with_options(
 
     // 3. Match each curated residue against compatible experimental clusters so:
     //    - partial disjoint clusters (e.g. CD-only vs curated CE/CZ) are never mixed into curated rings,
-    //    - clusters whose shifts belong to a curated residue are claimed and cannot jump onto another residue.
+    //    - clusters whose shifts belong to a curated residue (including superset clusters and 1-slot
+    //      user-tweaked curated rings) are claimed and cannot jump onto another residue.
+    let (cb_offset_hd, cb_offset_he) =
+        compute_yamazaki_cb_offsets(&curated_ref, pred_conf, arom_peaks, &cfg);
     let mut claimed_clusters: BTreeMap<usize, (usize, ClusterCuratedEval)> = BTreeMap::new();
     for &k_cur in &curated_residues {
         let mut best: Option<(usize, ClusterCuratedEval)> = None;
@@ -849,20 +905,17 @@ fn merge_gui_aromatic_with_options(
                 continue;
             }
             let ev = eval_cluster_vs_curated_residue(clu, k_cur, &curated_ref, &cfg);
-            if ev.conflict_obs > 0 || ev.cb_contradicts {
-                continue;
-            }
-            let min_corroborate = ev.total_cur_obs.clamp(1, 2);
-            let corroborates = ev.shared_obs >= min_corroborate;
-            let exact_subset_of_curated = ev.total_clu_obs > 0 && ev.shared_obs == ev.total_clu_obs;
-            if !corroborates && !exact_subset_of_curated {
+            if !cluster_belongs_to_curated(&ev) {
                 continue;
             }
             let better = match best {
                 None => true,
                 Some((_, b_ev)) => {
-                    ev.shared_obs > b_ev.shared_obs
-                        || (ev.shared_obs == b_ev.shared_obs && ev.norm_dist_sq < b_ev.norm_dist_sq)
+                    ev.conflict_obs < b_ev.conflict_obs
+                        || (ev.conflict_obs == b_ev.conflict_obs
+                            && (ev.shared_obs > b_ev.shared_obs
+                                || (ev.shared_obs == b_ev.shared_obs
+                                    && ev.norm_dist_sq < b_ev.norm_dist_sq)))
                 }
             };
             if better {
@@ -874,7 +927,9 @@ fn merge_gui_aromatic_with_options(
         }
     }
 
-    // 4. Solve uncurated residues on peaks excluding peaks owned solely by claimed curated clusters.
+    // 4. Solve uncurated residues on peaks excluding peaks owned solely by claimed curated clusters,
+    //    pre-applying `(cb_offset_hd, cb_offset_he)` so masking curated residues to `ALA` never loses
+    //    Yamazaki CB offset calibration on remaining uncurated residues.
     let mut sub_ref = curated_ref.clone();
     for &k_cur in &curated_residues {
         if let Some(slot) = sub_ref.sequence.get_mut(k_cur) {
@@ -884,24 +939,40 @@ fn merge_gui_aromatic_with_options(
     let sub_peaks: Vec<Peak> = arom_peaks
         .iter()
         .filter(|p| {
-            let matches_claimed = claimed_clusters
-                .keys()
-                .any(|&ci| peak_matches_aromatic_cluster(p, &probe.clusters[ci], &cfg));
+            let matches_claimed = claimed_clusters.keys().any(|&ci| {
+                peak_matches_aromatic_cluster(
+                    p,
+                    &probe.clusters[ci],
+                    cb_offset_hd,
+                    cb_offset_he,
+                    &cfg,
+                )
+            });
             if !matches_claimed {
                 return true;
             }
             probe.clusters.iter().enumerate().any(|(cj, clu)| {
-                !claimed_clusters.contains_key(&cj) && peak_matches_aromatic_cluster(p, clu, &cfg)
+                !claimed_clusters.contains_key(&cj)
+                    && peak_matches_aromatic_cluster(p, clu, cb_offset_hd, cb_offset_he, &cfg)
             })
         })
-        .cloned()
+        .map(|p| {
+            let mut q = p.clone();
+            if q.exp == "HBCBCGCDHD" && cb_offset_hd != 0.0 {
+                q.c = q.c.map(|c| c - cb_offset_hd);
+            } else if q.exp == "HBCBCGCDCEHE" && cb_offset_he != 0.0 {
+                q.c = q.c.map(|c| c - cb_offset_he);
+            }
+            q
+        })
         .collect();
 
     let sub_res = assign_aromatic_rings(&sub_ref, pred_conf, &sub_peaks, sc_priors, &cfg);
 
     let mut merged = curated_ref.clone();
 
-    // Corroborated missing-atom completion on curated residues (never overwriting curated keys or mixing disjoint CD-only into CE/CZ)
+    // Corroborated missing-atom completion on curated residues (strictly `conflict_obs == 0` so
+    // conflicting or disjoint slots NEVER overwrite or mix into curated rings!)
     for (&ci, &(k_cur, ev)) in &claimed_clusters {
         let min_corroborate = ev.total_cur_obs.clamp(1, 2);
         if ev.conflict_obs == 0 && !ev.cb_contradicts && ev.shared_obs >= min_corroborate {
@@ -925,10 +996,7 @@ fn merge_gui_aromatic_with_options(
                 return false;
             }
             let dup_ev = eval_cluster_vs_curated_residue(sub_clu, k_cur, &curated_ref, &cfg);
-            if !(dup_ev.conflict_obs == 0
-                && dup_ev.total_clu_obs > 0
-                && dup_ev.shared_obs == dup_ev.total_clu_obs)
-            {
+            if !cluster_belongs_to_curated(&dup_ev) {
                 return false;
             }
             // Allow only if >= 2 distinct clusters in probe genuinely shared these degenerate shifts,
@@ -938,7 +1006,7 @@ fn merge_gui_aromatic_with_options(
                 .iter()
                 .filter(|c| {
                     let e = eval_cluster_vs_curated_residue(c, k_cur, &curated_ref, &cfg);
-                    e.conflict_obs == 0 && e.total_clu_obs > 0 && e.shared_obs == e.total_clu_obs
+                    cluster_belongs_to_curated(&e)
                 })
                 .count();
             if n_probe_matches >= 2 {
@@ -6916,6 +6984,177 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
             !dup_checked.shifts.contains_key(&(3, "CD1".to_string()))
                 && !dup_checked.shifts.contains_key(&(3, "HD1".to_string())),
             "Cluster matching curated PHE #1 must not be assigned as duplicate onto PHE #2"
+        );
+    }
+
+    #[test]
+    fn test_gui_p1_10_superset_duplicate_tweaked_conflict_and_yamazaki_cb_offset() {
+        use nmr_core::peaks::Peak;
+
+        let sc_priors = SidechainPriors::empirical_bmrb();
+        let mk_peak = |exp: &str, h: f64, c: f64, height: f64| Peak {
+            exp: exp.to_string(),
+            h,
+            n: 0.0,
+            c: Some(c),
+            h2: None,
+            sign: 1,
+            height: Some(height),
+            volume: None,
+        };
+        let mk_tocsy = |h: f64, c: f64, h2: f64, height: f64| Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h,
+            n: 0.0,
+            c: Some(c),
+            h2: Some(h2),
+            sign: 1,
+            height: Some(height),
+            volume: None,
+        };
+
+        let seq = vec![
+            "ALA".to_string(),
+            "PHE".to_string(),
+            "GLY".to_string(),
+            "PHE".to_string(),
+            "TYR".to_string(),
+        ];
+        let seq_ids = vec![1, 2, 3, 4, 5];
+
+        // (a) 4-slot curated PHE #1 (`CD1/HD1/CE1/HE1`, missing `CZ/HZ`) vs a 6-slot superset PHE cluster:
+        //     must complete `CZ/HZ` on PHE #1 AND never duplicate onto uncurated PHE #2 (even with an
+        //     overlapping peak or degenerate CB)!
+        let mut ref_a = Reference::new(seq.clone(), seq_ids.clone());
+        ref_a.shifts.insert((1, "CA".to_string()), 57.4);
+        ref_a.shifts.insert((1, "CB".to_string()), 39.10);
+        ref_a.shifts.insert((1, "CD1".to_string()), 131.20);
+        ref_a.shifts.insert((1, "CD2".to_string()), 131.20);
+        ref_a.shifts.insert((1, "HD1".to_string()), 7.140);
+        ref_a.shifts.insert((1, "HD2".to_string()), 7.140);
+        ref_a.shifts.insert((1, "CE1".to_string()), 129.40);
+        ref_a.shifts.insert((1, "CE2".to_string()), 129.40);
+        ref_a.shifts.insert((1, "HE1".to_string()), 7.300);
+        ref_a.shifts.insert((1, "HE2".to_string()), 7.300);
+        ref_a.shifts.insert((3, "CA".to_string()), 56.9);
+        ref_a.shifts.insert((3, "CB".to_string()), 39.15); // Degenerate CB near PHE #1
+
+        let superset_peaks = vec![
+            mk_peak("C13HSQC", 7.140, 131.20, 1000.0),
+            mk_peak("C13HSQC", 7.300, 129.40, 1000.0),
+            mk_peak("C13HSQC", 7.220, 127.70, 900.0),
+            mk_tocsy(7.140, 131.20, 7.300, 500.0),
+            mk_tocsy(7.300, 129.40, 7.140, 500.0),
+            mk_tocsy(7.300, 129.40, 7.220, 500.0),
+            mk_tocsy(7.220, 127.70, 7.300, 500.0),
+            mk_peak("HBCBCGCDHD", 7.140, 39.12, 750.0),
+            mk_peak("HBCBCGCDCEHE", 7.300, 39.12, 700.0),
+        ];
+
+        let res_a = merge_gui_aromatic_with_options(
+            &ref_a,
+            Some(&ref_a),
+            &BTreeMap::new(),
+            None,
+            &superset_peaks,
+            &sc_priors,
+            false,
+        );
+        assert_eq!(
+            res_a.shifts.get(&(1, "CZ".to_string())).copied(),
+            Some(127.70)
+        );
+        assert_eq!(
+            res_a.shifts.get(&(1, "HZ".to_string())).copied(),
+            Some(7.220)
+        );
+        assert!(
+            !res_a.shifts.contains_key(&(3, "CD1".to_string()))
+                && !res_a.shifts.contains_key(&(3, "HD1".to_string())),
+            "6-slot superset cluster matching 4-slot curated PHE #1 must NOT duplicate onto uncurated PHE #2"
+        );
+
+        // (b) Curated PHE #1 with 1 user-adjusted slot slightly outside tol (`HE1 = 7.395` vs peak `7.300`,
+        //     `conflict_obs == 1, shared_obs == 3`): must NOT overwrite PHE #1, must NOT mix `CZ/HZ` into
+        //     PHE #1, AND must NOT leak/dump PHE #1's cluster onto uncurated PHE #2!
+        let mut ref_b = ref_a.clone();
+        ref_b.shifts.insert((1, "HE1".to_string()), 7.395);
+        ref_b.shifts.insert((1, "HE2".to_string()), 7.395);
+        let res_b = merge_gui_aromatic_with_options(
+            &ref_b,
+            Some(&ref_b),
+            &BTreeMap::new(),
+            None,
+            &superset_peaks,
+            &sc_priors,
+            false,
+        );
+        assert_eq!(
+            res_b.shifts.get(&(1, "HE1".to_string())).copied(),
+            Some(7.395),
+            "User-adjusted HE1 on PHE #1 must be preserved"
+        );
+        assert!(
+            !res_b.shifts.contains_key(&(1, "CZ".to_string())),
+            "Cluster with 1 conflicting slot must not fill missing CZ onto PHE #1"
+        );
+        assert!(
+            !res_b.shifts.contains_key(&(3, "CD1".to_string()))
+                && !res_b.shifts.contains_key(&(3, "HD1".to_string())),
+            "PHE #1's cluster with 1 tweaked slot must NOT leak onto uncurated PHE #2"
+        );
+
+        // (c) Systematic Yamazaki `13CB` referencing offset (`+2.20 ppm`):
+        //     `peak_matches_aromatic_cluster` must strip PHE #1's offset-shifted Yamazaki peaks and
+        //     still calibrate & assign distinct uncurated PHE #2 (`idx 3`, CB 41.80) + TYR #3 (`idx 4`, CB 37.20)!
+        let cb_off = 2.20;
+        let mut ref_c = ref_a.clone();
+        ref_c.shifts.insert((3, "CB".to_string()), 41.80);
+        ref_c.shifts.insert((4, "CA".to_string()), 58.10);
+        ref_c.shifts.insert((4, "CB".to_string()), 37.20);
+
+        let offset_peaks = vec![
+            // Curated PHE #1 (`idx 1`, CB 39.10 -> raw Yamazaki CB 41.30; notice 41.30 is close to PHE #2's true CB 41.80!)
+            mk_peak("C13HSQC", 7.140, 131.20, 1000.0),
+            mk_peak("C13HSQC", 7.300, 129.40, 1000.0),
+            mk_peak("C13HSQC", 7.220, 127.70, 900.0),
+            mk_tocsy(7.140, 131.20, 7.300, 500.0),
+            mk_tocsy(7.300, 129.40, 7.140, 500.0),
+            mk_tocsy(7.300, 129.40, 7.220, 500.0),
+            mk_tocsy(7.220, 127.70, 7.300, 500.0),
+            mk_peak("HBCBCGCDHD", 7.140, 39.10 + cb_off, 750.0),
+            mk_peak("HBCBCGCDCEHE", 7.300, 39.10 + cb_off, 700.0),
+            // Uncurated TYR #3 (`idx 4`, CB 37.20 -> raw Yamazaki CB 39.40) so >= 2 independent pairs establish +2.20 ppm offset!
+            mk_peak("C13HSQC", 7.020, 132.60, 1000.0),
+            mk_peak("C13HSQC", 6.780, 117.80, 1000.0),
+            mk_tocsy(7.020, 132.60, 6.780, 500.0),
+            mk_tocsy(6.780, 117.80, 7.020, 500.0),
+            mk_peak("HBCBCGCDHD", 7.020, 37.20 + cb_off, 750.0),
+            mk_peak("HBCBCGCDCEHE", 6.780, 37.20 + cb_off, 700.0),
+        ];
+
+        let res_c = merge_gui_aromatic_with_options(
+            &ref_c,
+            Some(&ref_c),
+            &BTreeMap::new(),
+            None,
+            &offset_peaks,
+            &sc_priors,
+            false,
+        );
+        // Without cb_offset in `peak_matches_aromatic_cluster`, PHE #1's raw Yamazaki peak at 41.30 ppm
+        // would NOT be stripped from `sub_peaks` and would falsely match uncurated PHE #2 (`CB = 41.80`)!
+        assert!(
+            !res_c.shifts.contains_key(&(3, "CD1".to_string()))
+                && !res_c.shifts.contains_key(&(3, "HD1".to_string())),
+            "Offset-shifted Yamazaki peak from curated PHE #1 (39.10 + 2.20 = 41.30) must NOT leak onto PHE #2 (CB 41.80)"
+        );
+        assert!(
+            res_c
+                .shifts
+                .get(&(4, "HD1".to_string()))
+                .is_some_and(|v| (v - 7.020).abs() < 0.03),
+            "Uncurated TYR #3 should still receive its calibrated aromatic assignment"
         );
     }
 }
