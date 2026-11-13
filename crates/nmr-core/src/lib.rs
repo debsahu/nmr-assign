@@ -36,6 +36,7 @@ pub mod picker;
 pub mod priors;
 pub mod process;
 pub mod qc;
+pub mod rdc;
 pub mod report;
 pub mod rng;
 pub mod service;
@@ -48,6 +49,7 @@ pub mod spinsystems;
 pub mod stereospec;
 pub mod structure;
 pub mod topology;
+pub mod torsion_db;
 
 // ============================================================================
 // Seamless Interoperability Bridges: `octet_mol` <-> `octet_analyt` <-> `octet_render`
