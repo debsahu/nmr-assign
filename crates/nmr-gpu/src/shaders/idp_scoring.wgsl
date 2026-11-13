@@ -171,8 +171,8 @@ fn compute_idp_unary(@builtin(global_invocation_id) gid: vec3<u32>) {
     var sys_assign_bonus: f32 = 0.5;
     if (n_3d_ch >= 1u) {
         sys_assign_bonus = 2.65;
-    } else if (params.multi_3d_dataset != 0u && params.s_len + 1u >= params.k_len) {
-        sys_assign_bonus = -3.5;
+    } else if (params.multi_3d_dataset != 0u) {
+        sys_assign_bonus = -6.5;
     }
 
     let cur_qf = params.off_seq_floats + k * SEQ_FLOAT_STRIDE;

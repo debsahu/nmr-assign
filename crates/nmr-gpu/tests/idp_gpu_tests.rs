@@ -56,23 +56,41 @@ fn simulate_mismatched_bmrb_picked_dataset(
     let off_cccon_aliph = glob_dca - 0.16;
     let off_ncaco = (glob_dc + 0.18, glob_dn + 0.11, glob_dca + 0.09);
 
-    let mut bond_indices: Vec<usize> = (1..seq_len)
+    let true_bonds: Vec<usize> = (1..seq_len)
         .filter(|&k| {
             ref_data.shifts.contains_key(&(k - 1, "C".to_string()))
                 && ref_data.shifts.contains_key(&(k, "N".to_string()))
         })
         .collect();
-    for i in (1..bond_indices.len()).rev() {
+    let n_spur_con = ((true_bonds.len() as f64) * 0.03).round().max(2.0) as usize;
+    let mut root_specs: Vec<Option<usize>> = true_bonds.into_iter().map(Some).collect();
+    root_specs.extend(std::iter::repeat_n(None, n_spur_con));
+
+    for i in (1..root_specs.len()).rev() {
         let j = rng.usize(i + 1);
-        bond_indices.swap(i, j);
+        root_specs.swap(i, j);
     }
 
-    let mut con_roots = Vec::with_capacity(bond_indices.len() + 4);
-    let mut truth = Vec::with_capacity(bond_indices.len() + 4);
+    let mut con_roots = Vec::with_capacity(root_specs.len());
+    let mut truth = Vec::with_capacity(root_specs.len());
     let mut strip_peaks = Vec::new();
     let sc_atoms = ["CG", "CG1", "CG2", "CD", "CD1", "CD2", "CE"];
 
-    for (r_idx, &k) in bond_indices.iter().enumerate() {
+    for (r_idx, spec) in root_specs.iter().copied().enumerate() {
+        let Some(k) = spec else {
+            let cp_spur = 169.5 + rng.f64() * 9.5;
+            let nc_spur = 107.5 + rng.f64() * 31.0;
+            con_roots.push(Con2DPeak {
+                c_prev_ppm: cp_spur,
+                n_curr_ppm: nc_spur,
+                height: 28.0 + rng.f64() * 6.0,
+                volume: 28.0,
+                is_proline_imino_region: nc_spur >= 131.5,
+                deconvolved_from_cluster: false,
+            });
+            truth.push(-1);
+            continue;
+        };
         let cp_true = ref_data.shifts[&(k - 1, "C".to_string())];
         let nc_true = ref_data.shifts[&(k, "N".to_string())];
         let cp_obs = cp_true + off_con.0 + rng.normal(0.0, 0.012);
@@ -162,7 +180,7 @@ fn simulate_mismatched_bmrb_picked_dataset(
         }
     }
 
-    let mut raw_ncaco = Vec::new();
+    // Emit raw drifted unanchored 3D NCACO peaks (`anchor_root_idx: None`, zero oracle registration!)
     for k in 1..seq_len {
         let (Some(&nc), Some(&ca_k), Some(&c_k)) = (
             ref_data.shifts.get(&(k, "N".to_string())),
@@ -172,31 +190,16 @@ fn simulate_mismatched_bmrb_picked_dataset(
             continue;
         };
         if rng.f64() >= p_missing_3d {
-            raw_ncaco.push((
-                c_k + off_ncaco.0 + rng.normal(0.0, 0.015),
-                nc + off_ncaco.1 + rng.normal(0.0, 0.025),
-                ca_k + off_ncaco.2 + rng.normal(0.0, 0.025),
-            ));
-        }
-    }
-    let dc_nc_vs_con = off_ncaco.0 - off_con.0;
-    let dn_nc_vs_con = off_ncaco.1 - off_con.1;
-    for &(c_raw, n_raw, ca_raw) in &raw_ncaco {
-        let c_corr = c_raw - dc_nc_vs_con;
-        let n_corr = n_raw - dn_nc_vs_con;
-        for (r_idx, r) in con_roots.iter().enumerate() {
-            if (r.n_curr_ppm - n_corr).abs() <= 0.16 {
-                strip_peaks.push(C13Strip3DPeak {
-                    exp: C13DetectedExp::Ncaco3D,
-                    c_prime_ppm: c_corr,
-                    n_ppm: r.n_curr_ppm,
-                    c_indirect_ppm: ca_raw,
-                    sign: 1,
-                    height: 88.0,
-                    volume: 88.0,
-                    anchor_root_idx: Some(r_idx),
-                });
-            }
+            strip_peaks.push(C13Strip3DPeak {
+                exp: C13DetectedExp::Ncaco3D,
+                c_prime_ppm: c_k + off_ncaco.0 + rng.normal(0.0, 0.015),
+                n_ppm: nc + off_ncaco.1 + rng.normal(0.0, 0.025),
+                c_indirect_ppm: ca_k + off_ncaco.2 + rng.normal(0.0, 0.025),
+                sign: 1,
+                height: 88.0,
+                volume: 88.0,
+                anchor_root_idx: None,
+            });
         }
     }
 
@@ -253,15 +256,25 @@ fn simulate_mismatched_bmrb_picked_dataset(
             }
             _ => (170.0 + rng.f64() * 8.5, 43.0 + rng.f64() * 23.0, 1),
         };
+        let anchor_root_idx = if exp == C13DetectedExp::Ncaco3D {
+            None
+        } else {
+            Some(r_idx)
+        };
+        let n_val = if exp == C13DetectedExp::Ncaco3D {
+            108.0 + rng.f64() * 30.0
+        } else {
+            con_roots[r_idx].n_curr_ppm
+        };
         strip_peaks.push(C13Strip3DPeak {
             exp,
             c_prime_ppm: c_p,
-            n_ppm: con_roots[r_idx].n_curr_ppm,
+            n_ppm: n_val,
             c_indirect_ppm: c_ind,
             sign: sgn,
             height: 22.0 * (sgn as f64),
             volume: 22.0 * (sgn as f64),
-            anchor_root_idx: Some(r_idx),
+            anchor_root_idx,
         });
     }
 
@@ -289,8 +302,12 @@ fn test_idp_gpu_unary_and_pair_matrix_parity_and_browser_limits() {
         let ref_data = read_star_all_atoms(root.join(rel_path), None).unwrap();
         let (picked, _) = simulate_mismatched_bmrb_picked_dataset(&ref_data, 0.08, 0.06, 123);
         let mut systems = register_and_build_con_dipeptide_systems(&picked);
+        assert!(
+            systems.iter().any(|s| !s.has_3d_support()),
+            "parity test must include 3D-unsupported spurious 2D CON noise roots"
+        );
         for s in 0..systems.len().saturating_sub(1) {
-            if s % 3 == 0 {
+            if s % 3 == 0 && systems[s].has_3d_support() {
                 let nxt = systems[s + 1].n_curr;
                 systems[s].n_next.push(nxt);
             }
@@ -355,13 +372,25 @@ fn test_idp_gpu_non_circular_real_bmrb_benchmarks_through_prolines() {
         (
             root.join("data/benchmark/bmr6968.str"),
             "bmr6968 (alpha-synuclein, 140 aa)",
-            288.0,
+            288.15,
             6.5,
+        ),
+        (
+            root.join("data/benchmark/bmr15176.str"),
+            "bmr15176 (DARPP-32, 119 aa, 12.6% Pro)",
+            298.15,
+            6.5,
+        ),
+        (
+            root.join("data/benchmark/bmr4375.str"),
+            "bmr4375 (8M-urea Ubiquitin, 76 aa, pH 2.0)",
+            298.15,
+            2.0,
         ),
         (
             root.join("data/fixtures/bmr26639_idp_cbp_id4.str"),
             "bmr26639 (CBP-ID4, 207 aa, 21.7% Pro)",
-            308.0,
+            308.15,
             6.5,
         ),
         (
@@ -413,6 +442,19 @@ fn test_idp_gpu_non_circular_real_bmrb_benchmarks_through_prolines() {
         );
 
         assert!(
+            truth.iter().filter(|&&t| t == -1).count() >= 2,
+            "[GPU] {label}: benchmark must include shuffled spurious 2D CON noise roots (truth == -1)"
+        );
+        for (s, &t) in truth.iter().enumerate() {
+            if t == -1 && !systems[s].has_3d_support() {
+                assert_eq!(
+                    res.position[s], -1,
+                    "[GPU] {label}: 3D-unsupported spurious 2D CON noise root s={s} falsely assigned to k={}",
+                    res.position[s]
+                );
+            }
+        }
+        assert!(
             m.accuracy() >= 0.92,
             "[GPU] {label}: accuracy {:.2}% < 92.0%",
             m.accuracy() * 100.0
@@ -421,6 +463,11 @@ fn test_idp_gpu_non_circular_real_bmrb_benchmarks_through_prolines() {
             m.hc_precision() >= 0.96,
             "[GPU] {label}: HC precision {:.2}% < 96.0%",
             m.hc_precision() * 100.0
+        );
+        assert!(
+            rel.ece <= 0.06,
+            "[GPU] {label}: per-protein ECE {:.4} > 0.06",
+            rel.ece
         );
 
         if label.contains("26639") {
@@ -467,7 +514,7 @@ fn test_idp_gpu_non_circular_real_bmrb_benchmarks_through_prolines() {
 
     let pooled = ProteinReliabilityCurve::from_predictions(&pooled_preds, 0.80);
     println!(
-        "[GPU] Pooled 3-protein real BMRB IDP calibration: total={} HC_prec={:.2}% ECE={:.4}",
+        "[GPU] Pooled 5-protein real BMRB IDP calibration: total={} HC_prec={:.2}% ECE={:.4}",
         pooled.total_predictions,
         pooled.hc_precision.unwrap_or(0.0) * 100.0,
         pooled.ece

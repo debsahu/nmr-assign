@@ -60,26 +60,44 @@ fn simulate_mismatched_bmrb_picked_dataset(
     let off_cccon_aliph = glob_dca - 0.16;
     let off_ncaco = (glob_dc + 0.18, glob_dn + 0.11, glob_dca + 0.09);
 
-    // Collect true peptide bonds `k in 1..seq_len` that have deposited `(C'(k-1), N(k))` in BMRB
-    let mut bond_indices: Vec<usize> = (1..seq_len)
+    // Collect true peptide bonds `k in 1..seq_len` (`Some(k)`) plus ~3% spurious 2D CON noise roots (`None`)
+    let true_bonds: Vec<usize> = (1..seq_len)
         .filter(|&k| {
             ref_data.shifts.contains_key(&(k - 1, "C".to_string()))
                 && ref_data.shifts.contains_key(&(k, "N".to_string()))
         })
         .collect();
-    // Shuffle `bond_indices` via Fisher-Yates so `con_roots` order is completely scrambled!
-    for i in (1..bond_indices.len()).rev() {
+    let n_spur_con = ((true_bonds.len() as f64) * 0.03).round().max(2.0) as usize;
+    let mut root_specs: Vec<Option<usize>> = true_bonds.into_iter().map(Some).collect();
+    root_specs.extend(std::iter::repeat_n(None, n_spur_con));
+
+    // Shuffle `root_specs` via Fisher-Yates so both true and spurious `con_roots` are completely scrambled!
+    for i in (1..root_specs.len()).rev() {
         let j = rng.usize(i + 1);
-        bond_indices.swap(i, j);
+        root_specs.swap(i, j);
     }
 
-    let mut con_roots = Vec::with_capacity(bond_indices.len() + 4);
-    let mut truth = Vec::with_capacity(bond_indices.len() + 4);
+    let mut con_roots = Vec::with_capacity(root_specs.len());
+    let mut truth = Vec::with_capacity(root_specs.len());
     let mut strip_peaks = Vec::new();
 
     let sc_atoms = ["CG", "CG1", "CG2", "CD", "CD1", "CD2", "CE"];
 
-    for (r_idx, &k) in bond_indices.iter().enumerate() {
+    for (r_idx, spec) in root_specs.iter().copied().enumerate() {
+        let Some(k) = spec else {
+            let cp_spur = 169.5 + rng.f64() * 9.5;
+            let nc_spur = 107.5 + rng.f64() * 31.0;
+            con_roots.push(Con2DPeak {
+                c_prev_ppm: cp_spur,
+                n_curr_ppm: nc_spur,
+                height: 28.0 + rng.f64() * 6.0,
+                volume: 28.0,
+                is_proline_imino_region: nc_spur >= 131.5,
+                deconvolved_from_cluster: false,
+            });
+            truth.push(-1);
+            continue;
+        };
         let cp_true = ref_data.shifts[&(k - 1, "C".to_string())];
         let nc_true = ref_data.shifts[&(k, "N".to_string())];
         let cp_obs = cp_true + off_con.0 + rng.normal(0.0, 0.012);
@@ -176,8 +194,7 @@ fn simulate_mismatched_bmrb_picked_dataset(
         }
     }
 
-    // 3D NCACO: plane-matched across `N(i)` (including realistic `15N` plane degeneracy across roots!)
-    let mut raw_ncaco = Vec::new();
+    // 3D NCACO: emit raw drifted unanchored 3D peaks (`anchor_root_idx: None`, zero oracle registration!)
     for k in 1..seq_len {
         let (Some(&nc), Some(&ca_k), Some(&c_k)) = (
             ref_data.shifts.get(&(k, "N".to_string())),
@@ -187,32 +204,16 @@ fn simulate_mismatched_bmrb_picked_dataset(
             continue;
         };
         if rng.f64() >= p_missing_3d {
-            raw_ncaco.push((
-                c_k + off_ncaco.0 + rng.normal(0.0, 0.015),
-                nc + off_ncaco.1 + rng.normal(0.0, 0.025),
-                ca_k + off_ncaco.2 + rng.normal(0.0, 0.025),
-            ));
-        }
-    }
-    // Register NCACO `(C', N)` onto CON `(C', N)` unsupervised (matching `pick_ncaco_3d_planes`)
-    let dc_nc_vs_con = off_ncaco.0 - off_con.0;
-    let dn_nc_vs_con = off_ncaco.1 - off_con.1;
-    for &(c_raw, n_raw, ca_raw) in &raw_ncaco {
-        let c_corr = c_raw - dc_nc_vs_con;
-        let n_corr = n_raw - dn_nc_vs_con;
-        for (r_idx, r) in con_roots.iter().enumerate() {
-            if (r.n_curr_ppm - n_corr).abs() <= 0.16 {
-                strip_peaks.push(C13Strip3DPeak {
-                    exp: C13DetectedExp::Ncaco3D,
-                    c_prime_ppm: c_corr,
-                    n_ppm: r.n_curr_ppm,
-                    c_indirect_ppm: ca_raw,
-                    sign: 1,
-                    height: 88.0,
-                    volume: 88.0,
-                    anchor_root_idx: Some(r_idx),
-                });
-            }
+            strip_peaks.push(C13Strip3DPeak {
+                exp: C13DetectedExp::Ncaco3D,
+                c_prime_ppm: c_k + off_ncaco.0 + rng.normal(0.0, 0.015),
+                n_ppm: nc + off_ncaco.1 + rng.normal(0.0, 0.025),
+                c_indirect_ppm: ca_k + off_ncaco.2 + rng.normal(0.0, 0.025),
+                sign: 1,
+                height: 88.0,
+                volume: 88.0,
+                anchor_root_idx: None,
+            });
         }
     }
 
@@ -271,15 +272,25 @@ fn simulate_mismatched_bmrb_picked_dataset(
             }
             _ => (170.0 + rng.f64() * 8.5, 43.0 + rng.f64() * 23.0, 1),
         };
+        let anchor_root_idx = if exp == C13DetectedExp::Ncaco3D {
+            None
+        } else {
+            Some(r_idx)
+        };
+        let n_val = if exp == C13DetectedExp::Ncaco3D {
+            108.0 + rng.f64() * 30.0
+        } else {
+            con_roots[r_idx].n_curr_ppm
+        };
         strip_peaks.push(C13Strip3DPeak {
             exp,
             c_prime_ppm: c_p,
-            n_ppm: con_roots[r_idx].n_curr_ppm,
+            n_ppm: n_val,
             c_indirect_ppm: c_ind,
             sign: sgn,
             height: 22.0 * (sgn as f64),
             volume: 22.0 * (sgn as f64),
-            anchor_root_idx: Some(r_idx),
+            anchor_root_idx,
         });
     }
 
@@ -568,6 +579,19 @@ fn test_non_circular_real_bmrb_idp_benchmarks_with_drift_missing_and_spurious_pe
             );
         }
 
+        assert!(
+            truth.iter().filter(|&&t| t == -1).count() >= 2,
+            "{label}: benchmark must include shuffled spurious 2D CON noise roots (truth == -1)"
+        );
+        for (s, &t) in truth.iter().enumerate() {
+            if t == -1 && !systems[s].has_3d_support() {
+                assert_eq!(
+                    res.position[s], -1,
+                    "{label}: 3D-unsupported spurious 2D CON noise root s={s} falsely assigned to k={}",
+                    res.position[s]
+                );
+            }
+        }
         if m.accuracy() < 0.92 {
             failures.push(format!(
                 "{label}: sequence-specific accuracy {:.2}% < 92.0% gate!",
@@ -578,6 +602,12 @@ fn test_non_circular_real_bmrb_idp_benchmarks_with_drift_missing_and_spurious_pe
             failures.push(format!(
                 "{label}: high-confidence precision {:.2}% < 96.0% gate!",
                 m.hc_precision() * 100.0
+            ));
+        }
+        if rel.ece > 0.06 {
+            failures.push(format!(
+                "{label}: per-protein ECE {:.4} > 0.06 gate!",
+                rel.ece
             ));
         }
     }
@@ -678,6 +708,101 @@ fn test_end_to_end_volumetric_cubes_to_idp_solver_through_prolines() {
     assert!(
         m.hc_precision() >= 0.96,
         "End-to-end 3D volumetric CBP-ID4 HC precision {:.2}% < 96%!",
+        m.hc_precision() * 100.0
+    );
+}
+
+#[test]
+fn test_unsupervised_ncaco_drift_and_spurious_con_gap_rejection() {
+    let root = workspace_root();
+    // Use incomplete real BMRB deposition `bmr15176` (`DARPP-32`, 119 aa, 17 missing bond gaps -> `s_len + 1 < k_len`)
+    let darpp = read_star_all_atoms(root.join("data/benchmark/bmr15176.str"), None).unwrap();
+    let (mut picked, mut truth) = simulate_mismatched_bmrb_picked_dataset(&darpp, 0.05, 0.04, 909);
+
+    // Inject 4 explicit high-risk spurious 2D CON noise roots (`truth = -1`, zero 3D relay peaks),
+    // including Proline (`136.8 ppm`) and Glycine (`109.7 ppm`) where 2D `(C', N)` alone would match sequence gaps!
+    for &(cp, np) in &[
+        (175.40, 136.80),
+        (174.10, 109.70),
+        (173.20, 121.40),
+        (176.10, 118.90),
+    ] {
+        picked.con_roots.push(Con2DPeak {
+            c_prev_ppm: cp,
+            n_curr_ppm: np,
+            height: 30.0,
+            volume: 30.0,
+            is_proline_imino_region: np >= 131.5,
+            deconvolved_from_cluster: false,
+        });
+        truth.push(-1);
+    }
+
+    // Verify unsupervised NCACO alignment on large `(+0.14 ppm C', -0.19 ppm N, +0.13 ppm CA)` unanchored drift:
+    // replace all NCACO peaks with fresh heavily drifted unanchored peaks (`anchor_root_idx: None`)
+    picked
+        .strip_peaks
+        .retain(|p| p.exp != C13DetectedExp::Ncaco3D);
+    for k in 1..darpp.sequence.len() {
+        let (Some(&nc), Some(&ca_k), Some(&c_k)) = (
+            darpp.shifts.get(&(k, "N".to_string())),
+            darpp.shifts.get(&(k, "CA".to_string())),
+            darpp.shifts.get(&(k, "C".to_string())),
+        ) else {
+            continue;
+        };
+        picked.strip_peaks.push(C13Strip3DPeak {
+            exp: C13DetectedExp::Ncaco3D,
+            c_prime_ppm: c_k + 0.14,
+            n_ppm: nc - 0.19,
+            c_indirect_ppm: ca_k + 0.13,
+            sign: 1,
+            height: 88.0,
+            volume: 88.0,
+            anchor_root_idx: None,
+        });
+    }
+
+    let systems = register_and_build_con_dipeptide_systems(&picked);
+    // True roots with sequential partners must recover `c_curr` registered onto the `CON` `C'` frame (`+0.08 ppm` in `simulate_mismatched_bmrb_picked_dataset`)
+    let with_c_curr = systems
+        .iter()
+        .zip(truth.iter())
+        .filter(|&(s, &t)| t >= 1 && !s.c_curr.is_empty())
+        .count();
+    assert!(
+        with_c_curr >= 80,
+        "Unsupervised unanchored NCACO registration must recover >=80 c_curr shifts despite (+0.14 C', -0.19 N) drift, got {with_c_curr}"
+    );
+
+    let cfg = IdpSolverConfig {
+        temperature_k: 298.15,
+        ph: 6.5,
+        seed: 909,
+        ..IdpSolverConfig::default()
+    };
+    let res = assign_idp_13c_cpu(&systems, &darpp.sequence, &cfg);
+
+    // Every single 3D-unsupported spurious 2D CON noise root (`truth == -1`, `n_3d_ch == 0`) MUST remain unassigned (`-1`),
+    // even when `s_len + 1 < k_len` leaves empty sequence gaps!
+    for (s, &t) in truth.iter().enumerate() {
+        if t == -1 && !systems[s].has_3d_support() {
+            assert_eq!(
+                res.position[s], -1,
+                "3D-unsupported spurious 2D CON root s={s} was falsely placed at k={} into an empty sequence gap!",
+                res.position[s]
+            );
+        }
+    }
+    let m = evaluate_metrics(&res.as_assign_result(), &truth, 0.80);
+    assert!(
+        m.accuracy() >= 0.95,
+        "DARPP-32 accuracy {:.2}% < 95%",
+        m.accuracy() * 100.0
+    );
+    assert!(
+        m.hc_precision() >= 0.98,
+        "DARPP-32 HC precision {:.2}% < 98%",
         m.hc_precision() * 100.0
     );
 }
