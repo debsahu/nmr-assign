@@ -703,3 +703,6 @@ impl From<&octet_render::RenderScene> for octet_mol::ChemDocument {
         }
     }
 }
+
+pub mod c13_detected;
+pub mod idp_solver;
