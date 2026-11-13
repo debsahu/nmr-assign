@@ -1251,3 +1251,5 @@ mod curation_gpu_tests {
         assert_eq!(res_gpu.confidence[4], 1.0);
     }
 }
+
+pub mod idp_gpu;
