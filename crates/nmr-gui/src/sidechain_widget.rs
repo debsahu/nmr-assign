@@ -595,17 +595,17 @@ impl SequenceRibbonState {
     }
 
     /// Set an explicit user chemical state variant override for `residue_idx`.
+    ///
+    /// Selecting [`ResidueVariant::Canonical`] records an explicit `Canonical` entry in
+    /// `user_variant_overrides` (rather than removing the key) so subsequent automatic shift
+    /// inference via [`Self::sync_inferred_variants_from_reference`] never silently overrides
+    /// the user's explicit `Canonical` choice. Call [`Self::clear_user_variant_override`] to
+    /// return a residue to automatic inference.
     pub fn set_variant(&mut self, residue_idx: usize, variant: ResidueVariant) {
+        self.user_variant_overrides.insert(residue_idx, variant);
         if variant == ResidueVariant::Canonical {
-            if self.auto_inferred_variants.contains_key(&residue_idx) {
-                self.user_variant_overrides
-                    .insert(residue_idx, ResidueVariant::Canonical);
-            } else {
-                self.user_variant_overrides.remove(&residue_idx);
-            }
             self.variant_overrides.remove(&residue_idx);
         } else {
-            self.user_variant_overrides.insert(residue_idx, variant);
             self.variant_overrides.insert(residue_idx, variant);
         }
     }
@@ -1328,5 +1328,65 @@ impl SidechainInspectorPanel {
             jump_to_atom,
             variant_override,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nmr_core::nmrstar::Reference;
+    use nmr_core::topology::ResidueVariant;
+
+    use super::SequenceRibbonState;
+
+    #[test]
+    fn explicit_canonical_override_persists_across_auto_sync() {
+        let seq = vec!["CYS".to_string(), "HIS".to_string()];
+        let seq_ids = vec![1, 2];
+
+        // 1. User selects Canonical BEFORE any shifts are synced (auto_inferred_variants is empty).
+        let mut state = SequenceRibbonState::new();
+        state.set_variant(0, ResidueVariant::Canonical);
+        state.set_variant(1, ResidueVariant::Canonical);
+        assert_eq!(
+            state.user_variant_overrides.get(&0),
+            Some(&ResidueVariant::Canonical)
+        );
+        assert_eq!(
+            state.user_variant_overrides.get(&1),
+            Some(&ResidueVariant::Canonical)
+        );
+
+        // 2. Subsequent auto-sync sees oxidized Cys CB and resolved Ne2H His shifts,
+        //    but MUST NOT overwrite the user's explicit Canonical override!
+        let mut r = Reference::new(seq.clone(), seq_ids.clone());
+        r.shifts.insert((0, "CB".to_string()), 41.4);
+        r.shifts.insert((1, "ND1".to_string()), 249.2);
+        r.shifts.insert((1, "NE2".to_string()), 167.5);
+        state.sync_inferred_variants_from_reference(&r);
+
+        assert_eq!(
+            state.auto_inferred_variants.get(&0),
+            Some(&ResidueVariant::CysOxidized)
+        );
+        assert_eq!(
+            state.auto_inferred_variants.get(&1),
+            Some(&ResidueVariant::HisNe2H)
+        );
+        assert_eq!(state.variant_for(0), ResidueVariant::Canonical);
+        assert_eq!(state.variant_for(1), ResidueVariant::Canonical);
+        assert!(!state.variant_overrides.contains_key(&0));
+        assert!(!state.variant_overrides.contains_key(&1));
+
+        // 3. Switching from CysReduced -> Canonical after auto-sync expires also persists across future syncs.
+        let empty_ref = Reference::new(seq, seq_ids);
+        state.sync_inferred_variants_from_reference(&empty_ref);
+        state.set_variant(0, ResidueVariant::CysReduced);
+        state.set_variant(0, ResidueVariant::Canonical);
+        state.sync_inferred_variants_from_reference(&r);
+        assert_eq!(state.variant_for(0), ResidueVariant::Canonical);
+
+        // 4. Clearing the explicit user override restores automatic inference cleanly.
+        state.clear_user_variant_override(0);
+        assert_eq!(state.variant_for(0), ResidueVariant::CysOxidized);
     }
 }

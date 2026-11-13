@@ -6,7 +6,7 @@
 #[allow(dead_code)]
 mod octet_canvas;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use eframe::{egui, egui_wgpu};
 use nmr_core::aromatic::{
-    assign_aromatic_rings, merge_aromatic_assignments_preserving_existing, AromaticSolverConfig,
+    assign_aromatic_rings, estimate_unlabelled_yamazaki_cb_offset,
+    merge_aromatic_assignments_preserving_existing, AromaticRingCluster, AromaticSolverConfig,
     AROMATIC_EXPERIMENTS,
 };
 use nmr_core::c13_detected::{
@@ -111,6 +112,8 @@ use nmr_gui::{
     },
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
+    mol3d_overlay::Mol3dSyncAction,
+    mol3d_viewer::{Mol3dPipelineResource, Mol3dViewerPanel},
     session_io::WorkbenchSessionController,
     sidechain_widget::{
         AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
@@ -125,6 +128,9 @@ const UBIQUITIN_SEQ: &str =
 
 const SYNTHETIC_UBIQUITIN_STR: &str =
     include_str!("../../../data/fixtures/synthetic_ubiquitin.str");
+
+const DEMO_UBIQUITIN_1UBQ_PDB: &str =
+    include_str!("../../../data/fixtures/ubiquitin_1ubq_xray.pdb");
 
 struct PerfTimer {
     #[cfg(not(target_arch = "wasm32"))]
@@ -414,6 +420,350 @@ fn parse_gui_c13_tsv_str(text: &str) -> Option<C13PickedDataset> {
     Some(ds)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ClusterCuratedEval {
+    total_cur_obs: usize,
+    total_clu_obs: usize,
+    shared_obs: usize,
+    conflict_obs: usize,
+    cb_contradicts: bool,
+    norm_dist_sq: f64,
+}
+
+fn eval_cluster_vs_curated_residue(
+    clu: &AromaticRingCluster,
+    k_cur: usize,
+    curated_ref: &Reference,
+    cfg: &AromaticSolverConfig,
+) -> ClusterCuratedEval {
+    let res_name = curated_ref
+        .sequence
+        .get(k_cur)
+        .map(String::as_str)
+        .unwrap_or("");
+    if clu.kind.res_name() != res_name {
+        return ClusterCuratedEval {
+            conflict_obs: 1,
+            ..ClusterCuratedEval::default()
+        };
+    }
+
+    let tol_h = (cfg.tol_h * 2.0).max(0.055);
+    let tol_c = (cfg.tol_c * 1.6).max(0.45);
+    let tol_n = (cfg.tol_n * 1.6).max(0.65);
+
+    let logical_schema: &[(&str, Option<&str>, f64)] = match res_name {
+        "PHE" => &[
+            ("CD1", Some("CD2"), tol_c),
+            ("HD1", Some("HD2"), tol_h),
+            ("CE1", Some("CE2"), tol_c),
+            ("HE1", Some("HE2"), tol_h),
+            ("CZ", None, tol_c),
+            ("HZ", None, tol_h),
+        ],
+        "TYR" => &[
+            ("CD1", Some("CD2"), tol_c),
+            ("HD1", Some("HD2"), tol_h),
+            ("CE1", Some("CE2"), tol_c),
+            ("HE1", Some("HE2"), tol_h),
+        ],
+        "TRP" => &[
+            ("CD1", None, tol_c),
+            ("HD1", None, tol_h),
+            ("CE3", None, tol_c),
+            ("HE3", None, tol_h),
+            ("CZ3", None, tol_c),
+            ("HZ3", None, tol_h),
+            ("CH2", None, tol_c),
+            ("HH2", None, tol_h),
+            ("CZ2", None, tol_c),
+            ("HZ2", None, tol_h),
+            ("NE1", None, tol_n),
+            ("HE1", None, tol_h),
+        ],
+        "HIS" => &[
+            ("CD2", None, tol_c),
+            ("HD2", None, tol_h),
+            ("CE1", None, tol_c),
+            ("HE1", None, tol_h),
+            ("ND1", None, tol_n),
+            ("NE2", None, tol_n),
+        ],
+        _ => &[],
+    };
+
+    let clu_val_for = |primary: &str| -> Option<f64> {
+        match (res_name, primary) {
+            ("PHE" | "TYR", "CD1") => clu.ch_slots.get("CD1").map(|s| s.c_ppm),
+            ("PHE" | "TYR", "HD1") => clu.ch_slots.get("CD1").map(|s| s.h_ppm),
+            ("PHE" | "TYR", "CE1") => clu.ch_slots.get("CE1").map(|s| s.c_ppm),
+            ("PHE" | "TYR", "HE1") => clu.ch_slots.get("CE1").map(|s| s.h_ppm),
+            ("PHE", "CZ") => clu.ch_slots.get("CZ").map(|s| s.c_ppm),
+            ("PHE", "HZ") => clu.ch_slots.get("CZ").map(|s| s.h_ppm),
+            ("TRP", "CD1") => clu.ch_slots.get("CD1").map(|s| s.c_ppm),
+            ("TRP", "HD1") => clu.ch_slots.get("CD1").map(|s| s.h_ppm),
+            ("TRP", "CE3") => clu.ch_slots.get("CE3").map(|s| s.c_ppm),
+            ("TRP", "HE3") => clu.ch_slots.get("CE3").map(|s| s.h_ppm),
+            ("TRP", "CZ3") => clu.ch_slots.get("CZ3").map(|s| s.c_ppm),
+            ("TRP", "HZ3") => clu.ch_slots.get("CZ3").map(|s| s.h_ppm),
+            ("TRP", "CH2") => clu.ch_slots.get("CH2").map(|s| s.c_ppm),
+            ("TRP", "HH2") => clu.ch_slots.get("CH2").map(|s| s.h_ppm),
+            ("TRP", "CZ2") => clu.ch_slots.get("CZ2").map(|s| s.c_ppm),
+            ("TRP", "HZ2") => clu.ch_slots.get("CZ2").map(|s| s.h_ppm),
+            ("TRP", "NE1") => clu.trp_indole.map(|(n, _, _)| n),
+            ("TRP", "HE1") => clu.trp_indole.map(|(_, h, _)| h),
+            ("HIS", "CD2") => clu.ch_slots.get("CD2").map(|s| s.c_ppm),
+            ("HIS", "HD2") => clu.ch_slots.get("CD2").map(|s| s.h_ppm),
+            ("HIS", "CE1") => clu.ch_slots.get("CE1").map(|s| s.c_ppm),
+            ("HIS", "HE1") => clu.ch_slots.get("CE1").map(|s| s.h_ppm),
+            ("HIS", "ND1") => clu.nd1_ppm.map(|(n, _)| n),
+            ("HIS", "NE2") => clu.ne2_ppm.map(|(n, _)| n),
+            _ => None,
+        }
+    };
+
+    let mut out = ClusterCuratedEval::default();
+    for &(a1, a2_opt, tol) in logical_schema {
+        let cur1 = curated_ref.shifts.get(&(k_cur, a1.to_string())).copied();
+        let cur2 = a2_opt.and_then(|a2| curated_ref.shifts.get(&(k_cur, a2.to_string())).copied());
+        let has_cur = cur1.is_some() || cur2.is_some();
+        if has_cur {
+            out.total_cur_obs += 1;
+        }
+        let Some(cv) = clu_val_for(a1) else {
+            continue;
+        };
+        out.total_clu_obs += 1;
+        if !has_cur {
+            continue;
+        }
+        let best_diff = [cur1, cur2]
+            .into_iter()
+            .flatten()
+            .map(|v| (cv - v).abs())
+            .fold(f64::INFINITY, f64::min);
+        if best_diff <= tol {
+            out.shared_obs += 1;
+            out.norm_dist_sq += (best_diff / tol).powi(2);
+        } else {
+            out.conflict_obs += 1;
+        }
+    }
+
+    if let Some(&cur_cb) = curated_ref.shifts.get(&(k_cur, "CB".to_string())) {
+        let cbs: Vec<f64> = [clu.cb_hd, clu.cb_he].into_iter().flatten().collect();
+        if !cbs.is_empty()
+            && cbs
+                .iter()
+                .all(|&cb| (cb - cur_cb).abs() > cfg.tol_cb * 1.20)
+        {
+            out.cb_contradicts = true;
+        }
+    }
+
+    out
+}
+
+fn cluster_belongs_to_curated(ev: &ClusterCuratedEval) -> bool {
+    if ev.cb_contradicts || ev.total_clu_obs == 0 {
+        return false;
+    }
+    let min_corroborate = ev.total_cur_obs.clamp(1, 2);
+    if ev.conflict_obs == 0 {
+        ev.shared_obs == ev.total_clu_obs || ev.shared_obs >= min_corroborate
+    } else {
+        ev.conflict_obs <= 1 && ev.shared_obs >= 2 && ev.shared_obs > ev.conflict_obs
+    }
+}
+
+fn compute_yamazaki_cb_offsets(
+    backbone_ref: &Reference,
+    backbone_conf: Option<&BTreeMap<usize, f64>>,
+    aromatic_peaks: &[Peak],
+    cfg: &AromaticSolverConfig,
+) -> (f64, f64) {
+    let d_joint = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        None,
+        cfg.min_backbone_conf,
+    );
+    let d_hd_raw = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        Some("HBCBCGCDHD"),
+        cfg.min_backbone_conf,
+    );
+    let d_he_raw = estimate_unlabelled_yamazaki_cb_offset(
+        backbone_ref,
+        backbone_conf,
+        aromatic_peaks,
+        Some("HBCBCGCDCEHE"),
+        cfg.min_backbone_conf,
+    );
+    let d_hd = if d_hd_raw != 0.0 { d_hd_raw } else { d_joint };
+    let d_he = if d_he_raw != 0.0 { d_he_raw } else { d_joint };
+    (d_hd, d_he)
+}
+
+fn peak_matches_aromatic_cluster(
+    p: &Peak,
+    clu: &AromaticRingCluster,
+    cb_offset_hd: f64,
+    cb_offset_he: f64,
+    cfg: &AromaticSolverConfig,
+) -> bool {
+    let tol_h = (cfg.tol_h * 1.5).max(0.045);
+    let tol_c = (cfg.tol_c * 1.5).max(0.42);
+    let tol_n = (cfg.tol_n * 1.5).max(0.55);
+    match p.exp.as_str() {
+        "C13HSQC" => clu.ch_slots.values().any(|s| {
+            (p.h - s.h_ppm).abs() <= tol_h && p.c.is_some_and(|c| (c - s.c_ppm).abs() <= tol_c)
+        }),
+        "AROM_HCCH_TOCSY" | "HCCHTOCSY" => {
+            clu.ch_slots
+                .values()
+                .any(|s| (p.h - s.h_ppm).abs() <= tol_h)
+                && clu
+                    .ch_slots
+                    .values()
+                    .any(|s| p.c.is_some_and(|c| (c - s.c_ppm).abs() <= tol_c))
+        }
+        "HBCBCGCDHD" => {
+            clu.ch_slots
+                .get("CD1")
+                .or_else(|| clu.ch_slots.get("CD2"))
+                .is_some_and(|s| (p.h - s.h_ppm).abs() <= tol_h * 1.25)
+                && clu.cb_hd.is_some_and(|cb| {
+                    p.c.is_some_and(|c| {
+                        ((c - cb_offset_hd) - cb).abs() <= cfg.tol_cb * 1.15
+                            || (c - cb).abs() <= cfg.tol_cb * 1.15
+                    })
+                })
+        }
+        "HBCBCGCDCEHE" => {
+            clu.ch_slots
+                .get("CE1")
+                .or_else(|| clu.ch_slots.get("CE3"))
+                .is_some_and(|s| (p.h - s.h_ppm).abs() <= tol_h * 1.25)
+                && clu.cb_he.is_some_and(|cb| {
+                    p.c.is_some_and(|c| {
+                        ((c - cb_offset_he) - cb).abs() <= cfg.tol_cb * 1.15
+                            || (c - cb).abs() <= cfg.tol_cb * 1.15
+                    })
+                })
+        }
+        "TRP_IND_N15HSQC" => clu
+            .trp_indole
+            .is_some_and(|(ne1, he1, _)| (p.h - he1).abs() <= tol_h && (p.n - ne1).abs() <= tol_n),
+        "HIS_LR_N15HMQC" => {
+            clu.ch_slots
+                .values()
+                .any(|s| (p.h - s.h_ppm).abs() <= tol_h)
+                && (clu.nd1_ppm.is_some_and(|(n, _)| (p.n - n).abs() <= tol_n)
+                    || clu.ne2_ppm.is_some_and(|(n, _)| (p.n - n).abs() <= tol_n))
+        }
+        _ => false,
+    }
+}
+
+fn put_ring_atom_if_missing(
+    merged: &mut Reference,
+    k_cur: usize,
+    res_name: &str,
+    atom: &str,
+    val: f64,
+) {
+    let key = (k_cur, atom.to_string());
+    if !merged.shifts.contains_key(&key) {
+        merged.shifts.insert(key.clone(), val);
+        let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
+        merged.ambiguity_codes.entry(key).or_insert(code);
+    }
+}
+
+fn insert_corroborated_missing_ring_atoms(
+    merged: &mut Reference,
+    k_cur: usize,
+    clu: &AromaticRingCluster,
+) {
+    let res_name = merged.sequence.get(k_cur).cloned().unwrap_or_default();
+    let has_any = |r: &Reference, atoms: &[&str]| -> bool {
+        atoms
+            .iter()
+            .any(|a| r.shifts.contains_key(&(k_cur, (*a).to_string())))
+    };
+
+    for (&c_atom, slot) in &clu.ch_slots {
+        match (res_name.as_str(), c_atom) {
+            ("PHE" | "TYR", "CD1") => {
+                if !has_any(merged, &["CD1", "CD2"]) {
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "CD1", slot.c_ppm);
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "CD2", slot.c_ppm);
+                }
+                if !has_any(merged, &["HD1", "HD2"]) {
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "HD1", slot.h_ppm);
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "HD2", slot.h_ppm);
+                }
+            }
+            ("PHE" | "TYR", "CE1") => {
+                if !has_any(merged, &["CE1", "CE2"]) {
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "CE1", slot.c_ppm);
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "CE2", slot.c_ppm);
+                }
+                if !has_any(merged, &["HE1", "HE2"]) {
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "HE1", slot.h_ppm);
+                    put_ring_atom_if_missing(merged, k_cur, &res_name, "HE2", slot.h_ppm);
+                }
+            }
+            ("PHE", "CZ") => {
+                put_ring_atom_if_missing(merged, k_cur, &res_name, "CZ", slot.c_ppm);
+                put_ring_atom_if_missing(merged, k_cur, &res_name, "HZ", slot.h_ppm);
+            }
+            ("TRP", ca) => {
+                let pa = match ca {
+                    "CD1" => "HD1",
+                    "CE3" => "HE3",
+                    "CZ3" => "HZ3",
+                    "CH2" => "HH2",
+                    "CZ2" => "HZ2",
+                    _ => continue,
+                };
+                put_ring_atom_if_missing(merged, k_cur, &res_name, ca, slot.c_ppm);
+                put_ring_atom_if_missing(merged, k_cur, &res_name, pa, slot.h_ppm);
+            }
+            ("HIS", ca) => {
+                let pa = if ca == "CD2" { "HD2" } else { "HE1" };
+                put_ring_atom_if_missing(merged, k_cur, &res_name, ca, slot.c_ppm);
+                put_ring_atom_if_missing(merged, k_cur, &res_name, pa, slot.h_ppm);
+            }
+            _ => {}
+        }
+    }
+    if res_name == "TRP" {
+        if let Some((ne1, he1, _)) = clu.trp_indole {
+            put_ring_atom_if_missing(merged, k_cur, &res_name, "NE1", ne1);
+            put_ring_atom_if_missing(merged, k_cur, &res_name, "HE1", he1);
+        }
+    }
+    if res_name == "HIS" {
+        if let Some((nd1, _)) = clu.nd1_ppm {
+            put_ring_atom_if_missing(merged, k_cur, &res_name, "ND1", nd1);
+        }
+        if let Some((ne2, _)) = clu.ne2_ppm {
+            put_ring_atom_if_missing(merged, k_cur, &res_name, "NE2", ne2);
+        }
+    }
+    if !merged.shifts.contains_key(&(k_cur, "CB".to_string())) {
+        if let Some(cb_y) = clu.cb_hd.or(clu.cb_he) {
+            put_ring_atom_if_missing(merged, k_cur, &res_name, "CB", cb_y);
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn merge_gui_aromatic_preserving_user_rings(
     working_ref: &Reference,
     prior_user_ref: Option<&Reference>,
@@ -422,9 +772,29 @@ fn merge_gui_aromatic_preserving_user_rings(
     arom_peaks: &[Peak],
     sc_priors: &SidechainPriors,
 ) -> Reference {
+    merge_gui_aromatic_with_options(
+        working_ref,
+        prior_user_ref,
+        prior_amb,
+        pred_conf,
+        arom_peaks,
+        sc_priors,
+        false,
+    )
+}
+
+fn merge_gui_aromatic_with_options(
+    working_ref: &Reference,
+    prior_user_ref: Option<&Reference>,
+    prior_amb: &BTreeMap<(usize, String), u8>,
+    pred_conf: Option<&BTreeMap<usize, f64>>,
+    arom_peaks: &[Peak],
+    sc_priors: &SidechainPriors,
+    overwrite_curated_rings: bool,
+) -> Reference {
     const RING_ATOMS: &[&str] = &[
-        "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3", "CZ2",
-        "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
+        "CG", "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
+        "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
     ];
     let is_arom_ring_key = |r: &Reference, k: usize, atom: &str| -> bool {
         matches!(
@@ -433,54 +803,260 @@ fn merge_gui_aromatic_preserving_user_rings(
         ) && RING_ATOMS.contains(&atom)
     };
 
-    let mut backbone_for_arom = working_ref.clone();
-    backbone_for_arom
-        .shifts
-        .retain(|&(k, ref atom), _| !is_arom_ring_key(working_ref, k, atom));
-    backbone_for_arom
-        .ambiguity_codes
-        .retain(|&(k, ref atom), _| !is_arom_ring_key(working_ref, k, atom));
-
-    let mut existing_for_merge = backbone_for_arom.clone();
+    // Assemble full reference retaining all user-curated ring shifts & ambiguity codes
+    let mut curated_ref = working_ref.clone();
     if let Some(user_ref) = prior_user_ref {
         for (&(k, ref atom), &v) in &user_ref.shifts {
             if is_arom_ring_key(user_ref, k, atom) {
-                existing_for_merge.shifts.insert((k, atom.clone()), v);
+                curated_ref.shifts.insert((k, atom.clone()), v);
             }
         }
         for (&(k, ref atom), &code) in &user_ref.ambiguity_codes {
             if is_arom_ring_key(user_ref, k, atom) {
-                existing_for_merge
-                    .ambiguity_codes
-                    .insert((k, atom.clone()), code);
+                curated_ref.ambiguity_codes.insert((k, atom.clone()), code);
             }
         }
     }
     for (&(k, ref atom), &code) in prior_amb {
-        if is_arom_ring_key(&existing_for_merge, k, atom) {
-            existing_for_merge
-                .ambiguity_codes
-                .insert((k, atom.clone()), code);
+        if is_arom_ring_key(&curated_ref, k, atom) {
+            curated_ref.ambiguity_codes.insert((k, atom.clone()), code);
         }
     }
 
-    let arom_res = assign_aromatic_rings(
-        &backbone_for_arom,
-        pred_conf,
-        arom_peaks,
-        sc_priors,
-        &AromaticSolverConfig::default(),
-    );
-    let mut merged = merge_aromatic_assignments_preserving_existing(
-        &existing_for_merge,
-        &arom_res.reference,
-        &arom_res.atom_confidence,
-    );
-    for (k, atom) in arom_res.atom_confidence.keys() {
-        let res_name = merged.sequence.get(*k).map(String::as_str).unwrap_or("");
-        let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
-        merged.ambiguity_codes.insert((*k, atom.clone()), code);
+    let cfg = AromaticSolverConfig::default();
+
+    if overwrite_curated_rings {
+        let mut backbone_for_arom = curated_ref.clone();
+        backbone_for_arom
+            .shifts
+            .retain(|&(k, ref atom), _| !is_arom_ring_key(&curated_ref, k, atom));
+        backbone_for_arom
+            .ambiguity_codes
+            .retain(|&(k, ref atom), _| !is_arom_ring_key(&curated_ref, k, atom));
+
+        let arom_res =
+            assign_aromatic_rings(&backbone_for_arom, pred_conf, arom_peaks, sc_priors, &cfg);
+        let assigned_ring_residues: BTreeSet<usize> = arom_res
+            .rings
+            .iter()
+            .filter_map(|r| r.cluster_idx.map(|_| r.residue_idx))
+            .collect();
+        let mut base_for_overwrite = curated_ref.clone();
+        base_for_overwrite.shifts.retain(|&(k, ref atom), _| {
+            !(assigned_ring_residues.contains(&k) && is_arom_ring_key(&curated_ref, k, atom))
+        });
+        base_for_overwrite
+            .ambiguity_codes
+            .retain(|&(k, ref atom), _| {
+                !(assigned_ring_residues.contains(&k) && is_arom_ring_key(&curated_ref, k, atom))
+            });
+        let mut merged = merge_aromatic_assignments_preserving_existing(
+            &base_for_overwrite,
+            &arom_res.reference,
+            &arom_res.atom_confidence,
+        );
+        for (k, atom) in arom_res.atom_confidence.keys() {
+            let res_name = merged.sequence.get(*k).map(String::as_str).unwrap_or("");
+            let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
+            merged.ambiguity_codes.insert((*k, atom.clone()), code);
+        }
+        return merged;
     }
+
+    // Default (`overwrite_curated_rings == false`):
+    // 1. Do NOT strip user-curated ring shifts before conflict/corroboration checking.
+    // 2. Identify residues with >= 1 user-curated aromatic ring shift.
+    let mut curated_residues: BTreeSet<usize> = BTreeSet::new();
+    for &(k, ref atom) in curated_ref.shifts.keys() {
+        if is_arom_ring_key(&curated_ref, k, atom) {
+            curated_residues.insert(k);
+        }
+    }
+
+    let probe = assign_aromatic_rings(&curated_ref, pred_conf, arom_peaks, sc_priors, &cfg);
+    if curated_residues.is_empty() {
+        let mut merged = merge_aromatic_assignments_preserving_existing(
+            &curated_ref,
+            &probe.reference,
+            &probe.atom_confidence,
+        );
+        for (k, atom) in probe.atom_confidence.keys() {
+            let res_name = merged.sequence.get(*k).map(String::as_str).unwrap_or("");
+            let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
+            merged
+                .ambiguity_codes
+                .entry((*k, atom.clone()))
+                .or_insert(code);
+        }
+        return merged;
+    }
+
+    // 3. Match each curated residue against compatible experimental clusters so:
+    //    - partial disjoint clusters (e.g. CD-only vs curated CE/CZ) are never mixed into curated rings,
+    //    - clusters whose shifts belong to a curated residue (including superset clusters and 1-slot
+    //      user-tweaked curated rings) are claimed and cannot jump onto another residue.
+    let (cb_offset_hd, cb_offset_he) =
+        compute_yamazaki_cb_offsets(&curated_ref, pred_conf, arom_peaks, &cfg);
+    let mut claimed_clusters: BTreeMap<usize, (usize, ClusterCuratedEval)> = BTreeMap::new();
+    for &k_cur in &curated_residues {
+        let mut best: Option<(usize, ClusterCuratedEval)> = None;
+        for (ci, clu) in probe.clusters.iter().enumerate() {
+            if claimed_clusters.contains_key(&ci) {
+                continue;
+            }
+            let ev = eval_cluster_vs_curated_residue(clu, k_cur, &curated_ref, &cfg);
+            if !cluster_belongs_to_curated(&ev) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, b_ev)) => {
+                    ev.conflict_obs < b_ev.conflict_obs
+                        || (ev.conflict_obs == b_ev.conflict_obs
+                            && (ev.shared_obs > b_ev.shared_obs
+                                || (ev.shared_obs == b_ev.shared_obs
+                                    && ev.norm_dist_sq < b_ev.norm_dist_sq)))
+                }
+            };
+            if better {
+                best = Some((ci, ev));
+            }
+        }
+        if let Some((ci, ev)) = best {
+            claimed_clusters.insert(ci, (k_cur, ev));
+        }
+    }
+
+    // 4. Solve uncurated residues on peaks excluding peaks owned solely by claimed curated clusters,
+    //    pre-applying `(cb_offset_hd, cb_offset_he)` so masking curated residues to `ALA` never loses
+    //    Yamazaki CB offset calibration on remaining uncurated residues.
+    let mut sub_ref = curated_ref.clone();
+    for &k_cur in &curated_residues {
+        if let Some(slot) = sub_ref.sequence.get_mut(k_cur) {
+            *slot = "ALA".to_string();
+        }
+    }
+    let sub_peaks: Vec<Peak> = arom_peaks
+        .iter()
+        .filter(|p| {
+            let matches_claimed = claimed_clusters.keys().any(|&ci| {
+                peak_matches_aromatic_cluster(
+                    p,
+                    &probe.clusters[ci],
+                    cb_offset_hd,
+                    cb_offset_he,
+                    &cfg,
+                )
+            });
+            if !matches_claimed {
+                return true;
+            }
+            probe.clusters.iter().enumerate().any(|(cj, clu)| {
+                !claimed_clusters.contains_key(&cj)
+                    && peak_matches_aromatic_cluster(p, clu, cb_offset_hd, cb_offset_he, &cfg)
+            })
+        })
+        .map(|p| {
+            let mut q = p.clone();
+            if q.exp == "HBCBCGCDHD" && cb_offset_hd != 0.0 {
+                q.c = q.c.map(|c| c - cb_offset_hd);
+            } else if q.exp == "HBCBCGCDCEHE" && cb_offset_he != 0.0 {
+                q.c = q.c.map(|c| c - cb_offset_he);
+            }
+            q
+        })
+        .collect();
+
+    let sub_res = assign_aromatic_rings(&sub_ref, pred_conf, &sub_peaks, sc_priors, &cfg);
+
+    let mut merged = curated_ref.clone();
+
+    // Corroborated missing-atom completion on curated residues (strictly `conflict_obs == 0` so
+    // conflicting or disjoint slots NEVER overwrite or mix into curated rings!)
+    for (&ci, &(k_cur, ev)) in &claimed_clusters {
+        let min_corroborate = ev.total_cur_obs.clamp(1, 2);
+        if ev.conflict_obs == 0 && !ev.cb_contradicts && ev.shared_obs >= min_corroborate {
+            insert_corroborated_missing_ring_atoms(&mut merged, k_cur, &probe.clusters[ci]);
+        }
+    }
+
+    // Merge assignments onto uncurated residues while blocking duplicate curated ring clusters
+    for r in &sub_res.rings {
+        let k_other = r.residue_idx;
+        if curated_residues.contains(&k_other) {
+            continue;
+        }
+        let Some(sub_ci) = r.cluster_idx else {
+            continue;
+        };
+        let sub_clu = &sub_res.clusters[sub_ci];
+
+        let is_duplicate_of_curated = curated_residues.iter().any(|&k_cur| {
+            if curated_ref.sequence.get(k_cur) != curated_ref.sequence.get(k_other) {
+                return false;
+            }
+            let dup_ev = eval_cluster_vs_curated_residue(sub_clu, k_cur, &curated_ref, &cfg);
+            if !cluster_belongs_to_curated(&dup_ev) {
+                return false;
+            }
+            // Allow only if >= 2 distinct clusters in probe genuinely shared these degenerate shifts,
+            // or if sub_clu carries a Yamazaki CB matching k_other's CB while contradicting k_cur's CB.
+            let n_probe_matches = probe
+                .clusters
+                .iter()
+                .filter(|c| {
+                    let e = eval_cluster_vs_curated_residue(c, k_cur, &curated_ref, &cfg);
+                    cluster_belongs_to_curated(&e)
+                })
+                .count();
+            if n_probe_matches >= 2 {
+                return false;
+            }
+            if let (Some(&cb_other), Some(&cb_cur)) = (
+                curated_ref.shifts.get(&(k_other, "CB".to_string())),
+                curated_ref.shifts.get(&(k_cur, "CB".to_string())),
+            ) {
+                let cbs: Vec<f64> = [sub_clu.cb_hd, sub_clu.cb_he]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                if !cbs.is_empty()
+                    && cbs.iter().any(|&cb| (cb - cb_other).abs() <= cfg.tol_cb)
+                    && cbs.iter().all(|&cb| (cb - cb_cur).abs() > cfg.tol_cb)
+                {
+                    return false;
+                }
+            }
+            true
+        });
+
+        if is_duplicate_of_curated {
+            continue;
+        }
+
+        for key in sub_res.atom_confidence.keys() {
+            if key.0 != k_other {
+                continue;
+            }
+            if let Some(&val) = sub_res.reference.shifts.get(key) {
+                merged.shifts.entry(key.clone()).or_insert(val);
+            }
+            let res_name = merged
+                .sequence
+                .get(k_other)
+                .map(String::as_str)
+                .unwrap_or("");
+            let default_code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, &key.1);
+            let code = sub_res
+                .reference
+                .ambiguity_codes
+                .get(key)
+                .copied()
+                .unwrap_or(default_code);
+            merged.ambiguity_codes.entry(key.clone()).or_insert(code);
+        }
+    }
+
     merged
 }
 
@@ -1013,6 +1589,9 @@ struct NmrWorkbenchApp {
     metrics: Option<Metrics>,
     sidechain_ribbon_state: SequenceRibbonState,
     show_sidechain_inspector: bool,
+    overwrite_curated_rings: bool,
+    mol3d_panel: Mol3dViewerPanel,
+    show_mol3d_viewport: bool,
 
     // Spectra for GPU contour & 3D strip visualization
     hsqc_spec: Option<Spectrum2D>,
@@ -1096,7 +1675,12 @@ impl NmrWorkbenchApp {
 
         if let Some(rs) = &cc.wgpu_render_state {
             let contour_res = ContourPipelineResource::new(&rs.device, rs.target_format);
-            rs.renderer.write().callback_resources.insert(contour_res);
+            let mol3d_res = Mol3dPipelineResource::new(&rs.device, Some(rs.target_format));
+            {
+                let mut rend = rs.renderer.write();
+                rend.callback_resources.insert(contour_res);
+                rend.callback_resources.insert(mol3d_res);
+            }
 
             let info = rs.adapter.get_info();
             let name = if info.name.trim().is_empty() {
@@ -1166,6 +1750,9 @@ impl NmrWorkbenchApp {
             metrics: None,
             sidechain_ribbon_state: SequenceRibbonState::new(),
             show_sidechain_inspector: false,
+            overwrite_curated_rings: false,
+            mol3d_panel: Mol3dViewerPanel::new(),
+            show_mol3d_viewport: true,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -1368,6 +1955,7 @@ impl NmrWorkbenchApp {
                 .is_some_and(|st| st.spin_system == Some(ss))
         });
         self.session.state.assignments = new_assign;
+        self.sync_mol3d_from_app();
     }
 
     fn sync_app_from_session(&mut self) {
@@ -1454,6 +2042,96 @@ impl NmrWorkbenchApp {
         self.pred_ref = Some(pred);
         self.pred_conf = conf;
         self.refresh_propensity_report();
+        self.sync_mol3d_from_app();
+    }
+
+    fn sync_mol3d_from_app(&mut self) {
+        let src_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
+        self.mol3d_panel
+            .sync_nmr_tracks(&self.pred_conf, src_ref, Some(&self.priors));
+        self.mol3d_panel
+            .highlight_sequence_residue(self.selected_res, false);
+        self.mol3d_panel.flush_pending_updates();
+    }
+
+    fn load_structure_3d_in_memory(&mut self, text: &str, source_label: &str) {
+        match self
+            .mol3d_panel
+            .load_structure_text(text, &self.sequence, &self.seq_ids)
+        {
+            Ok(()) => {
+                if self.sequence.is_empty() {
+                    if let Some(ens) = self.mol3d_panel.ensemble.as_ref() {
+                        if !ens.primary_sequence.is_empty() {
+                            self.sequence = ens.primary_sequence.clone();
+                            self.seq_ids = ens.primary_seq_ids.clone();
+                            self.octet_app
+                                .set_loaded_protein_sequence(self.sequence.clone());
+                            self.session.state.sequence = self.sequence.clone();
+                            self.session.state.seq_ids = self.seq_ids.clone();
+                        }
+                    }
+                }
+                self.show_mol3d_viewport = true;
+                self.has_structure_or_dynamics = true;
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.sync_mol3d_from_app();
+                self.status_msg = format!(
+                    "Loaded 3D structure from {source_label}: {}",
+                    self.mol3d_panel.status_banner
+                );
+            }
+            Err(e) => {
+                self.status_msg = format!("3D structure load error ({source_label}): {e}");
+            }
+        }
+    }
+
+    fn apply_mol3d_sync_action(&mut self, sync: Mol3dSyncAction) {
+        if sync.residue_idx < self.sequence.len() {
+            self.select_residue_and_sync_strip(sync.residue_idx);
+        }
+        if sync.open_sidechain_graph {
+            self.show_sidechain_inspector = true;
+        }
+        sync.apply_to_crosshair(&mut self.crosshair);
+        let h_ppm = sync.atom_jump.as_ref().and_then(|j| j.backbone_h_ppm);
+        let n_ppm = sync.atom_jump.as_ref().and_then(|j| j.backbone_n_ppm);
+        if let (Some(h), Some(n)) = (h_ppm, n_ppm) {
+            let h_f = h as f32;
+            let n_f = n as f32;
+            let h_min = self.view_h_left.min(self.view_h_right);
+            let h_max = self.view_h_left.max(self.view_h_right);
+            let n_min = self.view_n_top.min(self.view_n_bottom);
+            let n_max = self.view_n_top.max(self.view_n_bottom);
+            if h_f < h_min || h_f > h_max || n_f < n_min || n_f > n_max {
+                let half_h = 0.5 * (self.view_h_left - self.view_h_right).abs().max(0.8);
+                let half_n = 0.5 * (self.view_n_bottom - self.view_n_top).abs().max(6.0);
+                self.view_h_left = h_f + half_h;
+                self.view_h_right = h_f - half_h;
+                self.view_n_top = n_f - half_n;
+                self.view_n_bottom = n_f + half_n;
+            }
+        }
+        let shift_summary = if let Some(ref j) = sync.atom_jump {
+            match (j.backbone_h_ppm, j.backbone_n_ppm) {
+                (Some(h), Some(n)) => {
+                    format!(" ({} {:.3} ppm; ¹H {h:.3}, ¹⁵N {n:.2})", j.atom_name, j.ppm)
+                }
+                _ => format!(" ({} {:.3} ppm)", j.atom_name, j.ppm),
+            }
+        } else {
+            String::new()
+        };
+        let atom_lbl = if sync.clicked_atom.is_empty() {
+            "CA"
+        } else {
+            sync.clicked_atom.as_str()
+        };
+        self.status_msg = format!(
+            "3D Pick → {} {} {}{}",
+            sync.residue_name, sync.seq_id, atom_lbl, shift_summary
+        );
     }
 
     fn refresh_propensity_report(&mut self) {
@@ -1512,6 +2190,12 @@ impl NmrWorkbenchApp {
     fn load_demo_and_solve(&mut self) {
         let ref_data = build_synthetic_ubiquitin();
         self.load_from_reference(ref_data);
+        let _ = self.mol3d_panel.load_structure_text(
+            DEMO_UBIQUITIN_1UBQ_PDB,
+            &self.sequence,
+            &self.seq_ids,
+        );
+        self.has_structure_or_dynamics = true;
         self.run_assignment();
     }
 
@@ -2105,6 +2789,21 @@ impl NmrWorkbenchApp {
         }
         let lower_label = source_label.to_ascii_lowercase();
 
+        // Check 3D biomolecular structure formats (`.pdb`, `.ent`, `.cif`, `.mmcif`)
+        if lower_label.ends_with(".pdb")
+            || lower_label.ends_with(".ent")
+            || lower_label.ends_with(".cif")
+            || lower_label.ends_with(".mmcif")
+            || trimmed.contains("_atom_site.")
+            || trimmed
+                .lines()
+                .take(48)
+                .any(|ln| ln.starts_with("ATOM  ") || ln.starts_with("HETATM"))
+        {
+            self.load_structure_3d_in_memory(trimmed, source_label);
+            return;
+        }
+
         // Check chemical structure formats first (`CDXML`, `OCT`, `MOL`/`SDF`, `InChI`, `.smi`)
         if trimmed.contains("<CDXML")
             || lower_label.ends_with(".cdxml")
@@ -2324,6 +3023,10 @@ impl NmrWorkbenchApp {
             .unwrap_or("")
             .to_ascii_lowercase();
         match ext.as_str() {
+            "pdb" | "ent" | "cif" | "mmcif" => match std::fs::read_to_string(p) {
+                Ok(txt) => self.load_structure_3d_in_memory(&txt, &p.display().to_string()),
+                Err(e) => self.status_msg = format!("3D structure read error: {e}"),
+            },
             "str" | "star" => match read_star_all_atoms(p, None) {
                 Ok(r) => {
                     self.load_from_reference(r);
@@ -2609,25 +3312,81 @@ impl NmrWorkbenchApp {
 
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
+            // Intercept 3D biomolecular structure files (`.pdb`, `.ent`, `.cif`, `.mmcif`) directly
+            let mut struct_files = Vec::new();
+            let mut remaining = Vec::with_capacity(dropped.len());
+            for df in dropped {
+                let fname = df
+                    .path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| df.path().display().to_string());
+                let low = fname.to_ascii_lowercase();
+                if low.ends_with(".pdb")
+                    || low.ends_with(".ent")
+                    || low.ends_with(".cif")
+                    || low.ends_with(".mmcif")
+                {
+                    struct_files.push((fname, df));
+                } else {
+                    remaining.push(df);
+                }
+            }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let _ = ctx;
-                match ingest_dropped_files_native(&dropped) {
-                    Ok(outcome) => self.apply_drop_outcome(outcome),
-                    Err(e) => self.status_msg = format!("Drop ingest error: {e}"),
+                for (fname, df) in struct_files {
+                    let loaded_txt = df
+                        .bytes()
+                        .or_else(|_| std::fs::read(df.path()).map_err(|e| e.to_string()))
+                        .and_then(|b| {
+                            String::from_utf8(b).map_err(|e| format!("UTF-8 error: {e}"))
+                        });
+                    match loaded_txt {
+                        Ok(txt) => self.load_structure_3d_in_memory(&txt, &fname),
+                        Err(e) => self.status_msg = format!("Structure drop error: {e}"),
+                    }
+                }
+                if !remaining.is_empty() {
+                    match ingest_dropped_files_native(&remaining) {
+                        Ok(outcome) => self.apply_drop_outcome(outcome),
+                        Err(e) => self.status_msg = format!("Drop ingest error: {e}"),
+                    }
                 }
             }
             #[cfg(target_arch = "wasm32")]
             {
-                let slot = Arc::clone(&self.pending_drop_outcome);
-                let egui_ctx = ctx.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let res = ingest_dropped_files_wasm(dropped).await;
-                    if let Ok(mut g) = slot.lock() {
-                        *g = Some(res);
-                    }
-                    egui_ctx.request_repaint();
-                });
+                if let Some((fname, df)) = struct_files.into_iter().next() {
+                    let slot = Arc::clone(&self.pending_drop_outcome);
+                    let egui_ctx = ctx.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let res = df
+                            .bytes_async()
+                            .await
+                            .and_then(|b| {
+                                String::from_utf8(b).map_err(|e| format!("UTF-8 error: {e}"))
+                            })
+                            .map(|text| IngestDropOutcome::TextTable {
+                                source_name: fname,
+                                text,
+                            });
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(res);
+                        }
+                        egui_ctx.request_repaint();
+                    });
+                } else if !remaining.is_empty() {
+                    let slot = Arc::clone(&self.pending_drop_outcome);
+                    let egui_ctx = ctx.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let res = ingest_dropped_files_wasm(remaining).await;
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(res);
+                        }
+                        egui_ctx.request_repaint();
+                    });
+                }
             }
         }
     }
@@ -3010,6 +3769,34 @@ impl NmrWorkbenchApp {
                             }
                         }
                     }
+                    let mol3d_btn = egui::Button::new(
+                        egui::RichText::new("🧬 3D Structure")
+                            .size(11.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if self.show_mol3d_viewport {
+                        egui::Color32::from_rgb(24, 96, 118)
+                    } else {
+                        egui::Color32::from_rgb(32, 42, 58)
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.2,
+                        if self.show_mol3d_viewport {
+                            egui::Color32::from_rgb(120, 235, 255)
+                        } else {
+                            egui::Color32::from_rgb(76, 92, 118)
+                        },
+                    ))
+                    .min_size(egui::vec2(86.0, 28.0));
+                    if ui
+                        .add(mol3d_btn)
+                        .on_hover_text(
+                            "Toggle dockable WebGPU 3D biomolecular structure, NMR putty & NOE/PRE restraint viewport",
+                        )
+                        .clicked()
+                    {
+                        self.show_mol3d_viewport = !self.show_mol3d_viewport;
+                    }
                     ui.add_space(4.0);
                     for (k, three) in self.sequence.iter().enumerate() {
                         let one = three_to_one(three);
@@ -3070,6 +3857,7 @@ impl NmrWorkbenchApp {
                                     self.crosshair.snap_to(ss.h, ss.n, None);
                                 }
                             }
+                            self.mol3d_panel.highlight_sequence_residue(Some(k), true);
                         }
                         resp.on_hover_ui(|ui| {
                             ui.label(egui::RichText::new(format!("{three} {seq_id}")).strong());
@@ -3235,6 +4023,7 @@ impl NmrWorkbenchApp {
                             let rk = res.position[s] as usize;
                             self.selected_res = Some(rk);
                             self.assign_target_res = rk;
+                            self.mol3d_panel.highlight_sequence_residue(Some(rk), true);
                         }
                     }
                 }
@@ -3396,6 +4185,7 @@ impl NmrWorkbenchApp {
         self.selected_res = Some(k);
         self.sidechain_ribbon_state.selected_residue = k;
         self.assign_target_res = k;
+        self.mol3d_panel.highlight_sequence_residue(Some(k), true);
         if let Some(res) = &self.assign_res {
             for (s, &pos) in res.position.iter().enumerate() {
                 if pos >= 0 && (pos as usize) == k {
@@ -3509,13 +4299,14 @@ impl NmrWorkbenchApp {
         };
 
         if !loaded_arom_peaks.is_empty() {
-            working_ref = merge_gui_aromatic_preserving_user_rings(
+            working_ref = merge_gui_aromatic_with_options(
                 &working_ref,
                 prior_user_ref.as_ref(),
                 &prior_amb,
                 (!self.pred_conf.is_empty()).then_some(&self.pred_conf),
                 &loaded_arom_peaks,
                 &self.sidechain_priors,
+                self.overwrite_curated_rings,
             );
         }
 
@@ -3607,6 +4398,13 @@ impl NmrWorkbenchApp {
             {
                 trigger_sidechain_solve = true;
             }
+            ui.checkbox(
+                &mut self.overwrite_curated_rings,
+                egui::RichText::new("Overwrite curated rings").size(10.5),
+            )
+            .on_hover_text(
+                "When unchecked (default), user-curated aromatic ring shifts (CD*, CE*, CZ*, HD*, HE*, HZ*) are protected from overwrite, partial mixing, and duplicate re-assignment",
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("✕")
@@ -4463,6 +5261,7 @@ impl NmrWorkbenchApp {
                             let k = res.position[spin_system_idx] as usize;
                             self.selected_res = Some(k);
                             self.assign_target_res = k;
+                            self.mol3d_panel.highlight_sequence_residue(Some(k), true);
                         }
                     }
                 }
@@ -5725,6 +6524,28 @@ impl eframe::App for NmrWorkbenchApp {
                         self.draw_right_inspector(ui);
                     });
 
+                if self.show_mol3d_viewport {
+                    let mut picked_3d: Option<Mol3dSyncAction> = None;
+                    egui::Panel::left("mol3d_structure_dock")
+                        .default_size(390.0)
+                        .min_size(280.0)
+                        .max_size(680.0)
+                        .resizable(true)
+                        .show(ui, |ui| {
+                            let display_ref = self.pred_ref.as_ref().or(self.reference.as_ref());
+                            picked_3d = self.mol3d_panel.ui(
+                                ui,
+                                _frame.wgpu_render_state(),
+                                &self.sequence,
+                                &self.seq_ids,
+                                display_ref,
+                            );
+                        });
+                    if let Some(sync) = picked_3d {
+                        self.apply_mol3d_sync_action(sync);
+                    }
+                }
+
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.draw_hsqc_canvas(ui);
                 });
@@ -5810,8 +6631,8 @@ mod tests {
     use nmr_gui::sidechain_widget::SequenceRibbonState;
 
     use super::{
-        build_synthetic_ubiquitin, merge_gui_aromatic_preserving_user_rings, parse_gui_c13_tsv_str,
-        GuiRegimeKind, GuiSolverKind,
+        build_synthetic_ubiquitin, merge_gui_aromatic_preserving_user_rings,
+        merge_gui_aromatic_with_options, parse_gui_c13_tsv_str, GuiRegimeKind, GuiSolverKind,
     };
 
     #[test]
@@ -5969,5 +6790,371 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         for r in &rep.residues {
             assert!((r.population_sum() - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn test_gui_p2_explicit_canonical_override_persists_across_resolves() {
+        let seq = vec!["CYS".to_string(), "HIS".to_string()];
+        let seq_ids = vec![1, 2];
+        let mut ref_shifts = Reference::new(seq, seq_ids);
+        ref_shifts.shifts.insert((0, "CB".to_string()), 41.6); // Oxidized Cys signal
+        ref_shifts.shifts.insert((1, "ND1".to_string()), 249.4); // His Ne2H signal
+        ref_shifts.shifts.insert((1, "NE2".to_string()), 167.5);
+
+        let mut state = SequenceRibbonState::new();
+        state.sync_inferred_variants_from_reference(&ref_shifts);
+        assert_eq!(state.variant_for(0), ResidueVariant::CysOxidized);
+        assert_eq!(state.variant_for(1), ResidueVariant::HisNe2H);
+
+        // User explicitly selects Canonical on both residues: must record explicit Canonical override!
+        state.set_variant(0, ResidueVariant::Canonical);
+        state.set_variant(1, ResidueVariant::Canonical);
+        assert_eq!(
+            state.user_variant_overrides.get(&0),
+            Some(&ResidueVariant::Canonical)
+        );
+        assert_eq!(
+            state.user_variant_overrides.get(&1),
+            Some(&ResidueVariant::Canonical)
+        );
+
+        // Subsequent auto-sync must NEVER silently override explicit Canonical choice!
+        state.sync_inferred_variants_from_reference(&ref_shifts);
+        assert_eq!(state.variant_for(0), ResidueVariant::Canonical);
+        assert_eq!(state.variant_for(1), ResidueVariant::Canonical);
+    }
+
+    #[test]
+    fn test_gui_p1_10_curated_ring_protection_partial_and_duplicate_guards() {
+        use nmr_core::peaks::Peak;
+
+        let sc_priors = SidechainPriors::empirical_bmrb();
+        let seq = vec![
+            "ALA".to_string(),
+            "PHE".to_string(),
+            "GLY".to_string(),
+            "PHE".to_string(),
+        ];
+        let seq_ids = vec![1, 2, 3, 4];
+
+        // 1. Conflicting solver ring must NOT overwrite curated ring atoms unless overwrite_curated_rings == true
+        let mut curated = Reference::new(seq.clone(), seq_ids.clone());
+        curated.shifts.insert((1, "CA".to_string()), 57.5);
+        curated.shifts.insert((1, "CB".to_string()), 39.2);
+        curated.shifts.insert((1, "CD1".to_string()), 131.10);
+        curated.shifts.insert((1, "CD2".to_string()), 131.10);
+        curated.shifts.insert((1, "HD1".to_string()), 7.120);
+        curated.shifts.insert((1, "HD2".to_string()), 7.120);
+        curated.shifts.insert((1, "CE1".to_string()), 129.30);
+        curated.shifts.insert((1, "CE2".to_string()), 129.30);
+        curated.shifts.insert((1, "HE1".to_string()), 7.280);
+        curated.shifts.insert((1, "HE2".to_string()), 7.280);
+        curated.shifts.insert((1, "CZ".to_string()), 127.60);
+        curated.shifts.insert((1, "HZ".to_string()), 7.210);
+        let mut prior_amb = BTreeMap::new();
+        prior_amb.insert((1, "CD1".to_string()), 1u8);
+
+        let mk_peak = |exp: &str, h: f64, c: f64, height: f64| Peak {
+            exp: exp.to_string(),
+            h,
+            n: 0.0,
+            c: Some(c),
+            h2: None,
+            sign: 1,
+            height: Some(height),
+            volume: None,
+        };
+
+        // Experimental peaks with same CB (39.2) but shifted ring frequencies (7.45 / 7.56 / 7.39 ppm)
+        let conflicting_peaks = vec![
+            mk_peak("C13HSQC", 7.450, 132.40, 1000.0),
+            mk_peak("C13HSQC", 7.560, 130.60, 1000.0),
+            mk_peak("C13HSQC", 7.390, 128.90, 900.0),
+            mk_peak("HBCBCGCDHD", 7.450, 39.20, 700.0),
+            mk_peak("HBCBCGCDCEHE", 7.560, 39.20, 650.0),
+        ];
+
+        let kept = merge_gui_aromatic_with_options(
+            &curated,
+            Some(&curated),
+            &prior_amb,
+            None,
+            &conflicting_peaks,
+            &sc_priors,
+            false,
+        );
+        assert_eq!(
+            kept.shifts.get(&(1, "CD1".to_string())).copied(),
+            Some(131.10)
+        );
+        assert_eq!(
+            kept.shifts.get(&(1, "HD1".to_string())).copied(),
+            Some(7.120)
+        );
+        assert_eq!(
+            kept.shifts.get(&(1, "CE1".to_string())).copied(),
+            Some(129.30)
+        );
+        assert_eq!(
+            kept.shifts.get(&(1, "CZ".to_string())).copied(),
+            Some(127.60)
+        );
+        assert_eq!(
+            kept.ambiguity_codes.get(&(1, "CD1".to_string())).copied(),
+            Some(1)
+        );
+
+        // Explicit overwrite_curated_rings = true replaces curated shifts with solved shifts
+        let replaced = merge_gui_aromatic_with_options(
+            &curated,
+            Some(&curated),
+            &prior_amb,
+            None,
+            &conflicting_peaks,
+            &sc_priors,
+            true,
+        );
+        assert!(
+            (replaced.shifts[&(1, "HD1".to_string())] - 7.450).abs() < 0.03,
+            "overwrite_curated_rings=true should replace curated HD1"
+        );
+
+        // 2. Partial CD-only cluster must NOT be mixed into curated CE/CZ shifts when overwrite_curated_rings == false
+        let mut ce_cz_curated = Reference::new(seq.clone(), seq_ids.clone());
+        ce_cz_curated.shifts.insert((1, "CA".to_string()), 57.5);
+        ce_cz_curated.shifts.insert((1, "CB".to_string()), 39.2);
+        ce_cz_curated.shifts.insert((1, "CE1".to_string()), 129.30);
+        ce_cz_curated.shifts.insert((1, "CE2".to_string()), 129.30);
+        ce_cz_curated.shifts.insert((1, "HE1".to_string()), 7.280);
+        ce_cz_curated.shifts.insert((1, "HE2".to_string()), 7.280);
+        ce_cz_curated.shifts.insert((1, "CZ".to_string()), 127.60);
+        ce_cz_curated.shifts.insert((1, "HZ".to_string()), 7.210);
+        let cd_only_peaks = vec![
+            mk_peak("C13HSQC", 7.120, 131.10, 1000.0),
+            mk_peak("HBCBCGCDHD", 7.120, 39.20, 800.0),
+        ];
+        let no_partial_mix = merge_gui_aromatic_with_options(
+            &ce_cz_curated,
+            Some(&ce_cz_curated),
+            &BTreeMap::new(),
+            None,
+            &cd_only_peaks,
+            &sc_priors,
+            false,
+        );
+        assert!(
+            !no_partial_mix.shifts.contains_key(&(1, "CD1".to_string()))
+                && !no_partial_mix.shifts.contains_key(&(1, "HD1".to_string())),
+            "Partial CD-only cluster must not be mixed into curated CE/CZ shifts"
+        );
+        assert_eq!(
+            no_partial_mix.shifts.get(&(1, "CE1".to_string())).copied(),
+            Some(129.30)
+        );
+        assert_eq!(
+            no_partial_mix.shifts.get(&(1, "CZ".to_string())).copied(),
+            Some(127.60)
+        );
+
+        // 3. Duplicate ring cluster matching curated PHE #1 (idx 1) must NOT be assigned onto uncurated PHE #2 (idx 3)
+        let mut dup_ref = curated.clone();
+        dup_ref.shifts.insert((3, "CA".to_string()), 56.8);
+        dup_ref.shifts.insert((3, "CB".to_string()), 39.25); // Degenerate CB near PHE #1!
+        let dup_peaks_matching_phe1 = vec![
+            mk_peak("C13HSQC", 7.120, 131.10, 1000.0),
+            mk_peak("C13HSQC", 7.280, 129.30, 1000.0),
+            mk_peak("C13HSQC", 7.210, 127.60, 900.0),
+            mk_peak("HBCBCGCDHD", 7.120, 39.22, 750.0),
+            mk_peak("HBCBCGCDCEHE", 7.280, 39.22, 700.0),
+        ];
+        let dup_checked = merge_gui_aromatic_with_options(
+            &dup_ref,
+            Some(&dup_ref),
+            &prior_amb,
+            None,
+            &dup_peaks_matching_phe1,
+            &sc_priors,
+            false,
+        );
+        assert_eq!(
+            dup_checked.shifts.get(&(1, "HD1".to_string())).copied(),
+            Some(7.120)
+        );
+        assert!(
+            !dup_checked.shifts.contains_key(&(3, "CD1".to_string()))
+                && !dup_checked.shifts.contains_key(&(3, "HD1".to_string())),
+            "Cluster matching curated PHE #1 must not be assigned as duplicate onto PHE #2"
+        );
+    }
+
+    #[test]
+    fn test_gui_p1_10_superset_duplicate_tweaked_conflict_and_yamazaki_cb_offset() {
+        use nmr_core::peaks::Peak;
+
+        let sc_priors = SidechainPriors::empirical_bmrb();
+        let mk_peak = |exp: &str, h: f64, c: f64, height: f64| Peak {
+            exp: exp.to_string(),
+            h,
+            n: 0.0,
+            c: Some(c),
+            h2: None,
+            sign: 1,
+            height: Some(height),
+            volume: None,
+        };
+        let mk_tocsy = |h: f64, c: f64, h2: f64, height: f64| Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h,
+            n: 0.0,
+            c: Some(c),
+            h2: Some(h2),
+            sign: 1,
+            height: Some(height),
+            volume: None,
+        };
+
+        let seq = vec![
+            "ALA".to_string(),
+            "PHE".to_string(),
+            "GLY".to_string(),
+            "PHE".to_string(),
+            "TYR".to_string(),
+        ];
+        let seq_ids = vec![1, 2, 3, 4, 5];
+
+        // (a) 4-slot curated PHE #1 (`CD1/HD1/CE1/HE1`, missing `CZ/HZ`) vs a 6-slot superset PHE cluster:
+        //     must complete `CZ/HZ` on PHE #1 AND never duplicate onto uncurated PHE #2 (even with an
+        //     overlapping peak or degenerate CB)!
+        let mut ref_a = Reference::new(seq.clone(), seq_ids.clone());
+        ref_a.shifts.insert((1, "CA".to_string()), 57.4);
+        ref_a.shifts.insert((1, "CB".to_string()), 39.10);
+        ref_a.shifts.insert((1, "CD1".to_string()), 131.20);
+        ref_a.shifts.insert((1, "CD2".to_string()), 131.20);
+        ref_a.shifts.insert((1, "HD1".to_string()), 7.140);
+        ref_a.shifts.insert((1, "HD2".to_string()), 7.140);
+        ref_a.shifts.insert((1, "CE1".to_string()), 129.40);
+        ref_a.shifts.insert((1, "CE2".to_string()), 129.40);
+        ref_a.shifts.insert((1, "HE1".to_string()), 7.300);
+        ref_a.shifts.insert((1, "HE2".to_string()), 7.300);
+        ref_a.shifts.insert((3, "CA".to_string()), 56.9);
+        ref_a.shifts.insert((3, "CB".to_string()), 39.15); // Degenerate CB near PHE #1
+
+        let superset_peaks = vec![
+            mk_peak("C13HSQC", 7.140, 131.20, 1000.0),
+            mk_peak("C13HSQC", 7.300, 129.40, 1000.0),
+            mk_peak("C13HSQC", 7.220, 127.70, 900.0),
+            mk_tocsy(7.140, 131.20, 7.300, 500.0),
+            mk_tocsy(7.300, 129.40, 7.140, 500.0),
+            mk_tocsy(7.300, 129.40, 7.220, 500.0),
+            mk_tocsy(7.220, 127.70, 7.300, 500.0),
+            mk_peak("HBCBCGCDHD", 7.140, 39.12, 750.0),
+            mk_peak("HBCBCGCDCEHE", 7.300, 39.12, 700.0),
+        ];
+
+        let res_a = merge_gui_aromatic_with_options(
+            &ref_a,
+            Some(&ref_a),
+            &BTreeMap::new(),
+            None,
+            &superset_peaks,
+            &sc_priors,
+            false,
+        );
+        assert_eq!(
+            res_a.shifts.get(&(1, "CZ".to_string())).copied(),
+            Some(127.70)
+        );
+        assert_eq!(
+            res_a.shifts.get(&(1, "HZ".to_string())).copied(),
+            Some(7.220)
+        );
+        assert!(
+            !res_a.shifts.contains_key(&(3, "CD1".to_string()))
+                && !res_a.shifts.contains_key(&(3, "HD1".to_string())),
+            "6-slot superset cluster matching 4-slot curated PHE #1 must NOT duplicate onto uncurated PHE #2"
+        );
+
+        // (b) Curated PHE #1 with 1 user-adjusted slot slightly outside tol (`HE1 = 7.395` vs peak `7.300`,
+        //     `conflict_obs == 1, shared_obs == 3`): must NOT overwrite PHE #1, must NOT mix `CZ/HZ` into
+        //     PHE #1, AND must NOT leak/dump PHE #1's cluster onto uncurated PHE #2!
+        let mut ref_b = ref_a.clone();
+        ref_b.shifts.insert((1, "HE1".to_string()), 7.395);
+        ref_b.shifts.insert((1, "HE2".to_string()), 7.395);
+        let res_b = merge_gui_aromatic_with_options(
+            &ref_b,
+            Some(&ref_b),
+            &BTreeMap::new(),
+            None,
+            &superset_peaks,
+            &sc_priors,
+            false,
+        );
+        assert_eq!(
+            res_b.shifts.get(&(1, "HE1".to_string())).copied(),
+            Some(7.395),
+            "User-adjusted HE1 on PHE #1 must be preserved"
+        );
+        assert!(
+            !res_b.shifts.contains_key(&(1, "CZ".to_string())),
+            "Cluster with 1 conflicting slot must not fill missing CZ onto PHE #1"
+        );
+        assert!(
+            !res_b.shifts.contains_key(&(3, "CD1".to_string()))
+                && !res_b.shifts.contains_key(&(3, "HD1".to_string())),
+            "PHE #1's cluster with 1 tweaked slot must NOT leak onto uncurated PHE #2"
+        );
+
+        // (c) Systematic Yamazaki `13CB` referencing offset (`+2.20 ppm`):
+        //     `peak_matches_aromatic_cluster` must strip PHE #1's offset-shifted Yamazaki peaks and
+        //     still calibrate & assign distinct uncurated PHE #2 (`idx 3`, CB 41.80) + TYR #3 (`idx 4`, CB 37.20)!
+        let cb_off = 2.20;
+        let mut ref_c = ref_a.clone();
+        ref_c.shifts.insert((3, "CB".to_string()), 41.80);
+        ref_c.shifts.insert((4, "CA".to_string()), 58.10);
+        ref_c.shifts.insert((4, "CB".to_string()), 37.20);
+
+        let offset_peaks = vec![
+            // Curated PHE #1 (`idx 1`, CB 39.10 -> raw Yamazaki CB 41.30; notice 41.30 is close to PHE #2's true CB 41.80!)
+            mk_peak("C13HSQC", 7.140, 131.20, 1000.0),
+            mk_peak("C13HSQC", 7.300, 129.40, 1000.0),
+            mk_peak("C13HSQC", 7.220, 127.70, 900.0),
+            mk_tocsy(7.140, 131.20, 7.300, 500.0),
+            mk_tocsy(7.300, 129.40, 7.140, 500.0),
+            mk_tocsy(7.300, 129.40, 7.220, 500.0),
+            mk_tocsy(7.220, 127.70, 7.300, 500.0),
+            mk_peak("HBCBCGCDHD", 7.140, 39.10 + cb_off, 750.0),
+            mk_peak("HBCBCGCDCEHE", 7.300, 39.10 + cb_off, 700.0),
+            // Uncurated TYR #3 (`idx 4`, CB 37.20 -> raw Yamazaki CB 39.40) so >= 2 independent pairs establish +2.20 ppm offset!
+            mk_peak("C13HSQC", 7.020, 132.60, 1000.0),
+            mk_peak("C13HSQC", 6.780, 117.80, 1000.0),
+            mk_tocsy(7.020, 132.60, 6.780, 500.0),
+            mk_tocsy(6.780, 117.80, 7.020, 500.0),
+            mk_peak("HBCBCGCDHD", 7.020, 37.20 + cb_off, 750.0),
+            mk_peak("HBCBCGCDCEHE", 6.780, 37.20 + cb_off, 700.0),
+        ];
+
+        let res_c = merge_gui_aromatic_with_options(
+            &ref_c,
+            Some(&ref_c),
+            &BTreeMap::new(),
+            None,
+            &offset_peaks,
+            &sc_priors,
+            false,
+        );
+        // Without cb_offset in `peak_matches_aromatic_cluster`, PHE #1's raw Yamazaki peak at 41.30 ppm
+        // would NOT be stripped from `sub_peaks` and would falsely match uncurated PHE #2 (`CB = 41.80`)!
+        assert!(
+            !res_c.shifts.contains_key(&(3, "CD1".to_string()))
+                && !res_c.shifts.contains_key(&(3, "HD1".to_string())),
+            "Offset-shifted Yamazaki peak from curated PHE #1 (39.10 + 2.20 = 41.30) must NOT leak onto PHE #2 (CB 41.80)"
+        );
+        assert!(
+            res_c
+                .shifts
+                .get(&(4, "HD1".to_string()))
+                .is_some_and(|v| (v - 7.020).abs() < 0.03),
+            "Uncurated TYR #3 should still receive its calibrated aromatic assignment"
+        );
     }
 }
