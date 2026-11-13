@@ -138,3 +138,10 @@ Let $P_{\text{win}} = \max(P(H = \text{Direct} \mid \mathcal{D}),\; P(H = \text{
 1. **Exact `1D3Z` IUPAC Geometry**: Zero sign or handedness inversion across all 76 residues of `PDB 1D3Z` (`CB`, `Val`, `Leu`, `Gly`, `Ile`, `Thr`, `Pro`, `CG`, `CD`, `CE`, `Asn`, `Gln`), and `< 0.05 Å` mean analytical NeRF proton-proton distance error.
 2. **Noisy Scrambled `1D3Z` Precision Gate**: Across 10 independent seeds with `±0.7 Hz` Gaussian coupling noise, `±25%` multiplicative log-normal NOE intensity noise, and randomly scrambled `(a, b)` input ordering, stereospecifically committed methylene and `Val`/`Leu` isopropyl pairs (`posterior >= 0.90`) achieve **`>= 95.0%` precision**.
 3. **Zero Uncalibrated False Swaps**: Absent couplings/NOEs, rotamer-averaged `(1/3, 1/3, 1/3)` observables, symmetric inputs, and ambiguous single-pathway `3J_HAHB`-only inputs produce **`0` false `Ambiguity_code = 1` swaps** (`posterior` remains `< 0.90`, emitting `Ambiguity_code = 2` and NEF `x`/`y` labels).
+
+---
+
+## 7. CLI & Cross-Module Integration
+
+- **`nmrassign sidechain --stereospec [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>]`**: invokes `nmr_core::stereospec::assign_stereospecific_dataset` on top of aliphatic and aromatic sidechain assignments (`docs/specs/07-sidechain-assignment.md`), conditioning on PDB `(phi, psi)` torsions when `--pdb` is supplied or CSI-predicted dihedrals otherwise, and writing per-atom `_Atom_chem_shift.Ambiguity_code` (`1` vs `2` vs `3`) into the output NMR-STAR v3.2 file.
+- **Stereospecific Methyl-TROSY Precursor Labeling (`ILV-proS` / `ILV-proR`)**: see `docs/specs/13-methyl-trosy.md` for biosynthetic acetolactate / $\alpha$-ketoisovalerate stereospecific `Val CG1/CG2` and `Leu CD1/CD2` labeling in perdeuterated supramolecular complexes (`nmrassign methyl`).

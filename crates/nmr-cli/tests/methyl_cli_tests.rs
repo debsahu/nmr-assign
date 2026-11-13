@@ -1,5 +1,5 @@
-//! End-to-end integration tests for `crates/nmr-cli/src/methyl_cmd.rs` without modifying
-//! `crates/nmr-cli/src/main.rs` (ready for 2-line Wave 2 subcommand dispatch).
+//! End-to-end integration tests for `nmrassign methyl` (`crates/nmr-cli/src/methyl_cmd.rs`
+//! and top-level `nmrassign` binary subcommand dispatch).
 //!
 //! Provenance: Clean-room integration test suite citing:
 //! - Tugarinov, Hwang, Ollerenshaw & Kay (*J. Am. Chem. Soc.* 2003, 125, 10120–10121 & 10420–10428)
@@ -145,6 +145,52 @@ fn methyl_cli_end_to_end_tsv_and_ucsf_spectra() {
     ];
     methyl_cmd::run_methyl_cli(&cli_args_tsv).expect("methyl CLI on TSV peak lists");
     assert!(out_cpu_star.exists());
+
+    // 3. Exercise the compiled `nmrassign methyl` subcommand binary end-to-end
+    let bin = env!("CARGO_BIN_EXE_nmrassign");
+    let help_out = process::Command::new(bin)
+        .args(["methyl", "--help"])
+        .output()
+        .expect("spawn nmrassign methyl --help");
+    assert!(
+        help_out.status.success(),
+        "nmrassign methyl --help failed: {}",
+        String::from_utf8_lossy(&help_out.stderr)
+    );
+    let help_stdout = String::from_utf8_lossy(&help_out.stdout);
+    assert!(help_stdout.contains("Usage: nmrassign methyl"));
+
+    let out_bin_star = dir.join("ubq_bin_out.str");
+    let bin_run = process::Command::new(bin)
+        .args([
+            "methyl",
+            "--pdb",
+            &pdb_path.to_string_lossy(),
+            "--hmqc",
+            &hmqc_tsv.to_string_lossy(),
+            "--noesy",
+            &noesy_tsv.to_string_lossy(),
+            "--labeling",
+            "ILVMAT",
+            "--hmcmcbca",
+            &hmcm_tsv.to_string_lossy(),
+            "--engine",
+            "cpu",
+            "--seeds",
+            "1",
+            "-o",
+            &out_bin_star.to_string_lossy(),
+        ])
+        .output()
+        .expect("spawn nmrassign methyl end-to-end");
+    assert!(
+        bin_run.status.success(),
+        "nmrassign methyl failed: {}",
+        String::from_utf8_lossy(&bin_run.stderr)
+    );
+    let bin_ref = read_star_all_atoms(&out_bin_star, None).expect("parse binary methyl STAR");
+    assert_eq!(bin_ref.sequence.len(), 76);
+    assert!(bin_ref.shifts.len() >= 120);
 
     let _ = fs::remove_dir_all(&dir);
 }

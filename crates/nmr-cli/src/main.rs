@@ -3,8 +3,10 @@
 //! structure folding, CCPN NEF v1.1 interchange, HTML quality reporting, self-hosted HTTP service,
 //! and Octet-Draw 2D chemical structure / IUPAC / 1D NMR analytics.
 //!
-//! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/11-fid-processing.md`
+//! Provenance: Original CLI implementing `docs/specs/01-data-io.md` through `docs/specs/13-methyl-trosy.md`
 //! and Octet-Draw CLI workflows.
+
+pub mod methyl_cmd;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -124,7 +126,8 @@ fn usage() -> String {
        nmrassign simulate        --star <ref.str> --out <peaks.tsv> [--realistic] [--spectra-dir <dir>] [--experiments ...] [--seed 0]\n\
        nmrassign pick            (--hsqc <path> [--triple EXP=path ...] | --fid <dir> [--exp <EXP>] | --fid-hsqc <dir> [--fid-triple EXP=dir ...]) --out <peaks.tsv> [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--method classical|neural] [--engine cpu|gpu] [--snr 5.0] [--prob 0.45]\n\
        nmrassign priors          --stars <dir_or_file> --out <priors.json>\n\
-       nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
+       nmrassign sidechain       --star <ref.str> [--peaks <peaks.tsv>] [--aromatic] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]\n\
+       nmrassign methyl          --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]\n\
        nmrassign structure       --star <shifts.str> [--noesy-peaks <noesy.tsv>] [--pdb-ref <ref.pdb>] [--out-pdb <ensemble.pdb>] [--conformers 10] [--seed 42] [--dihedrals-only]\n\
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
@@ -2158,7 +2161,112 @@ fn cmd_e2e_benchmark(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_sidechain(args: &[String]) -> Result<(), String> {
+fn is_probable_peak_tsv(path: &Path) -> bool {
+    if path.is_dir() || is_ucsf_file(path) {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        let low = ext.to_ascii_lowercase();
+        if matches!(low.as_str(), "tsv" | "txt" | "list" | "pk") {
+            return true;
+        }
+        if matches!(low.as_str(), "ucsf" | "ft2" | "ft3" | "pipe" | "dat") {
+            return false;
+        }
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let head = &bytes[..bytes.len().min(512)];
+    !head.contains(&0) && std::str::from_utf8(head).is_ok()
+}
+
+fn load_2d_spectrum_any(path: &Path) -> Result<Spectrum2D, String> {
+    if path.is_dir() {
+        return read_bruker_pdata_2d(path);
+    }
+    if path.file_name().and_then(|s| s.to_str()) == Some("2rr") {
+        if let Some(parent) = path.parent() {
+            return read_bruker_pdata_2d(parent);
+        }
+    }
+    if is_ucsf_file(path) {
+        return read_ucsf_2d(path);
+    }
+    read_nmrpipe_2d(path)
+}
+
+fn load_3d_spectrum_any(path: &Path, label: &str) -> Result<Spectrum3D, String> {
+    if path.is_dir() {
+        return read_bruker_pdata_3d(path, label);
+    }
+    if path.file_name().and_then(|s| s.to_str()) == Some("3rrr") {
+        if let Some(parent) = path.parent() {
+            return read_bruker_pdata_3d(parent, label);
+        }
+    }
+    if is_ucsf_file(path) {
+        return read_ucsf_3d(path, label);
+    }
+    read_nmrpipe_3d(path, label)
+}
+
+fn load_aromatic_input_peaks(
+    path: &Path,
+    default_exp: &str,
+    c13_roots: Option<&[Peak]>,
+) -> Result<Vec<Peak>, String> {
+    use nmr_core::aromatic::{
+        pick_aromatic_2d, pick_aromatic_hcch_3d, AromaticExperiment, AromaticPickerConfig,
+        AROMATIC_EXPERIMENTS,
+    };
+
+    if is_probable_peak_tsv(path) {
+        let mut pks = read_peaks(path)?;
+        for p in &mut pks {
+            let trimmed = p.exp.trim();
+            if trimmed.is_empty()
+                || (!AROMATIC_EXPERIMENTS.contains(&trimmed)
+                    && trimmed != "NOESY13C"
+                    && trimmed != "AROM_HB_NOE")
+            {
+                p.exp = default_exp.to_string();
+            }
+        }
+        return Ok(pks);
+    }
+
+    let picker_cfg = AromaticPickerConfig::default();
+    if default_exp == "AROM_HCCH_TOCSY" {
+        let spec3d = load_3d_spectrum_any(path, "AROM_HCCH_TOCSY")?;
+        return Ok(pick_aromatic_hcch_3d(&spec3d, c13_roots, &picker_cfg));
+    }
+    if default_exp == "NOESY13C" || default_exp == "AROM_HB_NOE" {
+        let spec3d = load_3d_spectrum_any(path, default_exp)?;
+        let mut raw = pick_aromatic_hcch_3d(&spec3d, c13_roots, &picker_cfg);
+        for p in &mut raw {
+            p.exp = default_exp.to_string();
+        }
+        return Ok(raw);
+    }
+    let exp = AromaticExperiment::parse_exp(default_exp)
+        .ok_or_else(|| format!("unsupported aromatic experiment tag {default_exp:?}"))?;
+    let spec2d = load_2d_spectrum_any(path)?;
+    Ok(pick_aromatic_2d(&spec2d, exp, &picker_cfg))
+}
+
+fn run_sidechain(args: &[String]) -> Result<(), String> {
+    use nmr_core::aromatic::{
+        assign_aromatic_rings, default_his_tautomer_map, simulate_aromatic_peaks,
+        synthesize_aromatic_reference, AromaticSimConfig, AromaticSolverConfig,
+        AROMATIC_EXPERIMENTS,
+    };
+    use nmr_core::sidechain::assign_sidechains;
+    use nmr_core::stereospec::{
+        assign_stereospecific_dataset, format_nmrstar_with_ambiguity, StereospecConfig,
+        StereospecDatasetInput,
+    };
+
     let mut star_path: Option<PathBuf> = None;
     let mut peaks_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
@@ -2166,9 +2274,36 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     let mut steps = 2500usize;
     let mut seed = 2026u64;
 
+    // Phase 10 (`T10.2`) optional aromatic ring assignment flags
+    let mut aromatic_flag = false;
+    let mut arom_c13hsqc_path: Option<PathBuf> = None;
+    let mut hbcbgcdhd_path: Option<PathBuf> = None;
+    let mut hbcbgcdce_path: Option<PathBuf> = None;
+    let mut arom_tocsy_path: Option<PathBuf> = None;
+    let mut arom_noesy_path: Option<PathBuf> = None;
+    let mut his_hmqc_path: Option<PathBuf> = None;
+    let mut trp_hsqc_path: Option<PathBuf> = None;
+
+    // Phase 10 (`T10.3`) optional stereospecific prochiral assignment flags
+    let mut stereospec_flag = false;
+    let mut j_couplings_path: Option<PathBuf> = None;
+    let mut intra_noes_path: Option<PathBuf> = None;
+    let mut pdb_path: Option<PathBuf> = None;
+    let mut stereo_threshold = 0.90f64;
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "Usage: nmrassign sidechain --star <ref.str> [--peaks <peaks.tsv>] \\\n  \
+                     [--aromatic] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] \\\n  \
+                     [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] \\\n  \
+                     [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] \\\n  \
+                     [--stereo-threshold <0.90>] [--out <all_atom.str>] [--runs 16] [--steps 2500] [--seed 2026]"
+                );
+                return Ok(());
+            }
             "--star" => {
                 i += 1;
                 star_path = args.get(i).map(PathBuf::from);
@@ -2205,78 +2340,344 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?;
             }
+            "--aromatic" => {
+                aromatic_flag = true;
+            }
+            "--arom-c13hsqc" | "--aromatic-hsqc" | "--aromatic-c13hsqc" => {
+                i += 1;
+                arom_c13hsqc_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --arom-c13hsqc <path>")?,
+                ));
+            }
+            "--hbcbgcdhd" => {
+                i += 1;
+                hbcbgcdhd_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --hbcbgcdhd <path>")?,
+                ));
+            }
+            "--hbcbgcdce" | "--hbcbgcdcehe" => {
+                i += 1;
+                hbcbgcdce_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --hbcbgcdce <path>")?,
+                ));
+            }
+            "--aromatic-tocsy" | "--arom-hcch-tocsy" => {
+                i += 1;
+                arom_tocsy_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --aromatic-tocsy <path>")?,
+                ));
+            }
+            "--aromatic-noesy" | "--arom-noesy" => {
+                i += 1;
+                arom_noesy_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --aromatic-noesy <path>")?,
+                ));
+            }
+            "--his-hmqc" => {
+                i += 1;
+                his_hmqc_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --his-hmqc <path>")?,
+                ));
+            }
+            "--trp-hsqc" => {
+                i += 1;
+                trp_hsqc_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --trp-hsqc <path>")?,
+                ));
+            }
+            "--stereospec" => {
+                stereospec_flag = true;
+            }
+            "--j-couplings" => {
+                i += 1;
+                j_couplings_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --j-couplings <j.tsv>")?,
+                ));
+            }
+            "--intra-noes" => {
+                i += 1;
+                intra_noes_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --intra-noes <noes.tsv>")?,
+                ));
+            }
+            "--pdb" => {
+                i += 1;
+                pdb_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing --pdb <model.pdb>")?,
+                ));
+            }
+            "--stereo-threshold" => {
+                i += 1;
+                stereo_threshold = args
+                    .get(i)
+                    .ok_or("missing --stereo-threshold")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
+            }
             other => return Err(format!("unknown sidechain flag {other:?}")),
         }
         i += 1;
     }
+
+    let explicit_arom_inputs = arom_c13hsqc_path.is_some()
+        || hbcbgcdhd_path.is_some()
+        || hbcbgcdce_path.is_some()
+        || arom_tocsy_path.is_some()
+        || arom_noesy_path.is_some()
+        || his_hmqc_path.is_some()
+        || trp_hsqc_path.is_some();
+    let do_aromatic_opt = aromatic_flag || explicit_arom_inputs;
+    let do_stereospec_opt = stereospec_flag
+        || j_couplings_path.is_some()
+        || intra_noes_path.is_some()
+        || pdb_path.is_some();
 
     let star_p = star_path.ok_or("sidechain requires --star <entry.str>")?;
     let raw_ref = read_star_all_atoms(&star_p, None)?;
     let sc_priors = SidechainPriors::empirical_bmrb();
     let bb_priors = Priors::default();
 
-    // If the input STAR only has backbone atoms, synthesize realistic all-atom reference shifts for benchmarking
     let has_sidechains = raw_ref
         .shifts
         .keys()
         .any(|(_, a)| !["H", "N", "CA", "CB", "C"].contains(&a.as_str()));
-    let truth_all = if has_sidechains {
-        raw_ref
-    } else {
+    let synthetic_benchmark_mode = peaks_path.is_none()
+        && !explicit_arom_inputs
+        && j_couplings_path.is_none()
+        && intra_noes_path.is_none()
+        && !(do_stereospec_opt && has_sidechains);
+
+    let mut truth_all = if synthetic_benchmark_mode && !has_sidechains {
         synthesize_all_atom_reference(&raw_ref, &sc_priors, seed)
-    };
-
-    let (bb_peaks, sc_peaks, bb_truth_opt) = if let Some(pk_p) = &peaks_path {
-        let loaded = read_peaks(pk_p)?;
-        let (bb, sc): (Vec<Peak>, Vec<Peak>) = loaded
-            .into_iter()
-            .partition(|p| EXPERIMENT_NAMES.contains(&p.exp.as_str()));
-        (bb, sc, None)
     } else {
-        let (bb, bb_truth) = simulate(
-            &truth_all,
-            &SimConfig {
-                p_missing_peak: 0.04,
-                spurious_rate: 0.03,
-                seed,
-                ..SimConfig::default()
-            },
-        );
-        let sc = simulate_sidechain_peaks(
-            &truth_all,
-            &SidechainSimConfig {
-                include_aromatics: true,
-                p_missing_peak: 0.04,
-                spurious_rate: 0.02,
-                seed,
-                ..SidechainSimConfig::default()
-            },
-        );
-        (bb, sc, Some(bb_truth))
+        raw_ref.clone()
     };
+    if synthetic_benchmark_mode && do_aromatic_opt {
+        let his_map = default_his_tautomer_map(&truth_all.sequence, seed);
+        truth_all = synthesize_aromatic_reference(&truth_all, &sc_priors, &his_map, seed);
+    }
 
-    let systems = build_spin_systems(&bb_peaks, &Tolerances::default(), 3, false)?;
+    let (bb_peaks, mut sc_peaks, mut bundled_arom_peaks, bb_truth_opt) =
+        if let Some(pk_p) = &peaks_path {
+            let loaded = read_peaks(pk_p)?;
+            let mut bb = Vec::new();
+            let mut sc = Vec::new();
+            let mut ar = Vec::new();
+            for p in loaded {
+                if EXPERIMENT_NAMES.contains(&p.exp.as_str()) {
+                    bb.push(p);
+                } else if AROMATIC_EXPERIMENTS.contains(&p.exp.as_str()) || p.exp == "AROM_HB_NOE" {
+                    ar.push(p);
+                } else {
+                    sc.push(p);
+                }
+            }
+            (bb, sc, ar, None)
+        } else if synthetic_benchmark_mode {
+            let (bb, bb_truth) = simulate(
+                &truth_all,
+                &SimConfig {
+                    p_missing_peak: 0.04,
+                    spurious_rate: 0.03,
+                    seed,
+                    ..SimConfig::default()
+                },
+            );
+            let sc = simulate_sidechain_peaks(
+                &truth_all,
+                &SidechainSimConfig {
+                    include_aromatics: !do_aromatic_opt,
+                    p_missing_peak: 0.04,
+                    spurious_rate: 0.02,
+                    seed,
+                    ..SidechainSimConfig::default()
+                },
+            );
+            (bb, sc, Vec::new(), Some(bb_truth))
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), None)
+        };
+
+    // Load any explicit aromatic spectra or peak TSVs (`--hbcbgcdce`, `--aromatic-tocsy`, `--aromatic-noesy`, ...)
+    let mut c13_arom_roots: Vec<Peak> = bundled_arom_peaks
+        .iter()
+        .filter(|p| p.exp == "AROM_C13HSQC")
+        .cloned()
+        .collect();
+    if let Some(p) = &arom_c13hsqc_path {
+        let pks = load_aromatic_input_peaks(p, "AROM_C13HSQC", None)?;
+        c13_arom_roots.extend(pks.iter().cloned());
+        bundled_arom_peaks.extend(pks);
+    }
+    if let Some(p) = &hbcbgcdhd_path {
+        bundled_arom_peaks.extend(load_aromatic_input_peaks(p, "HBCBCGCDHD", None)?);
+    }
+    if let Some(p) = &hbcbgcdce_path {
+        bundled_arom_peaks.extend(load_aromatic_input_peaks(p, "HBCBCGCDCEHE", None)?);
+    }
+    if let Some(p) = &arom_tocsy_path {
+        let roots_opt = (!c13_arom_roots.is_empty()).then_some(c13_arom_roots.as_slice());
+        bundled_arom_peaks.extend(load_aromatic_input_peaks(p, "AROM_HCCH_TOCSY", roots_opt)?);
+    }
+    if let Some(p) = &arom_noesy_path {
+        let roots_opt = (!c13_arom_roots.is_empty()).then_some(c13_arom_roots.as_slice());
+        bundled_arom_peaks.extend(load_aromatic_input_peaks(p, "AROM_HB_NOE", roots_opt)?);
+    }
+    if let Some(p) = &his_hmqc_path {
+        bundled_arom_peaks.extend(load_aromatic_input_peaks(p, "HIS_LR_N15HMQC", None)?);
+    }
+    if let Some(p) = &trp_hsqc_path {
+        bundled_arom_peaks.extend(load_aromatic_input_peaks(p, "TRP_IND_N15HSQC", None)?);
+    }
+    if synthetic_benchmark_mode && aromatic_flag && bundled_arom_peaks.is_empty() {
+        let his_map = default_his_tautomer_map(&truth_all.sequence, seed);
+        let (sim_ar, sim_trp) = simulate_aromatic_peaks(
+            &truth_all,
+            &his_map,
+            &AromaticSimConfig {
+                seed,
+                ..AromaticSimConfig::default()
+            },
+        );
+        bundled_arom_peaks.extend(sim_ar);
+        bundled_arom_peaks.extend(sim_trp);
+    }
+    if !bundled_arom_peaks.is_empty() {
+        // Ensure aromatic NOESY peaks aren't duplicated in aliphatic sidechain peaks
+        sc_peaks.retain(|p| !AROMATIC_EXPERIMENTS.contains(&p.exp.as_str()));
+    }
+
     let t0 = Instant::now();
-    let joint = solve_joint_backbone_sidechain(
-        &systems,
-        &truth_all.sequence,
-        &truth_all.seq_ids,
-        &bb_priors,
-        &sc_priors,
-        &sc_peaks,
-        &ScoreConfig::default(),
-        &AnnealConfig {
-            runs,
-            steps_per_system: steps,
-            seed,
-            ..AnnealConfig::default()
-        },
-        &SidechainSolverConfig::default(),
-    );
+    let (mut working_ref, bb_conf, bb_eval_opt) =
+        if peaks_path.is_none() && !synthetic_benchmark_mode {
+            let mut conf = BTreeMap::new();
+            for &(k, _) in raw_ref.shifts.keys() {
+                conf.insert(k, 1.0);
+            }
+            (raw_ref.clone(), conf, None)
+        } else if !bb_peaks.is_empty() {
+            let systems = build_spin_systems(&bb_peaks, &Tolerances::default(), 3, false)?;
+            let joint = solve_joint_backbone_sidechain(
+                &systems,
+                &raw_ref.sequence,
+                &raw_ref.seq_ids,
+                &bb_priors,
+                &sc_priors,
+                &sc_peaks,
+                &ScoreConfig::default(),
+                &AnnealConfig {
+                    runs,
+                    steps_per_system: steps,
+                    seed,
+                    ..AnnealConfig::default()
+                },
+                &SidechainSolverConfig::default(),
+            );
+            let (_, conf) = to_reference(
+                &joint.backbone_result,
+                &systems,
+                &raw_ref.sequence,
+                &raw_ref.seq_ids,
+                0.0,
+                Some(&bb_priors),
+            );
+            let eval_pair = bb_truth_opt.map(|tr| (tr, joint.backbone_result));
+            (joint.sidechain_result.reference, conf, eval_pair)
+        } else {
+            let mut conf = BTreeMap::new();
+            for &(k, _) in raw_ref.shifts.keys() {
+                conf.insert(k, 1.0);
+            }
+            let assigned_ref = if !sc_peaks.is_empty() {
+                assign_sidechains(
+                    &raw_ref,
+                    None,
+                    &sc_peaks,
+                    &sc_priors,
+                    &SidechainSolverConfig::default(),
+                )
+                .reference
+            } else {
+                raw_ref.clone()
+            };
+            (assigned_ref, conf, None)
+        };
+
+    let mut ambiguity_codes: BTreeMap<(usize, String), u8> = BTreeMap::new();
+    let mut stereo_posteriors: BTreeMap<(usize, String), f64> = BTreeMap::new();
+    let run_arom_stage = !bundled_arom_peaks.is_empty();
+
+    if run_arom_stage {
+        // Clear any heuristic ring-atom placeholders on PHE/TYR/TRP/HIS so Kuhn-Munkres ring assignment is authoritative
+        const RING_ATOMS: &[&str] = &[
+            "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
+            "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
+        ];
+        working_ref.shifts.retain(|&(k, ref atom), _| {
+            let is_arom_res = matches!(
+                working_ref.sequence.get(k).map(String::as_str),
+                Some("PHE" | "TYR" | "TRP" | "HIS")
+            );
+            !(is_arom_res && RING_ATOMS.contains(&atom.as_str()))
+        });
+        let arom_res = assign_aromatic_rings(
+            &working_ref,
+            Some(&bb_conf),
+            &bundled_arom_peaks,
+            &sc_priors,
+            &AromaticSolverConfig::default(),
+        );
+        let n_arom_total = arom_res.rings.len();
+        let n_arom_assigned = arom_res
+            .rings
+            .iter()
+            .filter(|r| r.cluster_idx.is_some())
+            .count();
+        let n_his_taut = arom_res
+            .rings
+            .iter()
+            .filter(|r| r.his_tautomer.is_some())
+            .count();
+        working_ref = arom_res.reference;
+        for (k, res_name) in working_ref.sequence.iter().enumerate() {
+            if matches!(res_name.as_str(), "PHE" | "TYR") {
+                for sym_atom in ["CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2"] {
+                    if working_ref.shifts.contains_key(&(k, sym_atom.to_string())) {
+                        ambiguity_codes.insert((k, sym_atom.to_string()), 3);
+                    }
+                }
+            }
+        }
+        println!(
+            "Aromatic rings: assigned {n_arom_assigned}/{n_arom_total} aromatic residues ({n_his_taut} His tautomers classified)"
+        );
+    }
+
+    if do_stereospec_opt {
+        let stereo_out = assign_stereospecific_dataset(&StereospecDatasetInput {
+            reference: &working_ref,
+            j_couplings_tsv: j_couplings_path.as_deref(),
+            intra_noes_tsv: intra_noes_path.as_deref(),
+            pdb_path: pdb_path.as_deref(),
+            config: StereospecConfig {
+                commit_posterior_threshold: stereo_threshold,
+                ..StereospecConfig::default()
+            },
+        })?;
+        let total_pairs = stereo_out.pair_results.len();
+        println!(
+            "Stereospecific prochiral: committed {}/{total_pairs} pairs (Ambiguity_code=1, posterior>={stereo_threshold:.2}), {} ambiguous (Ambiguity_code=2)",
+            stereo_out.committed_pairs, stereo_out.ambiguous_pairs
+        );
+        working_ref = stereo_out.reference;
+        ambiguity_codes.extend(stereo_out.ambiguity_codes);
+        stereo_posteriors = stereo_out.atom_posteriors;
+    }
+
     let dt = t0.elapsed().as_secs_f64();
 
-    if let Some(bb_truth) = &bb_truth_opt {
-        let bbm = score(&joint.backbone_result, bb_truth, 0.8);
+    if let Some((bb_truth, bb_res)) = &bb_eval_opt {
+        let bbm = score(bb_res, bb_truth, 0.8);
         println!(
             "Backbone: accuracy={:.1}% ({}/{}), recall={:.1}%, hc_prec={:.1}%",
             bbm.accuracy() * 100.0,
@@ -2286,30 +2687,38 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
             bbm.hc_precision() * 100.0
         );
     }
-    if peaks_path.is_none() || has_sidechains {
-        let scm =
-            evaluate_sidechain_shifts(&joint.sidechain_result.reference, &truth_all, 0.40, 0.06);
+    if synthetic_benchmark_mode || (peaks_path.is_some() && has_sidechains && !bb_peaks.is_empty())
+    {
+        let scm = evaluate_sidechain_shifts(&working_ref, &truth_all, 0.40, 0.06);
         println!("{}", scm.summary());
     }
     println!(
         "Total assigned chemical shifts (backbone + sidechain): {} in {:.2}s",
-        joint.sidechain_result.reference.shifts.len(),
+        working_ref.shifts.len(),
         dt
     );
 
     if let Some(out_p) = out_path {
-        let (_, conf) = to_reference(
-            &joint.backbone_result,
-            &systems,
-            &truth_all.sequence,
-            &truth_all.seq_ids,
-            0.0,
-            Some(&bb_priors),
-        );
-        write_star(&out_p, &joint.sidechain_result.reference, Some(&conf))?;
+        if run_arom_stage || do_stereospec_opt {
+            let star_txt = format_nmrstar_with_ambiguity(
+                &working_ref,
+                Some(&bb_conf),
+                &ambiguity_codes,
+                (!stereo_posteriors.is_empty()).then_some(&stereo_posteriors),
+                None,
+            );
+            fs::write(&out_p, star_txt)
+                .map_err(|e| format!("failed to write {}: {e}", out_p.display()))?;
+        } else {
+            write_star(&out_p, &working_ref, Some(&bb_conf))?;
+        }
         println!("Wrote all-atom NMR-STAR shifts to {}", out_p.display());
     }
     Ok(())
+}
+
+fn cmd_sidechain(args: &[String]) -> Result<(), String> {
+    run_sidechain(args)
 }
 
 fn cmd_structure(args: &[String]) -> Result<(), String> {
@@ -4201,6 +4610,7 @@ fn main() {
         "pick" => cmd_pick(&args[1..]),
         "priors" => cmd_priors(&args[1..]),
         "sidechain" => cmd_sidechain(&args[1..]),
+        "methyl" => methyl_cmd::run_methyl_cli(&args[1..]),
         "structure" => cmd_structure(&args[1..]),
         "nef-import" => cmd_nef_import(&args[1..]),
         "nef-export" => cmd_nef_export(&args[1..]),

@@ -3247,3 +3247,665 @@ pub fn synthesize_ideal_observables_from_pdb(
 
     Some(obs)
 }
+
+// ============================================================================
+// 9. Dataset-Level CLI / Pipeline Orchestration (`assign_stereospecific_dataset`)
+// ============================================================================
+
+/// Parsed scalar coupling record from a `--j-couplings` TSV table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JCouplingTsvRow {
+    pub seq_id: i32,
+    pub res_name: String,
+    pub site: String,
+    pub j_kind: String,
+    pub val_a_hz: f64,
+    pub val_b_hz: Option<f64>,
+}
+
+/// Parsed intraresidue / sequential NOE pair record from an `--intra-noes` TSV table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IntraNoeTsvRow {
+    pub seq_id: i32,
+    pub res_name: String,
+    pub site: String,
+    pub anchor: AnchorProton,
+    pub intensity_a: f64,
+    pub intensity_b: f64,
+}
+
+/// Input bundle for dataset-wide stereospecific assignment (`nmrassign sidechain --stereospec`).
+pub struct StereospecDatasetInput<'a> {
+    pub reference: &'a Reference,
+    pub j_couplings_tsv: Option<&'a Path>,
+    pub intra_noes_tsv: Option<&'a Path>,
+    pub pdb_path: Option<&'a Path>,
+    pub config: StereospecConfig,
+}
+
+/// Output of [`assign_stereospecific_dataset`].
+#[derive(Clone, Debug)]
+pub struct StereospecDatasetOutput {
+    /// Updated `Reference` with stereospecifically resolved shifts ordered per IUPAC.
+    pub reference: Reference,
+    /// Per-`(residue_idx, atom_id)` NMR-STAR v3 `_Atom_chem_shift.Ambiguity_code` (`1`, `2`, `3`).
+    pub ambiguity_codes: BTreeMap<(usize, String), u8>,
+    /// Per-`(residue_idx, atom_id)` winning stereospecific posterior in `[0.50, 1.00]`.
+    pub atom_posteriors: BTreeMap<(usize, String), f64>,
+    /// Full Bayesian inference results for each evaluated prochiral site.
+    pub pair_results: Vec<StereospecResult>,
+    /// Count of prochiral pairs committed at `posterior >= config.commit_posterior_threshold` (`Ambiguity_code = 1`).
+    pub committed_pairs: usize,
+    /// Count of prochiral pairs left uncommitted (`Ambiguity_code = 2`).
+    pub ambiguous_pairs: usize,
+}
+
+fn parse_anchor_proton_token(tok: &str) -> Result<AnchorProton, String> {
+    let up = tok
+        .trim()
+        .to_ascii_uppercase()
+        .replace(['-', '(', ')', '+'], "_");
+    match up.as_str() {
+        "H" | "HN" | "INTRAAMIDEH" | "INTRA_AMIDE_H" => Ok(AnchorProton::IntraAmideH),
+        "HA" | "QA" | "INTRAALPHAHA" | "INTRA_ALPHA_HA" => Ok(AnchorProton::IntraAlphaHA),
+        "H_NEXT" | "HN_NEXT" | "H_I_1_" | "H_I1" | "SEQNEXTAMIDEH" | "SEQ_NEXT_AMIDE_H" => {
+            Ok(AnchorProton::SeqNextAmideH)
+        }
+        "HB" | "QB" | "INTRABETAHB" | "INTRA_BETA_HB" => Ok(AnchorProton::IntraBetaHB),
+        "HB2" | "INTRABETAHB2" | "INTRA_BETA_HB2" => Ok(AnchorProton::IntraBetaHB2),
+        "HB3" | "INTRABETAHB3" | "INTRA_BETA_HB3" => Ok(AnchorProton::IntraBetaHB3),
+        "HG" | "QG" | "INTRAGAMMAHG" | "INTRA_GAMMA_HG" => Ok(AnchorProton::IntraGammaHG),
+        "HD" | "QD" | "INTRADELTAHD" | "INTRA_DELTA_HD" => Ok(AnchorProton::IntraDeltaHD),
+        other => Err(format!("unknown NOE anchor proton {other:?}")),
+    }
+}
+
+const fn anchor_proton_token(anchor: AnchorProton) -> &'static str {
+    match anchor {
+        AnchorProton::IntraAmideH => "H",
+        AnchorProton::IntraAlphaHA => "HA",
+        AnchorProton::SeqNextAmideH => "H_NEXT",
+        AnchorProton::IntraBetaHB => "HB",
+        AnchorProton::IntraBetaHB2 => "HB2",
+        AnchorProton::IntraBetaHB3 => "HB3",
+        AnchorProton::IntraGammaHG => "HG",
+        AnchorProton::IntraDeltaHD => "HD",
+    }
+}
+
+/// Parse scalar `3J` coupling rows from TSV text (`seq_id  res_name  site  j_kind  val_a_hz  [val_b_hz]`).
+pub fn parse_j_couplings_tsv_str(text: &str) -> Result<Vec<JCouplingTsvRow>, String> {
+    let mut rows = Vec::new();
+    for (line_no, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.is_empty() {
+            continue;
+        }
+        if (line_no == 0
+            || cols[0].eq_ignore_ascii_case("seq_id")
+            || cols[0].eq_ignore_ascii_case("seq"))
+            && cols[0].parse::<i32>().is_err()
+        {
+            continue;
+        }
+        if cols.len() < 5 {
+            return Err(format!(
+                "j-couplings TSV line {}: expected >= 5 columns (seq_id res_name site j_kind val_a_hz [val_b_hz]), got {}",
+                line_no + 1,
+                cols.len()
+            ));
+        }
+        let seq_id = cols[0]
+            .parse::<i32>()
+            .map_err(|e| format!("j-couplings TSV line {}: invalid seq_id: {e}", line_no + 1))?;
+        let val_a_hz = cols[4].parse::<f64>().map_err(|e| {
+            format!(
+                "j-couplings TSV line {}: invalid val_a_hz: {e}",
+                line_no + 1
+            )
+        })?;
+        let val_b_hz = if let Some(b_tok) = cols.get(5) {
+            if *b_tok == "." || *b_tok == "NA" || *b_tok == "-" {
+                None
+            } else {
+                Some(b_tok.parse::<f64>().map_err(|e| {
+                    format!(
+                        "j-couplings TSV line {}: invalid val_b_hz: {e}",
+                        line_no + 1
+                    )
+                })?)
+            }
+        } else {
+            None
+        };
+        rows.push(JCouplingTsvRow {
+            seq_id,
+            res_name: cols[1].to_ascii_uppercase(),
+            site: cols[2].to_ascii_uppercase(),
+            j_kind: cols[3].to_ascii_uppercase(),
+            val_a_hz,
+            val_b_hz,
+        });
+    }
+    Ok(rows)
+}
+
+/// Read scalar `3J` coupling rows from a TSV file on disk.
+pub fn read_j_couplings_tsv(path: impl AsRef<Path>) -> Result<Vec<JCouplingTsvRow>, String> {
+    let text = fs::read_to_string(path.as_ref()).map_err(|e| {
+        format!(
+            "failed to read j-couplings {}: {e}",
+            path.as_ref().display()
+        )
+    })?;
+    parse_j_couplings_tsv_str(&text)
+}
+
+/// Write scalar `3J` coupling rows to a TSV file on disk.
+pub fn write_j_couplings_tsv(
+    path: impl AsRef<Path>,
+    rows: &[JCouplingTsvRow],
+) -> Result<(), String> {
+    let mut out = String::from("seq_id\tres_name\tsite\tj_kind\tval_a_hz\tval_b_hz\n");
+    for r in rows {
+        let b_str = r
+            .val_b_hz
+            .map(|v| format!("{v:.4}"))
+            .unwrap_or_else(|| ".".to_string());
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:.4}\t{}\n",
+            r.seq_id, r.res_name, r.site, r.j_kind, r.val_a_hz, b_str
+        ));
+    }
+    fs::write(path.as_ref(), out).map_err(|e| {
+        format!(
+            "failed to write j-couplings {}: {e}",
+            path.as_ref().display()
+        )
+    })
+}
+
+/// Parse intraresidue / sequential NOE intensity-pair rows from TSV text
+/// (`seq_id  res_name  site  anchor  intensity_a  intensity_b`).
+pub fn parse_intra_noes_tsv_str(text: &str) -> Result<Vec<IntraNoeTsvRow>, String> {
+    let mut rows = Vec::new();
+    for (line_no, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.is_empty() {
+            continue;
+        }
+        if (line_no == 0
+            || cols[0].eq_ignore_ascii_case("seq_id")
+            || cols[0].eq_ignore_ascii_case("seq"))
+            && cols[0].parse::<i32>().is_err()
+        {
+            continue;
+        }
+        if cols.len() < 6 {
+            return Err(format!(
+                "intra-noes TSV line {}: expected >= 6 columns (seq_id res_name site anchor intensity_a intensity_b), got {}",
+                line_no + 1,
+                cols.len()
+            ));
+        }
+        let seq_id = cols[0]
+            .parse::<i32>()
+            .map_err(|e| format!("intra-noes TSV line {}: invalid seq_id: {e}", line_no + 1))?;
+        let anchor = parse_anchor_proton_token(cols[3])
+            .map_err(|e| format!("intra-noes TSV line {}: {e}", line_no + 1))?;
+        let intensity_a = cols[4].parse::<f64>().map_err(|e| {
+            format!(
+                "intra-noes TSV line {}: invalid intensity_a: {e}",
+                line_no + 1
+            )
+        })?;
+        let intensity_b = cols[5].parse::<f64>().map_err(|e| {
+            format!(
+                "intra-noes TSV line {}: invalid intensity_b: {e}",
+                line_no + 1
+            )
+        })?;
+        rows.push(IntraNoeTsvRow {
+            seq_id,
+            res_name: cols[1].to_ascii_uppercase(),
+            site: cols[2].to_ascii_uppercase(),
+            anchor,
+            intensity_a,
+            intensity_b,
+        });
+    }
+    Ok(rows)
+}
+
+/// Read intraresidue / sequential NOE intensity-pair rows from a TSV file on disk.
+pub fn read_intra_noes_tsv(path: impl AsRef<Path>) -> Result<Vec<IntraNoeTsvRow>, String> {
+    let text = fs::read_to_string(path.as_ref())
+        .map_err(|e| format!("failed to read intra-noes {}: {e}", path.as_ref().display()))?;
+    parse_intra_noes_tsv_str(&text)
+}
+
+/// Write intraresidue / sequential NOE intensity-pair rows to a TSV file on disk.
+pub fn write_intra_noes_tsv(path: impl AsRef<Path>, rows: &[IntraNoeTsvRow]) -> Result<(), String> {
+    let mut out = String::from("seq_id\tres_name\tsite\tanchor\tintensity_a\tintensity_b\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:.6e}\t{:.6e}\n",
+            r.seq_id,
+            r.res_name,
+            r.site,
+            anchor_proton_token(r.anchor),
+            r.intensity_a,
+            r.intensity_b
+        ));
+    }
+    fs::write(path.as_ref(), out).map_err(|e| {
+        format!(
+            "failed to write intra-noes {}: {e}",
+            path.as_ref().display()
+        )
+    })
+}
+
+fn resolve_branch1_key(res_name: &str, site_tok: &str) -> Option<&'static str> {
+    let up = site_tok.trim().to_ascii_uppercase();
+    for spec in prochiral_pairs_for_residue(res_name) {
+        if up == spec.iupac_branch_1.to_ascii_uppercase()
+            || up == spec.iupac_branch_2.to_ascii_uppercase()
+            || up == spec.nef_nonstereo_protons.0.to_ascii_uppercase()
+            || up == spec.nef_nonstereo_protons.1.to_ascii_uppercase()
+            || spec
+                .shared_heavy_atom
+                .is_some_and(|hv| hv.eq_ignore_ascii_case(&up))
+            || spec.nef_nonstereo_carbons.is_some_and(|(cx, cy)| {
+                cx.eq_ignore_ascii_case(&up) || cy.eq_ignore_ascii_case(&up)
+            })
+        {
+            return Some(spec.iupac_branch_1);
+        }
+    }
+    None
+}
+
+fn lookup_proton_group_shift(
+    ref_data: &Reference,
+    res_idx: usize,
+    protons: &[&str],
+    nonstereo_fallback: &str,
+) -> Option<f64> {
+    for &p in protons {
+        if let Some(&v) = ref_data.shifts.get(&(res_idx, p.to_string())) {
+            return Some(v);
+        }
+    }
+    let trimmed = nonstereo_fallback.trim_end_matches('%');
+    ref_data
+        .shifts
+        .get(&(res_idx, nonstereo_fallback.to_string()))
+        .or_else(|| ref_data.shifts.get(&(res_idx, trimmed.to_string())))
+        .copied()
+}
+
+/// Assign prochiral sidechain & glycine `CH2` / isopropyl `CH3` / carboxamide `NH2` centers across
+/// an entire protein dataset (`Reference` + optional `--j-couplings`, `--intra-noes`, `--pdb`),
+/// returning the updated `Reference` and per-atom NMR-STAR `_Atom_chem_shift.Ambiguity_code` (`1` vs `2`).
+pub fn assign_stereospecific_dataset(
+    input: &StereospecDatasetInput<'_>,
+) -> Result<StereospecDatasetOutput, String> {
+    let n_res = input.reference.sequence.len();
+    let mut idx_by_seq_id: BTreeMap<i32, usize> = BTreeMap::new();
+    for (k, &sid) in input.reference.seq_ids.iter().enumerate() {
+        idx_by_seq_id.insert(sid, k);
+    }
+
+    // 1. Seed per-residue prochiral shift pairs from input Reference
+    let mut per_res_obs: Vec<BTreeMap<String, ProchiralObservables>> = vec![BTreeMap::new(); n_res];
+    let mut has_data_mask: BTreeMap<(usize, &'static str), bool> = BTreeMap::new();
+
+    for (k, res_name) in input.reference.sequence.iter().enumerate() {
+        let next_is_pro = input
+            .reference
+            .sequence
+            .get(k + 1)
+            .is_some_and(|nx| nx.eq_ignore_ascii_case("PRO"));
+        for spec in prochiral_pairs_for_residue(res_name) {
+            let mut obs = ProchiralObservables {
+                next_is_pro,
+                ..Default::default()
+            };
+            if let Some(hv) = spec.shared_heavy_atom {
+                obs.shared_heavy_shift_ppm =
+                    input.reference.shifts.get(&(k, hv.to_string())).copied();
+            }
+            if let Some((c1, c2)) = spec.iupac_carbons {
+                let (ncx, ncy) = spec.nef_nonstereo_carbons.unwrap_or((c1, c2));
+                let vc1 = input
+                    .reference
+                    .shifts
+                    .get(&(k, c1.to_string()))
+                    .or_else(|| input.reference.shifts.get(&(k, ncx.to_string())))
+                    .copied();
+                let vc2 = input
+                    .reference
+                    .shifts
+                    .get(&(k, c2.to_string()))
+                    .or_else(|| input.reference.shifts.get(&(k, ncy.to_string())))
+                    .copied();
+                if let (Some(va), Some(vb)) = (vc1, vc2) {
+                    obs.carbon_shifts_ppm = Some((va, vb));
+                }
+            }
+            let vh1 = lookup_proton_group_shift(
+                input.reference,
+                k,
+                spec.iupac_protons_1,
+                spec.nef_nonstereo_protons.0,
+            );
+            let vh2 = lookup_proton_group_shift(
+                input.reference,
+                k,
+                spec.iupac_protons_2,
+                spec.nef_nonstereo_protons.1,
+            );
+            if let (Some(ha), Some(hb)) = (vh1, vh2) {
+                obs.proton_shifts_ppm = Some((ha, hb));
+            }
+            if obs.proton_shifts_ppm.is_some() || obs.carbon_shifts_ppm.is_some() {
+                has_data_mask.insert((k, spec.iupac_branch_1), true);
+            }
+            per_res_obs[k].insert(spec.iupac_branch_1.to_string(), obs);
+        }
+    }
+
+    // 2. Merge experimental scalar couplings (`--j-couplings`)
+    if let Some(j_path) = input.j_couplings_tsv {
+        for row in read_j_couplings_tsv(j_path)? {
+            let Some(&k) = idx_by_seq_id.get(&row.seq_id) else {
+                continue;
+            };
+            let res_name = &input.reference.sequence[k];
+            let Some(b1) = resolve_branch1_key(res_name, &row.site) else {
+                continue;
+            };
+            let entry = per_res_obs[k].entry(b1.to_string()).or_default();
+            has_data_mask.insert((k, b1), true);
+            match row.j_kind.as_str() {
+                "3J_METHINE_HAHB" | "METHINE_HAHB" => {
+                    entry.j_methine_hahb_hz = Some(row.val_a_hz);
+                }
+                "3J_NHB" | "J_NHB" => {
+                    if let Some(vb) = row.val_b_hz {
+                        entry.j_nhb_hz = Some((row.val_a_hz, vb));
+                    }
+                }
+                "3J_NCG" | "J_NCG" => {
+                    if let Some(vb) = row.val_b_hz {
+                        entry.j_ncg_hz = Some((row.val_a_hz, vb));
+                    }
+                }
+                "3J_CCG" | "3J_C'CG" | "3J_CC" | "3J_CACD" | "J_CC" => {
+                    if let Some(vb) = row.val_b_hz {
+                        entry.j_cc_vicinal_hz = Some((row.val_a_hz, vb));
+                    }
+                }
+                _ => {
+                    if let Some(vb) = row.val_b_hz {
+                        entry.j_hh_vicinal_hz = Some((row.val_a_hz, vb));
+                    } else {
+                        entry.j_methine_hahb_hz = Some(row.val_a_hz);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Merge experimental intraresidue / sequential NOE pairs (`--intra-noes`)
+    if let Some(noe_path) = input.intra_noes_tsv {
+        for row in read_intra_noes_tsv(noe_path)? {
+            let Some(&k) = idx_by_seq_id.get(&row.seq_id) else {
+                continue;
+            };
+            let res_name = &input.reference.sequence[k];
+            let Some(b1) = resolve_branch1_key(res_name, &row.site) else {
+                continue;
+            };
+            let entry = per_res_obs[k].entry(b1.to_string()).or_default();
+            has_data_mask.insert((k, b1), true);
+            entry.noe_pairs.push(NoePairObs::new(
+                row.anchor,
+                row.intensity_a,
+                row.intensity_b,
+            ));
+        }
+    }
+
+    // 4. Build backbone (phi, psi) conditioning from `--pdb` if supplied, else CSI dihedral prediction
+    let backbones: Vec<BackboneConditioning> = if let Some(pdb_p) = input.pdb_path {
+        let pdb_res = parse_pdb_all_atoms_file(pdb_p)?;
+        let mut pdb_idx_by_seq: BTreeMap<i32, usize> = BTreeMap::new();
+        for (pi, pr) in pdb_res.iter().enumerate() {
+            pdb_idx_by_seq.entry(pr.seq_id).or_insert(pi);
+        }
+        (0..n_res)
+            .map(|k| {
+                let sid = input
+                    .reference
+                    .seq_ids
+                    .get(k)
+                    .copied()
+                    .unwrap_or((k + 1) as i32);
+                if let Some(&pi) = pdb_idx_by_seq.get(&sid) {
+                    backbone_conditioning_from_all_atom_pdb(&pdb_res, pi)
+                } else {
+                    BackboneConditioning::Marginalized
+                }
+            })
+            .collect()
+    } else {
+        let dih_preds = crate::dihedrals::predict_dihedrals(input.reference);
+        let mut dih_by_seq: BTreeMap<i32, BackboneConditioning> = BTreeMap::new();
+        for dr in &dih_preds {
+            dih_by_seq.insert(dr.seq_id, BackboneConditioning::from_dihedral_restraint(dr));
+        }
+        (0..n_res)
+            .map(|k| {
+                let sid = input
+                    .reference
+                    .seq_ids
+                    .get(k)
+                    .copied()
+                    .unwrap_or((k + 1) as i32);
+                dih_by_seq
+                    .get(&sid)
+                    .cloned()
+                    .unwrap_or(BackboneConditioning::Marginalized)
+            })
+            .collect()
+    };
+
+    // 5. Run hierarchical Bayesian stereospecific inference across the sequence
+    let raw_results = infer_protein_stereospec(
+        &input.reference.sequence,
+        &input.reference.seq_ids,
+        &backbones,
+        &per_res_obs,
+        &input.config,
+    );
+    let pair_results: Vec<StereospecResult> = raw_results
+        .into_iter()
+        .filter(|r| {
+            has_data_mask
+                .get(&(r.residue_idx, r.spec.iupac_branch_1))
+                .copied()
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let committed_pairs = pair_results.iter().filter(|r| r.committed).count();
+    let ambiguous_pairs = pair_results.len().saturating_sub(committed_pairs);
+
+    let (updated_ref, mut ambiguity_codes) =
+        apply_stereospec_to_reference(input.reference, &pair_results);
+
+    // Mark fast-flipping PHE/TYR symmetric aromatic pairs with standard BMRB Ambiguity_code = 3
+    for (k, res_name) in updated_ref.sequence.iter().enumerate() {
+        if matches!(res_name.as_str(), "PHE" | "TYR") {
+            for sym_atom in ["CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2"] {
+                if updated_ref.shifts.contains_key(&(k, sym_atom.to_string())) {
+                    ambiguity_codes.insert((k, sym_atom.to_string()), 3);
+                }
+            }
+        }
+    }
+
+    let mut atom_posteriors: BTreeMap<(usize, String), f64> = BTreeMap::new();
+    for r in &pair_results {
+        let k = r.residue_idx;
+        if let Some((c1, c2)) = r.spec.iupac_carbons {
+            atom_posteriors.insert((k, c1.to_string()), r.winning_posterior);
+            atom_posteriors.insert((k, c2.to_string()), r.winning_posterior);
+        }
+        for &p in r.spec.iupac_protons_1.iter().chain(r.spec.iupac_protons_2) {
+            atom_posteriors.insert((k, p.to_string()), r.winning_posterior);
+        }
+    }
+
+    Ok(StereospecDatasetOutput {
+        reference: updated_ref,
+        ambiguity_codes,
+        atom_posteriors,
+        pair_results,
+        committed_pairs,
+        ambiguous_pairs,
+    })
+}
+
+/// Format an all-atom NMR-STAR v3.2 shift saveframe preserving per-atom `_Atom_chem_shift.Ambiguity_code`
+/// (`1` unique/stereospecific, `2` prochiral/geminal, `3` symmetric aromatic ring flip) alongside
+/// optional residue backbone confidences and stereospecific posteriors.
+pub fn format_nmrstar_with_ambiguity(
+    ref_data: &Reference,
+    confidence: Option<&BTreeMap<usize, f64>>,
+    ambiguity_codes: &BTreeMap<(usize, String), u8>,
+    stereo_posteriors: Option<&BTreeMap<(usize, String), f64>>,
+    header_comment: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(hdr) = header_comment {
+        for l in hdr.lines() {
+            lines.push(format!(
+                "# {}",
+                l.trim_start_matches("# ").trim_start_matches('#')
+            ));
+        }
+        lines.push(String::new());
+    }
+    lines.extend([
+        "data_nmr_assign_output".to_string(),
+        String::new(),
+        "save_entity_1".to_string(),
+        "   _Entity.Sf_category  entity".to_string(),
+        "   _Entity.ID           1".to_string(),
+        String::new(),
+        "   loop_".to_string(),
+        "      _Entity_poly_seq.Entity_ID".to_string(),
+        "      _Entity_poly_seq.Num".to_string(),
+        "      _Entity_poly_seq.Mon_ID".to_string(),
+        String::new(),
+    ]);
+    for (seq_id, mon_id) in ref_data.seq_ids.iter().zip(ref_data.sequence.iter()) {
+        lines.push(format!("      1 {:5} {:3}", seq_id, mon_id));
+    }
+    lines.extend([
+        "   stop_".to_string(),
+        "save_".to_string(),
+        String::new(),
+        "save_assigned_chem_shift_list_1".to_string(),
+        "   _Assigned_chem_shift_list.Sf_category  assigned_chemical_shifts".to_string(),
+        String::new(),
+        "   loop_".to_string(),
+        "      _Atom_chem_shift.ID".to_string(),
+        "      _Atom_chem_shift.Entity_ID".to_string(),
+        "      _Atom_chem_shift.Seq_ID".to_string(),
+        "      _Atom_chem_shift.Comp_ID".to_string(),
+        "      _Atom_chem_shift.Atom_ID".to_string(),
+        "      _Atom_chem_shift.Atom_type".to_string(),
+        "      _Atom_chem_shift.Val".to_string(),
+        "      _Atom_chem_shift.Ambiguity_code".to_string(),
+        "      _Atom_chem_shift.Details".to_string(),
+        String::new(),
+    ]);
+
+    let bb_order = ["H", "N", "CA", "HA", "CB", "C"];
+    let mut entries: Vec<(usize, &str, f64)> = ref_data
+        .shifts
+        .iter()
+        .map(|(&(idx, ref atom), &v)| (idx, atom.as_str(), v))
+        .collect();
+    entries.sort_by(|&(ia, aa, _), &(ib, ab, _)| {
+        let oa = bb_order.iter().position(|&a| a == aa).unwrap_or(99);
+        let ob = bb_order.iter().position(|&a| a == ab).unwrap_or(99);
+        (ia, oa, aa).cmp(&(ib, ob, ab))
+    });
+
+    for (i, (idx, atom, v)) in entries.into_iter().enumerate() {
+        let Some(comp) = ref_data.sequence.get(idx) else {
+            continue;
+        };
+        let seq_id = ref_data
+            .seq_ids
+            .get(idx)
+            .copied()
+            .unwrap_or((idx + 1) as i32);
+        let default_amb = if matches!(comp.as_str(), "PHE" | "TYR")
+            && matches!(
+                atom,
+                "CD1" | "CD2" | "HD1" | "HD2" | "CE1" | "CE2" | "HE1" | "HE2"
+            ) {
+            3
+        } else {
+            1
+        };
+        let amb = ambiguity_codes
+            .get(&(idx, atom.to_string()))
+            .copied()
+            .unwrap_or(default_amb);
+        let atom_type = atom
+            .chars()
+            .find(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "X".to_string());
+        let conf_part = confidence
+            .and_then(|c| c.get(&idx))
+            .map(|&c| format!("conf={c:.2}"));
+        let post_part = stereo_posteriors
+            .and_then(|m| m.get(&(idx, atom.to_string())))
+            .map(|&p| format!("stereo_post={p:.3}"));
+        let details = match (conf_part, post_part) {
+            (Some(c), Some(p)) => format!("{c},{p}"),
+            (Some(c), None) => c,
+            (None, Some(p)) => p,
+            (None, None) => ".".to_string(),
+        };
+        lines.push(format!(
+            "      {:5} 1 {:5} {:3} {:4} {} {:9.3} {} {}",
+            i + 1,
+            seq_id,
+            comp,
+            atom,
+            atom_type,
+            v,
+            amb,
+            details
+        ));
+    }
+    lines.extend(["   stop_".to_string(), "save_".to_string(), String::new()]);
+    lines.join("\n")
+}

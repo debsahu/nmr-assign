@@ -29,6 +29,10 @@ Extending sequential backbone assignment (`H`, `N`, `CA`, `CB`, `C`; see `03-ass
 2. **Aromatic Ring Spin-System Assignment (`crates/nmr-core/src/aromatic.rs`)**:
    - Assigns aromatic `(1H, 13C, 15N)` ring resonances for `Phe` (`CD*/HD*`, `CE*/HE*`, `CZ/HZ`), `Tyr` (`CD*/HD*`, `CE*/HE*`), `Trp` (`CD1/HD1`, `NE1/HE1`, `CE3/HE3`, `CZ3/HZ3`, `CH2/HH2`, `CZ2/HZ2`), and `His` (`CD2/HD2`, `CE1/HE1`, `ND1`, `NE2`) when quaternary `13CG` carbons break standard aliphatic `HCCH-TOCSY` propagation.
    - Determines `His` imidazole tautomeric and protonation states (`Ne2H`, `Nd1H`, `DoublyProtonated`) from long-range `2J_NH` `1H-15N` HMQC and `13CD2`/`13CB` chemical shifts, and solves global 1-to-1 ring-to-backbone matching via exact Kuhn–Munkres optimization with leave-one-out Boltzmann confidence calibration.
+3. **Companion Sidechain & Methyl Specifications**:
+   - **Bayesian Stereospecific Prochiral Assignment (`docs/specs/07b-stereospecific.md`, `crates/nmr-core/src/stereospec.rs`)**: resolves diastereotopic `CH2` methylenes (`HB2/HB3`, `HA2/HA3`, `HG*`, `HD*`, `HE*`), prochiral `Val CG1/CG2` & `Leu CD1/CD2` isopropyl methyls, and `Asn`/`Gln` primary carboxamides from `3J` scalar couplings, intraresidue/sequential NOE ratios, and Lovell backbone-dependent rotamer priors, gating NMR-STAR `_Atom_chem_shift.Ambiguity_code` (`1` vs `2`) and NEF v1.1 `x`/`y` wildcards at posterior `>= 0.90`.
+   - **Supramolecular `13C`-Methyl TROSY (`docs/specs/13-methyl-trosy.md`, `crates/nmr-core/src/{methyl_trosy,methyl_solver}.rs`, `crates/nmr-gpu/src/methyl_gpu.rs`)**: assigns selectively protonated `ILVMAT` methyl probes in high-molecular-weight (`20–500 kDa`) perdeuterated systems from `2D 1H-13C HMQC`, `3D/4D` methyl-NOESY, and 3D structure contact graphs via WebGPU/CPU parallel simulated annealing (`nmrassign methyl`).
+   - **Interactive 2D IUPAC Covalent Sidechain Z-Score Inspector (`crates/nmr-core/src/topology.rs`, `crates/nmr-gui/src/sidechain_widget.rs`)**: planar non-overlapping 2D covalent atom-bond layouts (`Cys` redox & `His` protonation state-aware), BMRB empirical Z-score coloring (`|z| <= 1.5`, `1.5..3.0`, `> 3.0`), and 1-click `SyncCrosshair` frequency navigation in `nmr-gui`.
 
 ---
 
@@ -168,3 +172,12 @@ Crucially, whenever two homologous aromatic residues in unfolded or repetitive r
    - **Aromatic `(1H, 13C/15N)` assignment accuracy**: **`>= 92.0%`** required gate.
    - **High-confidence (`>= 0.80`) precision**: **`>= 96.0%`** required gate.
    - **Histidine tautomeric state (`Ne2H`, `Nd1H`, `DoublyProtonated`) accuracy**: **`100.0%`** required gate on canonical Pelton shift regimes and across the 12-protein suite.
+
+---
+
+## 8. CLI & Workbench Integration
+
+- **`nmrassign sidechain`**:
+  - Supports joint aliphatic sidechain assignment alongside optional aromatic ring assignment (`--aromatic`, `--arom-c13hsqc`, `--hbcbgcdhd`, `--hbcbgcdce`, `--aromatic-tocsy`, `--aromatic-noesy`, `--his-hmqc`, `--trp-hsqc` -> `nmr_core::aromatic::assign_aromatic_rings`) and optional Bayesian stereospecific prochiral assignment (`--stereospec`, `--j-couplings`, `--intra-noes`, `--pdb` -> `nmr_core::stereospec::assign_stereospecific_dataset`; see `docs/specs/07b-stereospecific.md`), emitting `_Atom_chem_shift.Ambiguity_code` (`1` stereospecific/unique, `2` uncommitted prochiral, `3` symmetric `Phe`/`Tyr` ring flip) in NMR-STAR v3.2.
+- **`nmrassign methyl`**:
+  - Dedicated CLI workflow for `ILVMAT` `13C`-methyl TROSY peak picking and WebGPU/CPU 3D NOE contact-graph assignment (`docs/specs/13-methyl-trosy.md`).

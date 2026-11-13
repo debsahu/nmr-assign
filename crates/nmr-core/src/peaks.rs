@@ -119,7 +119,7 @@ pub const EXPERIMENT_NAMES: [&str; 7] = [
     "HSQC", "HNCA", "HNCOCA", "HNCACB", "CBCACONH", "HNCO", "HNCACO",
 ];
 
-pub const ALL_EXPERIMENT_NAMES: [&str; 13] = [
+pub const ALL_EXPERIMENT_NAMES: [&str; 21] = [
     "HSQC",
     "HNCA",
     "HNCOCA",
@@ -131,8 +131,16 @@ pub const ALL_EXPERIMENT_NAMES: [&str; 13] = [
     "CCCONH",
     "HCCCONH",
     "HCCHTOCSY",
+    "HCCHCOSY",
     "NOESY15N",
     "NOESY13C",
+    "AROM_C13HSQC",
+    "HBCBCGCDHD",
+    "HBCBCGCDCEHE",
+    "AROM_HCCH_TOCSY",
+    "HIS_LR_N15HMQC",
+    "TRP_IND_N15HSQC",
+    "AROM_HB_NOE",
 ];
 
 pub fn is_known_experiment(exp: &str) -> bool {
@@ -236,10 +244,20 @@ pub fn read_peaks_str(text: &str) -> Result<Vec<Peak>, String> {
                 line_no + 1
             ));
         }
-        let exp = fields[0]
+        let raw_exp = fields[0]
             .trim()
             .to_ascii_uppercase()
             .replace(['(', ')', '-'], "");
+        let exp = match raw_exp.as_str() {
+            "AROMC13HSQC" => "AROM_C13HSQC".to_string(),
+            "AROMHCCHTOCSY" | "AROMHCCHCOSY" => "AROM_HCCH_TOCSY".to_string(),
+            "HISLRN15HMQC" | "LRN15HMQC" => "HIS_LR_N15HMQC".to_string(),
+            "TRPINDN15HSQC" => "TRP_IND_N15HSQC".to_string(),
+            "AROMHBNOE" => "AROM_HB_NOE".to_string(),
+            "HBCBGCDCE" => "HBCBCGCDCEHE".to_string(),
+            "HBCBGCDHD" => "HBCBCGCDHD".to_string(),
+            _ => raw_exp,
+        };
         if !is_known_experiment(&exp) {
             return Err(format!(
                 "line {}: unknown experiment {:?}; expected one of {:?}",

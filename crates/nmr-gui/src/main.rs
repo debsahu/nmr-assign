@@ -14,6 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::{egui, egui_wgpu};
+use nmr_core::aromatic::{
+    assign_aromatic_rings, AromaticSolverConfig, HisTautomer, AROMATIC_EXPERIMENTS,
+};
 use nmr_core::classify::DataState;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::classify::{ExperimentDimensionality, ExperimentVendor};
@@ -22,8 +25,8 @@ use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
 use nmr_core::nef::read_nef_str;
 use nmr_core::neural_picker::{pick_hsqc_2d_neural, NeuralPickerConfig};
 #[cfg(not(target_arch = "wasm32"))]
-use nmr_core::nmrstar::{read_star, write_star};
-use nmr_core::nmrstar::{read_star_str, Reference};
+use nmr_core::nmrstar::{read_star, read_star_all_atoms, write_star};
+use nmr_core::nmrstar::{read_star_str, read_star_str_all_atoms, Reference};
 use nmr_core::octet_analyt::iupac_naming::{iupac_name_to_mol, mol_to_iupac_name};
 use nmr_core::octet_analyt::jcamp_spec1d::{
     pick_1d_multiplets, read_jcamp, synthesize_1d_nmr, write_jcamp_nmr, JcampCompression,
@@ -44,7 +47,7 @@ use nmr_core::octet_render::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::peaks::read_peaks;
-use nmr_core::peaks::{read_peaks_str, Peak};
+use nmr_core::peaks::{read_peaks_str, Peak, EXPERIMENT_NAMES};
 use nmr_core::picker::{estimate_noise_mad, pick_hsqc_2d, PickerConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::picker::{pick_c13_hsqc_2d, pick_triple_3d_two_pass, CorroboratedRepickConfig};
@@ -56,6 +59,9 @@ use nmr_core::report::{generate_quality_report_html, predict_csi_dihedrals, Repo
 use nmr_core::rng::Rng;
 use nmr_core::session::{
     ResidueAssignmentState, SessionContourParams, WorkbenchCommand, WorkbenchSessionState,
+};
+use nmr_core::sidechain::{
+    assign_sidechains, solve_joint_backbone_sidechain, SidechainSolverConfig,
 };
 use nmr_core::simulate::{
     render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
@@ -71,6 +77,10 @@ use nmr_core::spectrum::{
 };
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
+use nmr_core::stereospec::{
+    assign_stereospecific_dataset, StereospecConfig, StereospecDatasetInput,
+};
+use nmr_core::topology::{ResidueVariant, SidechainPriors};
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
 #[cfg(not(target_arch = "wasm32"))]
@@ -88,6 +98,9 @@ use nmr_gui::{
     ingest_panel::{IngestAction, IngestDropOutcome, IngestExecutionPlan, IngestPanelState},
     keymap::{poll_global_modifier_shortcuts, ChordDispatcher, CONTOUR_FLOOR_STEP_RATIO},
     session_io::WorkbenchSessionController,
+    sidechain_widget::{
+        AssignedAtomInfo, SequenceRibbonState, SidechainInspectorPanel, SidechainWorkspaceInput,
+    },
     strip_tiler::{StripSpectra3D, StripTilerAction, StripTilerContext, StripTilerPanel},
     workflow_bar::{draw_workbench_chrome, WorkbenchAction, WorkspaceReadiness},
 };
@@ -762,6 +775,7 @@ struct NmrWorkbenchApp {
 
     // Active dataset
     priors: Priors,
+    sidechain_priors: SidechainPriors,
     reference: Option<Reference>,
     sequence: Vec<String>,
     seq_ids: Vec<i32>,
@@ -773,7 +787,10 @@ struct NmrWorkbenchApp {
     assign_res: Option<AssignResult>,
     pred_ref: Option<Reference>,
     pred_conf: BTreeMap<usize, f64>,
+    pred_ambiguity_codes: BTreeMap<(usize, String), u8>,
     metrics: Option<Metrics>,
+    sidechain_ribbon_state: SequenceRibbonState,
+    show_sidechain_inspector: bool,
 
     // Spectra for GPU contour & 3D strip visualization
     hsqc_spec: Option<Spectrum2D>,
@@ -904,6 +921,7 @@ impl NmrWorkbenchApp {
             status_msg: String::new(),
             last_solve_ms: None,
             priors: Priors::provisional(),
+            sidechain_priors: SidechainPriors::empirical_bmrb(),
             reference: None,
             sequence: Vec::new(),
             seq_ids: Vec::new(),
@@ -915,7 +933,10 @@ impl NmrWorkbenchApp {
             assign_res: None,
             pred_ref: None,
             pred_conf: BTreeMap::new(),
+            pred_ambiguity_codes: BTreeMap::new(),
             metrics: None,
+            sidechain_ribbon_state: SequenceRibbonState::new(),
+            show_sidechain_inspector: false,
             hsqc_spec: None,
             hsqc_arc: Arc::new(Vec::new()),
             hsqc_gen: 1,
@@ -1263,6 +1284,8 @@ impl NmrWorkbenchApp {
         self.assign_res = None;
         self.pred_ref = None;
         self.pred_conf.clear();
+        self.pred_ambiguity_codes.clear();
+        self.sidechain_ribbon_state.variant_overrides.clear();
         self.metrics = None;
         self.qc_report = None;
         self.raw_fids_total = 0;
@@ -1632,7 +1655,7 @@ impl NmrWorkbenchApp {
             || trimmed.starts_with("data_");
 
         if looks_like_star {
-            match read_star_str(trimmed, None) {
+            match read_star_str_all_atoms(trimmed, None) {
                 Ok(r) => {
                     self.load_from_reference(r);
                     self.run_assignment();
@@ -1724,7 +1747,7 @@ impl NmrWorkbenchApp {
             .unwrap_or("")
             .to_ascii_lowercase();
         match ext.as_str() {
-            "str" | "star" => match read_star(p, None) {
+            "str" | "star" => match read_star_all_atoms(p, None) {
                 Ok(r) => {
                     self.load_from_reference(r);
                     self.workspace_mode = WorkspaceMode::ProteinNmr;
@@ -2275,6 +2298,38 @@ impl NmrWorkbenchApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
+                    let toggle_btn = egui::Button::new(
+                        egui::RichText::new("🔬 2D Graph")
+                            .size(11.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if self.show_sidechain_inspector {
+                        egui::Color32::from_rgb(20, 108, 130)
+                    } else {
+                        egui::Color32::from_rgb(32, 42, 58)
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.2,
+                        if self.show_sidechain_inspector {
+                            egui::Color32::from_rgb(120, 235, 255)
+                        } else {
+                            egui::Color32::from_rgb(76, 92, 118)
+                        },
+                    ))
+                    .min_size(egui::vec2(68.0, 28.0));
+                    if ui
+                        .add(toggle_btn)
+                        .on_hover_text(
+                            "Toggle live 2D IUPAC covalent sidechain Z-score inspector & atom crosshair jump",
+                        )
+                        .clicked()
+                    {
+                        self.show_sidechain_inspector = !self.show_sidechain_inspector;
+                        if self.show_sidechain_inspector && self.selected_res.is_none() {
+                            self.selected_res = Some(0);
+                        }
+                    }
+                    ui.add_space(4.0);
                     for (k, three) in self.sequence.iter().enumerate() {
                         let one = three_to_one(three);
                         let seq_id = self.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
@@ -2323,6 +2378,7 @@ impl NmrWorkbenchApp {
                         let resp = ui.add(btn);
                         if resp.clicked() {
                             self.selected_res = Some(k);
+                            self.sidechain_ribbon_state.selected_residue = k;
                             self.assign_target_res = k;
                             if let Some((ss_idx, _)) = assigned {
                                 self.selected_ss = Some(ss_idx);
@@ -2642,6 +2698,324 @@ impl NmrWorkbenchApp {
         );
     }
 
+    fn select_residue_and_sync_strip(&mut self, k: usize) {
+        if k >= self.sequence.len() {
+            return;
+        }
+        self.selected_res = Some(k);
+        self.sidechain_ribbon_state.selected_residue = k;
+        self.assign_target_res = k;
+        if let Some(res) = &self.assign_res {
+            for (s, &pos) in res.position.iter().enumerate() {
+                if pos >= 0 && (pos as usize) == k {
+                    self.selected_ss = Some(s);
+                    if let Some(ss) = self.systems.get(s) {
+                        self.crosshair.snap_to(ss.h, ss.n, self.crosshair.c_ppm);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn run_joint_sidechain_in_gui(&mut self) {
+        if self.sequence.is_empty() {
+            self.status_msg =
+                "Load sequence and peaks/spin systems before sidechain assignment".to_string();
+            return;
+        }
+        let timer = PerfTimer::start();
+        let seed = self.sim_seed.wrapping_add(2026);
+        let mut loaded_sc_peaks = Vec::new();
+        let mut loaded_arom_peaks = Vec::new();
+        for p in &self.peaks {
+            if EXPERIMENT_NAMES.contains(&p.exp.as_str()) {
+                continue;
+            }
+            if AROMATIC_EXPERIMENTS.contains(&p.exp.as_str()) || p.exp == "AROM_HB_NOE" {
+                loaded_arom_peaks.push(p.clone());
+            } else {
+                loaded_sc_peaks.push(p.clone());
+            }
+        }
+
+        let mut working_ref = if !loaded_sc_peaks.is_empty() {
+            if !self.systems.is_empty() {
+                let locked_pairs: Vec<(usize, usize)> = self
+                    .session
+                    .state
+                    .locked_residues
+                    .iter()
+                    .map(|(&s, &k)| (s, k))
+                    .collect();
+                let scfg = ScoreConfig {
+                    assign_cost: self.assign_cost,
+                    locked_assignments: locked_pairs,
+                    ..ScoreConfig::default()
+                };
+                let acfg = AnnealConfig {
+                    runs: self.replicas.clamp(4, 16),
+                    steps_per_system: self.steps_per_sys,
+                    seed,
+                    ..AnnealConfig::default()
+                };
+                let joint = solve_joint_backbone_sidechain(
+                    &self.systems,
+                    &self.sequence,
+                    &self.seq_ids,
+                    &self.priors,
+                    &self.sidechain_priors,
+                    &loaded_sc_peaks,
+                    &scfg,
+                    &acfg,
+                    &SidechainSolverConfig::default(),
+                );
+                let (_, bb_conf) = to_reference(
+                    &joint.backbone_result,
+                    &self.systems,
+                    &self.sequence,
+                    &self.seq_ids,
+                    0.0,
+                    Some(&self.priors),
+                );
+                if let Some(truth) = &self.truth {
+                    self.metrics = Some(score(&joint.backbone_result, truth, 0.8));
+                }
+                self.assign_res = Some(joint.backbone_result);
+                self.pred_conf = bb_conf;
+                joint.sidechain_result.reference
+            } else if let Some(base_ref) = self.pred_ref.clone().or_else(|| self.reference.clone())
+            {
+                let sc_res = assign_sidechains(
+                    &base_ref,
+                    (!self.pred_conf.is_empty()).then_some(&self.pred_conf),
+                    &loaded_sc_peaks,
+                    &self.sidechain_priors,
+                    &SidechainSolverConfig::default(),
+                );
+                sc_res.reference
+            } else {
+                self.status_msg =
+                    "Load backbone shifts or spin systems before sidechain assignment".to_string();
+                return;
+            }
+        } else {
+            if self.pred_ref.is_none() && !self.systems.is_empty() {
+                self.run_assignment();
+            }
+            if let Some(pred) = &self.pred_ref {
+                pred.clone()
+            } else if self.systems.is_empty() {
+                if let Some(r) = &self.reference {
+                    r.clone()
+                } else {
+                    Reference::new(self.sequence.clone(), self.seq_ids.clone())
+                }
+            } else {
+                Reference::new(self.sequence.clone(), self.seq_ids.clone())
+            }
+        };
+
+        if !loaded_arom_peaks.is_empty() {
+            const RING_ATOMS: &[&str] = &[
+                "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
+                "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
+            ];
+            working_ref.shifts.retain(|&(k, ref atom), _| {
+                let is_arom_res = matches!(
+                    working_ref.sequence.get(k).map(String::as_str),
+                    Some("PHE" | "TYR" | "TRP" | "HIS")
+                );
+                !(is_arom_res && RING_ATOMS.contains(&atom.as_str()))
+            });
+            let arom_res = assign_aromatic_rings(
+                &working_ref,
+                (!self.pred_conf.is_empty()).then_some(&self.pred_conf),
+                &loaded_arom_peaks,
+                &self.sidechain_priors,
+                &AromaticSolverConfig::default(),
+            );
+            for ring in &arom_res.rings {
+                if let Some((taut, _)) = ring.his_tautomer {
+                    let var = match taut {
+                        HisTautomer::Nd1H => ResidueVariant::HisNd1H,
+                        HisTautomer::Ne2H => ResidueVariant::HisNe2H,
+                        HisTautomer::DoublyProtonated => ResidueVariant::HisDoublyProtonated,
+                    };
+                    self.sidechain_ribbon_state
+                        .variant_overrides
+                        .entry(ring.residue_idx)
+                        .or_insert(var);
+                }
+            }
+            working_ref = arom_res.reference;
+        }
+
+        // Auto-infer Cys redox variant from CB shift when user hasn't explicitly overridden it
+        for (k, rname) in working_ref.sequence.iter().enumerate() {
+            if rname == "CYS" {
+                if let Some(&cb) = working_ref.shifts.get(&(k, "CB".to_string())) {
+                    let var = if cb >= 35.5 {
+                        ResidueVariant::CysOxidized
+                    } else {
+                        ResidueVariant::CysReduced
+                    };
+                    self.sidechain_ribbon_state
+                        .variant_overrides
+                        .entry(k)
+                        .or_insert(var);
+                }
+            }
+        }
+
+        let mut amb_codes = BTreeMap::new();
+        if let Ok(stereo_out) = assign_stereospecific_dataset(&StereospecDatasetInput {
+            reference: &working_ref,
+            j_couplings_tsv: None,
+            intra_noes_tsv: None,
+            pdb_path: None,
+            config: StereospecConfig::default(),
+        }) {
+            working_ref = stereo_out.reference;
+            amb_codes = stereo_out.ambiguity_codes;
+        }
+
+        let n_shifts = working_ref.shifts.len();
+        let dt_ms = timer.elapsed_ms();
+        self.pred_ref = Some(working_ref);
+        self.pred_ambiguity_codes = amb_codes;
+        if !loaded_sc_peaks.is_empty() || !loaded_arom_peaks.is_empty() {
+            self.has_structure_or_dynamics = true;
+        }
+        self.show_sidechain_inspector = true;
+        if self.selected_res.is_none() && !self.sequence.is_empty() {
+            self.select_residue_and_sync_strip(0);
+        }
+        self.sync_session_assignments_from_solver();
+        self.status_msg = if !loaded_sc_peaks.is_empty() && !loaded_arom_peaks.is_empty() {
+            format!("Assigned {n_shifts} backbone + aliphatic + aromatic shifts in {dt_ms:.0} ms")
+        } else if !loaded_sc_peaks.is_empty() {
+            format!("Assigned {n_shifts} backbone + aliphatic sidechain shifts in {dt_ms:.0} ms")
+        } else if !loaded_arom_peaks.is_empty() {
+            format!("Assigned aromatic rings ({n_shifts} total shifts) in {dt_ms:.0} ms")
+        } else {
+            format!(
+                "No sidechain or aromatic peak lists loaded — inspecting {n_shifts} existing shifts & BMRB Z-scores"
+            )
+        };
+    }
+
+    fn draw_sidechain_inspector_drawer(&mut self, ui: &mut egui::Ui) {
+        if self.sequence.is_empty() {
+            ui.label("Load a sequence or NMR-STAR file to inspect 2D covalent sidechains.");
+            return;
+        }
+        let cur_k = self
+            .selected_res
+            .unwrap_or(self.sidechain_ribbon_state.selected_residue)
+            .min(self.sequence.len() - 1);
+        self.selected_res = Some(cur_k);
+        self.sidechain_ribbon_state.selected_residue = cur_k;
+
+        let mut trigger_sidechain_solve = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(cur_k > 0, egui::Button::new("◀").small())
+                .on_hover_text("Previous residue")
+                .clicked()
+            {
+                self.select_residue_and_sync_strip(cur_k - 1);
+            }
+            if ui
+                .add_enabled(
+                    cur_k + 1 < self.sequence.len(),
+                    egui::Button::new("▶").small(),
+                )
+                .on_hover_text("Next residue")
+                .clicked()
+            {
+                self.select_residue_and_sync_strip(cur_k + 1);
+            }
+            if ui
+                .small_button("▶ Assign Sidechains")
+                .on_hover_text(
+                    "Run joint aliphatic, aromatic (Pelton His tautomer), and stereospecific assignment",
+                )
+                .clicked()
+            {
+                trigger_sidechain_solve = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Hide 2D covalent sidechain inspector")
+                    .clicked()
+                {
+                    self.show_sidechain_inspector = false;
+                }
+            });
+        });
+
+        if trigger_sidechain_solve {
+            self.run_joint_sidechain_in_gui();
+        }
+        if !self.show_sidechain_inspector {
+            return;
+        }
+
+        let mut assigned_map: BTreeMap<(usize, String), AssignedAtomInfo> = BTreeMap::new();
+        let display_ref = self.pred_ref.as_ref().or({
+            if self.systems.is_empty() {
+                self.reference.as_ref()
+            } else {
+                None
+            }
+        });
+        if let Some(pred) = display_ref {
+            for (&(rk, ref atom), &ppm) in &pred.shifts {
+                let amb = self.pred_ambiguity_codes.get(&(rk, atom.clone())).copied();
+                assigned_map.insert(
+                    (rk, atom.clone()),
+                    AssignedAtomInfo::with_metadata(ppm, None, amb),
+                );
+            }
+        }
+        let locked_set = self
+            .session
+            .state
+            .locked_residues
+            .values()
+            .copied()
+            .collect();
+
+        let out = {
+            let sc_input = SidechainWorkspaceInput::from_assigned_map(
+                &self.sequence,
+                &self.seq_ids,
+                assigned_map,
+                &self.priors,
+                &self.sidechain_priors,
+            )
+            .with_backbone_confidences(self.pred_conf.clone())
+            .with_locked_residues(locked_set);
+            SidechainInspectorPanel::show_inspector(ui, &mut self.sidechain_ribbon_state, &sc_input)
+        };
+
+        if out.selected_residue < self.sequence.len()
+            && self.selected_res != Some(out.selected_residue)
+        {
+            self.select_residue_and_sync_strip(out.selected_residue);
+        }
+        if let Some(jump) = out.jump_to_atom {
+            self.select_residue_and_sync_strip(jump.residue_idx);
+            jump.apply_to_crosshair(&mut self.crosshair);
+            self.status_msg = format!(
+                "Jumped crosshair to {} {} {} ({:.3} ppm)",
+                jump.residue_name, jump.seq_id, jump.atom_name, jump.ppm
+            );
+        }
+    }
+
     fn draw_right_inspector(&mut self, ui: &mut egui::Ui) {
         // 1. Metrics summary card if reference truth is present
         if let Some(m) = &self.metrics {
@@ -2694,18 +3068,45 @@ impl NmrWorkbenchApp {
             ui.add_space(6.0);
         }
 
-        // 2. Strip View Mode Switch: Match-Finder (`st`) vs Sequential Walk
-        ui.horizontal(|ui| {
+        // 2. Strip View Mode Switch: Match-Finder (`st`), Sequential Walk, & Live 2D Sidechain Graph
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(
                 &mut self.use_match_finder_strips,
                 true,
                 "🎯 Match-Finder (i−1/i/i+1)",
             );
             ui.selectable_value(&mut self.use_match_finder_strips, false, "🧬 Walk & LLR");
+            let sc_btn = egui::Button::new(
+                egui::RichText::new("🔬 Sidechain 2D")
+                    .size(12.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if self.show_sidechain_inspector {
+                egui::Color32::from_rgb(20, 108, 130)
+            } else {
+                egui::Color32::from_rgb(34, 42, 58)
+            });
+            if ui
+                .add(sc_btn)
+                .on_hover_text("Inspect 2D IUPAC covalent atom-bond BMRB Z-score graph")
+                .clicked()
+            {
+                self.show_sidechain_inspector = !self.show_sidechain_inspector;
+                if self.show_sidechain_inspector && self.selected_res.is_none() {
+                    self.selected_res = Some(0);
+                }
+            }
             if ui.small_button("📌 Assign/Lock (at)").clicked() {
                 self.show_assign_popover = true;
             }
         });
+
+        if self.show_sidechain_inspector {
+            ui.add_space(4.0);
+            self.draw_sidechain_inspector_drawer(ui);
+            ui.add_space(6.0);
+            ui.separator();
+        }
 
         let Some(sel_s) = self.selected_ss.filter(|&s| s < self.systems.len()) else {
             ui.label("Click any HSQC peak or assigned residue to inspect 3D strips.");
@@ -3962,9 +4363,20 @@ impl NmrWorkbenchApp {
                         "Run backbone assignment before predicting dihedrals".to_string();
                 }
             }
-            WorkbenchAction::RunJointSidechainAssignment
-            | WorkbenchAction::InspectSidechainCovalentGraph
-            | WorkbenchAction::AssignNoesyRestraints
+            WorkbenchAction::RunJointSidechainAssignment => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.run_joint_sidechain_in_gui();
+            }
+            WorkbenchAction::InspectSidechainCovalentGraph => {
+                self.workspace_mode = WorkspaceMode::ProteinNmr;
+                self.show_sidechain_inspector = true;
+                if self.selected_res.is_none() && !self.sequence.is_empty() {
+                    self.select_residue_and_sync_strip(0);
+                }
+                self.status_msg =
+                    "Opened live 2D IUPAC covalent sidechain Z-score inspector".to_string();
+            }
+            WorkbenchAction::AssignNoesyRestraints
             | WorkbenchAction::FoldStructureEnsemble
             | WorkbenchAction::ValidateEnsembleRmsdRamachandran
             | WorkbenchAction::FitRelaxationR1R2HetNoe
