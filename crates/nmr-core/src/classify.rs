@@ -632,6 +632,7 @@ struct GzipStreamDecoder<R: Read> {
     inner: BufReader<R>,
     bit_buf: u64,
     bit_cnt: u8,
+    pending_id1: Option<u8>,
     window: [u8; 32768],
     win_pos: usize,
     crc32_state: u32,
@@ -650,6 +651,7 @@ impl<R: Read> GzipStreamDecoder<R> {
             inner: BufReader::with_capacity(32 * 1024, reader),
             bit_buf: 0,
             bit_cnt: 0,
+            pending_id1: None,
             window: [0u8; 32768],
             win_pos: 0,
             crc32_state: 0xFFFF_FFFF,
@@ -793,7 +795,11 @@ impl<R: Read> GzipStreamDecoder<R> {
 
     fn parse_gzip_header(&mut self) -> io::Result<bool> {
         self.align_byte();
-        let Some(id1) = self.next_raw_byte()? else {
+        let next_id1 = match self.pending_id1.take() {
+            Some(b) => Some(b),
+            None => self.next_raw_byte()?,
+        };
+        let Some(id1) = next_id1 else {
             return Ok(false);
         };
         let id2 = self.require_raw_byte()?;
@@ -949,8 +955,75 @@ impl<R: Read> Read for GzipStreamDecoder<R> {
                             "gzip trailer CRC32 or ISIZE mismatch",
                         ));
                     }
-                    // Support concatenated multi-member gzip streams
-                    self.phase = DeflatePhase::NeedGzipHeader;
+                    // Peek at remaining bytes after the 8-byte trailer:
+                    // - EOF or all-zero trailing padding -> finish cleanly (`Done`).
+                    // - Non-zero byte -> concatenated next gzip member (`NeedGzipHeader`).
+                    match self.next_raw_byte()? {
+                        None => {
+                            self.phase = DeflatePhase::Done;
+                        }
+                        Some(0x00) => {
+                            let mut pad_bytes: u64 = 1;
+                            if self.total_out_bytes.saturating_add(pad_bytes)
+                                > self.max_inflate_bytes
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "compressed archive exceeds maximum uncompressed byte limit",
+                                ));
+                            }
+                            while self.bit_cnt >= 8 {
+                                let b = (self.bit_buf & 0xFF) as u8;
+                                self.bit_buf >>= 8;
+                                self.bit_cnt -= 8;
+                                if b != 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid GZIP magic bytes (expected 0x1f 0x8b)",
+                                    ));
+                                }
+                                pad_bytes += 1;
+                                if self.total_out_bytes.saturating_add(pad_bytes)
+                                    > self.max_inflate_bytes
+                                {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "compressed archive exceeds maximum uncompressed byte limit",
+                                    ));
+                                }
+                            }
+                            self.bit_buf = 0;
+                            self.bit_cnt = 0;
+                            loop {
+                                let chunk = std::io::BufRead::fill_buf(&mut self.inner)?;
+                                if chunk.is_empty() {
+                                    break;
+                                }
+                                if chunk.iter().any(|&b| b != 0) {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid GZIP magic bytes (expected 0x1f 0x8b)",
+                                    ));
+                                }
+                                let n = chunk.len();
+                                pad_bytes = pad_bytes.saturating_add(n as u64);
+                                if self.total_out_bytes.saturating_add(pad_bytes)
+                                    > self.max_inflate_bytes
+                                {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "compressed archive exceeds maximum uncompressed byte limit",
+                                    ));
+                                }
+                                std::io::BufRead::consume(&mut self.inner, n);
+                            }
+                            self.phase = DeflatePhase::Done;
+                        }
+                        Some(b) => {
+                            self.pending_id1 = Some(b);
+                            self.phase = DeflatePhase::NeedGzipHeader;
+                        }
+                    }
                 }
                 DeflatePhase::NeedBlockHeader => {
                     let bfinal = self.read_bits(1)? == 1;

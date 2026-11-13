@@ -1056,33 +1056,25 @@ impl StereospecResult {
     }
 
     /// Return `(shift_branch_1, shift_branch_2)` ordered onto `(iupac_branch_1, iupac_branch_2)`.
-    /// When uncommitted (`Ambiguity_code = 2`), preserves canonical downfield-first convention on `(1, 2)`.
+    /// Swaps `(ha, hb) -> (hb, ha)` ONLY when `committed` with `SwapHypothesis::Swapped`; when
+    /// uncommitted (`Ambiguity_code = 2`), preserves input `(ha, hb)` order verbatim so coupled
+    /// `13C-1H` groups and user STAR tables are never silently mutated.
     pub fn ordered_iupac_proton_shifts(&self) -> Option<(f64, f64)> {
         let (ha, hb) = self.proton_shifts_ppm?;
-        if self.committed {
-            Some(match self.winning_hypothesis {
-                SwapHypothesis::Direct => (ha, hb),
-                SwapHypothesis::Swapped => (hb, ha),
-            })
-        } else if ha >= hb {
-            Some((ha, hb))
-        } else {
+        if self.committed && self.winning_hypothesis == SwapHypothesis::Swapped {
             Some((hb, ha))
+        } else {
+            Some((ha, hb))
         }
     }
 
     /// Return `(c_branch_1, c_branch_2)` ordered onto `(CG1, CG2)` or `(CD1, CD2)`.
     pub fn ordered_iupac_carbon_shifts(&self) -> Option<(f64, f64)> {
         let (ca, cb) = self.carbon_shifts_ppm?;
-        if self.committed {
-            Some(match self.winning_hypothesis {
-                SwapHypothesis::Direct => (ca, cb),
-                SwapHypothesis::Swapped => (cb, ca),
-            })
-        } else if ca >= cb {
-            Some((ca, cb))
-        } else {
+        if self.committed && self.winning_hypothesis == SwapHypothesis::Swapped {
             Some((cb, ca))
+        } else {
+            Some((ca, cb))
         }
     }
 }
@@ -1778,6 +1770,252 @@ fn log_sum_exp(xs: &[f64]) -> f64 {
 // 6. Core Bayesian Prochiral Inference Engine
 // ============================================================================
 
+const MIN_PHYSICAL_3J_HZ: f64 = -0.5;
+const MAX_PHYSICAL_3J_HZ: f64 = 16.0;
+const MAX_REDUCED_CHI2: f64 = 9.0;
+const DEGENERATE_POSTERIOR_CAP: f64 = 0.85;
+
+fn is_valid_3j_hz(v: f64) -> bool {
+    v.is_finite() && (MIN_PHYSICAL_3J_HZ..=MAX_PHYSICAL_3J_HZ).contains(&v)
+}
+
+fn has_invalid_or_out_of_range_observables(
+    backbone: &BackboneConditioning,
+    obs: &ProchiralObservables,
+    cfg: &StereospecConfig,
+) -> bool {
+    if !cfg.commit_posterior_threshold.is_finite()
+        || !cfg.homonuclear_j_sigma_hz.is_finite()
+        || cfg.homonuclear_j_sigma_hz <= 0.0
+        || !cfg.heteronuclear_j_sigma_hz.is_finite()
+        || cfg.heteronuclear_j_sigma_hz <= 0.0
+        || !cfg.noe_log_sigma.is_finite()
+        || cfg.noe_log_sigma <= 0.0
+        || !cfg.libration_sigma_deg.is_finite()
+        || cfg.libration_sigma_deg < 0.0
+    {
+        return true;
+    }
+    match *backbone {
+        BackboneConditioning::ExactTorsions { phi_deg, psi_deg } => {
+            if !phi_deg.is_finite() || !psi_deg.is_finite() {
+                return true;
+            }
+        }
+        BackboneConditioning::DihedralEstimate {
+            phi_deg,
+            psi_deg,
+            phi_err_deg,
+            psi_err_deg,
+            ..
+        } => {
+            if !phi_deg.is_finite()
+                || !psi_deg.is_finite()
+                || !phi_err_deg.is_finite()
+                || !psi_err_deg.is_finite()
+                || phi_err_deg <= 0.0
+                || psi_err_deg <= 0.0
+            {
+                return true;
+            }
+        }
+        BackboneConditioning::SecondaryStructurePrior(_) | BackboneConditioning::Marginalized => {}
+    }
+    if obs
+        .proton_shifts_ppm
+        .is_some_and(|(a, b)| !a.is_finite() || !b.is_finite())
+        || obs
+            .carbon_shifts_ppm
+            .is_some_and(|(a, b)| !a.is_finite() || !b.is_finite())
+        || obs.shared_heavy_shift_ppm.is_some_and(|x| !x.is_finite())
+        || obs
+            .upstream_chi1_posterior
+            .is_some_and(|w| w.iter().any(|x| !x.is_finite() || *x < 0.0))
+    {
+        return true;
+    }
+    for pair_j in [
+        obs.j_hh_vicinal_hz,
+        obs.j_nhb_hz,
+        obs.j_ncg_hz,
+        obs.j_cc_vicinal_hz,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !is_valid_3j_hz(pair_j.0) || !is_valid_3j_hz(pair_j.1) {
+            return true;
+        }
+    }
+    if let Some(jm) = obs.j_methine_hahb_hz {
+        if !is_valid_3j_hz(jm) {
+            return true;
+        }
+    }
+    for np in &obs.noe_pairs {
+        if !np.intensity_a.is_finite()
+            || !np.intensity_b.is_finite()
+            || np.intensity_a <= 0.0
+            || np.intensity_b <= 0.0
+        {
+            return true;
+        }
+        if np.rel_sigma_ln.is_some_and(|s| !s.is_finite() || s <= 0.0) {
+            return true;
+        }
+    }
+    false
+}
+
+fn uncommitted_null_result(
+    residue_idx: usize,
+    seq_id: i32,
+    spec: ProchiralPairSpec,
+    obs: &ProchiralObservables,
+) -> StereospecResult {
+    StereospecResult {
+        residue_idx,
+        seq_id,
+        res_name: spec.residue.to_string(),
+        spec,
+        posterior_direct: 0.50,
+        posterior_swapped: 0.50,
+        winning_hypothesis: SwapHypothesis::Direct,
+        winning_posterior: 0.50,
+        committed: false,
+        nmr_star_ambiguity_code: 2,
+        rotamer_marginal: [1.0 / 3.0; 3],
+        map_simplex_weights: [1.0 / 3.0; 3],
+        dominant_rotamer: None,
+        dynamic_mixture_posterior: 0.0,
+        proton_shifts_ppm: obs.proton_shifts_ppm,
+        carbon_shifts_ppm: obs.carbon_shifts_ppm,
+        shared_heavy_shift_ppm: obs.shared_heavy_shift_ppm,
+    }
+}
+
+fn count_basis_observations(basis: &RotamerBasisPredictions, obs: &ProchiralObservables) -> usize {
+    let mut n = 0usize;
+    if basis.j_hh.is_some() && obs.j_hh_vicinal_hz.is_some() {
+        n += 2;
+    }
+    if basis.j_nhb.is_some() && obs.j_nhb_hz.is_some() {
+        n += 2;
+    }
+    if basis.j_ncg.is_some() && obs.j_ncg_hz.is_some() {
+        n += 2;
+    }
+    if basis.j_cc.is_some() && obs.j_cc_vicinal_hz.is_some() {
+        n += 2;
+    }
+    if basis.j_methine_hahb.is_some() && obs.j_methine_hahb_hz.is_some() {
+        n += 1;
+    }
+    for np in &obs.noe_pairs {
+        if np.intensity_a > 0.0 && np.intensity_b > 0.0 && basis.noe_r6.contains_key(&np.anchor) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn anchor_discriminates_site(
+    spec: ProchiralPairSpec,
+    anchor: AnchorProton,
+    next_is_pro: bool,
+) -> bool {
+    if anchor == AnchorProton::SeqNextAmideH && next_is_pro {
+        return false;
+    }
+    match spec.kind {
+        ProchiralSiteKind::GlyAlphaMethylene => {
+            matches!(
+                anchor,
+                AnchorProton::IntraAmideH | AnchorProton::SeqNextAmideH
+            )
+        }
+        ProchiralSiteKind::BetaMethylene | ProchiralSiteKind::ValIsopropyl => matches!(
+            anchor,
+            AnchorProton::IntraAmideH | AnchorProton::IntraAlphaHA | AnchorProton::SeqNextAmideH
+        ),
+        ProchiralSiteKind::GammaMethylene => matches!(
+            anchor,
+            AnchorProton::IntraAmideH
+                | AnchorProton::IntraAlphaHA
+                | AnchorProton::IntraBetaHB
+                | AnchorProton::IntraBetaHB2
+                | AnchorProton::IntraBetaHB3
+                | AnchorProton::SeqNextAmideH
+        ),
+        ProchiralSiteKind::LeuIsopropyl => matches!(
+            anchor,
+            AnchorProton::IntraAmideH
+                | AnchorProton::IntraAlphaHA
+                | AnchorProton::IntraBetaHB
+                | AnchorProton::IntraBetaHB2
+                | AnchorProton::IntraBetaHB3
+                | AnchorProton::IntraGammaHG
+                | AnchorProton::SeqNextAmideH
+        ),
+        ProchiralSiteKind::AsnCarboxamide => matches!(
+            anchor,
+            AnchorProton::IntraBetaHB
+                | AnchorProton::IntraBetaHB2
+                | AnchorProton::IntraBetaHB3
+                | AnchorProton::IntraAlphaHA
+        ),
+        ProchiralSiteKind::GlnCarboxamide => matches!(
+            anchor,
+            AnchorProton::IntraGammaHG
+                | AnchorProton::IntraBetaHB
+                | AnchorProton::IntraBetaHB2
+                | AnchorProton::IntraBetaHB3
+        ),
+        ProchiralSiteKind::DeltaMethylene | ProchiralSiteKind::EpsilonMethylene => {
+            spec.residue.eq_ignore_ascii_case("PRO") && anchor == AnchorProton::IntraAlphaHA
+        }
+    }
+}
+
+/// Return `true` only when at least two independent pair-discriminating pathways (or at least one
+/// asymmetric NOE on a planar carboxamide) are present; returns `false` whenever zero or only a
+/// single scalar-coupling pathway is supplied without a second independent `J` or discriminating NOE.
+fn has_multi_pathway_prochiral_evidence(
+    spec: ProchiralPairSpec,
+    obs: &ProchiralObservables,
+) -> bool {
+    let n_paired_j = match spec.kind {
+        ProchiralSiteKind::BetaMethylene => {
+            usize::from(obs.j_hh_vicinal_hz.is_some()) + usize::from(obs.j_nhb_hz.is_some())
+        }
+        ProchiralSiteKind::ValIsopropyl => {
+            usize::from(obs.j_ncg_hz.is_some()) + usize::from(obs.j_cc_vicinal_hz.is_some())
+        }
+        ProchiralSiteKind::GammaMethylene => usize::from(obs.j_hh_vicinal_hz.is_some()),
+        ProchiralSiteKind::LeuIsopropyl => usize::from(obs.j_cc_vicinal_hz.is_some()),
+        ProchiralSiteKind::GlyAlphaMethylene
+        | ProchiralSiteKind::DeltaMethylene
+        | ProchiralSiteKind::EpsilonMethylene => usize::from(obs.j_hh_vicinal_hz.is_some()),
+        ProchiralSiteKind::AsnCarboxamide | ProchiralSiteKind::GlnCarboxamide => 0,
+    };
+    let n_disc_noes = obs
+        .noe_pairs
+        .iter()
+        .filter(|np| {
+            np.intensity_a > 0.0
+                && np.intensity_b > 0.0
+                && anchor_discriminates_site(spec, np.anchor, obs.next_is_pro)
+                && (np.intensity_a / np.intensity_b).ln().abs() > 1e-4
+        })
+        .count();
+
+    !(n_paired_j <= 1 && n_disc_noes == 0)
+}
+
+fn cap_degenerate_posterior(p_dir: f64) -> f64 {
+    p_dir.clamp(1.0 - DEGENERATE_POSTERIOR_CAP, DEGENERATE_POSTERIOR_CAP)
+}
+
 /// Infer joint rotamer-population posterior and stereospecific swap hypothesis `H in {Direct, Swapped}`
 /// for a single prochiral pair `(a, b)`.
 pub fn infer_prochiral_pair(
@@ -1788,6 +2026,9 @@ pub fn infer_prochiral_pair(
     obs: &ProchiralObservables,
     cfg: &StereospecConfig,
 ) -> StereospecResult {
+    if has_invalid_or_out_of_range_observables(backbone, obs, cfg) {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
+    }
     match spec.kind {
         ProchiralSiteKind::GlyAlphaMethylene => {
             infer_gly_pair(residue_idx, seq_id, spec, backbone, obs, cfg)
@@ -1819,14 +2060,21 @@ fn finalize_result(
     obs: &ProchiralObservables,
     cfg: &StereospecConfig,
 ) -> StereospecResult {
-    let p_dir = posterior_direct.clamp(0.0, 1.0);
+    if !posterior_direct.is_finite() {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
+    }
+    let mut p_dir = posterior_direct.clamp(0.0, 1.0);
+    if !has_multi_pathway_prochiral_evidence(spec, obs) {
+        p_dir = cap_degenerate_posterior(p_dir);
+    }
     let p_swp = (1.0 - p_dir).clamp(0.0, 1.0);
     let (winning_hypothesis, winning_posterior) = if p_dir >= 0.5 {
         (SwapHypothesis::Direct, p_dir)
     } else {
         (SwapHypothesis::Swapped, p_swp)
     };
-    let committed = winning_posterior >= cfg.commit_posterior_threshold;
+    let thresh = cfg.commit_posterior_threshold.clamp(0.500_001, 1.0);
+    let committed = winning_posterior >= thresh;
     let nmr_star_ambiguity_code = if committed { 1 } else { 2 };
 
     let mut best_r = 0;
@@ -1874,9 +2122,14 @@ fn infer_chi1_simplex_pair(
     let n_s = simplex.len();
     let bb_pts = backbone.quadrature_points(spec.residue);
     let ln_half = 0.5_f64.ln();
+    let uniform_log_priors = normalized_simplex_log_priors(&simplex, [1.0 / 3.0; 3], cfg);
 
     // Accumulate joint log-posterior across backbone quadrature points into [hyp][simplex_idx]
     let mut joint_log = [vec![f64::NEG_INFINITY; n_s], vec![f64::NEG_INFINITY; n_s]];
+    let mut unif_dir_terms: Vec<f64> = Vec::new();
+    let mut unif_swp_terms: Vec<f64> = Vec::new();
+    let mut max_data_ll = f64::NEG_INFINITY;
+    let mut n_obs = 0usize;
 
     for &(phi, psi, w_bb, ss_hint) in &bb_pts {
         if w_bb <= 0.0 {
@@ -1895,41 +2148,60 @@ fn infer_chi1_simplex_pair(
         } else {
             compute_cb_basis(spec.residue, &frame, cfg.libration_sigma_deg)
         };
+        n_obs = n_obs.max(count_basis_observations(&basis, obs));
 
         for (si, sp) in simplex.iter().enumerate() {
             let base_lp = ln_wbb + log_priors[si] + ln_half;
-            let (ll_dir, ll_swp) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
-                let ll0 = base_lp + evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
-                (ll0, ll0)
+            let unif_lp = ln_wbb + uniform_log_priors[si] + ln_half;
+            let (raw_d, raw_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
+                let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
+                (r0, r0)
             } else {
                 (
-                    base_lp
-                        + evaluate_basis_simplex_log_likelihood(
-                            &basis,
-                            sp.w,
-                            SwapHypothesis::Direct,
-                            obs,
-                            cfg,
-                        ),
-                    base_lp
-                        + evaluate_basis_simplex_log_likelihood(
-                            &basis,
-                            sp.w,
-                            SwapHypothesis::Swapped,
-                            obs,
-                            cfg,
-                        ),
+                    evaluate_basis_simplex_log_likelihood(
+                        &basis,
+                        sp.w,
+                        SwapHypothesis::Direct,
+                        obs,
+                        cfg,
+                    ),
+                    evaluate_basis_simplex_log_likelihood(
+                        &basis,
+                        sp.w,
+                        SwapHypothesis::Swapped,
+                        obs,
+                        cfg,
+                    ),
                 )
             };
-            joint_log[0][si] = log_sum_exp(&[joint_log[0][si], ll_dir]);
-            joint_log[1][si] = log_sum_exp(&[joint_log[1][si], ll_swp]);
+            max_data_ll = max_data_ll.max(raw_d).max(raw_s);
+            joint_log[0][si] = log_sum_exp(&[joint_log[0][si], base_lp + raw_d]);
+            joint_log[1][si] = log_sum_exp(&[joint_log[1][si], base_lp + raw_s]);
+            unif_dir_terms.push(unif_lp + raw_d);
+            unif_swp_terms.push(unif_lp + raw_s);
         }
+    }
+
+    if n_obs > 0
+        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+    {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
 
     let lse_dir = log_sum_exp(&joint_log[0]);
     let lse_swp = log_sum_exp(&joint_log[1]);
     let lse_tot = log_sum_exp(&[lse_dir, lse_swp]);
-    let p_dir = (lse_dir - lse_tot).exp();
+    let mut p_dir = (lse_dir - lse_tot).exp();
+
+    let u_dir = log_sum_exp(&unif_dir_terms);
+    let u_swp = log_sum_exp(&unif_swp_terms);
+    let p_dir_unif = (u_dir - log_sum_exp(&[u_dir, u_swp])).exp();
+    if !p_dir_unif.is_finite()
+        || (p_dir_unif - 0.5).abs() < 0.10
+        || (p_dir - 0.5) * (p_dir_unif - 0.5) < 0.0
+    {
+        p_dir = cap_degenerate_posterior(p_dir);
+    }
 
     let mut rot_marg = [0.0; 3];
     let mut dyn_post = 0.0;
@@ -1977,8 +2249,14 @@ fn infer_chi1_chi2_simplex_pair(
     let bb_pts = backbone.quadrature_points(spec.residue);
     let chi1_angles = canonical_chi_angles(spec.residue);
     let ln_half = 0.5_f64.ln();
+    let ln_third = (1.0_f64 / 3.0).ln();
+    let uniform_log_priors = normalized_simplex_log_priors(&simplex, [1.0 / 3.0; 3], cfg);
 
     let mut joint_log = [vec![f64::NEG_INFINITY; n_s], vec![f64::NEG_INFINITY; n_s]];
+    let mut unif_dir_terms: Vec<f64> = Vec::new();
+    let mut unif_swp_terms: Vec<f64> = Vec::new();
+    let mut max_data_ll = f64::NEG_INFINITY;
+    let mut n_obs = 0usize;
 
     for &(phi, psi, w_bb, ss_hint) in &bb_pts {
         if w_bb <= 0.0 {
@@ -1993,9 +2271,6 @@ fn infer_chi1_chi2_simplex_pair(
 
         for (r1_idx, &chi1_deg) in chi1_angles.iter().enumerate() {
             let w_c1 = pi_chi1[r1_idx];
-            if w_c1 <= 1e-6 {
-                continue;
-            }
             let chi1_state = RotamerState::ALL[r1_idx];
             let pi_chi2 = lovell_chi2_prior(spec.residue, chi1_state);
             let log_priors = normalized_simplex_log_priors(&simplex, pi_chi2, cfg);
@@ -2009,6 +2284,9 @@ fn infer_chi1_chi2_simplex_pair(
                     cfg.libration_sigma_deg,
                 )
             };
+            let has_ile_methine =
+                obs.j_methine_hahb_hz.is_some() && spec.residue.eq_ignore_ascii_case("ILE");
+            n_obs = n_obs.max(count_basis_observations(&basis, obs) + usize::from(has_ile_methine));
 
             // Include Ile single methine 3J_HAHB(chi1) when supplied:
             // In (2S,3S)-Ile, dihedral(N,CA,CB,HB) = chi1 + 120 deg => dihedral(HA,CA,CB,HB) = chi1 - 120 deg.
@@ -2027,42 +2305,61 @@ fn infer_chi1_chi2_simplex_pair(
                 0.0
             };
 
-            let prefix = w_bb.ln() + w_c1.ln() + ll_meth + ln_half;
+            let unif_prefix = w_bb.ln() + ln_third + ll_meth + ln_half;
             for (si, sp) in simplex.iter().enumerate() {
-                let base_lp = prefix + log_priors[si];
-                let (ll_dir, ll_swp) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
-                    let ll0 = base_lp + evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
-                    (ll0, ll0)
+                let (raw_d, raw_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
+                    let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
+                    (r0, r0)
                 } else {
                     (
-                        base_lp
-                            + evaluate_basis_simplex_log_likelihood(
-                                &basis,
-                                sp.w,
-                                SwapHypothesis::Direct,
-                                obs,
-                                cfg,
-                            ),
-                        base_lp
-                            + evaluate_basis_simplex_log_likelihood(
-                                &basis,
-                                sp.w,
-                                SwapHypothesis::Swapped,
-                                obs,
-                                cfg,
-                            ),
+                        evaluate_basis_simplex_log_likelihood(
+                            &basis,
+                            sp.w,
+                            SwapHypothesis::Direct,
+                            obs,
+                            cfg,
+                        ),
+                        evaluate_basis_simplex_log_likelihood(
+                            &basis,
+                            sp.w,
+                            SwapHypothesis::Swapped,
+                            obs,
+                            cfg,
+                        ),
                     )
                 };
-                joint_log[0][si] = log_sum_exp(&[joint_log[0][si], ll_dir]);
-                joint_log[1][si] = log_sum_exp(&[joint_log[1][si], ll_swp]);
+                max_data_ll = max_data_ll.max(ll_meth + raw_d).max(ll_meth + raw_s);
+                unif_dir_terms.push(unif_prefix + uniform_log_priors[si] + raw_d);
+                unif_swp_terms.push(unif_prefix + uniform_log_priors[si] + raw_s);
+                if w_c1 > 1e-6 {
+                    let base_lp = w_bb.ln() + w_c1.ln() + ll_meth + ln_half + log_priors[si];
+                    joint_log[0][si] = log_sum_exp(&[joint_log[0][si], base_lp + raw_d]);
+                    joint_log[1][si] = log_sum_exp(&[joint_log[1][si], base_lp + raw_s]);
+                }
             }
         }
+    }
+
+    if n_obs > 0
+        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+    {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
 
     let lse_dir = log_sum_exp(&joint_log[0]);
     let lse_swp = log_sum_exp(&joint_log[1]);
     let lse_tot = log_sum_exp(&[lse_dir, lse_swp]);
-    let p_dir = (lse_dir - lse_tot).exp();
+    let mut p_dir = (lse_dir - lse_tot).exp();
+
+    let u_dir = log_sum_exp(&unif_dir_terms);
+    let u_swp = log_sum_exp(&unif_swp_terms);
+    let p_dir_unif = (u_dir - log_sum_exp(&[u_dir, u_swp])).exp();
+    if !p_dir_unif.is_finite()
+        || (p_dir_unif - 0.5).abs() < 0.10
+        || (p_dir - 0.5) * (p_dir_unif - 0.5) < 0.0
+    {
+        p_dir = cap_degenerate_posterior(p_dir);
+    }
 
     let mut rot_marg = [0.0; 3];
     let mut dyn_post = 0.0;
@@ -2114,6 +2411,18 @@ fn infer_gly_pair(
 
     let mut terms_dir = Vec::with_capacity(bb_pts.len() + 1);
     let mut terms_swp = Vec::with_capacity(bb_pts.len() + 1);
+    let mut max_data_ll = f64::NEG_INFINITY;
+    let mut n_obs = usize::from(obs.j_hh_vicinal_hz.is_some()) * 2
+        + obs
+            .noe_pairs
+            .iter()
+            .filter(|np| {
+                np.intensity_a > 0.0
+                    && np.intensity_b > 0.0
+                    && (np.anchor == AnchorProton::IntraAmideH
+                        || (!obs.next_is_pro && np.anchor == AnchorProton::SeqNextAmideH))
+            })
+            .count();
 
     for &(phi, psi, w_bb, _) in &bb_pts {
         if w_bb <= 0.0 {
@@ -2126,14 +2435,14 @@ fn infer_gly_pair(
         let j3 = librational_avg(karplus_3j_hnha_hz, th_h_3, cfg.libration_sigma_deg);
 
         for hyp in [SwapHypothesis::Direct, SwapHypothesis::Swapped] {
-            let mut ll = (p_struct * w_bb * 0.5).ln();
+            let mut data_ll = 0.0;
             if let Some((ja, jb)) = obs.j_hh_vicinal_hz {
                 let (o2, o3) = if hyp == SwapHypothesis::Direct {
                     (ja, jb)
                 } else {
                     (jb, ja)
                 };
-                ll -= 0.5 * ((o2 - j2).powi(2) + (o3 - j3).powi(2))
+                data_ll -= 0.5 * ((o2 - j2).powi(2) + (o3 - j3).powi(2))
                     / cfg.homonuclear_j_sigma_hz.powi(2);
             }
             for np in &obs.noe_pairs {
@@ -2156,8 +2465,10 @@ fn infer_gly_pair(
                     (np.intensity_b, np.intensity_a)
                 };
                 let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
-                ll -= 0.5 * ((ia / ib).ln() - (u2 / u3).ln()).powi(2) / (2.0 * sig * sig);
+                data_ll -= 0.5 * ((ia / ib).ln() - (u2 / u3).ln()).powi(2) / (2.0 * sig * sig);
             }
+            max_data_ll = max_data_ll.max(data_ll);
+            let ll = (p_struct * w_bb * 0.5).ln() + data_ll;
             if hyp == SwapHypothesis::Direct {
                 terms_dir.push(ll);
             } else {
@@ -2167,26 +2478,55 @@ fn infer_gly_pair(
     }
 
     // Isotropic conformational-averaging null term (J_avg = 5.95 Hz, equal NOE distances)
-    let mut ll_iso = (p_iso * 0.5).ln();
+    let mut iso_data_ll = 0.0;
     if let Some((ja, jb)) = obs.j_hh_vicinal_hz {
         let j_iso = 5.95;
-        ll_iso -= 0.5 * ((ja - j_iso).powi(2) + (jb - j_iso).powi(2))
+        iso_data_ll -= 0.5 * ((ja - j_iso).powi(2) + (jb - j_iso).powi(2))
             / cfg.homonuclear_j_sigma_hz.powi(2);
     }
     for np in &obs.noe_pairs {
-        if np.intensity_a > 0.0 && np.intensity_b > 0.0 {
+        if np.intensity_a > 0.0
+            && np.intensity_b > 0.0
+            && (np.anchor == AnchorProton::IntraAmideH
+                || (!obs.next_is_pro && np.anchor == AnchorProton::SeqNextAmideH))
+        {
             let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
-            ll_iso -= 0.5 * (np.intensity_a / np.intensity_b).ln().powi(2) / (2.0 * sig * sig);
+            iso_data_ll -= 0.5 * (np.intensity_a / np.intensity_b).ln().powi(2) / (2.0 * sig * sig);
         }
     }
+    max_data_ll = max_data_ll.max(iso_data_ll);
+    let _ = &mut n_obs;
+    if n_obs > 0
+        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+    {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
+    }
+
+    let ll_iso = (p_iso * 0.5).ln() + iso_data_ll;
     terms_dir.push(ll_iso);
     terms_swp.push(ll_iso);
 
     let lse_dir = log_sum_exp(&terms_dir);
     let lse_swp = log_sum_exp(&terms_swp);
     let lse_tot = log_sum_exp(&[lse_dir, lse_swp]);
-    let p_dir = (lse_dir - lse_tot).exp();
+    let mut p_dir = (lse_dir - lse_tot).exp();
     let dyn_post = (log_sum_exp(&[ll_iso, ll_iso]) - lse_tot).exp();
+
+    // Under phi -> -phi, Gly 3J(HN, HA2/HA3) and intraresidue HN-HA2/HA3 NOEs are exact mirror
+    // images under Direct <-> Swapped! Cap Gly posterior below 0.90 unless phi comes from an
+    // explicit 3D structural model (ExactTorsions) OR an independent sequential HA(i)-HN(i+1)
+    // NOE pair with distinct intensities breaks the mirror degeneracy.
+    let has_pdb_torsions = matches!(backbone, BackboneConditioning::ExactTorsions { .. });
+    let has_seq_noe_asymmetry = !obs.next_is_pro
+        && obs.noe_pairs.iter().any(|np| {
+            np.anchor == AnchorProton::SeqNextAmideH
+                && np.intensity_a > 0.0
+                && np.intensity_b > 0.0
+                && (np.intensity_a / np.intensity_b).ln().abs() > 0.05
+        });
+    if !has_pdb_torsions && !has_seq_noe_asymmetry {
+        p_dir = cap_degenerate_posterior(p_dir);
+    }
 
     finalize_result(
         residue_idx,
@@ -2279,8 +2619,9 @@ fn infer_carboxamide_pair(
         0.0
     };
 
-    let mut ll_dir = 0.5 * shift_llr;
-    let mut ll_swp = -0.5 * shift_llr;
+    let mut data_ll_dir = 0.0;
+    let mut data_ll_swp = 0.0;
+    let mut n_obs = 0usize;
     for np in &obs.noe_pairs {
         if np.intensity_a <= 0.0 || np.intensity_b <= 0.0 {
             continue;
@@ -2305,6 +2646,7 @@ fn infer_carboxamide_pair(
         if !relevant {
             continue;
         }
+        n_obs += 1;
         let scale = if (spec.kind == ProchiralSiteKind::AsnCarboxamide
             && np.anchor == AnchorProton::IntraAlphaHA)
             || (spec.kind == ProchiralSiteKind::GlnCarboxamide
@@ -2316,10 +2658,19 @@ fn infer_carboxamide_pair(
         };
         let sig = np.rel_sigma_ln.unwrap_or(cfg.noe_log_sigma).max(0.10);
         let obs_lr = (np.intensity_a / np.intensity_b).ln();
-        ll_dir -= 0.5 * (obs_lr - scale * pred_lr).powi(2) / (2.0 * sig * sig);
-        ll_swp -= 0.5 * (-obs_lr - scale * pred_lr).powi(2) / (2.0 * sig * sig);
+        data_ll_dir -= 0.5 * (obs_lr - scale * pred_lr).powi(2) / (2.0 * sig * sig);
+        data_ll_swp -= 0.5 * (-obs_lr - scale * pred_lr).powi(2) / (2.0 * sig * sig);
     }
 
+    let max_data_ll = data_ll_dir.max(data_ll_swp);
+    if n_obs > 0
+        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+    {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
+    }
+
+    let ll_dir = 0.5 * shift_llr + data_ll_dir;
+    let ll_swp = -0.5 * shift_llr + data_ll_swp;
     let lse_tot = log_sum_exp(&[ll_dir, ll_swp]);
     let p_dir = (ll_dir - lse_tot).exp();
 
@@ -2352,6 +2703,7 @@ fn infer_distal_methylene_pair(
         [0.16, 0.68, 0.16]
     };
     let log_priors = normalized_simplex_log_priors(&simplex, pi, cfg);
+    let uniform_log_priors = normalized_simplex_log_priors(&simplex, [1.0 / 3.0; 3], cfg);
     let chis = canonical_chi_angles(spec.residue);
 
     // Local 4-carbon chain C_{k-2} - C_{k-1} - C_k - X_{k+1}
@@ -2391,43 +2743,66 @@ fn infer_distal_methylene_pair(
         j_methine_hahb: None,
         noe_r6,
     };
+    let n_obs = count_basis_observations(&basis, obs);
 
     let n_s = simplex.len();
     let ln_half = 0.5_f64.ln();
     let mut l_dir = Vec::with_capacity(n_s);
     let mut l_swp = Vec::with_capacity(n_s);
+    let mut u_dir = Vec::with_capacity(n_s);
+    let mut u_swp = Vec::with_capacity(n_s);
+    let mut max_data_ll = f64::NEG_INFINITY;
     for (si, sp) in simplex.iter().enumerate() {
         let base = log_priors[si] + ln_half;
-        if matches!(sp.kind, SimplexPointKind::Isotropic) {
-            let ll0 = base + evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
-            l_dir.push(ll0);
-            l_swp.push(ll0);
+        let ubase = uniform_log_priors[si] + ln_half;
+        let (raw_d, raw_s) = if matches!(sp.kind, SimplexPointKind::Isotropic) {
+            let r0 = evaluate_isotropic_null_log_likelihood(&basis, obs, cfg);
+            (r0, r0)
         } else {
-            l_dir.push(
-                base + evaluate_basis_simplex_log_likelihood(
+            (
+                evaluate_basis_simplex_log_likelihood(
                     &basis,
                     sp.w,
                     SwapHypothesis::Direct,
                     obs,
                     cfg,
                 ),
-            );
-            l_swp.push(
-                base + evaluate_basis_simplex_log_likelihood(
+                evaluate_basis_simplex_log_likelihood(
                     &basis,
                     sp.w,
                     SwapHypothesis::Swapped,
                     obs,
                     cfg,
                 ),
-            );
-        }
+            )
+        };
+        max_data_ll = max_data_ll.max(raw_d).max(raw_s);
+        l_dir.push(base + raw_d);
+        l_swp.push(base + raw_s);
+        u_dir.push(ubase + raw_d);
+        u_swp.push(ubase + raw_s);
+    }
+
+    if n_obs > 0
+        && (!max_data_ll.is_finite() || (-2.0 * max_data_ll) / (n_obs as f64) > MAX_REDUCED_CHI2)
+    {
+        return uncommitted_null_result(residue_idx, seq_id, spec, obs);
     }
 
     let lse_dir = log_sum_exp(&l_dir);
     let lse_swp = log_sum_exp(&l_swp);
     let lse_tot = log_sum_exp(&[lse_dir, lse_swp]);
-    let p_dir = (lse_dir - lse_tot).exp();
+    let mut p_dir = (lse_dir - lse_tot).exp();
+
+    let lse_udir = log_sum_exp(&u_dir);
+    let lse_uswp = log_sum_exp(&u_swp);
+    let p_dir_unif = (lse_udir - log_sum_exp(&[lse_udir, lse_uswp])).exp();
+    if !p_dir_unif.is_finite()
+        || (p_dir_unif - 0.5).abs() < 0.10
+        || (p_dir - 0.5) * (p_dir_unif - 0.5) < 0.0
+    {
+        p_dir = cap_degenerate_posterior(p_dir);
+    }
 
     let mut rot_marg = [0.0; 3];
     let mut dyn_post = 0.0;
@@ -2535,47 +2910,723 @@ pub struct StarChemShiftRow {
     pub details: String,
 }
 
+fn get_shift_ci(shifts: &BTreeMap<(usize, String), f64>, k: usize, name: &str) -> Option<f64> {
+    if let Some(&v) = shifts.get(&(k, name.to_string())) {
+        return Some(v);
+    }
+    let up = name.to_ascii_uppercase();
+    if let Some(&v) = shifts.get(&(k, up.clone())) {
+        return Some(v);
+    }
+    for (&(rk, ref ak), &v) in shifts.range((k, String::new())..=(k, "\u{10FFFF}".to_string())) {
+        if rk == k && ak.eq_ignore_ascii_case(&up) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn remove_atom_ci(
+    shifts: &mut BTreeMap<(usize, String), f64>,
+    amb_map: &mut BTreeMap<(usize, String), u8>,
+    k: usize,
+    name: &str,
+) {
+    let keys_to_drop: Vec<String> = shifts
+        .range((k, String::new())..=(k, "\u{10FFFF}".to_string()))
+        .filter(|&(&(rk, ref ak), _)| rk == k && ak.eq_ignore_ascii_case(name))
+        .map(|((_, ak), _)| ak.clone())
+        .collect();
+    for ak in keys_to_drop {
+        shifts.remove(&(k, ak.clone()));
+        amb_map.remove(&(k, ak));
+    }
+    amb_map.remove(&(k, name.to_string()));
+    amb_map.remove(&(k, name.to_ascii_uppercase()));
+}
+
+fn is_nef_nonstereo_wildcard_ci(atom: &str) -> bool {
+    let base = atom.trim().trim_end_matches(['%', '*']);
+    if base.len() < 2 {
+        return false;
+    }
+    let last = base.as_bytes()[base.len() - 1];
+    matches!(last, b'x' | b'y' | b'X' | b'Y')
+}
+
+const VAL_PROTON_SUBPAIRS: &[(&str, &str)] = &[
+    ("HG11", "HG21"),
+    ("HG12", "HG22"),
+    ("HG13", "HG23"),
+    ("HG1*", "HG2*"),
+    ("HG1%", "HG2%"),
+    ("HG1", "HG2"),
+    ("QG1", "QG2"),
+];
+
+const VAL_WILDCARD_PROTON_SUBPAIRS: &[(&str, &str)] =
+    &[("HGx%", "HGy%"), ("HGx*", "HGy*"), ("HGx", "HGy")];
+
+const LEU_PROTON_SUBPAIRS: &[(&str, &str)] = &[
+    ("HD11", "HD21"),
+    ("HD12", "HD22"),
+    ("HD13", "HD23"),
+    ("HD1*", "HD2*"),
+    ("HD1%", "HD2%"),
+    ("HD1", "HD2"),
+    ("QD1", "QD2"),
+];
+
+const LEU_WILDCARD_PROTON_SUBPAIRS: &[(&str, &str)] =
+    &[("HDx%", "HDy%"), ("HDx*", "HDy*"), ("HDx", "HDy")];
+
+/// Canonical NMR-STAR v3 `_Atom_chem_shift.Ambiguity_code` default when no stereospecific
+/// commitment has been established:
+/// - `3` for symmetric aromatic ring-flip pairs (`PHE`/`TYR` `CD1/CD2/HD1/HD2/CE1/CE2/HE1/HE2`),
+/// - `2` for any prochiral methylene, isopropyl methyl, planar carboxamide, guanidinium, or NEF `x`/`y` wildcard atom,
+/// - `1` for non-prochiral backbone/methine/single-methyl/non-symmetric-ring atoms.
+pub fn default_atom_ambiguity_code(res_name: &str, atom: &str) -> u8 {
+    let r_up = res_name.trim().to_ascii_uppercase();
+    let a_up = atom.trim().to_ascii_uppercase();
+    if matches!(r_up.as_str(), "PHE" | "TYR")
+        && matches!(
+            a_up.as_str(),
+            "CD1"
+                | "CD2"
+                | "HD1"
+                | "HD2"
+                | "CE1"
+                | "CE2"
+                | "HE1"
+                | "HE2"
+                | "CDX"
+                | "CDY"
+                | "HDX"
+                | "HDY"
+                | "CEX"
+                | "CEY"
+                | "HEX"
+                | "HEY"
+                | "QD"
+                | "QE"
+        )
+    {
+        return 3;
+    }
+    if is_nef_nonstereo_wildcard_ci(&a_up) {
+        return 2;
+    }
+    if r_up == "ARG"
+        && matches!(
+            a_up.as_str(),
+            "NH1" | "NH2" | "HH11" | "HH12" | "HH21" | "HH22"
+        )
+    {
+        return 2;
+    }
+    if r_up == "VAL"
+        && VAL_PROTON_SUBPAIRS
+            .iter()
+            .any(|&(p1, p2)| a_up == p1 || a_up == p2)
+    {
+        return 2;
+    }
+    if r_up == "LEU"
+        && LEU_PROTON_SUBPAIRS
+            .iter()
+            .any(|&(p1, p2)| a_up == p1 || a_up == p2)
+    {
+        return 2;
+    }
+    for spec in prochiral_pairs_for_residue(&r_up) {
+        if a_up == spec.iupac_branch_1.to_ascii_uppercase()
+            || a_up == spec.iupac_branch_2.to_ascii_uppercase()
+            || a_up == spec.nef_nonstereo_protons.0.to_ascii_uppercase()
+            || a_up == spec.nef_nonstereo_protons.1.to_ascii_uppercase()
+            || spec.iupac_carbons.is_some_and(|(c1, c2)| {
+                a_up.eq_ignore_ascii_case(c1) || a_up.eq_ignore_ascii_case(c2)
+            })
+            || spec.nef_nonstereo_carbons.is_some_and(|(cx, cy)| {
+                a_up.eq_ignore_ascii_case(cx) || a_up.eq_ignore_ascii_case(cy)
+            })
+            || spec
+                .iupac_protons_1
+                .iter()
+                .any(|p| a_up.eq_ignore_ascii_case(p))
+            || spec
+                .iupac_protons_2
+                .iter()
+                .any(|p| a_up.eq_ignore_ascii_case(p))
+        {
+            return 2;
+        }
+    }
+    1
+}
+
+fn is_methyl_group_asymmetrically_populated(
+    shifts: &BTreeMap<(usize, String), f64>,
+    k: usize,
+    spec: ProchiralPairSpec,
+) -> bool {
+    let (canon_subs, wild_subs, (c1, c2), (cx, cy)) = match spec.kind {
+        ProchiralSiteKind::ValIsopropyl => (
+            VAL_PROTON_SUBPAIRS,
+            VAL_WILDCARD_PROTON_SUBPAIRS,
+            ("CG1", "CG2"),
+            ("CGx", "CGy"),
+        ),
+        ProchiralSiteKind::LeuIsopropyl => (
+            LEU_PROTON_SUBPAIRS,
+            LEU_WILDCARD_PROTON_SUBPAIRS,
+            ("CD1", "CD2"),
+            ("CDx", "CDy"),
+        ),
+        _ => return false,
+    };
+
+    let has_c1 = get_shift_ci(shifts, k, c1).is_some();
+    let has_c2 = get_shift_ci(shifts, k, c2).is_some();
+    let has_cx = get_shift_ci(shifts, k, cx).is_some();
+    let has_cy = get_shift_ci(shifts, k, cy).is_some();
+    if has_c1 != has_c2 || has_cx != has_cy {
+        return true;
+    }
+    for &(p1, p2) in canon_subs.iter().chain(wild_subs.iter()) {
+        if get_shift_ci(shifts, k, p1).is_some() != get_shift_ci(shifts, k, p2).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_half_present_prochiral_atom(
+    shifts: &BTreeMap<(usize, String), f64>,
+    k: usize,
+    res_name: &str,
+    atom: &str,
+) -> bool {
+    let a_up = atom.trim().to_ascii_uppercase();
+    let r_up = res_name.trim().to_ascii_uppercase();
+    if r_up == "ARG" {
+        for (c1, c2, wx, wy) in [
+            ("NH1", "NH2", "NHx", "NHy"),
+            ("HH11", "HH12", "HH1x", "HH1y"),
+            ("HH21", "HH22", "HH2x", "HH2y"),
+        ] {
+            if a_up.eq_ignore_ascii_case(c1)
+                || a_up.eq_ignore_ascii_case(c2)
+                || a_up.eq_ignore_ascii_case(wx)
+                || a_up.eq_ignore_ascii_case(wy)
+            {
+                let has_1 =
+                    get_shift_ci(shifts, k, c1).is_some() || get_shift_ci(shifts, k, wx).is_some();
+                let has_2 =
+                    get_shift_ci(shifts, k, c2).is_some() || get_shift_ci(shifts, k, wy).is_some();
+                if has_1 != has_2 {
+                    return true;
+                }
+            }
+        }
+    }
+    for spec in prochiral_pairs_for_residue(&r_up) {
+        if matches!(
+            spec.kind,
+            ProchiralSiteKind::ValIsopropyl | ProchiralSiteKind::LeuIsopropyl
+        ) {
+            let (subs, wsubs, (c1, c2), (cx, cy)) = if spec.kind == ProchiralSiteKind::ValIsopropyl
+            {
+                (
+                    VAL_PROTON_SUBPAIRS,
+                    VAL_WILDCARD_PROTON_SUBPAIRS,
+                    ("CG1", "CG2"),
+                    ("CGx", "CGy"),
+                )
+            } else {
+                (
+                    LEU_PROTON_SUBPAIRS,
+                    LEU_WILDCARD_PROTON_SUBPAIRS,
+                    ("CD1", "CD2"),
+                    ("CDx", "CDy"),
+                )
+            };
+            let belongs = a_up.eq_ignore_ascii_case(c1)
+                || a_up.eq_ignore_ascii_case(c2)
+                || a_up.eq_ignore_ascii_case(cx)
+                || a_up.eq_ignore_ascii_case(cy)
+                || subs.iter().chain(wsubs.iter()).any(|&(p1, p2)| {
+                    a_up.eq_ignore_ascii_case(p1) || a_up.eq_ignore_ascii_case(p2)
+                });
+            if belongs && is_methyl_group_asymmetrically_populated(shifts, k, spec) {
+                return true;
+            }
+            continue;
+        }
+
+        let extra_shorthand: Option<(&str, &str)> = match (r_up.as_str(), spec.kind) {
+            ("ILE", ProchiralSiteKind::GammaMethylene) => Some(("HGx", "HGy")),
+            ("ASN", ProchiralSiteKind::AsnCarboxamide) => Some(("HDx", "HDy")),
+            ("GLN", ProchiralSiteKind::GlnCarboxamide) => Some(("HEx", "HEy")),
+            _ => None,
+        };
+        let b1_match = a_up.eq_ignore_ascii_case(spec.iupac_branch_1)
+            || a_up.eq_ignore_ascii_case(spec.nef_nonstereo_protons.0)
+            || extra_shorthand.is_some_and(|(sx, _)| a_up.eq_ignore_ascii_case(sx))
+            || spec
+                .iupac_protons_1
+                .iter()
+                .any(|p| a_up.eq_ignore_ascii_case(p));
+        let b2_match = a_up.eq_ignore_ascii_case(spec.iupac_branch_2)
+            || a_up.eq_ignore_ascii_case(spec.nef_nonstereo_protons.1)
+            || extra_shorthand.is_some_and(|(_, sy)| a_up.eq_ignore_ascii_case(sy))
+            || spec
+                .iupac_protons_2
+                .iter()
+                .any(|p| a_up.eq_ignore_ascii_case(p));
+        if b1_match || b2_match {
+            let has_b1 = get_shift_ci(shifts, k, spec.iupac_branch_1).is_some()
+                || get_shift_ci(shifts, k, spec.nef_nonstereo_protons.0).is_some()
+                || extra_shorthand.is_some_and(|(sx, _)| get_shift_ci(shifts, k, sx).is_some());
+            let has_b2 = get_shift_ci(shifts, k, spec.iupac_branch_2).is_some()
+                || get_shift_ci(shifts, k, spec.nef_nonstereo_protons.1).is_some()
+                || extra_shorthand.is_some_and(|(_, sy)| get_shift_ci(shifts, k, sy).is_some());
+            if has_b1 != has_b2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn remove_site_nef_wildcards(
+    shifts: &mut BTreeMap<(usize, String), f64>,
+    amb_map: &mut BTreeMap<(usize, String), u8>,
+    k: usize,
+    spec: ProchiralPairSpec,
+) {
+    remove_atom_ci(shifts, amb_map, k, spec.nef_nonstereo_protons.0);
+    remove_atom_ci(shifts, amb_map, k, spec.nef_nonstereo_protons.1);
+    if let Some((cx, cy)) = spec.nef_nonstereo_carbons {
+        remove_atom_ci(shifts, amb_map, k, cx);
+        remove_atom_ci(shifts, amb_map, k, cy);
+    }
+    match spec.kind {
+        ProchiralSiteKind::ValIsopropyl => {
+            for &(wx, wy) in VAL_WILDCARD_PROTON_SUBPAIRS {
+                remove_atom_ci(shifts, amb_map, k, wx);
+                remove_atom_ci(shifts, amb_map, k, wy);
+            }
+        }
+        ProchiralSiteKind::LeuIsopropyl => {
+            for &(wx, wy) in LEU_WILDCARD_PROTON_SUBPAIRS {
+                remove_atom_ci(shifts, amb_map, k, wx);
+                remove_atom_ci(shifts, amb_map, k, wy);
+            }
+        }
+        ProchiralSiteKind::GammaMethylene if spec.residue.eq_ignore_ascii_case("ILE") => {
+            remove_atom_ci(shifts, amb_map, k, "HGx");
+            remove_atom_ci(shifts, amb_map, k, "HGy");
+        }
+        ProchiralSiteKind::AsnCarboxamide => {
+            remove_atom_ci(shifts, amb_map, k, "HDx");
+            remove_atom_ci(shifts, amb_map, k, "HDy");
+        }
+        ProchiralSiteKind::GlnCarboxamide => {
+            remove_atom_ci(shifts, amb_map, k, "HEx");
+            remove_atom_ci(shifts, amb_map, k, "HEy");
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_wildcard_pair(
+    shifts: &mut BTreeMap<(usize, String), f64>,
+    amb_map: &mut BTreeMap<(usize, String), u8>,
+    k: usize,
+    wx: &str,
+    wy: &str,
+    canon_1_insert: &[&str],
+    canon_2_insert: &[&str],
+    canon_1_existing: &[&str],
+    canon_2_existing: &[&str],
+    amb_code: u8,
+) {
+    let vx = get_shift_ci(shifts, k, wx);
+    let vy = get_shift_ci(shifts, k, wy);
+    if vx.is_none() && vy.is_none() {
+        return;
+    }
+    let has_c1 = canon_1_existing
+        .iter()
+        .any(|c| get_shift_ci(shifts, k, c).is_some());
+    let has_c2 = canon_2_existing
+        .iter()
+        .any(|c| get_shift_ci(shifts, k, c).is_some());
+    remove_atom_ci(shifts, amb_map, k, wx);
+    remove_atom_ci(shifts, amb_map, k, wy);
+    if !has_c1 {
+        if let Some(v) = vx {
+            for &c1 in canon_1_insert {
+                shifts.insert((k, c1.to_string()), v);
+                amb_map.insert((k, c1.to_string()), amb_code);
+            }
+        }
+    }
+    if !has_c2 {
+        if let Some(v) = vy {
+            for &c2 in canon_2_insert {
+                shifts.insert((k, c2.to_string()), v);
+                amb_map.insert((k, c2.to_string()), amb_code);
+            }
+        }
+    }
+}
+
+fn normalize_residue_nef_wildcards(
+    shifts: &mut BTreeMap<(usize, String), f64>,
+    amb_map: &mut BTreeMap<(usize, String), u8>,
+    k: usize,
+    res_name: &str,
+) {
+    const VAL_G1_EXISTING: &[&str] = &["HG11", "HG12", "HG13", "HG1*", "HG1%", "HG1", "QG1"];
+    const VAL_G2_EXISTING: &[&str] = &["HG21", "HG22", "HG23", "HG2*", "HG2%", "HG2", "QG2"];
+    const LEU_D1_EXISTING: &[&str] = &["HD11", "HD12", "HD13", "HD1*", "HD1%", "HD1", "QD1"];
+    const LEU_D2_EXISTING: &[&str] = &["HD21", "HD22", "HD23", "HD2*", "HD2%", "HD2", "QD2"];
+
+    let r_up = res_name.trim().to_ascii_uppercase();
+    for spec in prochiral_pairs_for_residue(&r_up) {
+        match spec.kind {
+            ProchiralSiteKind::ValIsopropyl => {
+                normalize_wildcard_pair(
+                    shifts,
+                    amb_map,
+                    k,
+                    "CGx",
+                    "CGy",
+                    &["CG1"],
+                    &["CG2"],
+                    &["CG1"],
+                    &["CG2"],
+                    2,
+                );
+                for &(wx, wy) in VAL_WILDCARD_PROTON_SUBPAIRS {
+                    normalize_wildcard_pair(
+                        shifts,
+                        amb_map,
+                        k,
+                        wx,
+                        wy,
+                        H_VAL_G1,
+                        H_VAL_G2,
+                        VAL_G1_EXISTING,
+                        VAL_G2_EXISTING,
+                        2,
+                    );
+                }
+            }
+            ProchiralSiteKind::LeuIsopropyl => {
+                normalize_wildcard_pair(
+                    shifts,
+                    amb_map,
+                    k,
+                    "CDx",
+                    "CDy",
+                    &["CD1"],
+                    &["CD2"],
+                    &["CD1"],
+                    &["CD2"],
+                    2,
+                );
+                for &(wx, wy) in LEU_WILDCARD_PROTON_SUBPAIRS {
+                    normalize_wildcard_pair(
+                        shifts,
+                        amb_map,
+                        k,
+                        wx,
+                        wy,
+                        H_LEU_D1,
+                        H_LEU_D2,
+                        LEU_D1_EXISTING,
+                        LEU_D2_EXISTING,
+                        2,
+                    );
+                }
+            }
+            _ => {
+                let (wx, wy) = spec.nef_nonstereo_protons;
+                normalize_wildcard_pair(
+                    shifts,
+                    amb_map,
+                    k,
+                    wx,
+                    wy,
+                    spec.iupac_protons_1,
+                    spec.iupac_protons_2,
+                    spec.iupac_protons_1,
+                    spec.iupac_protons_2,
+                    2,
+                );
+                if let (Some((cx, cy)), Some((c1, c2))) =
+                    (spec.nef_nonstereo_carbons, spec.iupac_carbons)
+                {
+                    let c1s = [c1];
+                    let c2s = [c2];
+                    normalize_wildcard_pair(shifts, amb_map, k, cx, cy, &c1s, &c2s, &c1s, &c2s, 2);
+                }
+                if r_up == "ILE" && spec.kind == ProchiralSiteKind::GammaMethylene {
+                    normalize_wildcard_pair(
+                        shifts,
+                        amb_map,
+                        k,
+                        "HGx",
+                        "HGy",
+                        spec.iupac_protons_1,
+                        spec.iupac_protons_2,
+                        spec.iupac_protons_1,
+                        spec.iupac_protons_2,
+                        2,
+                    );
+                } else if r_up == "ASN" && spec.kind == ProchiralSiteKind::AsnCarboxamide {
+                    normalize_wildcard_pair(
+                        shifts,
+                        amb_map,
+                        k,
+                        "HDx",
+                        "HDy",
+                        spec.iupac_protons_1,
+                        spec.iupac_protons_2,
+                        spec.iupac_protons_1,
+                        spec.iupac_protons_2,
+                        2,
+                    );
+                } else if r_up == "GLN" && spec.kind == ProchiralSiteKind::GlnCarboxamide {
+                    normalize_wildcard_pair(
+                        shifts,
+                        amb_map,
+                        k,
+                        "HEx",
+                        "HEy",
+                        spec.iupac_protons_1,
+                        spec.iupac_protons_2,
+                        spec.iupac_protons_1,
+                        spec.iupac_protons_2,
+                        2,
+                    );
+                }
+            }
+        }
+    }
+
+    match r_up.as_str() {
+        "PHE" | "TYR" => {
+            for (wx, wy, c1, c2) in [
+                ("CDx", "CDy", "CD1", "CD2"),
+                ("CEx", "CEy", "CE1", "CE2"),
+                ("HDx", "HDy", "HD1", "HD2"),
+                ("HEx", "HEy", "HE1", "HE2"),
+            ] {
+                let c1s = [c1];
+                let c2s = [c2];
+                normalize_wildcard_pair(shifts, amb_map, k, wx, wy, &c1s, &c2s, &c1s, &c2s, 3);
+            }
+        }
+        "ARG" => {
+            for (wx, wy, c1, c2) in [
+                ("NHx", "NHy", "NH1", "NH2"),
+                ("HH1x", "HH1y", "HH11", "HH12"),
+                ("HH2x", "HH2y", "HH21", "HH22"),
+            ] {
+                let c1s = [c1];
+                let c2s = [c2];
+                normalize_wildcard_pair(shifts, amb_map, k, wx, wy, &c1s, &c2s, &c1s, &c2s, 2);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Apply stereospecific inference results onto a `Reference` shift map and return both the updated
-/// `Reference` and the exact per-`(residue_idx, atom_id)` NMR-STAR `Ambiguity_code` table (`1` vs `2`).
+/// `Reference` and the exact per-`(residue_idx, atom_id)` NMR-STAR `Ambiguity_code` table (`1`, `2`, `3`).
 pub fn apply_stereospec_to_reference(
     base: &Reference,
     results: &[StereospecResult],
 ) -> (Reference, BTreeMap<(usize, String), u8>) {
     let mut out = base.clone();
     let mut amb_map: BTreeMap<(usize, String), u8> = BTreeMap::new();
+
+    // 1. Seed each base atom's ambiguity code from `base.ambiguity_codes` when present (except
+    //    NEF `x`/`y` wildcards which take `default_atom_ambiguity_code` — `3` on PHE/TYR rings,
+    //    `2` elsewhere — and half-present prochiral atoms which MUST start at `2`), otherwise
+    //    `default_atom_ambiguity_code` (`3` for PHE/TYR symmetric rings, `2` for prochiral, `1` for unique).
     for &(k, ref atom) in base.shifts.keys() {
-        amb_map.insert((k, atom.clone()), 1);
+        let res_name = base.sequence.get(k).map(String::as_str).unwrap_or("");
+        let code = if is_nef_nonstereo_wildcard_ci(atom) {
+            default_atom_ambiguity_code(res_name, atom)
+        } else if is_half_present_prochiral_atom(&base.shifts, k, res_name, atom) {
+            2
+        } else if let Some(&existing) = base.ambiguity_codes.get(&(k, atom.clone())) {
+            existing
+        } else {
+            default_atom_ambiguity_code(res_name, atom)
+        };
+        amb_map.insert((k, atom.clone()), code);
+    }
+
+    // 2. Residue-aware normalization/deduplication of NEF `x`/`y` wildcards into exact canonical
+    //    IUPAC atom names (`HG11..13`/`HG21..23` on VAL, `HD11..13`/`HD21..23` on LEU, `HG12`/`HG13`
+    //    on ILE, `CD1/CD2/CE1/CE2/HD1/HD2/HE1/HE2` with `Ambiguity_code = 3` on PHE/TYR, etc.).
+    for (k, res_name) in base.sequence.iter().enumerate() {
+        normalize_residue_nef_wildcards(&mut out.shifts, &mut amb_map, k, res_name);
     }
 
     for r in results {
         let k = r.residue_idx;
-        let code = r.nmr_star_ambiguity_code;
         if let Some(sh) = r.shared_heavy_shift_ppm {
             if let Some(hname) = r.spec.shared_heavy_atom {
                 out.shifts.insert((k, hname.to_string()), sh);
                 amb_map.insert((k, hname.to_string()), 1);
             }
         }
-        if let (Some((c1_name, c2_name)), Some((c1_v, c2_v))) =
-            (r.spec.iupac_carbons, r.ordered_iupac_carbon_shifts())
-        {
-            out.shifts.insert((k, c1_name.to_string()), c1_v);
-            out.shifts.insert((k, c2_name.to_string()), c2_v);
-            amb_map.insert((k, c1_name.to_string()), code);
-            amb_map.insert((k, c2_name.to_string()), code);
+
+        if matches!(
+            r.spec.kind,
+            ProchiralSiteKind::ValIsopropyl | ProchiralSiteKind::LeuIsopropyl
+        ) {
+            let (canon_subs, wild_subs) = if r.spec.kind == ProchiralSiteKind::ValIsopropyl {
+                (VAL_PROTON_SUBPAIRS, VAL_WILDCARD_PROTON_SUBPAIRS)
+            } else {
+                (LEU_PROTON_SUBPAIRS, LEU_WILDCARD_PROTON_SUBPAIRS)
+            };
+            let asym = is_methyl_group_asymmetrically_populated(&base.shifts, k, r.spec);
+            remove_site_nef_wildcards(&mut out.shifts, &mut amb_map, k, r.spec);
+
+            if asym {
+                // Refuse to commit when any carbon or proton sub-pair is half-present: keep all
+                // present members (including half-present NEF wildcards already normalized in Step 2)
+                // unswapped at their input values with `Ambiguity_code = 2`.
+                if let Some((c1_name, c2_name)) = r.spec.iupac_carbons {
+                    for cname in [c1_name, c2_name] {
+                        if let Some(v) = get_shift_ci(&out.shifts, k, cname) {
+                            remove_atom_ci(&mut out.shifts, &mut amb_map, k, cname);
+                            out.shifts.insert((k, cname.to_string()), v);
+                            amb_map.insert((k, cname.to_string()), 2);
+                        }
+                    }
+                }
+                for &(p1, p2) in canon_subs {
+                    for pname in [p1, p2] {
+                        if let Some(v) = get_shift_ci(&out.shifts, k, pname) {
+                            remove_atom_ci(&mut out.shifts, &mut amb_map, k, pname);
+                            out.shifts.insert((k, pname.to_string()), v);
+                            amb_map.insert((k, pname.to_string()), 2);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let eff_committed = r.committed;
+            let eff_code = if eff_committed { 1 } else { 2 };
+            let do_swap = eff_committed && r.winning_hypothesis == SwapHypothesis::Swapped;
+
+            // Swap or preserve methyl carbons atomically
+            if let Some((c1_name, c2_name)) = r.spec.iupac_carbons {
+                let base_pair = get_shift_ci(&base.shifts, k, c1_name)
+                    .zip(get_shift_ci(&base.shifts, k, c2_name))
+                    .or_else(|| {
+                        r.spec.nef_nonstereo_carbons.and_then(|(cx, cy)| {
+                            get_shift_ci(&base.shifts, k, cx).zip(get_shift_ci(&base.shifts, k, cy))
+                        })
+                    })
+                    .or(r.carbon_shifts_ppm);
+                if let Some((vc1, vc2)) = base_pair {
+                    let (nc1, nc2) = if do_swap { (vc2, vc1) } else { (vc1, vc2) };
+                    remove_atom_ci(&mut out.shifts, &mut amb_map, k, c1_name);
+                    remove_atom_ci(&mut out.shifts, &mut amb_map, k, c2_name);
+                    out.shifts.insert((k, c1_name.to_string()), nc1);
+                    out.shifts.insert((k, c2_name.to_string()), nc2);
+                    amb_map.insert((k, c1_name.to_string()), eff_code);
+                    amb_map.insert((k, c2_name.to_string()), eff_code);
+                }
+            }
+
+            // Swap or preserve EVERY present methyl proton representation atomically with its carbon!
+            let mut any_canon_subpair_in_base = false;
+            for &(p1, p2) in canon_subs {
+                if let (Some(vp1), Some(vp2)) = (
+                    get_shift_ci(&base.shifts, k, p1),
+                    get_shift_ci(&base.shifts, k, p2),
+                ) {
+                    any_canon_subpair_in_base = true;
+                    let (np1, np2) = if do_swap { (vp2, vp1) } else { (vp1, vp2) };
+                    remove_atom_ci(&mut out.shifts, &mut amb_map, k, p1);
+                    remove_atom_ci(&mut out.shifts, &mut amb_map, k, p2);
+                    out.shifts.insert((k, p1.to_string()), np1);
+                    out.shifts.insert((k, p2.to_string()), np2);
+                    amb_map.insert((k, p1.to_string()), eff_code);
+                    amb_map.insert((k, p2.to_string()), eff_code);
+                }
+            }
+
+            if !any_canon_subpair_in_base {
+                let wild_pair = wild_subs.iter().find_map(|&(wx, wy)| {
+                    get_shift_ci(&base.shifts, k, wx).zip(get_shift_ci(&base.shifts, k, wy))
+                });
+                if let Some((ha, hb)) = wild_pair.or(r.proton_shifts_ppm) {
+                    let (nh1, nh2) = if do_swap { (hb, ha) } else { (ha, hb) };
+                    for &p1 in r.spec.iupac_protons_1 {
+                        remove_atom_ci(&mut out.shifts, &mut amb_map, k, p1);
+                        out.shifts.insert((k, p1.to_string()), nh1);
+                        amb_map.insert((k, p1.to_string()), eff_code);
+                    }
+                    for &p2 in r.spec.iupac_protons_2 {
+                        remove_atom_ci(&mut out.shifts, &mut amb_map, k, p2);
+                        out.shifts.insert((k, p2.to_string()), nh2);
+                        amb_map.insert((k, p2.to_string()), eff_code);
+                    }
+                }
+            }
+            continue;
         }
-        if let Some((h1_v, h2_v)) = r.ordered_iupac_proton_shifts() {
+
+        // Non-methyl prochiral pair (`GlyAlphaMethylene`, `BetaMethylene`, `GammaMethylene`,
+        // `AsnCarboxamide`, `GlnCarboxamide`, `DeltaMethylene`, `EpsilonMethylene`).
+        // Step 2 has already normalized any residue-valid NEF `x`/`y` wildcards into `out.shifts`.
+        let out_b1 = get_shift_ci(&out.shifts, k, r.spec.iupac_branch_1);
+        let out_b2 = get_shift_ci(&out.shifts, k, r.spec.iupac_branch_2);
+        remove_site_nef_wildcards(&mut out.shifts, &mut amb_map, k, r.spec);
+
+        // If base had a half-present proton and `r.proton_shifts_ppm` is absent, refuse to commit
+        if out_b1.is_some() != out_b2.is_some() && r.proton_shifts_ppm.is_none() {
+            for &p in r.spec.iupac_protons_1.iter().chain(r.spec.iupac_protons_2) {
+                if let Some(v) = get_shift_ci(&out.shifts, k, p) {
+                    remove_atom_ci(&mut out.shifts, &mut amb_map, k, p);
+                    out.shifts.insert((k, p.to_string()), v);
+                    amb_map.insert((k, p.to_string()), 2);
+                }
+            }
+            continue;
+        }
+
+        let code = r.nmr_star_ambiguity_code;
+        let do_swap = r.committed && r.winning_hypothesis == SwapHypothesis::Swapped;
+        if let Some((ha, hb)) = r.proton_shifts_ppm.or_else(|| out_b1.zip(out_b2)) {
+            let (h1_v, h2_v) = if do_swap { (hb, ha) } else { (ha, hb) };
             for &p1 in r.spec.iupac_protons_1 {
+                remove_atom_ci(&mut out.shifts, &mut amb_map, k, p1);
                 out.shifts.insert((k, p1.to_string()), h1_v);
                 amb_map.insert((k, p1.to_string()), code);
             }
             for &p2 in r.spec.iupac_protons_2 {
+                remove_atom_ci(&mut out.shifts, &mut amb_map, k, p2);
                 out.shifts.insert((k, p2.to_string()), h2_v);
                 amb_map.insert((k, p2.to_string()), code);
             }
         }
     }
 
+    out.ambiguity_codes = amb_map.clone();
     (out, amb_map)
 }
 
@@ -2623,7 +3674,10 @@ pub fn to_star_chem_shift_rows(
             continue;
         };
         let seq_id = merged.seq_ids.get(k).copied().unwrap_or((k + 1) as i32);
-        let amb = amb_map.get(&(k, atom.clone())).copied().unwrap_or(1);
+        let amb = amb_map
+            .get(&(k, atom.clone()))
+            .copied()
+            .unwrap_or_else(|| default_atom_ambiguity_code(comp, &atom));
         let atom_type = atom
             .chars()
             .find(|c| c.is_ascii_alphabetic())
@@ -3527,6 +4581,16 @@ fn resolve_branch1_key(res_name: &str, site_tok: &str) -> Option<&'static str> {
             || spec.nef_nonstereo_carbons.is_some_and(|(cx, cy)| {
                 cx.eq_ignore_ascii_case(&up) || cy.eq_ignore_ascii_case(&up)
             })
+            || (spec.kind == ProchiralSiteKind::ValIsopropyl
+                && VAL_PROTON_SUBPAIRS
+                    .iter()
+                    .chain(VAL_WILDCARD_PROTON_SUBPAIRS.iter())
+                    .any(|&(p1, p2)| up.eq_ignore_ascii_case(p1) || up.eq_ignore_ascii_case(p2)))
+            || (spec.kind == ProchiralSiteKind::LeuIsopropyl
+                && LEU_PROTON_SUBPAIRS
+                    .iter()
+                    .chain(LEU_WILDCARD_PROTON_SUBPAIRS.iter())
+                    .any(|&(p1, p2)| up.eq_ignore_ascii_case(p1) || up.eq_ignore_ascii_case(p2)))
         {
             return Some(spec.iupac_branch_1);
         }
@@ -3537,20 +4601,47 @@ fn resolve_branch1_key(res_name: &str, site_tok: &str) -> Option<&'static str> {
 fn lookup_proton_group_shift(
     ref_data: &Reference,
     res_idx: usize,
-    protons: &[&str],
-    nonstereo_fallback: &str,
+    spec: ProchiralPairSpec,
+    is_branch_1: bool,
 ) -> Option<f64> {
+    let (protons, nonstereo_fallback) = if is_branch_1 {
+        (spec.iupac_protons_1, spec.nef_nonstereo_protons.0)
+    } else {
+        (spec.iupac_protons_2, spec.nef_nonstereo_protons.1)
+    };
     for &p in protons {
-        if let Some(&v) = ref_data.shifts.get(&(res_idx, p.to_string())) {
+        if let Some(v) = get_shift_ci(&ref_data.shifts, res_idx, p) {
             return Some(v);
         }
     }
+    match spec.kind {
+        ProchiralSiteKind::ValIsopropyl => {
+            for &(p1, p2) in VAL_PROTON_SUBPAIRS
+                .iter()
+                .chain(VAL_WILDCARD_PROTON_SUBPAIRS.iter())
+            {
+                let target = if is_branch_1 { p1 } else { p2 };
+                if let Some(v) = get_shift_ci(&ref_data.shifts, res_idx, target) {
+                    return Some(v);
+                }
+            }
+        }
+        ProchiralSiteKind::LeuIsopropyl => {
+            for &(p1, p2) in LEU_PROTON_SUBPAIRS
+                .iter()
+                .chain(LEU_WILDCARD_PROTON_SUBPAIRS.iter())
+            {
+                let target = if is_branch_1 { p1 } else { p2 };
+                if let Some(v) = get_shift_ci(&ref_data.shifts, res_idx, target) {
+                    return Some(v);
+                }
+            }
+        }
+        _ => {}
+    }
     let trimmed = nonstereo_fallback.trim_end_matches('%');
-    ref_data
-        .shifts
-        .get(&(res_idx, nonstereo_fallback.to_string()))
-        .or_else(|| ref_data.shifts.get(&(res_idx, trimmed.to_string())))
-        .copied()
+    get_shift_ci(&ref_data.shifts, res_idx, nonstereo_fallback)
+        .or_else(|| get_shift_ci(&ref_data.shifts, res_idx, trimmed))
 }
 
 /// Assign prochiral sidechain & glycine `CH2` / isopropyl `CH3` / carboxamide `NH2` centers across
@@ -3581,39 +4672,20 @@ pub fn assign_stereospecific_dataset(
                 ..Default::default()
             };
             if let Some(hv) = spec.shared_heavy_atom {
-                obs.shared_heavy_shift_ppm =
-                    input.reference.shifts.get(&(k, hv.to_string())).copied();
+                obs.shared_heavy_shift_ppm = get_shift_ci(&input.reference.shifts, k, hv);
             }
             if let Some((c1, c2)) = spec.iupac_carbons {
                 let (ncx, ncy) = spec.nef_nonstereo_carbons.unwrap_or((c1, c2));
-                let vc1 = input
-                    .reference
-                    .shifts
-                    .get(&(k, c1.to_string()))
-                    .or_else(|| input.reference.shifts.get(&(k, ncx.to_string())))
-                    .copied();
-                let vc2 = input
-                    .reference
-                    .shifts
-                    .get(&(k, c2.to_string()))
-                    .or_else(|| input.reference.shifts.get(&(k, ncy.to_string())))
-                    .copied();
+                let vc1 = get_shift_ci(&input.reference.shifts, k, c1)
+                    .or_else(|| get_shift_ci(&input.reference.shifts, k, ncx));
+                let vc2 = get_shift_ci(&input.reference.shifts, k, c2)
+                    .or_else(|| get_shift_ci(&input.reference.shifts, k, ncy));
                 if let (Some(va), Some(vb)) = (vc1, vc2) {
                     obs.carbon_shifts_ppm = Some((va, vb));
                 }
             }
-            let vh1 = lookup_proton_group_shift(
-                input.reference,
-                k,
-                spec.iupac_protons_1,
-                spec.nef_nonstereo_protons.0,
-            );
-            let vh2 = lookup_proton_group_shift(
-                input.reference,
-                k,
-                spec.iupac_protons_2,
-                spec.nef_nonstereo_protons.1,
-            );
+            let vh1 = lookup_proton_group_shift(input.reference, k, spec, true);
+            let vh2 = lookup_proton_group_shift(input.reference, k, spec, false);
             if let (Some(ha), Some(hb)) = (vh1, vh2) {
                 obs.proton_shifts_ppm = Some((ha, hb));
             }
@@ -3738,7 +4810,7 @@ pub fn assign_stereospecific_dataset(
         &per_res_obs,
         &input.config,
     );
-    let pair_results: Vec<StereospecResult> = raw_results
+    let mut pair_results: Vec<StereospecResult> = raw_results
         .into_iter()
         .filter(|r| {
             has_data_mask
@@ -3747,11 +4819,18 @@ pub fn assign_stereospecific_dataset(
                 .unwrap_or(false)
         })
         .collect();
+    for r in &mut pair_results {
+        if is_methyl_group_asymmetrically_populated(&input.reference.shifts, r.residue_idx, r.spec)
+        {
+            r.committed = false;
+            r.nmr_star_ambiguity_code = 2;
+        }
+    }
 
     let committed_pairs = pair_results.iter().filter(|r| r.committed).count();
     let ambiguous_pairs = pair_results.len().saturating_sub(committed_pairs);
 
-    let (updated_ref, mut ambiguity_codes) =
+    let (mut updated_ref, mut ambiguity_codes) =
         apply_stereospec_to_reference(input.reference, &pair_results);
 
     // Mark fast-flipping PHE/TYR symmetric aromatic pairs with standard BMRB Ambiguity_code = 3
@@ -3764,6 +4843,7 @@ pub fn assign_stereospecific_dataset(
             }
         }
     }
+    updated_ref.ambiguity_codes = ambiguity_codes.clone();
 
     let mut atom_posteriors: BTreeMap<(usize, String), f64> = BTreeMap::new();
     for r in &pair_results {
@@ -3864,17 +4944,10 @@ pub fn format_nmrstar_with_ambiguity(
             .get(idx)
             .copied()
             .unwrap_or((idx + 1) as i32);
-        let default_amb = if matches!(comp.as_str(), "PHE" | "TYR")
-            && matches!(
-                atom,
-                "CD1" | "CD2" | "HD1" | "HD2" | "CE1" | "CE2" | "HE1" | "HE2"
-            ) {
-            3
-        } else {
-            1
-        };
+        let default_amb = default_atom_ambiguity_code(comp, atom);
         let amb = ambiguity_codes
             .get(&(idx, atom.to_string()))
+            .or_else(|| ref_data.ambiguity_codes.get(&(idx, atom.to_string())))
             .copied()
             .unwrap_or(default_amb);
         let atom_type = atom

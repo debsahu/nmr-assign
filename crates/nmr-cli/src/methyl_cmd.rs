@@ -35,6 +35,7 @@ use nmr_gpu::GpuEngine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComputeBackend {
+    Auto,
     Gpu,
     Cpu,
 }
@@ -43,7 +44,7 @@ fn print_methyl_usage() {
     println!(
         "Usage: nmrassign methyl --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> \\\n  \
          [--labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<RES:ATOM,...>] \\\n  \
-         [--hmcmcbca <hmcm.tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]"
+         [--hmcmcbca <hmcm.tsv>] [--engine auto|gpu|cpu] [--seeds <N>] [-o <out.str>]"
     );
 }
 
@@ -160,9 +161,21 @@ pub fn format_methyl_summary(
 
 /// Execute `nmrassign methyl` from command-line arguments (excluding `argv[0]` and subcommand token).
 pub fn run_methyl_cli(args: &[String]) -> Result<(), String> {
+    run_methyl_cli_with_gpu_init(args, GpuEngine::new_headless).map(|_| ())
+}
+
+/// Execute `nmrassign methyl` with an injectable WebGPU initializer (used to unit-test headless
+/// CPU fallback when no GPU adapter is available). Returns any emitted fallback warning string.
+pub fn run_methyl_cli_with_gpu_init<F>(
+    args: &[String],
+    gpu_init: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Result<GpuEngine, String>,
+{
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_methyl_usage();
-        return Ok(());
+        return Ok(None);
     }
 
     let mut pdb_path: Option<PathBuf> = None;
@@ -171,7 +184,7 @@ pub fn run_methyl_cli(args: &[String]) -> Result<(), String> {
     let mut hmcm_path: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut labeling = MethylLabelingScheme::Ilvmat;
-    let mut backend = ComputeBackend::Gpu;
+    let mut backend = ComputeBackend::Auto;
     let mut seeds: usize = 1;
     let mut seed_base: u64 = 2026;
 
@@ -207,11 +220,12 @@ pub fn run_methyl_cli(args: &[String]) -> Result<(), String> {
             "--engine" => {
                 let v = next_val(i, "--engine")?;
                 backend = match v.to_ascii_lowercase().as_str() {
+                    "auto" => ComputeBackend::Auto,
                     "gpu" | "webgpu" => ComputeBackend::Gpu,
                     "cpu" => ComputeBackend::Cpu,
                     other => {
                         return Err(format!(
-                            "unknown `--engine {other}` (expected `gpu` or `cpu`)"
+                            "unknown `--engine {other}` (expected `auto`, `gpu`, or `cpu`)"
                         ))
                     }
                 };
@@ -268,16 +282,42 @@ pub fn run_methyl_cli(args: &[String]) -> Result<(), String> {
         ..MethylAnnealConfig::default()
     };
 
-    let (result, engine_label) = match backend {
-        ComputeBackend::Gpu => {
-            let gpu = GpuEngine::new_headless()?;
-            let label = format!("WebGPU ({} / {})", gpu.adapter_name, gpu.backend_name);
-            let res = assign_methyl_gpu(&gpu, &prob, &anneal_cfg)?;
-            (res, label)
-        }
+    let (result, engine_label, fallback_warning) = match backend {
+        ComputeBackend::Auto | ComputeBackend::Gpu => match gpu_init() {
+            Ok(gpu) => match assign_methyl_gpu(&gpu, &prob, &anneal_cfg) {
+                Ok(res) => {
+                    let label = format!("WebGPU ({} / {})", gpu.adapter_name, gpu.backend_name);
+                    (res, label, None)
+                }
+                Err(e) => {
+                    let warn = format!(
+                        "warning: WebGPU methyl solver failed ({e}); falling back to CPU methyl solver"
+                    );
+                    eprintln!("{warn}");
+                    let res = assign_methyl_cpu(&prob, &anneal_cfg);
+                    (
+                        res,
+                        "CPU (multi-threaded, WebGPU fallback)".to_string(),
+                        Some(warn),
+                    )
+                }
+            },
+            Err(e) => {
+                let warn = format!(
+                    "warning: WebGPU adapter unavailable ({e}); falling back to CPU methyl solver"
+                );
+                eprintln!("{warn}");
+                let res = assign_methyl_cpu(&prob, &anneal_cfg);
+                (
+                    res,
+                    "CPU (multi-threaded, WebGPU fallback)".to_string(),
+                    Some(warn),
+                )
+            }
+        },
         ComputeBackend::Cpu => {
             let res = assign_methyl_cpu(&prob, &anneal_cfg);
-            (res, "CPU (multi-threaded)".to_string())
+            (res, "CPU (multi-threaded)".to_string(), None)
         }
     };
 
@@ -302,5 +342,5 @@ pub fn run_methyl_cli(args: &[String]) -> Result<(), String> {
         );
     }
 
-    Ok(())
+    Ok(fallback_warning)
 }

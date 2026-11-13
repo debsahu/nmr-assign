@@ -2251,13 +2251,14 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
     let mut intra_noes_path: Option<PathBuf> = None;
     let mut pdb_path: Option<PathBuf> = None;
     let mut stereo_threshold = 0.90f64;
+    let mut simulate_flag = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nmrassign sidechain --star <ref.str> [--peaks <peaks.tsv>] \\\n  \
+                    "Usage: nmrassign sidechain --star <ref.str> [--peaks <peaks.tsv>] [--simulate] \\\n  \
                      [--aromatic] [--arom-c13hsqc <path>] [--hbcbgcdhd <path>] [--hbcbgcdce <path>] \\\n  \
                      [--aromatic-tocsy <path>] [--aromatic-noesy <path>] [--his-hmqc <path>] [--trp-hsqc <path>] \\\n  \
                      [--stereospec] [--j-couplings <j.tsv>] [--intra-noes <noes.tsv>] [--pdb <model.pdb>] \\\n  \
@@ -2375,9 +2376,18 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?;
             }
+            "--simulate" | "--benchmark" => {
+                simulate_flag = true;
+            }
             other => return Err(format!("unknown sidechain flag {other:?}")),
         }
         i += 1;
+    }
+
+    if !stereo_threshold.is_finite() || stereo_threshold <= 0.5 || stereo_threshold > 1.0 {
+        return Err(format!(
+            "invalid --stereo-threshold {stereo_threshold}: must be finite and in (0.5, 1.0]"
+        ));
     }
 
     let explicit_arom_inputs = arom_c13hsqc_path.is_some()
@@ -2394,6 +2404,21 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
         || pdb_path.is_some();
 
     let star_p = star_path.ok_or("sidechain requires --star <entry.str>")?;
+    if !simulate_flag {
+        if peaks_path.is_none() && aromatic_flag && !explicit_arom_inputs {
+            return Err(
+                "sidechain --aromatic without --peaks requires at least one aromatic spectrum or peak input (--arom-c13hsqc, --hbcbgcdhd, --hbcbgcdce, --aromatic-tocsy, --aromatic-noesy, --his-hmqc, or --trp-hsqc); pass --simulate only for synthetic benchmarking"
+                    .to_string(),
+            );
+        }
+        if peaks_path.is_none() && !explicit_arom_inputs && !do_stereospec_opt {
+            return Err(
+                "sidechain requires --peaks, explicit aromatic spectrum/peak inputs, or --stereospec inputs (pass --simulate only for synthetic benchmarking)"
+                    .to_string(),
+            );
+        }
+    }
+
     let raw_ref = read_star_all_atoms(&star_p, None)?;
     let sc_priors = SidechainPriors::empirical_bmrb();
     let bb_priors = Priors::default();
@@ -2402,11 +2427,7 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
         .shifts
         .keys()
         .any(|(_, a)| !["H", "N", "CA", "CB", "C"].contains(&a.as_str()));
-    let synthetic_benchmark_mode = peaks_path.is_none()
-        && !explicit_arom_inputs
-        && j_couplings_path.is_none()
-        && intra_noes_path.is_none()
-        && !(do_stereospec_opt && has_sidechains);
+    let synthetic_benchmark_mode = simulate_flag;
 
     let mut truth_all = if synthetic_benchmark_mode && !has_sidechains {
         synthesize_all_atom_reference(&raw_ref, &sc_priors, seed)
@@ -2512,7 +2533,7 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
     let (mut working_ref, bb_conf, bb_eval_opt) =
         if peaks_path.is_none() && !synthetic_benchmark_mode {
             let mut conf = BTreeMap::new();
-            for &(k, _) in raw_ref.shifts.keys() {
+            for k in 0..raw_ref.sequence.len() {
                 conf.insert(k, 1.0);
             }
             (raw_ref.clone(), conf, None)
@@ -2546,7 +2567,7 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             (joint.sidechain_result.reference, conf, eval_pair)
         } else {
             let mut conf = BTreeMap::new();
-            for &(k, _) in raw_ref.shifts.keys() {
+            for k in 0..raw_ref.sequence.len() {
                 conf.insert(k, 1.0);
             }
             let assigned_ref = if !sc_peaks.is_empty() {
@@ -2564,12 +2585,13 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             (assigned_ref, conf, None)
         };
 
-    let mut ambiguity_codes: BTreeMap<(usize, String), u8> = BTreeMap::new();
+    let mut ambiguity_codes: BTreeMap<(usize, String), u8> = working_ref.ambiguity_codes.clone();
     let mut stereo_posteriors: BTreeMap<(usize, String), f64> = BTreeMap::new();
     let run_arom_stage = !bundled_arom_peaks.is_empty();
 
     if run_arom_stage {
-        // Clear any heuristic ring-atom placeholders on PHE/TYR/TRP/HIS so Kuhn-Munkres ring assignment is authoritative
+        // Clear heuristic ring-atom placeholders synthesized or placed by `assign_sidechains`,
+        // while preserving 100% of untouched ring atoms that came from the user's input STAR!
         const RING_ATOMS: &[&str] = &[
             "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
             "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
@@ -2579,7 +2601,10 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
                 working_ref.sequence.get(k).map(String::as_str),
                 Some("PHE" | "TYR" | "TRP" | "HIS")
             );
-            !(is_arom_res && RING_ATOMS.contains(&atom.as_str()))
+            if !is_arom_res || !RING_ATOMS.contains(&atom.as_str()) {
+                return true;
+            }
+            !synthetic_benchmark_mode && raw_ref.shifts.contains_key(&(k, atom.clone()))
         });
         let arom_res = assign_aromatic_rings(
             &working_ref,
@@ -2600,14 +2625,15 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             .filter(|r| r.his_tautomer.is_some())
             .count();
         working_ref = arom_res.reference;
-        for (k, res_name) in working_ref.sequence.iter().enumerate() {
-            if matches!(res_name.as_str(), "PHE" | "TYR") {
-                for sym_atom in ["CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2"] {
-                    if working_ref.shifts.contains_key(&(k, sym_atom.to_string())) {
-                        ambiguity_codes.insert((k, sym_atom.to_string()), 3);
-                    }
-                }
-            }
+        for (k, atom) in arom_res.atom_confidence.keys() {
+            let res_name = working_ref
+                .sequence
+                .get(*k)
+                .map(String::as_str)
+                .unwrap_or("");
+            let code = nmr_core::stereospec::default_atom_ambiguity_code(res_name, atom);
+            working_ref.ambiguity_codes.insert((*k, atom.clone()), code);
+            ambiguity_codes.insert((*k, atom.clone()), code);
         }
         println!(
             "Aromatic rings: assigned {n_arom_assigned}/{n_arom_total} aromatic residues ({n_his_taut} His tautomers classified)"
@@ -2631,7 +2657,7 @@ fn run_sidechain(args: &[String]) -> Result<(), String> {
             stereo_out.committed_pairs, stereo_out.ambiguous_pairs
         );
         working_ref = stereo_out.reference;
-        ambiguity_codes.extend(stereo_out.ambiguity_codes);
+        ambiguity_codes = stereo_out.ambiguity_codes;
         stereo_posteriors = stereo_out.atom_posteriors;
     }
 

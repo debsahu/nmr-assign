@@ -172,11 +172,7 @@ fn test_pelton_his_tautomer_canonical_and_jittered_regimes_100_percent() {
 
     // Test 60 randomized synthetic draws across the 3 Pelton shift regimes (20 each)
     let mut truth_taut = BTreeMap::new();
-    let mut base_ref = Reference {
-        sequence: Vec::new(),
-        seq_ids: Vec::new(),
-        shifts: BTreeMap::new(),
-    };
+    let mut base_ref = Reference::default();
     let states = [
         HisTautomer::Ne2H,
         HisTautomer::Nd1H,
@@ -304,6 +300,7 @@ fn test_volumetric_simulation_fast_flip_degeneracy_trp_and_his_tautomers() {
         sequence: seq,
         seq_ids,
         shifts: bb_shifts,
+        ..Default::default()
     };
     let mut his_map = BTreeMap::new();
     his_map.insert(4, HisTautomer::Ne2H);
@@ -416,11 +413,13 @@ fn test_hungarian_exact_optimality_and_degenerate_cb_confidence_calibration() {
             m.insert((2, "CB".to_string()), 39.309);
             m
         },
+        ..Default::default()
     };
     let bb_with_hb = Reference {
         sequence: seq,
         seq_ids: vec![4, 25, 45],
         shifts,
+        ..Default::default()
     };
 
     let priors = SidechainPriors::empirical_bmrb();
@@ -511,7 +510,7 @@ fn test_missing_backbone_cb_fallback_and_trp_indole_tiebreaker() {
     let mut truth_base = Reference {
         sequence: seq.clone(),
         seq_ids: vec![10, 11, 12, 13],
-        shifts: BTreeMap::new(),
+        ..Default::default()
     };
     truth_base.shifts.insert((0, "CB".to_string()), 28.90);
     truth_base.shifts.insert((2, "CB".to_string()), 28.90);

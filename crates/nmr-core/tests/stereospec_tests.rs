@@ -920,6 +920,7 @@ fn test_nmrstar_ambiguity_code_and_nef_v1_1_x_y_roundtrip_export() {
             ((1, "N".to_string()), 121.5),
             ((1, "CA".to_string()), 57.5),
         ]),
+        ..Default::default()
     };
 
     // Synthesize VAL 5 in Swapped order: a = CG2/HG2, b = CG1/HG1
@@ -1041,4 +1042,707 @@ fn test_nmrstar_ambiguity_code_and_nef_v1_1_x_y_roundtrip_export() {
         .shifts
         .iter()
         .any(|s| s.atom_name == "CG1"));
+}
+
+#[test]
+fn test_p1_1_gly_phi_sign_mirror_degeneracy_cap() {
+    let cfg = StereospecConfig::default();
+    let gly_spec = prochiral_pairs_for_residue("GLY")[0];
+
+    // Exact probe: true phi = +100 deg gives 3J(HN, HA2/HA3) = (4.1, 9.0) Hz,
+    // evaluated under CSI-predicted phi = -100 deg (DihedralEstimate, no 3D PDB).
+    // Under phi -> -phi, Gly 3J(HN, HA) and intraresidue HN-HA NOEs are mirror-degenerate
+    // with Direct <-> Swapped, so this MUST stay uncommitted (< 0.90, Ambiguity_code = 2).
+    let csi_bb = BackboneConditioning::DihedralEstimate {
+        phi_deg: -100.0,
+        psi_deg: 0.0,
+        phi_err_deg: 20.0,
+        psi_err_deg: 20.0,
+        ss_class: SecondaryStructure::Coil,
+    };
+    let obs_j_only = ProchiralObservables {
+        proton_shifts_ppm: Some((3.82, 4.18)),
+        j_hh_vicinal_hz: Some((4.1, 9.0)),
+        ..Default::default()
+    };
+    let res_j = infer_prochiral_pair(0, 1, gly_spec, &csi_bb, &obs_j_only, &cfg);
+    assert!(
+        !res_j.committed,
+        "Gly without PDB or sequential NOE must remain uncommitted, got {:?}",
+        res_j
+    );
+    assert_eq!(res_j.nmr_star_ambiguity_code, 2);
+    assert!(
+        res_j.winning_posterior <= 0.85 + 1e-9,
+        "expected winning_posterior <= 0.85, got {:.4}",
+        res_j.winning_posterior
+    );
+
+    // Even adding intraresidue HN-HA NOEs under CSI-predicted phi = -100 deg is still
+    // mirror-degenerate under phi -> -phi without a 3D PDB or sequential HA(i)-HN(i+1) NOE.
+    let mut obs_with_intra = obs_j_only.clone();
+    obs_with_intra
+        .noe_pairs
+        .push(NoePairObs::new(AnchorProton::IntraAmideH, 0.008, 0.028));
+    let res_intra_csi = infer_prochiral_pair(0, 1, gly_spec, &csi_bb, &obs_with_intra, &cfg);
+    assert!(!res_intra_csi.committed);
+    assert_eq!(res_intra_csi.nmr_star_ambiguity_code, 2);
+    assert!(res_intra_csi.winning_posterior < 0.90);
+
+    // When phi = +100 deg comes from an explicit 3D PDB structure (ExactTorsions) AND
+    // multi-pathway evidence (3J + intraresidue NOE) is present, Gly resolves cleanly.
+    let pdb_bb = BackboneConditioning::ExactTorsions {
+        phi_deg: 100.0,
+        psi_deg: 0.0,
+    };
+    let res_pdb = infer_prochiral_pair(0, 1, gly_spec, &pdb_bb, &obs_j_only, &cfg);
+    // Single J pathway alone is still capped by P1-2 (< 0.90):
+    assert!(!res_pdb.committed);
+    assert!(res_pdb.winning_posterior < 0.90);
+
+    let frame = build_local_peptide_frame("GLY", 100.0, 0.0, false);
+    let h_in = frame.h.unwrap();
+    let (gly_ha2, gly_ha3) = frame.gly_ha2_ha3.unwrap();
+    let r6_2 = v_dist(h_in, gly_ha2).powi(-6);
+    let r6_3 = v_dist(h_in, gly_ha3).powi(-6);
+    let obs_pdb_multi = ProchiralObservables {
+        proton_shifts_ppm: Some((3.82, 4.18)),
+        j_hh_vicinal_hz: Some((4.1, 9.0)),
+        noe_pairs: vec![NoePairObs::new(AnchorProton::IntraAmideH, r6_2, r6_3)],
+        ..Default::default()
+    };
+    let res_pdb_multi = infer_prochiral_pair(0, 1, gly_spec, &pdb_bb, &obs_pdb_multi, &cfg);
+    assert!(res_pdb_multi.committed);
+    assert_eq!(res_pdb_multi.winning_hypothesis, SwapHypothesis::Direct);
+    assert_eq!(res_pdb_multi.nmr_star_ambiguity_code, 1);
+
+    // Or without PDB, when psi is constrained (e.g. beta-strand psi ~ 135 deg) while phi sign is
+    // uncertain, an asymmetric sequential HA(i)-HN(i+1) NOE breaks the phi -> -phi mirror symmetry:
+    let frame_seq = build_local_peptide_frame("GLY", 100.0, 135.0, false);
+    let (seq_ha2, seq_ha3) = frame_seq.gly_ha2_ha3.unwrap();
+    let h_next = frame_seq.h_next.unwrap();
+    let r6_seq2 = v_dist(h_next, seq_ha2).powi(-6);
+    let r6_seq3 = v_dist(h_next, seq_ha3).powi(-6);
+    let obs_seq_noe = ProchiralObservables {
+        proton_shifts_ppm: Some((3.82, 4.18)),
+        j_hh_vicinal_hz: Some((4.1, 9.0)),
+        noe_pairs: vec![NoePairObs::new(
+            AnchorProton::SeqNextAmideH,
+            r6_seq2,
+            r6_seq3,
+        )],
+        ..Default::default()
+    };
+    let psi_known_phi_uncertain = BackboneConditioning::DihedralEstimate {
+        phi_deg: 0.0,
+        psi_deg: 135.0,
+        phi_err_deg: 120.0,
+        psi_err_deg: 15.0,
+        ss_class: SecondaryStructure::Sheet,
+    };
+    let res_seq =
+        infer_prochiral_pair(0, 1, gly_spec, &psi_known_phi_uncertain, &obs_seq_noe, &cfg);
+    assert!(res_seq.committed);
+    assert_eq!(res_seq.winning_hypothesis, SwapHypothesis::Direct);
+}
+
+#[test]
+fn test_p1_2_ile_hg12_hg13_and_general_single_pathway_degeneracy_cap() {
+    let cfg = StereospecConfig::default();
+
+    // Exact probe: Ile in helix with single 3J(HB, HG12/HG13) = (11.0, 3.0) Hz MUST stay < 0.90.
+    let ile_spec = prochiral_pairs_for_residue("ILE")[0];
+    let helix_ss = BackboneConditioning::SecondaryStructurePrior(SecondaryStructure::Helix);
+    let helix_pdb = BackboneConditioning::ExactTorsions {
+        phi_deg: -63.0,
+        psi_deg: -42.0,
+    };
+    let ile_obs = ProchiralObservables {
+        proton_shifts_ppm: Some((1.15, 1.48)),
+        j_hh_vicinal_hz: Some((11.0, 3.0)),
+        ..Default::default()
+    };
+    for bb in [&helix_ss, &helix_pdb] {
+        let res = infer_prochiral_pair(0, 1, ile_spec, bb, &ile_obs, &cfg);
+        assert!(
+            !res.committed,
+            "Ile HG12/HG13 with single 3J(HB, HG) must not commit: {:?}",
+            res
+        );
+        assert_eq!(res.nmr_star_ambiguity_code, 2);
+        assert!(
+            res.winning_posterior <= 0.85 + 1e-9,
+            "Ile single-pathway posterior must be <= 0.85, got {:.4}",
+            res.winning_posterior
+        );
+    }
+
+    // Even if single methine 3J(HA, HB) is also given on Ile without a second paired HG12/HG13 pathway
+    // or discriminating NOE, HG12/HG13 remains single-pathway degenerate on chi2!
+    let mut ile_obs_with_methine = ile_obs.clone();
+    ile_obs_with_methine.j_methine_hahb_hz = Some(10.5);
+    let res_ile_methine =
+        infer_prochiral_pair(0, 1, ile_spec, &helix_pdb, &ile_obs_with_methine, &cfg);
+    assert!(!res_ile_methine.committed);
+    assert_eq!(res_ile_methine.nmr_star_ambiguity_code, 2);
+    assert!(res_ile_methine.winning_posterior < 0.90);
+
+    // General single-pathway cap across Asp HB2/HB3, Val CG1/CG2, Leu CD1/CD2, and Lys CG distal methylene:
+    let asp_spec = prochiral_pairs_for_residue("ASP")[0];
+    let res_asp = infer_prochiral_pair(
+        0,
+        2,
+        asp_spec,
+        &helix_pdb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((2.65, 2.91)),
+            j_hh_vicinal_hz: Some((11.2, 3.4)),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_asp.committed);
+    assert_eq!(res_asp.nmr_star_ambiguity_code, 2);
+    assert!(res_asp.winning_posterior < 0.90);
+
+    let val_spec = prochiral_pairs_for_residue("VAL")[0];
+    let res_val = infer_prochiral_pair(
+        0,
+        3,
+        val_spec,
+        &helix_pdb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((0.82, 0.95)),
+            carbon_shifts_ppm: Some((19.5, 21.6)),
+            j_ncg_hz: Some((2.1, 0.4)),
+            j_methine_hahb_hz: Some(10.8),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_val.committed);
+    assert_eq!(res_val.nmr_star_ambiguity_code, 2);
+    assert!(res_val.winning_posterior < 0.90);
+
+    let leu_cd_spec = prochiral_pairs_for_residue("LEU")[1];
+    let res_leu = infer_prochiral_pair(
+        0,
+        4,
+        leu_cd_spec,
+        &helix_pdb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((0.81, 0.92)),
+            carbon_shifts_ppm: Some((22.1, 24.8)),
+            j_cc_vicinal_hz: Some((3.4, 1.1)),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_leu.committed);
+    assert_eq!(res_leu.nmr_star_ambiguity_code, 2);
+    assert!(res_leu.winning_posterior < 0.90);
+
+    let lys_cg_spec = prochiral_pairs_for_residue("LYS")[1];
+    let res_lys = infer_prochiral_pair(
+        0,
+        5,
+        lys_cg_spec,
+        &helix_pdb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((1.38, 1.51)),
+            j_hh_vicinal_hz: Some((10.8, 3.6)),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_lys.committed);
+    assert_eq!(res_lys.nmr_star_ambiguity_code, 2);
+    assert!(res_lys.winning_posterior < 0.90);
+}
+
+#[test]
+fn test_p1_3_outlier_model_error_and_nan_inf_guards() {
+    let cfg = StereospecConfig::default();
+    let asp_spec = prochiral_pairs_for_residue("ASP")[0];
+    let bb = BackboneConditioning::ExactTorsions {
+        phi_deg: -63.0,
+        psi_deg: -42.0,
+    };
+
+    // (1) Unphysical Asp J = (40.0, 39.0) Hz
+    let res_40 = infer_prochiral_pair(
+        0,
+        1,
+        asp_spec,
+        &bb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((2.60, 2.90)),
+            j_hh_vicinal_hz: Some((40.0, 39.0)),
+            j_nhb_hz: Some((3.1, 0.5)),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_40.committed);
+    assert_eq!(res_40.nmr_star_ambiguity_code, 2);
+    assert!(!res_40.winning_posterior.is_nan());
+    assert!(res_40.winning_posterior <= 0.50);
+
+    // (2) Unphysical Asp J = (2.0, 25.0) Hz
+    let res_25 = infer_prochiral_pair(
+        0,
+        1,
+        asp_spec,
+        &bb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((2.60, 2.90)),
+            j_hh_vicinal_hz: Some((2.0, 25.0)),
+            j_nhb_hz: Some((3.1, 0.5)),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_25.committed);
+    assert_eq!(res_25.nmr_star_ambiguity_code, 2);
+    assert!(!res_25.winning_posterior.is_nan());
+    assert!(res_25.winning_posterior <= 0.50);
+
+    // (3) In-bounds [0..16 Hz] couplings that violate Karplus geometry severely (reduced chi^2 > 9.0):
+    // e.g. both 3J(HA, HB2) and 3J(HA, HB3) = 15.5 Hz simultaneously AND 3J(N, HB) = (15.0, 14.5) Hz!
+    let res_misfit = infer_prochiral_pair(
+        0,
+        1,
+        asp_spec,
+        &bb,
+        &ProchiralObservables {
+            proton_shifts_ppm: Some((2.60, 2.90)),
+            j_hh_vicinal_hz: Some((15.5, 15.2)),
+            j_nhb_hz: Some((15.0, 14.5)),
+            ..Default::default()
+        },
+        &cfg,
+    );
+    assert!(!res_misfit.committed);
+    assert_eq!(res_misfit.nmr_star_ambiguity_code, 2);
+    assert!(res_misfit.winning_posterior.is_finite());
+    assert!(res_misfit.winning_posterior <= 0.50);
+
+    // (4) NaN and +/-INFINITY in J and NOE inputs, and non-positive NOE intensities
+    let bad_inputs = [
+        ProchiralObservables {
+            j_hh_vicinal_hz: Some((f64::NAN, 4.0)),
+            j_nhb_hz: Some((3.0, 0.5)),
+            ..Default::default()
+        },
+        ProchiralObservables {
+            j_hh_vicinal_hz: Some((10.5, f64::INFINITY)),
+            j_nhb_hz: Some((3.0, 0.5)),
+            ..Default::default()
+        },
+        ProchiralObservables {
+            j_hh_vicinal_hz: Some((10.5, 3.2)),
+            noe_pairs: vec![NoePairObs::new(AnchorProton::IntraAmideH, f64::NAN, 0.02)],
+            ..Default::default()
+        },
+        ProchiralObservables {
+            j_hh_vicinal_hz: Some((10.5, 3.2)),
+            noe_pairs: vec![NoePairObs::new(
+                AnchorProton::IntraAmideH,
+                0.01,
+                f64::INFINITY,
+            )],
+            ..Default::default()
+        },
+        ProchiralObservables {
+            j_hh_vicinal_hz: Some((10.5, 3.2)),
+            noe_pairs: vec![NoePairObs::new(AnchorProton::IntraAmideH, 0.0, 0.02)],
+            ..Default::default()
+        },
+        ProchiralObservables {
+            j_hh_vicinal_hz: Some((10.5, 3.2)),
+            noe_pairs: vec![NoePairObs::new(AnchorProton::IntraAmideH, -0.01, 0.02)],
+            ..Default::default()
+        },
+    ];
+    for (idx, bad) in bad_inputs.iter().enumerate() {
+        let res = infer_prochiral_pair(0, 1, asp_spec, &bb, bad, &cfg);
+        assert!(!res.committed, "bad input #{idx} must not commit");
+        assert_eq!(res.nmr_star_ambiguity_code, 2, "bad input #{idx} code != 2");
+        assert!(
+            res.winning_posterior.is_finite() && res.winning_posterior <= 0.50,
+            "bad input #{idx} posterior must be finite <= 0.50, got {}",
+            res.winning_posterior
+        );
+    }
+}
+
+#[test]
+fn test_p1_4_ambiguity_code_seeding_wildcard_dedup_and_atomic_methyl_swaps() {
+    let pdb = parse_pdb_all_atoms_file(repo_file("data/pdb_refs/1d3z.pdb"))
+        .expect("parse 1d3z all atoms");
+    let cfg = StereospecConfig::default();
+
+    // (a) Half-present HB2 (HB3 missing) and unprocessed prochiral atoms -> Ambiguity_code = 2;
+    //     symmetric Phe CD1/CD2/HD1/HD2/CE1/CE2/HE1/HE2 -> 3, Phe CZ/HZ -> 1;
+    //     existing Reference.ambiguity_codes preserved when complete & untouched.
+    let mut base_a = Reference {
+        sequence: vec![
+            "ASP".to_string(),
+            "PHE".to_string(),
+            "SER".to_string(),
+            "ASN".to_string(),
+        ],
+        seq_ids: vec![1, 2, 3, 4],
+        shifts: BTreeMap::from([
+            // ASP 1: unique HA + half-present HB2 (HB3 missing!)
+            ((0, "HA".to_string()), 4.62),
+            ((0, "HB2".to_string()), 2.74),
+            // PHE 2: symmetric ring CD1/HD1/CE1/HE1 + unique CZ/HZ + unprocessed HB2/HB3
+            ((1, "HB2".to_string()), 3.12),
+            ((1, "HB3".to_string()), 2.95),
+            ((1, "CD1".to_string()), 131.4),
+            ((1, "CD2".to_string()), 131.4),
+            ((1, "HD1".to_string()), 7.22),
+            ((1, "HD2".to_string()), 7.22),
+            ((1, "CZ".to_string()), 129.1),
+            ((1, "HZ".to_string()), 7.15),
+            // SER 3: previously stereo-assigned HB2/HB3 with Ambiguity_code = 1 in input STAR
+            ((2, "HB2".to_string()), 3.88),
+            ((2, "HB3".to_string()), 3.96),
+            // ASN 4: half-present HB2 annotated with bogus code 1 in input -> must still become 2!
+            ((3, "HB2".to_string()), 2.81),
+        ]),
+        ambiguity_codes: BTreeMap::from([
+            ((2, "HB2".to_string()), 1),
+            ((2, "HB3".to_string()), 1),
+            ((3, "HB2".to_string()), 1),
+        ]),
+    };
+    let (merged_a, amb_a) = apply_stereospec_to_reference(&base_a, &[]);
+    assert_eq!(amb_a[&(0, "HA".to_string())], 1);
+    assert_eq!(
+        amb_a[&(0, "HB2".to_string())],
+        2,
+        "half-present HB2 must get Ambiguity_code = 2"
+    );
+    assert_eq!(
+        amb_a[&(1, "HB2".to_string())],
+        2,
+        "unprocessed prochiral HB2/HB3 must default to Ambiguity_code = 2"
+    );
+    assert_eq!(amb_a[&(1, "HB3".to_string())], 2);
+    assert_eq!(amb_a[&(1, "CD1".to_string())], 3);
+    assert_eq!(amb_a[&(1, "HD1".to_string())], 3);
+    assert_eq!(amb_a[&(1, "CZ".to_string())], 1);
+    assert_eq!(amb_a[&(1, "HZ".to_string())], 1);
+    assert_eq!(
+        amb_a[&(2, "HB2".to_string())],
+        1,
+        "pre-existing input Ambiguity_code = 1 on complete untouched pair must be preserved"
+    );
+    assert_eq!(amb_a[&(2, "HB3".to_string())], 1);
+    assert_eq!(
+        amb_a[&(3, "HB2".to_string())],
+        2,
+        "half-present HB2 must be forced to Ambiguity_code = 2 even if input had 1"
+    );
+    assert_eq!(merged_a.shifts.len(), base_a.shifts.len());
+    base_a.ambiguity_codes = amb_a;
+
+    // (b) NEF wildcard inputs (HBx/HBy, CGx/CGy, HGx%/HGy%, HE2x/HE2y, both mixed-case and
+    //     uppercased as read_star_str_all_atoms produces) -> zero duplicate wildcard + canonical rows!
+    let base_b = Reference {
+        sequence: vec!["ASP".to_string(), "VAL".to_string(), "GLN".to_string()],
+        seq_ids: vec![1, 2, 3],
+        shifts: BTreeMap::from([
+            ((0, "HBX".to_string()), 2.65),
+            ((0, "HBY".to_string()), 2.92),
+            ((1, "CGx".to_string()), 19.6),
+            ((1, "CGy".to_string()), 21.8),
+            ((1, "HGx%".to_string()), 0.74),
+            ((1, "HGy%".to_string()), 0.89),
+            ((2, "HE2X".to_string()), 6.85),
+            ((2, "HE2Y".to_string()), 7.52),
+        ]),
+        ..Default::default()
+    };
+    let asp_spec = prochiral_pairs_for_residue("ASP")[0];
+    let val_spec = prochiral_pairs_for_residue("VAL")[0];
+    let gln_spec = prochiral_pairs_for_residue("GLN")[2];
+    let b_results = vec![
+        infer_prochiral_pair(
+            0,
+            1,
+            asp_spec,
+            &BackboneConditioning::Marginalized,
+            &ProchiralObservables {
+                proton_shifts_ppm: Some((2.65, 2.92)),
+                ..Default::default()
+            },
+            &cfg,
+        ),
+        infer_prochiral_pair(
+            1,
+            2,
+            val_spec,
+            &BackboneConditioning::Marginalized,
+            &ProchiralObservables {
+                proton_shifts_ppm: Some((0.74, 0.89)),
+                carbon_shifts_ppm: Some((19.6, 21.8)),
+                ..Default::default()
+            },
+            &cfg,
+        ),
+        infer_prochiral_pair(
+            2,
+            3,
+            gln_spec,
+            &BackboneConditioning::Marginalized,
+            &ProchiralObservables {
+                proton_shifts_ppm: Some((6.85, 7.52)),
+                ..Default::default()
+            },
+            &cfg,
+        ),
+    ];
+    let (merged_b, _amb_b) = apply_stereospec_to_reference(&base_b, &b_results);
+    for (k, atom) in merged_b.shifts.keys() {
+        let up = atom.to_ascii_uppercase();
+        assert!(
+            !up.contains('X') && !up.contains('Y'),
+            "wildcard alias ({k}, {atom}) leaked alongside canonical row: {:?}",
+            merged_b.shifts
+        );
+    }
+    assert_eq!(merged_b.shifts.len(), 12);
+    assert!((merged_b.shifts[&(0, "HB2".to_string())] - 2.65).abs() < 1e-9);
+    assert!((merged_b.shifts[&(0, "HB3".to_string())] - 2.92).abs() < 1e-9);
+    // Uncommitted Val CG1/CG2 + HG11..13/HG21..23 MUST preserve input (a, b) correspondence, NOT sort C and H independently!
+    assert!((merged_b.shifts[&(1, "CG1".to_string())] - 19.6).abs() < 1e-9);
+    assert!((merged_b.shifts[&(1, "CG2".to_string())] - 21.8).abs() < 1e-9);
+    assert!((merged_b.shifts[&(1, "HG11".to_string())] - 0.74).abs() < 1e-9);
+    assert!((merged_b.shifts[&(1, "HG21".to_string())] - 0.89).abs() < 1e-9);
+    assert!((merged_b.shifts[&(2, "HE21".to_string())] - 6.85).abs() < 1e-9);
+    assert!((merged_b.shifts[&(2, "HE22".to_string())] - 7.52).abs() < 1e-9);
+
+    // (c1) Val with CG1/CG2 + QG1/QG2 + HG11/12/13 & HG21/22/23 committed Swapped -> ALL members swap atomically!
+    let val_ideal = synthesize_ideal_observables_from_pdb(&pdb, 4, val_spec).unwrap();
+    let val_swapped_obs = ProchiralObservables {
+        proton_shifts_ppm: Some((0.74, 0.89)),
+        carbon_shifts_ppm: Some((19.6, 21.8)),
+        j_ncg_hz: val_ideal.j_ncg_hz.map(|(x, y)| (y, x)),
+        j_cc_vicinal_hz: val_ideal.j_cc_vicinal_hz.map(|(x, y)| (y, x)),
+        j_methine_hahb_hz: val_ideal.j_methine_hahb_hz,
+        noe_pairs: val_ideal
+            .noe_pairs
+            .iter()
+            .map(|np| NoePairObs::new(np.anchor, np.intensity_b, np.intensity_a))
+            .collect(),
+        ..Default::default()
+    };
+    let val_bb = backbone_conditioning_from_all_atom_pdb(&pdb, 4);
+    let val_res = infer_prochiral_pair(0, 1, val_spec, &val_bb, &val_swapped_obs, &cfg);
+    assert!(val_res.committed);
+    assert_eq!(val_res.winning_hypothesis, SwapHypothesis::Swapped);
+
+    let base_val_qg = Reference {
+        sequence: vec!["VAL".to_string()],
+        seq_ids: vec![1],
+        shifts: BTreeMap::from([
+            ((0, "CG1".to_string()), 19.6),
+            ((0, "CG2".to_string()), 21.8),
+            ((0, "QG1".to_string()), 0.74),
+            ((0, "QG2".to_string()), 0.89),
+            ((0, "HG11".to_string()), 0.74),
+            ((0, "HG12".to_string()), 0.74),
+            ((0, "HG13".to_string()), 0.74),
+            ((0, "HG21".to_string()), 0.89),
+            ((0, "HG22".to_string()), 0.89),
+            ((0, "HG23".to_string()), 0.89),
+        ]),
+        ..Default::default()
+    };
+    let (merged_val_qg, amb_val_qg) =
+        apply_stereospec_to_reference(&base_val_qg, std::slice::from_ref(&val_res));
+    assert!((merged_val_qg.shifts[&(0, "CG1".to_string())] - 21.8).abs() < 1e-9);
+    assert!((merged_val_qg.shifts[&(0, "CG2".to_string())] - 19.6).abs() < 1e-9);
+    assert!((merged_val_qg.shifts[&(0, "QG1".to_string())] - 0.89).abs() < 1e-9);
+    assert!((merged_val_qg.shifts[&(0, "QG2".to_string())] - 0.74).abs() < 1e-9);
+    assert!((merged_val_qg.shifts[&(0, "HG11".to_string())] - 0.89).abs() < 1e-9);
+    assert!((merged_val_qg.shifts[&(0, "HG21".to_string())] - 0.74).abs() < 1e-9);
+    for atom in ["CG1", "CG2", "QG1", "QG2", "HG11", "HG21"] {
+        assert_eq!(amb_val_qg[&(0, atom.to_string())], 1);
+    }
+
+    // (c2) Val with CG1/CG2 + lone QG1 (missing QG2) -> refuse to commit! Keep ALL members unswapped at code 2!
+    let base_val_half = Reference {
+        sequence: vec!["VAL".to_string()],
+        seq_ids: vec![1],
+        shifts: BTreeMap::from([
+            ((0, "CG1".to_string()), 19.6),
+            ((0, "CG2".to_string()), 21.8),
+            ((0, "QG1".to_string()), 0.74),
+        ]),
+        ..Default::default()
+    };
+    let mut val_res_no_obs_h = val_res.clone();
+    val_res_no_obs_h.proton_shifts_ppm = None;
+    let (merged_half, amb_half) =
+        apply_stereospec_to_reference(&base_val_half, std::slice::from_ref(&val_res_no_obs_h));
+    assert!(
+        (merged_half.shifts[&(0, "CG1".to_string())] - 19.6).abs() < 1e-9,
+        "CG1 must NOT swap when QG2 is missing"
+    );
+    assert!((merged_half.shifts[&(0, "CG2".to_string())] - 21.8).abs() < 1e-9);
+    assert!((merged_half.shifts[&(0, "QG1".to_string())] - 0.74).abs() < 1e-9);
+    assert_eq!(amb_half[&(0, "CG1".to_string())], 2);
+    assert_eq!(amb_half[&(0, "CG2".to_string())], 2);
+    assert_eq!(amb_half[&(0, "QG1".to_string())], 2);
+
+    // (c3) Half-present VAL methyl wildcard (`CG1/CG2` + lone `HGx%` without `HGy%`) -> must NOT
+    //      swap `CG1/CG2` AND must preserve `HGx%` normalized to `HG11..13` at `Ambiguity_code = 2`
+    //      (both when `results = &[]` and when a committed Swapped `StereospecResult` is supplied).
+    let base_val_half_wild = Reference {
+        sequence: vec!["VAL".to_string()],
+        seq_ids: vec![1],
+        shifts: BTreeMap::from([
+            ((0, "CG1".to_string()), 19.6),
+            ((0, "CG2".to_string()), 21.8),
+            ((0, "HGx%".to_string()), 0.74),
+        ]),
+        ..Default::default()
+    };
+    for half_res_slice in [&[][..], std::slice::from_ref(&val_res_no_obs_h)] {
+        let (m_hw, a_hw) = apply_stereospec_to_reference(&base_val_half_wild, half_res_slice);
+        assert!((m_hw.shifts[&(0, "CG1".to_string())] - 19.6).abs() < 1e-9);
+        assert!((m_hw.shifts[&(0, "CG2".to_string())] - 21.8).abs() < 1e-9);
+        assert_eq!(a_hw[&(0, "CG1".to_string())], 2);
+        assert_eq!(a_hw[&(0, "CG2".to_string())], 2);
+        for h1 in ["HG11", "HG12", "HG13"] {
+            assert!(
+                (m_hw.shifts[&(0, h1.to_string())] - 0.74).abs() < 1e-9,
+                "half-present HGx% must be preserved as {h1}, got {:?}",
+                m_hw.shifts
+            );
+            assert_eq!(a_hw[&(0, h1.to_string())], 2);
+        }
+        assert!(!m_hw.shifts.contains_key(&(0, "HGx%".to_string())));
+        assert!(!m_hw.shifts.contains_key(&(0, "HG21".to_string())));
+    }
+
+    // (b2) Residue-aware NEF wildcard normalization on VAL (`HGx/HGy`), LEU (`HDx/HDy` & `HDx%/HDy%`),
+    //      ILE (`HGx/HGy`), and PHE/TYR (`CDx/CDy`, `CEx/CEy`, `HDx/HDy`, `HEx/HEy`):
+    //      - NEVER fabricates invalid methylene names (`HG2/HG3` on VAL/ILE, `HD2/HD3` on LEU/PHE, `HE3` on PHE/TYR),
+    //      - assigns `Ambiguity_code = 3` (NOT 2!) to PHE/TYR symmetric ring wildcards,
+    //      - normalizes VAL/LEU `%` and shorthand `HGx/HGy` / `HDx/HDy` even when `results = &[]`.
+    let base_res_aware = Reference {
+        sequence: vec![
+            "VAL".to_string(),
+            "LEU".to_string(),
+            "ILE".to_string(),
+            "PHE".to_string(),
+            "LEU".to_string(),
+        ],
+        seq_ids: vec![1, 2, 3, 4, 5],
+        shifts: BTreeMap::from([
+            // res 0: VAL with shorthand HGx/HGy + CGx/CGy
+            ((0, "CGx".to_string()), 19.6),
+            ((0, "CGy".to_string()), 21.8),
+            ((0, "HGx".to_string()), 0.74),
+            ((0, "HGy".to_string()), 0.89),
+            // res 1: LEU with shorthand HDx/HDy + CDx/CDy
+            ((1, "CDx".to_string()), 22.4),
+            ((1, "CDy".to_string()), 24.9),
+            ((1, "HDx".to_string()), 0.81),
+            ((1, "HDy".to_string()), 0.94),
+            // res 2: ILE with shorthand HGx/HGy
+            ((2, "HGx".to_string()), 1.18),
+            ((2, "HGy".to_string()), 1.46),
+            // res 3: PHE with symmetric aromatic wildcards CDx/CDy, CEx/CEy, HDx/HDy, HEx/HEy + HBx/HBy
+            ((3, "HBx".to_string()), 2.95),
+            ((3, "HBy".to_string()), 3.12),
+            ((3, "CDx".to_string()), 131.4),
+            ((3, "CDy".to_string()), 131.4),
+            ((3, "CEx".to_string()), 130.2),
+            ((3, "CEy".to_string()), 130.2),
+            ((3, "HDx".to_string()), 7.22),
+            ((3, "HDy".to_string()), 7.22),
+            ((3, "HEx".to_string()), 7.31),
+            ((3, "HEy".to_string()), 7.31),
+            // res 4: LEU with HDx%/HDy% (unprocessed)
+            ((4, "HDx%".to_string()), 0.77),
+            ((4, "HDy%".to_string()), 0.91),
+        ]),
+        ..Default::default()
+    };
+
+    // First test with `results = &[]`
+    let (m_empty, a_empty) = apply_stereospec_to_reference(&base_res_aware, &[]);
+    for (k, atom) in m_empty.shifts.keys() {
+        let up = atom.to_ascii_uppercase();
+        assert!(
+            !up.contains('X') && !up.contains('Y'),
+            "un-normalized wildcard ({k}, {atom}) remained with results=&[]: {:?}",
+            m_empty.shifts
+        );
+    }
+    // VAL 0: HG11..13 & HG21..23, NO HG2/HG3!
+    assert!(!m_empty.shifts.contains_key(&(0, "HG2".to_string())));
+    assert!(!m_empty.shifts.contains_key(&(0, "HG3".to_string())));
+    assert!((m_empty.shifts[&(0, "HG11".to_string())] - 0.74).abs() < 1e-9);
+    assert!((m_empty.shifts[&(0, "HG21".to_string())] - 0.89).abs() < 1e-9);
+    assert_eq!(a_empty[&(0, "HG11".to_string())], 2);
+    // LEU 1 & LEU 4: HD11..13 & HD21..23, NO HD2/HD3!
+    for lk in [1usize, 4usize] {
+        assert!(!m_empty.shifts.contains_key(&(lk, "HD2".to_string())));
+        assert!(!m_empty.shifts.contains_key(&(lk, "HD3".to_string())));
+        assert!(m_empty.shifts.contains_key(&(lk, "HD11".to_string())));
+        assert!(m_empty.shifts.contains_key(&(lk, "HD21".to_string())));
+        assert_eq!(a_empty[&(lk, "HD11".to_string())], 2);
+    }
+    // ILE 2: HG12 & HG13, NO HG2/HG3!
+    assert!(!m_empty.shifts.contains_key(&(2, "HG2".to_string())));
+    assert!(!m_empty.shifts.contains_key(&(2, "HG3".to_string())));
+    assert!((m_empty.shifts[&(2, "HG12".to_string())] - 1.18).abs() < 1e-9);
+    assert!((m_empty.shifts[&(2, "HG13".to_string())] - 1.46).abs() < 1e-9);
+    assert_eq!(a_empty[&(2, "HG12".to_string())], 2);
+    // PHE 3: CD1/CD2/CE1/CE2/HD1/HD2/HE1/HE2 at Ambiguity_code = 3, HB2/HB3 at 2, NO HD3/HE3!
+    assert!(
+        !m_empty.shifts.contains_key(&(3, "HD2".to_string()))
+            || a_empty[&(3, "HD2".to_string())] == 3
+    );
+    assert!(!m_empty.shifts.contains_key(&(3, "HD3".to_string())));
+    assert!(!m_empty.shifts.contains_key(&(3, "HE3".to_string())));
+    for sym in ["CD1", "CD2", "CE1", "CE2", "HD1", "HD2", "HE1", "HE2"] {
+        assert_eq!(
+            a_empty[&(3, sym.to_string())],
+            3,
+            "PHE {sym} must have Ambiguity_code = 3"
+        );
+    }
+    assert_eq!(a_empty[&(3, "HB2".to_string())], 2);
+    assert_eq!(a_empty[&(3, "HB3".to_string())], 2);
+
+    // Also test with committed Swapped VAL 0 (`val_res`) + uncommitted ILE 2: still zero bogus HG2/HG3!
+    let ile_spec = prochiral_pairs_for_residue("ILE")[0];
+    let ile_uncomm = infer_prochiral_pair(
+        2,
+        3,
+        ile_spec,
+        &BackboneConditioning::Marginalized,
+        &ProchiralObservables::default(),
+        &cfg,
+    );
+    let (m_with_res, a_with_res) =
+        apply_stereospec_to_reference(&base_res_aware, &[val_res, ile_uncomm]);
+    assert!(!m_with_res.shifts.contains_key(&(0, "HG2".to_string())));
+    assert!(!m_with_res.shifts.contains_key(&(0, "HG3".to_string())));
+    assert!((m_with_res.shifts[&(0, "CG1".to_string())] - 21.8).abs() < 1e-9);
+    assert!((m_with_res.shifts[&(0, "HG11".to_string())] - 0.89).abs() < 1e-9);
+    assert!((m_with_res.shifts[&(0, "HG21".to_string())] - 0.74).abs() < 1e-9);
+    assert_eq!(a_with_res[&(0, "HG11".to_string())], 1);
+    assert!(!m_with_res.shifts.contains_key(&(2, "HG2".to_string())));
+    assert!((m_with_res.shifts[&(2, "HG12".to_string())] - 1.18).abs() < 1e-9);
+    assert!((m_with_res.shifts[&(2, "HG13".to_string())] - 1.46).abs() < 1e-9);
+    assert_eq!(a_with_res[&(2, "HG12".to_string())], 2);
 }

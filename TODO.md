@@ -82,8 +82,8 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 - [x] (A) `T08.7` — CLI raw-FID integration (`nmrassign process`, `--fid` on `pick`/`pipeline`, `nmrassign real-benchmark`; `dev` split verified, single-shot cold `heldout` run recorded at merge)
 
 ## Phase 9: Zero-friction spectrometer ingest, interactive NMR workbench UX & solver curation (`specs/06`, `specs/12`)
-- [x] (A) `T09.1` — Spectrometer folder & archive auto-classifier (`nmr-core::classify`: Bruker `PULPROG`/`vdlist`/`fqlist`/`nuslist` & Varian `seqfil`/`pslabel` -> experiment & problem-regime detection)
-- [x] (A) `T09.2` — Drag-and-drop folder/archive loader & editable Experiment Selection Matrix (`nmr-gui` desktop + `wasm32` WebGPU + `nmr-core::service`)
+- [x] (A) `T09.1` — Spectrometer folder & archive auto-classifier (`nmr-core::classify`: Bruker `PULPROG`/`vdlist`/`fqlist`/`nuslist` & Varian `seqfil`/`pslabel` -> experiment & problem-regime detection; `< 50 ms` on unpacked folders & seekable `.tar` archives, trailing zero-padding tolerance on `.tgz`)
+- [x] (A) `T09.2` — Drag-and-drop folder/archive loader & editable Experiment Selection Matrix (`nmr-gui` desktop + `wasm32` WebGPU + `nmr-core::service` with loopback `Host` DNS-rebinding protection)
 - [x] (A) `T09.3` — Guided *"What Next?"* workflow stepper, structured top menu bar, and fuzzy command palette (`Cmd/Ctrl+K`) in `nmr-gui`
 - [x] (A) `T09.4` — Interactive two-key NMR spectrum keyboard accelerators (`vt`, `pa`, `pd`, `pc`, `oz`, `ct`, `st`, `at`, `Space`, `?` cheat-sheet) comparable to modern desktop assignment suites (`nmr-gui::keymap`)
 - [x] (A) `T09.5` — Synchronized 2D/3D/4D multi-spectrum contour overlays and ranked `i-1 / i / i+1` candidate match-finding strips (`nmr-gui`)
@@ -92,10 +92,10 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 
 ## Phase 10: Interactive covalent sidechain graph, aromatics, stereospecificity & Methyl-TROSY (`specs/07`, `specs/07b`, `specs/13`)
 - [x] (A) `T10.1` — Interactive sequence ribbon & live 2D covalent amino-acid sidechain graph with per-atom assigned `ppm`, BMRB Z-scores, and strip jump (`nmr-core::topology`, `nmr-gui::sidechain_widget`; all 20 canonical AAs + 5 `Cys`/`His` variants planar with `min_dist >= 0.35`, `0` bond-node collisions, regular 5/6-rings, live `SyncCrosshair` jump, `wasm32`-clean)
-- [x] (A) `T10.2` — Aromatic ring spin-system assignment (`(HB)CB(CGCD)HD`, `(HB)CB(CGCDCE)HE`, aromatic `13C-HSQC`/`HCCH-TOCSY`/`NOESY` -> `Phe`/`Tyr`/`Trp`/`His` rings; `nmr-core::aromatic`, `nmrassign sidechain`; 12-protein BMRB volumetric suite: `95.07%` (`405/426`) acc, `98.48%` (`323/328`) HC prec, `100.0%` (`18/18`) Pelton `HisTautomer` acc)
-- [x] (A) `T10.3` — Stereospecific prochiral (`HB2`/`HB3`, `HG1`/`HG2`, `HD1`/`HD2`) Bayesian assignment from `3J` couplings, local NOEs & rotamer priors (`nmr-core::stereospec`, `nmrassign sidechain --stereospec`; 10-seed noisy scrambled `1D3Z`: `100.00%` precision at `posterior >= 0.90` (`96.4%` cov on `1D3Z` `(φ,ψ)`, `90.5%` on CSI `(φ,ψ)`), `0` false `Ambiguity_code = 1` swaps)
-- [x] (A) `T10.4` — Supramolecular `13C`-Methyl TROSY (`ILVMAT` `2D 13C-HMQC` + `3D/4D` Methyl-NOESY) picker & isotopic labeling schemes (Tugarinov & Kay *JACS* 2003; `nmr-core::methyl_trosy`; `25/18 Hz` recovery `100.00%` on 2D/3D/4D Ubiquitin & `99.87%` (`772/773`) on 3D `MBP 1EZP`, `<= 2.77%` artifacts)
-- [x] (A) `T10.5` — WebGPU Methyl-TROSY structure-based NOE contact-graph assignment solver (`nmr-core::methyl_solver`, `nmr-gpu::methyl_gpu`, `nmrassign methyl`; CPU/WebGPU parity `<= 3.45e-6`, WebGPU `Ubiquitin 1D3Z` `92.86%` acc / `100.0%` HC prec in `0.55 s`, `MBP 1EZP` (`370 aa`, `41 kDa`) `93.62%` (`176/188`) acc / `100.0%` (`90/90`) HC prec in `1.54 s`)
+- [x] (A) `T10.2` — Aromatic ring spin-system assignment (`(HB)CB(CGCD)HD`, `(HB)CB(CGCDCE)HE`, aromatic `13C-HSQC`/`HCCH-TOCSY`/`NOESY` -> `Phe`/`Tyr`/`Trp`/`His` rings via Gaussian / bounded-tail BMRB priors and exact Kuhn–Munkres leave-one-edge-out bipartite matching; `nmr-core::aromatic`, `nmrassign sidechain --aromatic`; 12-protein BMRB **synthetic self-consistency** volumetric suite: `95.07%` (`405/426`) acc, `85.1%` (`405/476`) recall, `98.48%` (`323/328`) HC prec, `100.0%` (`18/18`) Pelton `HisTautomer` acc; experimental aromatic validation open in Phase 11)
+- [x] (A) `T10.3` — Stereospecific prochiral (`HB2`/`HB3`, `HG1`/`HG2`, `HD1`/`HD2`) Bayesian assignment from `3J` couplings, local NOEs & rotamer priors (`nmr-core::stereospec`, `nmrassign sidechain --stereospec`; **synthetic self-consistency** 10-seed noisy scrambled `1D3Z`: `100.00%` committed precision at `posterior >= 0.90` (`96.4%` cov on `1D3Z` `(φ,ψ)`, `90.5%` on CSI `(φ,ψ)`), `0/1,665` isotropic null swaps, plus `Gly` φ-sign, general single-pathway, `[-0.5, 16.0] Hz` / reduced-`χ² <= 9.0` outlier, and `Ambiguity_code = 2` / atomic `CH3` guards; experimental `3J` validation open in Phase 11)
+- [x] (A) `T10.4` — Supramolecular `13C`-Methyl TROSY (`ILVMAT` `2D 13C-HMQC` + `3D/4D` Methyl-NOESY) picker & isotopic labeling schemes (Tugarinov & Kay *JACS* 2003; `nmr-core::methyl_trosy`; **synthetic self-consistency** `25/18 Hz` recovery `100.00%` on 2D/3D/4D Ubiquitin & `99.87%` (`772/773`) on 3D `MBP 1EZP`, `<= 2.77%` artifacts)
+- [x] (A) `T10.5` — WebGPU/CPU Methyl-TROSY structure-based NOE contact-graph assignment solver via **independent multi-replica simulated annealing (`56` default in `MethylAnnealConfig`, `64 × seeds` CLI, with automatic CPU fallback)** (`nmr-core::methyl_solver`, `nmr-gpu::methyl_gpu`, `nmrassign methyl`; CPU/WebGPU normalized objective parity `<= 3.45e-6`; **synthetic self-consistency** benchmarks: WebGPU `Ubiquitin 1D3Z` `92.86%` (`39/42`) acc / `100.0%` (`35/35`) HC prec in `0.55 s`, `MBP 1EZP` (`370 aa`, `41 kDa`) `93.62%` (`176/188`) acc / `100.0%` (`90/90`) HC prec in `1.53 s`; experimental methyl NOESY validation open in Phase 11)
 
 ## Phase 11: Problem-regime GPU solvers — IDPs (`13C`-detected) & paramagnetic metalloproteins (`specs/14`)
 - [ ] (A) `T11.1` — Protonless `13C`-detected IDP experiment models, narrow-dispersion picker & volumetric simulator (`2D CON`, `CACO`, `3D CANCO`, `CBCACO`, `CCCON`, `NCACO`; Bermel et al. 2006–2009)
@@ -125,7 +125,7 @@ Specs: `docs/specs/`. Agent rules: `AGENTS.md`.
 
 ## Housekeeping
 - [x] (A) CCPN NEF v1.1 lossless import/export (`nmr-core::nef`, `nmrassign nef-import` / `nef-export`)
-- [x] (A) Single-source SemVer versioning (`v0.3.0`, `nmr_core::VERSION`, `nmrassign --version` with short git SHA, NEF/HTML/API provenance, annotated `vX.Y.Z` git tags)
+- [x] (A) Single-source SemVer versioning (`v0.6.0`, `nmr_core::VERSION`, `nmrassign --version` with short git SHA, NEF/HTML/API provenance, annotated `vX.Y.Z` git tags)
 - [ ] (M) Choose a public project name (avoid commercial product names)
 - [ ] (M) Patent search on deep-learning peak picking and automated assignment
 - [x] (A) Add `CONTRIBUTING.md`, `THIRD_PARTY.md`, author metadata, and CI workflow

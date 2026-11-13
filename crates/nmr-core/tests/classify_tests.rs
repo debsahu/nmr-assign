@@ -1747,3 +1747,138 @@ fn test_q1b_methyl_carrier_sw_and_interleaved_acqu2s_qf_cest() {
     assert_eq!(cest_inv.problem_regime, ProblemRegime::RelaxationDynamics);
     let _ = fs::remove_dir_all(&cest_dir);
 }
+
+#[test]
+fn test_p1_5_n2_trailing_zero_padded_tgz_succeeds_and_rejects_corrupt_nonzero_tail() {
+    let root = make_temp_dir("p1_5_n2_pad_tgz");
+    let acqus = bruker_acqus("hncogp3d", "1H", 700.13, 14.0, 2048, 0);
+    let acqu2s = bruker_indirect_acqus("13C", 176.05, 14.0, 96, 5);
+    let acqu3s = bruker_indirect_acqus("15N", 70.95, 32.0, 64, 6);
+
+    let mut tar = Vec::new();
+    append_tar_entry(&mut tar, "pad_ws/10_hnco/acqus", acqus.as_bytes());
+    append_tar_entry(&mut tar, "pad_ws/10_hnco/acqu2s", acqu2s.as_bytes());
+    append_tar_entry(&mut tar, "pad_ws/10_hnco/acqu3s", acqu3s.as_bytes());
+    append_tar_entry(&mut tar, "pad_ws/10_hnco/ser", &[0u8; 256]);
+    tar.extend(std::iter::repeat_n(0u8, 1024));
+
+    // Valid `.tar.gz` + 1024 trailing 0x00 bytes (`pad.tgz`)
+    let mut pad_tgz = gzip_fixed_huffman_rle_zeros(&tar);
+    pad_tgz.extend(std::iter::repeat_n(0u8, 1024));
+
+    let pad_tgz_path = root.join("pad.tgz");
+    fs::write(&pad_tgz_path, &pad_tgz).expect("write pad.tgz");
+
+    let entries =
+        extract_archive_virtual_entries("pad.tgz", &pad_tgz).expect("extract zero-padded pad.tgz");
+    assert_eq!(entries.len(), 4);
+    let mem_inv = classify_nmr_entries(&entries);
+    assert_eq!(mem_inv.experiments.len(), 1);
+    assert_eq!(mem_inv.experiments[0].pulse_class, PulseSequenceClass::Hnco);
+
+    let fs_inv =
+        classify_nmr_workspace(&pad_tgz_path).expect("classify_nmr_workspace on zero-padded .tgz");
+    assert_eq!(fs_inv.experiments, mem_inv.experiments);
+
+    // Non-zero garbage after trailing 0x00 must still be rejected as corrupt gzip magic
+    let mut corrupt_tail = pad_tgz.clone();
+    corrupt_tail.push(0x42);
+    assert!(
+        extract_archive_virtual_entries("corrupt_tail.tgz", &corrupt_tail).is_err(),
+        "non-zero corrupt byte after zero padding must be rejected"
+    );
+
+    // Excessive zero padding exceeding `max_inflate_bytes` must also be rejected
+    let mut huge_pad = gzip_fixed_huffman_rle_zeros(&tar);
+    huge_pad.extend(std::iter::repeat_n(0u8, 8192));
+    assert!(
+        extract_archive_virtual_entries_bounded("huge_pad.tgz", &huge_pad, 4096, 4096).is_err(),
+        "zero padding exceeding max_inflate_bytes must be rejected"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_p1_5_n3_loopback_dns_rebinding_host_header_validation() {
+    let root = make_temp_dir("p1_5_n3_dns_rebind");
+    let mut srv = spawn_background_server("127.0.0.1:0", root.join("srv"))
+        .expect("spawn background server for DNS rebinding test");
+    let addr = srv.local_addr();
+    let port = addr.port();
+
+    let send_raw = |raw_req: &str| -> u16 {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream.write_all(raw_req.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let hdr = String::from_utf8_lossy(&raw);
+        hdr.lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    // 1. Exact probe: `Host: attacker-rebind.example:8080` + `Origin: http://attacker-rebind.example:8080` -> 403 Forbidden
+    let rebind_8080 = "GET /api/v1/health HTTP/1.1\r\n\
+                       Host: attacker-rebind.example:8080\r\n\
+                       Origin: http://attacker-rebind.example:8080\r\n\
+                       Connection: close\r\n\r\n";
+    assert_eq!(send_raw(rebind_8080), 403);
+
+    // 2. DNS rebinding matching the actual bound port `attacker-rebind.example:<port>` (with or without Origin) -> 403 Forbidden
+    let rebind_bound = format!(
+        "GET /api/v1/health HTTP/1.1\r\n\
+         Host: attacker-rebind.example:{port}\r\n\
+         Origin: http://attacker-rebind.example:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    assert_eq!(send_raw(&rebind_bound), 403);
+
+    // 3. Missing `Host` header -> 403 Forbidden
+    let no_host = "GET /api/v1/health HTTP/1.1\r\nConnection: close\r\n\r\n";
+    assert_eq!(send_raw(no_host), 403);
+
+    // 4. Loopback `Host` with mismatched or missing port on non-80/443 listener -> 403 Forbidden
+    let wrong_port = format!(
+        "GET /api/v1/health HTTP/1.1\r\n\
+         Host: 127.0.0.1:{}\r\n\
+         Connection: close\r\n\r\n",
+        port.wrapping_add(1).max(1)
+    );
+    assert_eq!(send_raw(&wrong_port), 403);
+    if !matches!(port, 80 | 443) {
+        let bare_loopback = "GET /api/v1/health HTTP/1.1\r\n\
+                             Host: localhost\r\n\
+                             Origin: http://localhost\r\n\
+                             Connection: close\r\n\r\n";
+        assert_eq!(send_raw(bare_loopback), 403);
+    }
+
+    // 5. Valid loopback `Host: 127.0.0.1:<port>`, `localhost:<port>`, and `[::1]:<port>` -> 200 OK
+    for ok_host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let valid_req = format!(
+            "GET /api/v1/health HTTP/1.1\r\n\
+             Host: {ok_host}\r\n\
+             Origin: http://{ok_host}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        assert_eq!(
+            send_raw(&valid_req),
+            200,
+            "expected 200 OK for Host: {ok_host}"
+        );
+    }
+
+    srv.shutdown();
+    let _ = fs::remove_dir_all(&root);
+}

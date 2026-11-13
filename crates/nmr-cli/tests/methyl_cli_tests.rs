@@ -192,5 +192,48 @@ fn methyl_cli_end_to_end_tsv_and_ucsf_spectra() {
     assert_eq!(bin_ref.sequence.len(), 76);
     assert!(bin_ref.shifts.len() >= 120);
 
+    // 4. Test P1-6 headless CPU fallback when `GpuEngine::new_headless()` fails with `Err("no adapter")`
+    //    for both default (`--engine auto` / omitted) and explicit `--engine gpu`.
+    for explicit_engine in [None, Some("auto"), Some("gpu")] {
+        let out_fb_star = dir.join(format!(
+            "ubq_fallback_{}.str",
+            explicit_engine.unwrap_or("default")
+        ));
+        let mut fb_args = vec![
+            "--pdb".to_string(),
+            pdb_path.to_string_lossy().to_string(),
+            "--hmqc".to_string(),
+            hmqc_tsv.to_string_lossy().to_string(),
+            "--noesy".to_string(),
+            noesy_tsv.to_string_lossy().to_string(),
+            "--labeling".to_string(),
+            "ILVMAT".to_string(),
+            "--hmcmcbca".to_string(),
+            hmcm_tsv.to_string_lossy().to_string(),
+            "--seeds".to_string(),
+            "1".to_string(),
+            "-o".to_string(),
+            out_fb_star.to_string_lossy().to_string(),
+        ];
+        if let Some(eng) = explicit_engine {
+            fb_args.push("--engine".to_string());
+            fb_args.push(eng.to_string());
+        }
+        let warn_opt =
+            methyl_cmd::run_methyl_cli_with_gpu_init(&fb_args, || Err("no adapter".to_string()))
+                .expect(
+                    "headless CPU fallback must succeed when WebGPU returns Err(\"no adapter\")",
+                );
+        let warn = warn_opt.expect("expected warning string on simulated WebGPU failure");
+        assert!(
+            warn.starts_with("warning:") && warn.contains("no adapter") && warn.contains("CPU"),
+            "unexpected fallback warning: {warn}"
+        );
+        let fb_ref =
+            read_star_all_atoms(&out_fb_star, None).expect("parse fallback methyl NMR-STAR v3");
+        assert_eq!(fb_ref.sequence.len(), 76);
+        assert!(fb_ref.shifts.len() >= 120);
+    }
+
     let _ = fs::remove_dir_all(&dir);
 }

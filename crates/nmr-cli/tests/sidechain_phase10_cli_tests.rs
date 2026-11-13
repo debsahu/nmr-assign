@@ -595,3 +595,342 @@ fn sidechain_cli_real_star_without_peaks_preserves_shifts_and_resolves_stereospe
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sidechain_cli_p0_1_rejects_implicit_simulation_and_invalid_stereo_threshold() {
+    let root = repo_root();
+    let star_in = root.join("data/fixtures/synthetic_ubiquitin.str");
+    let bin = env!("CARGO_BIN_EXE_nmrassign");
+
+    let dir = env::temp_dir().join(format!("nmr_sidechain_p0_1_err_test_{}", process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    // (a1) `--aromatic` without `--peaks`, explicit aromatic peak lists, or `--simulate` MUST fail cleanly!
+    let out_arom_err = dir.join("should_not_exist_arom.str");
+    let run_arom_err = process::Command::new(bin)
+        .args([
+            "sidechain",
+            "--star",
+            &star_in.to_string_lossy(),
+            "--aromatic",
+            "--out",
+            &out_arom_err.to_string_lossy(),
+        ])
+        .output()
+        .expect("spawn nmrassign sidechain --aromatic without inputs");
+    assert!(
+        !run_arom_err.status.success(),
+        "sidechain --aromatic without peak inputs or --simulate must fail instead of fabricating shifts"
+    );
+    assert!(
+        !out_arom_err.exists(),
+        "failed command must not write synthetic output STAR"
+    );
+
+    // (a2) Bare `sidechain --star ... --out ...` without `--peaks`, `--stereospec`, or `--simulate` MUST fail cleanly!
+    let out_bare_err = dir.join("should_not_exist_bare.str");
+    let run_bare_err = process::Command::new(bin)
+        .args([
+            "sidechain",
+            "--star",
+            &star_in.to_string_lossy(),
+            "--out",
+            &out_bare_err.to_string_lossy(),
+        ])
+        .output()
+        .expect("spawn bare nmrassign sidechain");
+    assert!(!run_bare_err.status.success());
+    assert!(!out_bare_err.exists());
+
+    // (a3) `--stereo-threshold` outside `(0.5, 1.0]` or `NaN` MUST fail cleanly!
+    for bad_thr in ["0.5", "0.3", "1.05", "-0.1", "NaN"] {
+        let run_thr = process::Command::new(bin)
+            .args([
+                "sidechain",
+                "--star",
+                &star_in.to_string_lossy(),
+                "--stereospec",
+                "--stereo-threshold",
+                bad_thr,
+            ])
+            .output()
+            .expect("spawn nmrassign sidechain bad --stereo-threshold");
+        assert!(
+            !run_thr.status.success(),
+            "--stereo-threshold {bad_thr} must be rejected"
+        );
+    }
+
+    // (a4) Explicit `--simulate` opt-in still works for intentional synthetic benchmarking
+    let out_sim = dir.join("explicit_sim.str");
+    let run_sim = process::Command::new(bin)
+        .args([
+            "sidechain",
+            "--star",
+            &star_in.to_string_lossy(),
+            "--aromatic",
+            "--simulate",
+            "--runs",
+            "4",
+            "--steps",
+            "600",
+            "--seed",
+            "2026",
+            "--out",
+            &out_sim.to_string_lossy(),
+        ])
+        .output()
+        .expect("spawn nmrassign sidechain --simulate");
+    assert!(
+        run_sim.status.success(),
+        "explicit --simulate failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run_sim.stdout),
+        String::from_utf8_lossy(&run_sim.stderr)
+    );
+    assert!(out_sim.exists());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sidechain_cli_p0_1_real_aromatic_and_stereospec_roundtrip_preserves_untouched_atoms_byte_identical(
+) {
+    let root = repo_root();
+    let star_bb = root.join("data/fixtures/synthetic_ubiquitin.str");
+    let pdb_in = root.join("data/pdb_refs/1d3z.pdb");
+    let seed = 2026u64;
+    let bin = env!("CARGO_BIN_EXE_nmrassign");
+
+    let dir = env::temp_dir().join(format!(
+        "nmr_sidechain_p0_1_roundtrip_test_{}",
+        process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let raw_bb = read_star_all_atoms(&star_bb, None).expect("read ubiquitin star");
+    let sc_priors = SidechainPriors::empirical_bmrb();
+    let mut in_ref = synthesize_all_atom_reference(&raw_bb, &sc_priors, seed);
+    let his_map = default_his_tautomer_map(&in_ref.sequence, seed);
+    let arom_truth = synthesize_aromatic_reference(&in_ref, &sc_priors, &his_map, seed);
+
+    // Ensure Phe45 (k = 44) CZ/HZ and Lys63 (k = 62) H/N are present on `in.str` with sentinel values,
+    // and intentionally omit Phe45's CZ/HZ peaks from the aromatic peak lists so Phe45 CZ/HZ is untouched!
+    assert_eq!(in_ref.sequence[44], "PHE");
+    assert_eq!(in_ref.sequence[62], "LYS");
+    let phe45_cz_ppm = 129.345;
+    let phe45_hz_ppm = 7.182;
+    let lys63_h_ppm = *in_ref.shifts.entry((62, "H".to_string())).or_insert(8.412);
+    let lys63_n_ppm = *in_ref
+        .shifts
+        .entry((62, "N".to_string()))
+        .or_insert(121.634);
+    in_ref.shifts.insert((44, "CZ".to_string()), phe45_cz_ppm);
+    in_ref.shifts.insert((44, "HZ".to_string()), phe45_hz_ppm);
+
+    let in_star = dir.join("in.str");
+    write_star(&in_star, &in_ref, None).unwrap();
+    let exact_in_ref = read_star_all_atoms(&in_star, None).unwrap();
+
+    // Build real aromatic peak TSVs from `arom_truth`, removing Phe45's CZ/HZ peak so `Phe45 CZ/HZ`
+    // is NOT reassigned by `assign_aromatic_rings` and must survive untouched from `in.str`!
+    let truth_phe45_cz = arom_truth.shifts[&(44, "CZ".to_string())];
+    let truth_phe45_hz = arom_truth.shifts[&(44, "HZ".to_string())];
+    let (arom_pks, trp_relays) = simulate_aromatic_peaks(
+        &arom_truth,
+        &his_map,
+        &AromaticSimConfig {
+            seed,
+            ..AromaticSimConfig::default()
+        },
+    );
+    let is_phe45_cz_peak = |p: &Peak| -> bool {
+        (p.h - truth_phe45_hz).abs() < 0.08 && p.c.is_some_and(|c| (c - truth_phe45_cz).abs() < 0.6)
+    };
+    let mut c13_hsqc = Vec::new();
+    let mut hd_pks = Vec::new();
+    let mut he_pks = Vec::new();
+    let mut tocsy_pks = Vec::new();
+    let mut his_pks = Vec::new();
+    for p in arom_pks {
+        if is_phe45_cz_peak(&p) {
+            continue;
+        }
+        match p.exp.as_str() {
+            "AROM_C13HSQC" => c13_hsqc.push(p),
+            "HBCBCGCDHD" => hd_pks.push(p),
+            "HBCBCGCDCEHE" => he_pks.push(p),
+            "AROM_HCCH_TOCSY" => {
+                // Also omit TOCSY cross-peaks whose indirect proton is Phe45 HZ
+                if p.h2.is_some_and(|h2| (h2 - truth_phe45_hz).abs() < 0.05) {
+                    continue;
+                }
+                tocsy_pks.push(p);
+            }
+            "HIS_LR_N15HMQC" => his_pks.push(p),
+            _ => {}
+        }
+    }
+    let arom_noe_pks: Vec<Peak> = trp_relays;
+
+    let arom_hsqc_tsv = dir.join("arom_c13hsqc.tsv");
+    let hd_tsv = dir.join("hbcbgcdhd.tsv");
+    let he_tsv = dir.join("hbcbgcdce.tsv");
+    let tocsy_tsv = dir.join("arom_tocsy.tsv");
+    let noe_tsv = dir.join("arom_noesy.tsv");
+    let his_tsv = dir.join("his_hmqc.tsv");
+    write_peaks(&arom_hsqc_tsv, &c13_hsqc).unwrap();
+    write_peaks(&hd_tsv, &hd_pks).unwrap();
+    write_peaks(&he_tsv, &he_pks).unwrap();
+    write_peaks(&tocsy_tsv, &tocsy_pks).unwrap();
+    write_peaks(&noe_tsv, &arom_noe_pks).unwrap();
+    write_peaks(&his_tsv, &his_pks).unwrap();
+
+    // Build real J-coupling + intra-NOE TSVs for residues 1..=25 in canonical IUPAC order
+    let pdb_res = parse_pdb_all_atoms_file(&pdb_in).expect("parse 1d3z");
+    let mut j_rows = Vec::new();
+    let mut intra_noe_rows = Vec::new();
+    for (pi, pr) in pdb_res.iter().enumerate().take(25) {
+        for spec in prochiral_pairs_for_residue(&pr.res_name) {
+            let Some(obs) = synthesize_ideal_observables_from_pdb(&pdb_res, pi, spec) else {
+                continue;
+            };
+            if let Some((ja, jb)) = obs.j_hh_vicinal_hz {
+                j_rows.push(JCouplingTsvRow {
+                    seq_id: pr.seq_id,
+                    res_name: pr.res_name.clone(),
+                    site: spec.iupac_branch_1.to_string(),
+                    j_kind: "3J_HAHB".to_string(),
+                    val_a_hz: ja,
+                    val_b_hz: Some(jb),
+                });
+            }
+            if let Some((ja, jb)) = obs.j_nhb_hz {
+                j_rows.push(JCouplingTsvRow {
+                    seq_id: pr.seq_id,
+                    res_name: pr.res_name.clone(),
+                    site: spec.iupac_branch_1.to_string(),
+                    j_kind: "3J_NHB".to_string(),
+                    val_a_hz: ja,
+                    val_b_hz: Some(jb),
+                });
+            }
+            for np in &obs.noe_pairs {
+                if spec.kind != ProchiralSiteKind::AsnCarboxamide
+                    && spec.kind != ProchiralSiteKind::GlnCarboxamide
+                {
+                    intra_noe_rows.push(IntraNoeTsvRow {
+                        seq_id: pr.seq_id,
+                        res_name: pr.res_name.clone(),
+                        site: spec.iupac_branch_1.to_string(),
+                        anchor: np.anchor,
+                        intensity_a: np.intensity_a,
+                        intensity_b: np.intensity_b,
+                    });
+                }
+            }
+        }
+    }
+    let j_tsv = dir.join("j_couplings.tsv");
+    let inoe_tsv = dir.join("intra_noes.tsv");
+    write_j_couplings_tsv(&j_tsv, &j_rows).unwrap();
+    write_intra_noes_tsv(&inoe_tsv, &intra_noe_rows).unwrap();
+
+    let run_once = |star_arg: &PathBuf, out_arg: &PathBuf| {
+        let out = process::Command::new(bin)
+            .args([
+                "sidechain",
+                "--star",
+                &star_arg.to_string_lossy(),
+                "--aromatic",
+                "--arom-c13hsqc",
+                &arom_hsqc_tsv.to_string_lossy(),
+                "--hbcbgcdhd",
+                &hd_tsv.to_string_lossy(),
+                "--hbcbgcdce",
+                &he_tsv.to_string_lossy(),
+                "--aromatic-tocsy",
+                &tocsy_tsv.to_string_lossy(),
+                "--aromatic-noesy",
+                &noe_tsv.to_string_lossy(),
+                "--his-hmqc",
+                &his_tsv.to_string_lossy(),
+                "--stereospec",
+                "--j-couplings",
+                &j_tsv.to_string_lossy(),
+                "--intra-noes",
+                &inoe_tsv.to_string_lossy(),
+                "--pdb",
+                &pdb_in.to_string_lossy(),
+                "--out",
+                &out_arg.to_string_lossy(),
+            ])
+            .output()
+            .expect("spawn nmrassign sidechain real roundtrip");
+        assert!(
+            out.status.success(),
+            "nmrassign sidechain failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    let a1_star = dir.join("a1.str");
+    let a2_star = dir.join("a2.str");
+    run_once(&in_star, &a1_star);
+    run_once(&a1_star, &a2_star);
+
+    let a1_bytes = fs::read_to_string(&a1_star).expect("read a1.str");
+    let a2_bytes = fs::read_to_string(&a2_star).expect("read a2.str");
+    assert_eq!(
+        a1_bytes, a2_bytes,
+        "round-trip 2 (a1.str -> a2.str) must be 100% byte-for-byte identical!"
+    );
+
+    let a1_ref = read_star_all_atoms(&a1_star, None).expect("parse a1.str");
+    // Verify Phe45 CZ/HZ and Lys63 H/N and every untouched backbone/aliphatic shift survived verbatim!
+    assert!(
+        (a1_ref.shifts[&(44, "CZ".to_string())] - phe45_cz_ppm).abs() < 1e-3,
+        "Phe45 CZ was dropped or modified!"
+    );
+    assert!(
+        (a1_ref.shifts[&(44, "HZ".to_string())] - phe45_hz_ppm).abs() < 1e-3,
+        "Phe45 HZ was dropped or modified!"
+    );
+    assert!(
+        (a1_ref.shifts[&(62, "H".to_string())] - lys63_h_ppm).abs() < 1e-3,
+        "Lys63 H was dropped or modified!"
+    );
+    assert!(
+        (a1_ref.shifts[&(62, "N".to_string())] - lys63_n_ppm).abs() < 1e-3,
+        "Lys63 N was dropped or modified!"
+    );
+
+    const RING_ATOMS: &[&str] = &[
+        "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3", "CZ2",
+        "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
+    ];
+    for (&(k, ref atom), &in_ppm) in &exact_in_ref.shifts {
+        let is_arom_ring = matches!(
+            exact_in_ref.sequence[k].as_str(),
+            "PHE" | "TYR" | "TRP" | "HIS"
+        ) && RING_ATOMS.contains(&atom.as_str());
+        if !is_arom_ring {
+            let out_ppm = *a1_ref
+                .shifts
+                .get(&(k, atom.clone()))
+                .unwrap_or_else(|| panic!("untouched atom ({k}, {atom}) dropped in a1.str"));
+            // Asn/Gln carboxamide or prochiral shifts could only swap within pair, but canonical Direct order stays identical
+            if !matches!(atom.as_str(), "HD21" | "HD22" | "HE21" | "HE22") {
+                assert!(
+                    (out_ppm - in_ppm).abs() <= 1e-6,
+                    "untouched non-ring shift ({k} {}, {atom}) mutated: in={in_ppm:.3}, out={out_ppm:.3}",
+                    exact_in_ref.sequence[k]
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

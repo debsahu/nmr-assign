@@ -37,7 +37,7 @@ fn detailed_reference_offsets_distinguish_fitted_not_significant_and_too_few_val
     let mut pred = Reference {
         sequence: truth.sequence.clone(),
         seq_ids: truth.seq_ids.clone(),
-        shifts: Default::default(),
+        ..Default::default()
     };
     let mut cb_kept = 0usize;
     for (&(k, ref atom), &val) in &truth.shifts {
@@ -101,7 +101,7 @@ fn detailed_reference_offsets_distinguish_fitted_not_significant_and_too_few_val
     let mut permuted = Reference {
         sequence: pred.sequence.clone(),
         seq_ids: pred.seq_ids.clone(),
-        shifts: Default::default(),
+        ..Default::default()
     };
     for (&(k, ref atom), &val) in &pred.shifts {
         let k_perm = if k == 0 {

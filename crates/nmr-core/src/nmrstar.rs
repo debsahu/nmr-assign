@@ -11,14 +11,16 @@ use std::path::Path;
 
 use crate::priors::{three_to_one, ATOMS};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Reference {
     /// Three-letter residue codes, indexed `0..K-1`.
     pub sequence: Vec<String>,
     /// Original sequence numbering (`Seq_ID`).
     pub seq_ids: Vec<i32>,
-    /// Assigned backbone chemical shifts keyed by `(residue_index, atom_name)`.
+    /// Assigned backbone/sidechain chemical shifts keyed by `(residue_index, atom_name)`.
     pub shifts: BTreeMap<(usize, String), f64>,
+    /// Optional NMR-STAR v3 `_Atom_chem_shift.Ambiguity_code` (`1..=9`) keyed by `(residue_index, atom_name)`.
+    pub ambiguity_codes: BTreeMap<(usize, String), u8>,
 }
 
 impl Reference {
@@ -27,6 +29,7 @@ impl Reference {
             sequence,
             seq_ids,
             shifts: BTreeMap::new(),
+            ambiguity_codes: BTreeMap::new(),
         }
     }
 
@@ -194,7 +197,7 @@ fn read_star_str_inner(
     let tokens = tokenize(text);
     let loops = parse_loops(&tokens);
 
-    let mut shift_rows: Vec<(String, i32, String, String, f64)> = Vec::new();
+    let mut shift_rows: Vec<(String, i32, String, String, f64, Option<u8>)> = Vec::new();
     let mut seq_rows: Vec<(String, i32, String)> = Vec::new();
     let mut loaded_shift_loop = false;
 
@@ -215,6 +218,13 @@ fn read_star_str_inner(
             let comp_col = find_col(tags, &["_Atom_chem_shift.Comp_ID", "_Residue_label"]);
             let atom_col = find_col(tags, &["_Atom_chem_shift.Atom_ID", "_Atom_name"]);
             let ent_col = find_col(tags, &["_Atom_chem_shift.Entity_ID"]);
+            let amb_col = find_col(
+                tags,
+                &[
+                    "_Atom_chem_shift.Ambiguity_code",
+                    "_Chem_shift_ambiguity_code",
+                ],
+            );
             let (Some(sid_c), Some(comp_c), Some(atom_c)) = (sid_col, comp_col, atom_col) else {
                 continue;
             };
@@ -228,12 +238,16 @@ fn read_star_str_inner(
                 let ent = ent_col
                     .map(|c| r[c].clone())
                     .unwrap_or_else(|| "1".to_string());
+                let amb = amb_col
+                    .and_then(|c| r[c].parse::<u8>().ok())
+                    .filter(|&a| (1..=9).contains(&a));
                 shift_rows.push((
                     ent,
                     sid,
                     r[comp_c].to_ascii_uppercase(),
                     r[atom_c].to_ascii_uppercase(),
                     val,
+                    amb,
                 ));
             }
             if !shift_rows.is_empty() {
@@ -279,7 +293,7 @@ fn read_star_str_inner(
     };
 
     let mut comps: BTreeMap<i32, String> = BTreeMap::new();
-    for (e, s, c, _, _) in &shift_rows {
+    for (e, s, c, _, _, _) in &shift_rows {
         if e == &chosen_entity {
             comps.insert(*s, c.clone());
         }
@@ -305,7 +319,7 @@ fn read_star_str_inner(
         .collect();
 
     let mut ref_data = Reference::new(sequence, seq_ids);
-    for (e, s, _, atom_raw, v) in shift_rows {
+    for (e, s, _, atom_raw, v, amb) in shift_rows {
         let atom = atom_alias(&atom_raw);
         if e == chosen_entity
             && !atom.is_empty()
@@ -315,9 +329,11 @@ fn read_star_str_inner(
             && s >= lo
             && s <= hi
         {
-            ref_data
-                .shifts
-                .insert(((s - lo) as usize, atom.to_string()), v);
+            let key = ((s - lo) as usize, atom.to_string());
+            ref_data.shifts.insert(key.clone(), v);
+            if let Some(code) = amb {
+                ref_data.ambiguity_codes.insert(key, code);
+            }
         }
     }
     Ok(ref_data)
@@ -408,14 +424,22 @@ pub fn write_star_with_header(
             .find(|c| c.is_ascii_alphabetic())
             .map(|c| c.to_string())
             .unwrap_or_else(|| "X".to_string());
+        let amb = ref_data
+            .ambiguity_codes
+            .get(&(idx, atom.to_string()))
+            .copied()
+            .unwrap_or_else(|| {
+                crate::stereospec::default_atom_ambiguity_code(&ref_data.sequence[idx], atom)
+            });
         lines.push(format!(
-            "      {:5} 1 {:5} {:3} {:4} {} {:9.3} 1 {}",
+            "      {:5} 1 {:5} {:3} {:4} {} {:9.3} {} {}",
             i + 1,
             ref_data.seq_ids[idx],
             ref_data.sequence[idx],
             atom,
             atom_type,
             v,
+            amb,
             det
         ));
     }

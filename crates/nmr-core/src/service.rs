@@ -127,6 +127,7 @@ struct SharedState {
     storage_dir: PathBuf,
     inspect_root: Option<PathBuf>,
     allowed_origins: Vec<String>,
+    bound_port: u16,
     jobs: Mutex<BTreeMap<String, JobRecord>>,
     job_order: Mutex<Vec<String>>,
     job_tx: Mutex<Option<mpsc::Sender<String>>>,
@@ -276,6 +277,7 @@ impl ServiceServer {
             storage_dir,
             inspect_root: canon_inspect_root,
             allowed_origins: normalized_origins,
+            bound_port: bound_addr.port(),
             jobs: Mutex::new(existing_jobs),
             job_order: Mutex::new(existing_order),
             job_tx: Mutex::new(Some(tx)),
@@ -401,6 +403,7 @@ struct HttpRequest {
     method: String,
     path: String,
     host: String,
+    duplicate_host: bool,
     origin: Option<String>,
     content_type: String,
     body: Vec<u8>,
@@ -427,6 +430,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
     let mut content_length = 0usize;
     let mut content_type = String::new();
     let mut host = String::new();
+    let mut seen_host = false;
+    let mut duplicate_host = false;
     let mut origin: Option<String> = None;
     loop {
         let mut line = String::new();
@@ -449,6 +454,10 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
             } else if key.eq_ignore_ascii_case("content-type") {
                 content_type = v.trim().to_ascii_lowercase();
             } else if key.eq_ignore_ascii_case("host") {
+                if seen_host {
+                    duplicate_host = true;
+                }
+                seen_host = true;
                 host = v.trim().to_ascii_lowercase();
             } else if key.eq_ignore_ascii_case("origin") {
                 let norm = v.trim().trim_end_matches('/').to_ascii_lowercase();
@@ -470,6 +479,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, Stri
         method,
         path,
         host,
+        duplicate_host,
         origin,
         content_type,
         body,
@@ -495,24 +505,91 @@ fn is_archive_content_type(content_type: &str) -> bool {
     )
 }
 
-/// Validate `Origin` (when present): allows strict same-origin (`http(s)://<Host>`) or an explicit
-/// entry in `state.allowed_origins`. Returns `Ok(Some(origin))` only when an explicit cross-origin
-/// allow-list entry matched (so `Access-Control-Allow-Origin` can echo that specific origin);
-/// returns `Ok(None)` for same-origin or non-browser CLI requests (`Access-Control-Allow-Origin`
-/// omitted completely); returns `Err` for untrusted cross-origin requests.
+/// Validate the HTTP `Host` header on every request to prevent DNS rebinding against loopback:
+/// rejects missing or duplicate `Host`, and requires the host part to be `localhost`, `127.0.0.1`,
+/// or `[::1]` with `:port` matching `state.bound_port` (omitting `:port` only when bound to default
+/// HTTP/HTTPS ports `80`/`443`) unless `http(s)://{Host}` explicitly matches `state.allowed_origins`.
+fn is_valid_request_host(req: &HttpRequest, state: &SharedState) -> bool {
+    if req.duplicate_host || req.host.is_empty() {
+        return false;
+    }
+    let host_http = format!("http://{}", req.host);
+    let host_https = format!("https://{}", req.host);
+    if state
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed == &host_http || allowed == &host_https)
+    {
+        return true;
+    }
+
+    let parse_strict_port = |p: &str| -> Option<u16> {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse::<u16>().ok()
+    };
+
+    let (is_loopback_host, opt_port) = if let Some(after_open) = req.host.strip_prefix('[') {
+        let Some((ipv6_body, rest)) = after_open.split_once(']') else {
+            return false;
+        };
+        let port = if rest.is_empty() {
+            None
+        } else if let Some(p_str) = rest.strip_prefix(':') {
+            let Some(p) = parse_strict_port(p_str) else {
+                return false;
+            };
+            Some(p)
+        } else {
+            return false;
+        };
+        (ipv6_body == "::1", port)
+    } else if let Some((h, p_str)) = req.host.split_once(':') {
+        if p_str.contains(':') {
+            return false;
+        }
+        let Some(p) = parse_strict_port(p_str) else {
+            return false;
+        };
+        (matches!(h, "localhost" | "127.0.0.1"), Some(p))
+    } else {
+        (matches!(req.host.as_str(), "localhost" | "127.0.0.1"), None)
+    };
+
+    if !is_loopback_host {
+        return false;
+    }
+    if state.bound_port != 0 {
+        match opt_port {
+            Some(p) if p == state.bound_port => {}
+            None if matches!(state.bound_port, 80 | 443) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Validate `Origin` (when present): requires `is_valid_request_host` to have passed first, then
+/// allows strict same-origin (`http(s)://<Host>`) or an explicit entry in `state.allowed_origins`.
+/// Returns `Ok(Some(origin))` only when an explicit cross-origin allow-list entry matched (so
+/// `Access-Control-Allow-Origin` can echo that specific origin); returns `Ok(None)` for same-origin
+/// or non-browser CLI requests (`Access-Control-Allow-Origin` omitted completely); returns `Err`
+/// for untrusted cross-origin requests.
 fn authorize_request_origin<'a>(
     req: &'a HttpRequest,
     state: &SharedState,
 ) -> Result<Option<&'a str>, ()> {
+    if !is_valid_request_host(req, state) {
+        return Err(());
+    }
     let Some(ref orig) = req.origin else {
         return Ok(None);
     };
-    if !req.host.is_empty() {
-        let same_http = format!("http://{}", req.host);
-        let same_https = format!("https://{}", req.host);
-        if orig == &same_http || orig == &same_https {
-            return Ok(None);
-        }
+    let same_http = format!("http://{}", req.host);
+    let same_https = format!("https://{}", req.host);
+    if orig == &same_http || orig == &same_https {
+        return Ok(None);
     }
     if state.allowed_origins.iter().any(|allowed| allowed == orig) {
         return Ok(Some(orig.as_str()));
@@ -604,6 +681,15 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<SharedState>) -> Result<
             return write_json_error(&mut stream, 400, "Bad Request", &e);
         }
     };
+
+    if !is_valid_request_host(&req, state) {
+        return write_json_error(
+            &mut stream,
+            403,
+            "Forbidden",
+            "untrusted or missing HTTP Host header blocked by loopback DNS-rebinding policy",
+        );
+    }
 
     let matched_cors_origin = match authorize_request_origin(&req, state) {
         Ok(c) => c,

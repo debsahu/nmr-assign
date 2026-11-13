@@ -91,8 +91,8 @@ $$E_{\text{raw}}(\pi) = \sum_{s: \text{pos}[s] \ge 0} U(s, \text{pos}[s]) + \sum
 4. **Missing Short-Contact Penalty $\Lambda_{\text{miss}}(m_1, m_2; \pi)$**:
    - For structural contacts with $d_{\text{CC}}(m_1, m_2) \le r_{\text{obs}}$ (`7.6 Å`), $\lambda_{\text{miss}}(d) = \lambda_0 \left(\frac{r_{\text{obs}} - d}{r_{\text{obs}} - 2.5}\right)^2$ penalizes unexplained missing NOEs unless masked by diagonal overlap (`|C_{s1} - C_{s2}| < 0.18 ppm`).
 
-### 3.2 CPU & WebGPU Multi-Replica Simulated Annealing (`16 KiB` Portable SRAM)
-Both CPU (`methyl_solver.rs`) and WebGPU (`methyl_gpu.rs` + `methyl_anneal.wgsl`) initialize replicas with intact `Leu`/`Val` geminal pairs and execute parallel Metropolis–Hastings annealing ($T_{\text{start}} \to T_{\text{end}}$) over a four-move QAP proposal kernel touching at most 4 sites per step:
+### 3.2 CPU & WebGPU Independent Multi-Replica Simulated Annealing (`16 KiB` Portable SRAM)
+Both CPU (`methyl_solver.rs`) and WebGPU (`methyl_gpu.rs` + `methyl_anneal.wgsl`) initialize independent annealing replicas (`56` replicas by default in `MethylAnnealConfig`, `64 × seeds` in CLI `nmrassign methyl`, with zero inter-replica temperature exchange — **independent multi-replica simulated annealing**, not parallel tempering) with intact `Leu`/`Val` geminal pairs and anneal each replica independently ($T_{\text{start}} \to T_{\text{end}}$) over a four-move QAP proposal kernel touching at most 4 sites per step:
 1. **Single-root compatible slot placement / 2-way swap**,
 2. **3D NOE-neighbor contact-guided extension** (proposing NOE partner $s_{\text{nb}}$ of anchored $s_{\text{anc}}$ onto 3D structural neighbor $m_{\text{nb}}$ of $\text{pos}[s_{\text{anc}}]$),
 3. **Slot- & contact-guided 4-body geminal residue swap** $(m_1, m_2) \leftrightarrow (m_3, m_4)$ (enabling barrier-free swaps of `Leu`/`Val` isopropyl pairs in `IlvRacemic` and `Ilvmat`),
@@ -112,6 +112,11 @@ Solvent-exposed degree-0 or symmetric methyls whose swap with an alternative sit
 ```text
 nmrassign methyl --pdb <model.pdb> --hmqc <2d_or_tsv> --noesy <3d_or_tsv> \
   --labeling ILV-proS|ILV-proR|ILV-racemic|ILVMAT|<custom> \
-  [--hmcmcbca <tsv>] [--engine gpu|cpu] [--seeds <N>] [-o <out.str>]
+  [--hmcmcbca <tsv>] [--engine auto|gpu|cpu] [--seeds <N>] [-o <out.str>]
 ```
-Accepts either processed 2D/3D spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf` — automatically picked via `pick_methyl_hmqc_2d` and `pick_methyl_noesy_3d`) or pre-picked `.tsv` peak lists, solves the contact-graph assignment on WebGPU (`gpu`, default with explicit error or requested CPU mode) or multi-threaded CPU (`cpu`), prints an assignment summary table, and writes NMR-STAR v3 output with per-methyl confidence annotations.
+Accepts either processed 2D/3D spectra (Bruker `pdata`, NMRPipe, Sparky `.ucsf` — automatically picked via `pick_methyl_hmqc_2d` and `pick_methyl_noesy_3d`) or pre-picked `.tsv` peak lists, solves the contact-graph assignment via independent multi-replica simulated annealing (`64 × seeds` replicas in CLI; `56` default in `MethylAnnealConfig`) on WebGPU with **automatic fallback to the multi-threaded CPU solver (emitting a stderr warning) whenever no WebGPU adapter is available** (`--engine cpu` runs directly on CPU), prints an assignment summary table, and writes NMR-STAR v3 output with `assignment_method = "structure_based_methyl_noe_graph"` and per-methyl confidence annotations.
+
+### 3.5 Synthetic Self-Consistency Benchmark Scope (`crates/nmr-gpu/tests/methyl_gpu_tests.rs`)
+- **CPU-vs-WebGPU normalized objective parity**: `1.20e-6` on Ubiquitin (`1D3Z`) and `3.45e-6` on Maltose-Binding Protein (`MBP`, `1EZP`, `370 aa`, `41 kDa`), within the `< 1e-4` gate.
+- **Synthetic self-consistency benchmark figures**: Across volumetric `25 Hz / 18 Hz` pseudo-Voigt simulations (`99.87%` [`772/773`]–`100.00%` picker recovery, `<= 2.77%` artifacts), WebGPU independent multi-replica annealing achieves **`92.86%` (`39/42`) accuracy / `100.00%` (`35/35`) HC-precision in `0.55 s`** on Ubiquitin `1D3Z` (`ILVMAT`) and **`93.62%` (`176/188`) accuracy / `100.00%` (`90/90`) HC-precision in `1.53 s`** on `MBP` `1EZP` (`ILVMAT`; `95.21%` acc / `100.00%` [`91/91`] HC-prec on CPU).
+- **Candid scope disclosure (`P0-2`)**: Because these tests simulate `HMQC-NOESY` intensities from the same `PDB` `dist_cc` matrix and $d_{\text{sat}} = 3.8\text{ \AA}$ saturation radius scored by the solver and extract noise-free `(CA, CB, CG)` `HMCM(CG)CBCA` relays from the reference BMRB table, they measure **synthetic self-consistency** rather than accuracy on experimental methyl NOESY peak lists against independent X-ray/cryo-EM structures (real-data methyl validation is tracked for Phase 11).
