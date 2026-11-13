@@ -527,6 +527,91 @@ fn test_phase12_cli_strict_cross_command_and_flag_guards() {
             ],
             "unsupported torsions output extension",
         ),
+        // 8. `--include-chi1` guards across `structure` (without `--torsion-db`), `assign`, and `pipeline`
+        (
+            &[
+                "structure",
+                "--star",
+                star.to_str().unwrap(),
+                "--include-chi1",
+            ],
+            "--include-chi1 requires --torsion-db",
+        ),
+        (
+            &[
+                "assign",
+                "--star",
+                star.to_str().unwrap(),
+                "--out",
+                dummy_out.to_str().unwrap(),
+                "--include-chi1",
+            ],
+            "post-assignment structure/report flag",
+        ),
+        (
+            &[
+                "pipeline",
+                "--star",
+                star.to_str().unwrap(),
+                "--out-dir",
+                dummy_out.to_str().unwrap(),
+                "--include-chi1",
+            ],
+            "not supported in `nmrassign pipeline`",
+        ),
+        // 9. `--ph` bounds on `sidechain` (`0.0..=14.0`) and rejection on `torsions` / `structure`
+        (
+            &[
+                "sidechain",
+                "--star",
+                star.to_str().unwrap(),
+                "--simulate",
+                "--aromatic",
+                "--ph",
+                "15.0",
+            ],
+            "invalid --ph",
+        ),
+        (
+            &[
+                "sidechain",
+                "--star",
+                star.to_str().unwrap(),
+                "--simulate",
+                "--aromatic",
+                "--ph",
+                "-0.5",
+            ],
+            "invalid --ph",
+        ),
+        (
+            &[
+                "sidechain",
+                "--star",
+                star.to_str().unwrap(),
+                "--simulate",
+                "--aromatic",
+                "--ph",
+                "NaN",
+            ],
+            "invalid --ph",
+        ),
+        (
+            &[
+                "torsions",
+                "--shifts",
+                star.to_str().unwrap(),
+                "-o",
+                dummy_out.to_str().unwrap(),
+                "--ph",
+                "6.5",
+            ],
+            "unknown torsions flag",
+        ),
+        (
+            &["structure", "--star", star.to_str().unwrap(), "--ph", "6.5"],
+            "unknown structure flag",
+        ),
     ];
 
     for (args, expected_substr) in cases {
@@ -548,6 +633,264 @@ fn test_phase12_cli_strict_cross_command_and_flag_guards() {
             stderr
         );
     }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_p12_pretag_sidechain_ph_include_chi1_default_rdc_free_and_dropped_rdc_warnings() {
+    let bin = nmrassign_bin();
+    let root = workspace_root();
+    let star_1d3z = root.join("data/benchmark/bmr17769.str");
+    let pdb_1d3z = root.join("data/pdb_refs/1d3z.pdb");
+    let rdc_1d3z = root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv");
+    let star_syn = root.join("data/fixtures/synthetic_ubiquitin.str");
+
+    let tmp = env::temp_dir().join(format!("nmr_p12_pretag_cli_{}", process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    // 1. `P1-2`: `nmrassign sidechain --aromatic --ph 6.5` succeeds and writes STAR
+    let out_sc_star = tmp.join("sidechain_ph65.str");
+    let run_sc = Command::new(&bin)
+        .args([
+            "sidechain",
+            "--star",
+            star_syn.to_str().unwrap(),
+            "--simulate",
+            "--aromatic",
+            "--ph",
+            "6.5",
+            "--runs",
+            "2",
+            "--steps",
+            "200",
+            "--out",
+            out_sc_star.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign sidechain --aromatic --ph 6.5");
+    assert!(
+        run_sc.status.success(),
+        "sidechain --aromatic --ph 6.5 failed: {}",
+        String::from_utf8_lossy(&run_sc.stderr)
+    );
+    assert!(out_sc_star.exists());
+
+    // 2. `P1-5`: `nmrassign torsions` omits CHI1 by default and emits CHI1 only with `--include-chi1`
+    let tsv_no_chi1 = tmp.join("tors_default.tsv");
+    let nef_no_chi1 = tmp.join("tors_default.nef");
+    let tsv_with_chi1 = tmp.join("tors_chi1.tsv");
+    let nef_with_chi1 = tmp.join("tors_chi1.nef");
+
+    assert!(Command::new(&bin)
+        .args([
+            "torsions",
+            "--shifts",
+            star_1d3z.to_str().unwrap(),
+            "-o",
+            tsv_no_chi1.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(Command::new(&bin)
+        .args([
+            "torsions",
+            "--shifts",
+            star_1d3z.to_str().unwrap(),
+            "-o",
+            nef_no_chi1.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(Command::new(&bin)
+        .args([
+            "torsions",
+            "--shifts",
+            star_1d3z.to_str().unwrap(),
+            "--include-chi1",
+            "-o",
+            tsv_with_chi1.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(Command::new(&bin)
+        .args([
+            "torsions",
+            "--shifts",
+            star_1d3z.to_str().unwrap(),
+            "--include-chi1",
+            "-o",
+            nef_with_chi1.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let txt_no_chi1 = fs::read_to_string(&tsv_no_chi1).unwrap();
+    let txt_with_chi1 = fs::read_to_string(&tsv_with_chi1).unwrap();
+    let any_chi1_default = txt_no_chi1
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("seq_id\t"))
+        .any(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            cols.get(7).copied().unwrap_or(".") != "."
+        });
+    let any_chi1_opt_in = txt_with_chi1
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("seq_id\t"))
+        .any(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            cols.get(7).copied().unwrap_or(".") != "."
+        });
+    assert!(
+        !any_chi1_default,
+        "default torsions TSV must omit all numeric chi1_deg values (all '.')"
+    );
+    assert!(
+        any_chi1_opt_in,
+        "--include-chi1 torsions TSV must emit numeric chi1_deg values on Good residues"
+    );
+    let doc_no_chi1 = read_nef_file(&nef_no_chi1).unwrap();
+    let doc_with_chi1 = read_nef_file(&nef_with_chi1).unwrap();
+    assert!(
+        doc_no_chi1.dihedral_restraint_lists[0]
+            .restraints
+            .iter()
+            .all(|r| r.name != "CHI1"),
+        "default torsions NEF must emit zero CHI1 restraints"
+    );
+    assert!(
+        doc_with_chi1.dihedral_restraint_lists[0]
+            .restraints
+            .iter()
+            .any(|r| r.name == "CHI1"),
+        "--include-chi1 torsions NEF must emit CHI1 restraints"
+    );
+
+    // 3. `P1-5` + `P1-6`: Default `structure --rdc` (omitting `--rdc-free-frac`) holds out 20% `Q_free`,
+    //    `--rdc-free-frac 0.0` explicitly disables holdout, and 22 RDC rows (20 valid + 2 unresolved)
+    //    print `warning: dropped 2 RDC restraint(s)` to stderr in BOTH `structure` and `report`!
+    let raw_rdc = fs::read_to_string(&rdc_1d3z).unwrap();
+    let mut rdc_22_lines: Vec<String> = Vec::new();
+    let mut valid_taken = 0usize;
+    for line in raw_rdc.lines() {
+        let tr = line.trim();
+        if tr.is_empty() || tr.starts_with('#') || tr.starts_with("medium_id") {
+            rdc_22_lines.push(line.to_string());
+            continue;
+        }
+        if tr.starts_with("bicelle_neutral\t") && valid_taken < 20 {
+            rdc_22_lines.push(line.to_string());
+            valid_taken += 1;
+        }
+    }
+    assert_eq!(valid_taken, 20);
+    // Append 2 unresolved rows: one out-of-range seq_id (999) and one unresolvable atom (NOTANATOM)
+    rdc_22_lines.push(
+        "bicelle_neutral\t999\tILE\tN\t999\tILE\tH\t1D_NH\t8.5000\t0.500\t21655.82\t0".to_string(),
+    );
+    rdc_22_lines.push(
+        "bicelle_neutral\t3\tILE\tN\t3\tILE\tNOTANATOM\t1D_NH\t-6.2000\t0.500\t21655.82\t0"
+            .to_string(),
+    );
+    let rdc_22_path = tmp.join("rdc_22_with_2_bad.tsv");
+    fs::write(&rdc_22_path, rdc_22_lines.join("\n") + "\n").unwrap();
+
+    // 3a. `structure --rdc` WITHOUT `--rdc-free-frac` -> finite `Q_free` + stderr `dropped 2 RDC`
+    let run_struct_def = Command::new(&bin)
+        .args([
+            "structure",
+            "--star",
+            star_1d3z.to_str().unwrap(),
+            "--pdb-ref",
+            pdb_1d3z.to_str().unwrap(),
+            "--rdc",
+            rdc_22_path.to_str().unwrap(),
+            "--torsion-db",
+            "--include-chi1",
+            "--engine",
+            "cpu",
+            "--conformers",
+            "1",
+            "--seed",
+            "42",
+        ])
+        .output()
+        .expect("run structure --rdc default free_frac + 22 rows");
+    assert!(
+        run_struct_def.status.success(),
+        "structure --rdc failed: {}",
+        String::from_utf8_lossy(&run_struct_def.stderr)
+    );
+    let stdout_def = String::from_utf8_lossy(&run_struct_def.stdout);
+    let stderr_def = String::from_utf8_lossy(&run_struct_def.stderr);
+    assert!(
+        stdout_def.contains("20 couplings") && !stdout_def.contains("Q_free=n/a"),
+        "expected 20 couplings and finite default 20% Q_free, got stdout:\n{stdout_def}"
+    );
+    assert!(
+        stderr_def.contains("warning: dropped 2 RDC restraint(s)"),
+        "expected stderr dropped-RDC warning in structure, got stderr:\n{stderr_def}"
+    );
+
+    // 3b. `structure --rdc --rdc-free-frac 0.0` explicitly disables holdout (`Q_free=n/a (0 free RDCs)`)
+    let run_struct_zero = Command::new(&bin)
+        .args([
+            "structure",
+            "--star",
+            star_1d3z.to_str().unwrap(),
+            "--pdb-ref",
+            pdb_1d3z.to_str().unwrap(),
+            "--rdc",
+            rdc_22_path.to_str().unwrap(),
+            "--rdc-free-frac",
+            "0.0",
+            "--engine",
+            "cpu",
+            "--conformers",
+            "1",
+            "--seed",
+            "42",
+        ])
+        .output()
+        .expect("run structure --rdc --rdc-free-frac 0.0");
+    assert!(run_struct_zero.status.success());
+    let stdout_zero = String::from_utf8_lossy(&run_struct_zero.stdout);
+    assert!(
+        stdout_zero.contains("Q_free=n/a (0 free RDCs)"),
+        "expected explicit --rdc-free-frac 0.0 to disable free holdout, got:\n{stdout_zero}"
+    );
+
+    // 3c. `report --pdb --rdc` on the same 22-row file also emits `warning: dropped 2 RDC restraint(s)` on stderr
+    let rep_html = tmp.join("rep_22.html");
+    let run_rep_22 = Command::new(&bin)
+        .args([
+            "report",
+            "--shifts",
+            star_1d3z.to_str().unwrap(),
+            "--pdb",
+            pdb_1d3z.to_str().unwrap(),
+            "--rdc",
+            rdc_22_path.to_str().unwrap(),
+            "--out",
+            rep_html.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run report --pdb --rdc with 22 rows");
+    assert!(run_rep_22.status.success());
+    let stderr_rep = String::from_utf8_lossy(&run_rep_22.stderr);
+    assert!(
+        stderr_rep.contains("warning: dropped 2 RDC restraint(s)"),
+        "expected stderr dropped-RDC warning in report, got stderr:\n{stderr_rep}"
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }

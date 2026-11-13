@@ -163,6 +163,7 @@ fn resolve_gpu_atom_slot_and_seg(
     let res_name = sequence.get(res_idx)?;
     let norm = normalize_rdc_atom_name(atom_name);
     let i = res_idx as u32;
+    let is_gly = res_name.eq_ignore_ascii_case("GLY");
     match norm {
         "N" => Some((7 * i, 2 * i)),
         "H" => {
@@ -173,11 +174,31 @@ fn resolve_gpu_atom_slot_and_seg(
             }
         }
         "CA" => Some((7 * i + 2, 2 * i)),
-        "HA" => Some((7 * i + 3, 2 * i + 1)),
+        "HA" => {
+            if is_gly {
+                None
+            } else {
+                Some((7 * i + 3, 2 * i + 1))
+            }
+        }
+        "HA2" => {
+            if is_gly {
+                Some((7 * i + 3, 2 * i + 1))
+            } else {
+                None
+            }
+        }
+        "HA3" => {
+            if is_gly {
+                Some((7 * i + 6, 2 * i + 1))
+            } else {
+                None
+            }
+        }
         "C" => Some((7 * i + 4, 2 * i + 1)),
         "O" => Some((7 * i + 5, 2 * i + 2)),
         "CB" => {
-            if res_name.eq_ignore_ascii_case("GLY") {
+            if is_gly {
                 None
             } else {
                 Some((7 * i + 6, 2 * i + 1))

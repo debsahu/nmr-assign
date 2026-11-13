@@ -529,6 +529,10 @@ pub struct SequenceRibbonState {
     pub variant_overrides: BTreeMap<usize, ResidueVariant>,
     /// Whether to display `ppm +- uncertainty` captions next to assigned nodes in the 2D diagram.
     pub show_ppm_captions: bool,
+    /// Optional sample pH in `[0.0, 14.0]` forwarded to Pelton `His` tautomer/protonation state inference.
+    pub sample_ph: Option<f64>,
+    /// Remembered numeric pH draft (`0.0..=14.0`) for the UI checkbox + `DragValue` control.
+    pub sample_ph_draft: f64,
     /// Screen-space hit rectangles of sequence ribbon cells from the most recent frame.
     pub last_ribbon_cell_rects: Vec<egui::Rect>,
     /// Screen-space hit rectangles of 2D atom nodes (`atom_name -> Rect`) from the most recent frame.
@@ -557,6 +561,8 @@ impl SequenceRibbonState {
             user_variant_overrides: BTreeMap::new(),
             variant_overrides: BTreeMap::new(),
             show_ppm_captions: true,
+            sample_ph: None,
+            sample_ph_draft: 6.5,
             last_ribbon_cell_rects: Vec::new(),
             last_atom_hit_rects: BTreeMap::new(),
             last_variant_button_rects: BTreeMap::new(),
@@ -620,6 +626,31 @@ impl SequenceRibbonState {
         }
     }
 
+    /// Configure optional sample pH (`0.0..=14.0`) used by [`Self::sync_inferred_variants_from_reference`].
+    pub fn set_sample_ph(&mut self, ph: Option<f64>) {
+        match ph.filter(|v| v.is_finite()) {
+            Some(v) => {
+                let clamped = v.clamp(0.0, 14.0);
+                self.sample_ph = Some(clamped);
+                self.sample_ph_draft = clamped;
+            }
+            None => {
+                self.sample_ph = None;
+            }
+        }
+    }
+
+    /// Recompute `auto_inferred_variants` directly from a [`SidechainWorkspaceInput`] snapshot.
+    pub fn sync_inferred_variants_from_workspace(&mut self, input: &SidechainWorkspaceInput<'_>) {
+        let mut r = Reference::new(input.sequence.to_vec(), input.seq_ids.to_vec());
+        for (&(k, ref atom), info) in &input.assigned_atoms {
+            if info.ppm.is_finite() {
+                r.shifts.insert((k, atom.clone()), info.ppm);
+            }
+        }
+        self.sync_inferred_variants_from_reference(&r);
+    }
+
     /// Recompute `auto_inferred_variants` from `reference` (`Cys` `13CB` redox regime + `His`
     /// Pelton `classify_his_state` `Resolved` tautomer), clearing stale auto-inferred entries
     /// whenever shifts change or abstain, WITHOUT ever overwriting `user_variant_overrides`.
@@ -631,6 +662,10 @@ impl SequenceRibbonState {
                 self.variant_overrides.remove(&k);
             }
         }
+
+        let valid_ph = self
+            .sample_ph
+            .filter(|v| v.is_finite() && (0.0..=14.0).contains(v));
 
         for (k, res_raw) in reference.sequence.iter().enumerate() {
             let Some(topo) = residue_topology(res_raw) else {
@@ -664,16 +699,13 @@ impl SequenceRibbonState {
                         ce1_ppm: reference.shifts.get(&(k, "CE1".to_string())).copied(),
                         he1_ppm: reference.shifts.get(&(k, "HE1".to_string())).copied(),
                         cb_ppm: reference.shifts.get(&(k, "CB".to_string())).copied(),
-                        sample_ph: None,
+                        sample_ph: valid_ph,
                         metal_coordinated_hint: false,
                     };
-                    let has_ring_evidence = ev.nd1_ppm.is_some()
-                        || ev.ne2_ppm.is_some()
-                        || ev.cg_ppm.is_some()
-                        || ev.cd2_ppm.is_some()
-                        || ev.ce1_ppm.is_some()
-                        || ev.he1_ppm.is_some();
-                    if has_ring_evidence {
+                    // P1-2: Require >= 1 imidazole 15N observation (`ND1` or `NE2`) before auto-applying
+                    // any static `His` tautomer/protonation state in the GUI inspector!
+                    let has_his_15n = ev.nd1_ppm.is_some() || ev.ne2_ppm.is_some();
+                    if has_his_15n {
                         let (state, conf) = classify_his_state(&ev);
                         if conf >= 0.75 {
                             if let HisStateClassification::Resolved(taut) = state {
@@ -1150,10 +1182,9 @@ impl SidechainInspectorPanel {
         };
 
         let mut variant_override: Option<(usize, ResidueVariant)> = None;
-        let active_variant = state.variant_for(res_idx);
         let applicable_variants = ResidueVariant::applicable_for_residue(topo.three_letter);
 
-        // Header bar: residue name, completeness badge, ppm toggle, and Cys/His variant selector
+        // Header bar: residue name, ppm toggle, optional sample pH control, and Cys/His variant selector
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new(format!(
@@ -1167,6 +1198,43 @@ impl SidechainInspectorPanel {
             ui.separator();
             ui.checkbox(&mut state.show_ppm_captions, "Show ppm");
 
+            ui.separator();
+            let mut ph_enabled = state.sample_ph.is_some();
+            let mut ph_changed = false;
+            if ui
+                .checkbox(&mut ph_enabled, "pH")
+                .on_hover_text(
+                    "Optional sample pH (0.0..=14.0) forwarded to Pelton His tautomer/protonation classification and aromatic ring assignment",
+                )
+                .changed()
+            {
+                if ph_enabled {
+                    state.sample_ph = Some(state.sample_ph_draft.clamp(0.0, 14.0));
+                } else {
+                    state.sample_ph = None;
+                }
+                ph_changed = true;
+            }
+            if ph_enabled {
+                let mut draft = state.sample_ph.unwrap_or(state.sample_ph_draft);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut draft)
+                            .range(0.0..=14.0)
+                            .speed(0.05)
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    state.set_sample_ph(Some(draft));
+                    ph_changed = true;
+                }
+            }
+            if ph_changed {
+                state.sync_inferred_variants_from_workspace(input);
+            }
+
+            let active_variant = state.variant_for(res_idx);
             if applicable_variants.len() > 1 {
                 ui.separator();
                 ui.label(egui::RichText::new("State:").weak());
@@ -1388,5 +1456,40 @@ mod tests {
         // 4. Clearing the explicit user override restores automatic inference cleanly.
         state.clear_user_variant_override(0);
         assert_eq!(state.variant_for(0), ResidueVariant::CysOxidized);
+    }
+
+    #[test]
+    fn p1_2_his_auto_infer_requires_15n_and_honors_sample_ph() {
+        let seq = vec!["HIS".to_string()];
+        let seq_ids = vec![10];
+
+        // 1. CH/CG-only His shifts (0 15N observations) MUST NOT auto-apply a static His variant!
+        let mut r_ch_only = Reference::new(seq.clone(), seq_ids.clone());
+        r_ch_only.shifts.insert((0, "CG".to_string()), 135.6);
+        r_ch_only.shifts.insert((0, "CD2".to_string()), 118.1);
+        r_ch_only.shifts.insert((0, "HE1".to_string()), 7.78);
+        let mut state = SequenceRibbonState::new();
+        state.sync_inferred_variants_from_reference(&r_ch_only);
+        assert_eq!(state.variant_for(0), ResidueVariant::Canonical);
+        assert!(state.auto_inferred_variants.is_empty());
+
+        // 2. Discordant alkaline pH = 7.8 on uncorroborated 175.5/172.8 + HE1=7.74 abstains when sample_ph is wired!
+        let mut r_disc = Reference::new(seq, seq_ids);
+        r_disc.shifts.insert((0, "ND1".to_string()), 175.5);
+        r_disc.shifts.insert((0, "NE2".to_string()), 172.8);
+        r_disc.shifts.insert((0, "CD2".to_string()), 118.9);
+        r_disc.shifts.insert((0, "HE1".to_string()), 7.74);
+
+        state.set_sample_ph(Some(4.5));
+        state.sync_inferred_variants_from_reference(&r_disc);
+        assert_eq!(state.variant_for(0), ResidueVariant::HisDoublyProtonated);
+
+        state.set_sample_ph(Some(7.8));
+        state.sync_inferred_variants_from_reference(&r_disc);
+        assert_eq!(
+            state.variant_for(0),
+            ResidueVariant::Canonical,
+            "sample_ph=7.8 must abstain on discordant uncorroborated His shifts in GUI inspector"
+        );
     }
 }

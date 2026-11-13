@@ -84,7 +84,9 @@ impl RdcBondType {
         let up = s.trim().to_ascii_uppercase();
         match up.as_str() {
             "1D_NH" | "NH" | "N-H" | "HN-N" => Ok(Self::NH),
-            "1D_CAHA" | "CAHA" | "CA-HA" => Ok(Self::CAHA),
+            "1D_CAHA" | "CAHA" | "CA-HA" | "CA-HA2" | "CA-HA3" | "CAHA2" | "CAHA3" => {
+                Ok(Self::CAHA)
+            }
             "1D_CACO" | "CACO" | "CA-C" | "CA-CO" | "CAC'" => Ok(Self::CACO),
             "1D_NC'" | "NC'" | "NC" | "N-C" | "N-C'" | "NCPRIME" | "1D_NCPRIME" => {
                 Ok(Self::NCPrime)
@@ -106,7 +108,7 @@ impl RdcBondType {
         let a2 = normalize_rdc_atom_name(atom_2);
         match (a1, a2, seq_2 - seq_1) {
             ("N", "H", 0) | ("H", "N", 0) => Ok(Self::NH),
-            ("CA", "HA", 0) | ("HA", "CA", 0) => Ok(Self::CAHA),
+            ("CA", "HA" | "HA2" | "HA3", 0) | ("HA" | "HA2" | "HA3", "CA", 0) => Ok(Self::CAHA),
             ("CA", "C", 0) | ("C", "CA", 0) => Ok(Self::CACO),
             ("N", "C", -1) | ("C", "N", 1) => Ok(Self::NCPrime),
             ("H", "C", -1) | ("C", "H", 1) => Ok(Self::HNCPrime),
@@ -126,8 +128,12 @@ pub fn normalize_rdc_atom_name(atom: &str) -> &str {
         "N"
     } else if t.eq_ignore_ascii_case("CA") {
         "CA"
-    } else if t.eq_ignore_ascii_case("HA") || t.eq_ignore_ascii_case("HA2") {
+    } else if t.eq_ignore_ascii_case("HA") {
         "HA"
+    } else if t.eq_ignore_ascii_case("HA2") || t.eq_ignore_ascii_case("1HA") {
+        "HA2"
+    } else if t.eq_ignore_ascii_case("HA3") || t.eq_ignore_ascii_case("2HA") {
+        "HA3"
     } else if t.eq_ignore_ascii_case("C")
         || t.eq_ignore_ascii_case("CO")
         || t.eq_ignore_ascii_case("C'")
@@ -178,6 +184,32 @@ impl RdcRestraint {
                 "invalid d_max_hz ({}) on {}:{}; must be finite and > 0",
                 self.d_max_hz, self.seq_id_1, self.atom_name_1
             ));
+        }
+        for (seq_id, res_name, atom_name) in [
+            (
+                self.seq_id_1,
+                self.res_name_1.trim(),
+                self.atom_name_1.as_str(),
+            ),
+            (
+                self.seq_id_2,
+                self.res_name_2.trim(),
+                self.atom_name_2.as_str(),
+            ),
+        ] {
+            if !res_name.is_empty() && res_name != "." {
+                let norm = normalize_rdc_atom_name(atom_name);
+                if (norm == "HA2" || norm == "HA3") && !res_name.eq_ignore_ascii_case("GLY") {
+                    return Err(format!(
+                        "atom '{norm}' on {seq_id}:{res_name} is only valid on GLY"
+                    ));
+                }
+                if norm == "HA" && res_name.eq_ignore_ascii_case("GLY") {
+                    return Err(format!(
+                        "ambiguous 'HA' on {seq_id}:GLY; specify prochiral HA2 or HA3"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -489,16 +521,58 @@ pub fn resolve_chain_rdc_atom(
     let &res_idx = seq_id_to_idx.get(&seq_id)?;
     let res: &PdbResidue = chain.residues.get(res_idx)?;
     let norm = normalize_rdc_atom_name(atom_name);
+    let is_gly = res.res_name.eq_ignore_ascii_case("GLY");
     match norm {
         "N" => Some((res_idx, 2 * res_idx, res.n)),
         "H" => res.h.map(|p| (res_idx, 2 * res_idx, p)),
         "CA" => Some((res_idx, 2 * res_idx, res.ca)),
-        "HA" => Some((res_idx, 2 * res_idx + 1, res.ha)),
+        "HA" => {
+            if is_gly {
+                None
+            } else {
+                Some((res_idx, 2 * res_idx + 1, res.ha))
+            }
+        }
+        "HA2" => {
+            if is_gly {
+                res.ha2.map(|p| (res_idx, 2 * res_idx + 1, p))
+            } else {
+                None
+            }
+        }
+        "HA3" => {
+            if is_gly {
+                res.ha3.map(|p| (res_idx, 2 * res_idx + 1, p))
+            } else {
+                None
+            }
+        }
         "C" => Some((res_idx, 2 * res_idx + 1, res.c)),
         "O" => Some((res_idx, 2 * res_idx + 2, res.o)),
         "CB" => res.cb.map(|p| (res_idx, 2 * res_idx + 1, p)),
         _ => None,
     }
+}
+
+/// Count RDC restraints across `media` whose endpoints fail to resolve to finite 3D coordinates on `chain`.
+pub fn count_unresolved_rdc_restraints(chain: &PdbChain, media: &[RdcMediumSet]) -> usize {
+    let mut seq_to_idx = BTreeMap::new();
+    for (idx, r) in chain.residues.iter().enumerate() {
+        seq_to_idx.insert(r.seq_id, idx);
+    }
+    let mut unresolved = 0usize;
+    for m in media {
+        for r in &m.restraints {
+            let ok_1 =
+                resolve_chain_rdc_atom(chain, &seq_to_idx, r.seq_id_1, &r.atom_name_1).is_some();
+            let ok_2 =
+                resolve_chain_rdc_atom(chain, &seq_to_idx, r.seq_id_2, &r.atom_name_2).is_some();
+            if !ok_1 || !ok_2 {
+                unresolved += 1;
+            }
+        }
+    }
+    unresolved
 }
 
 type ThinSvdM5 = (Vec<[f64; 5]>, [f64; 5], [[f64; 5]; 5]);

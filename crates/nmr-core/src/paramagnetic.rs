@@ -828,7 +828,7 @@ fn parse_paramagnetic_pdb_first_model(
             if r.atoms.contains_key("O") {
                 all_chain_donors.push(o_pos);
             }
-            let (rec_cb, rec_ha, rec_ha3, rec_qb) =
+            let (rec_cb, rec_ha, rec_ha2, rec_ha3, rec_qb) =
                 reconstruct_ca_substituents(&r.res_name, n, ca, c);
             let h_coord = if let Some(&(h_exp, _)) = r.atoms.get("H") {
                 Some(h_exp)
@@ -851,6 +851,7 @@ fn parse_paramagnetic_pdb_first_model(
             } else {
                 None
             };
+            let is_gly = r.res_name.eq_ignore_ascii_case("GLY");
             residues.push(PdbResidue {
                 seq_id: r.seq_id,
                 res_name: r.res_name.clone(),
@@ -864,7 +865,16 @@ fn parse_paramagnetic_pdb_first_model(
                     .or_else(|| r.atoms.get("HA2"))
                     .map(|x| x.0)
                     .unwrap_or(rec_ha),
-                ha3: r.atoms.get("HA3").map(|x| x.0).or(rec_ha3),
+                ha2: if is_gly {
+                    r.atoms.get("HA2").map(|x| x.0).or(rec_ha2)
+                } else {
+                    None
+                },
+                ha3: if is_gly {
+                    r.atoms.get("HA3").map(|x| x.0).or(rec_ha3)
+                } else {
+                    None
+                },
                 c,
                 o: o_pos,
                 cb: r.atoms.get("CB").map(|x| x.0).or(rec_cb),

@@ -168,10 +168,11 @@ fn eval_rdc_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dir_ha = safe_unit(u_bis * (-0.5810) + nrm * (-0.8139));
         let flg = res_flags[i];
         if (flg == 1u) {
-            let ha2 = cai + dir_cb * 1.090;
-            let ha3 = cai + dir_ha * 1.090;
-            scratch[r_off + 3u] = vec4<f32>((ha2 + ha3) * 0.5, 1.0);
-            scratch[r_off + 6u] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            // Explicit tetrahedral Gly pro-R HA2 (slot +3) and pro-S HA3 (slot +6, unused CB slot on Gly)
+            let ha2 = cai + dir_ha * 1.090;
+            let ha3 = cai + dir_cb * 1.090;
+            scratch[r_off + 3u] = vec4<f32>(ha2, 1.0);
+            scratch[r_off + 6u] = vec4<f32>(ha3, 1.0);
         } else {
             scratch[r_off + 3u] = vec4<f32>(cai + dir_ha * 1.090, 1.0);
             scratch[r_off + 6u] = vec4<f32>(cai + dir_cb * 1.526, 1.0);

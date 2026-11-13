@@ -1728,16 +1728,18 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
                 .with_coord_uncertainty(0.25),
         );
     }
-    assert!(
-        raw_pcs_obs.len() >= 45,
-        "expected >= 45 real experimental Yb3+ - La3+ amide 1H PCSs in Calbindin D9k, got {}",
+    assert_eq!(
+        raw_pcs_obs.len(),
+        51,
+        "expected all 51 matched experimental Yb3+ - La3+ amide 1H PCSs in Calbindin D9k, got {}",
         raw_pcs_obs.len()
     );
 
-    // Filter out core blind-sphere points for ModerateLanthanide Yb3+ (r_bleach = 5.5 Å) and select
-    // the dipolar outer-sphere shell (r >= 10.8 Å, matching Bertini et al. 2001 / Schmitz et al. 2008
-    // where local EF-hand II Yb3+ vs La3+ ionic-radius contraction 0.86 Å vs 1.03 Å and Fermi contact
-    // shifts vanish; N = 47 real experimental amide 1H PCSs).
+    // 1. Full-dataset evaluation (all N = 51 experimental Yb3+ - La3+ amide 1H PCSs):
+    //    Confirm that the default ModerateLanthanide Yb3+ blind-sphere gate (`r_bleach = 5.5 Å`,
+    //    `p_bleach >= 0.85`) removes 0/51 points (`pre_filtered.len() == 51`), and evaluate both
+    //    fixed-metal SVD (`Q ~ 0.297`) and 1.5 Å trust-radius VarPro (`Q ~ 0.286`) on all 51 points
+    //    without hiding any inner-shell exclusions.
     let pre_filtered = filter_pcs_observations_blind_zone(
         &raw_pcs_obs,
         &[la_metal_pos],
@@ -1745,16 +1747,54 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
         false,
         0.85,
     );
+    assert_eq!(
+        pre_filtered.len(),
+        51,
+        "Yb3+ blind-sphere filter (r_bleach = 5.5 Å, p_bleach >= 0.85) must remove 0 of 51 experimental points"
+    );
+
+    let full_svd = fit_pcs_tensor_svd(&pre_filtered, la_metal_pos).expect("Calbindin full-51 SVD");
+    let full_huber = fit_pcs_tensor_robust(&pre_filtered, la_metal_pos, 1.65, 25)
+        .expect("Calbindin full-51 Huber IRLS");
+    let full_varpro_1p5 = refine_metal_position_and_tensor(&pre_filtered, la_metal_pos, 1.5, 0.5)
+        .expect("Calbindin full-51 VarPro r_max=1.5 Å");
+    let full_shift_1p5 = v_dist(full_varpro_1p5.metal_pos_angstrom, la_metal_pos);
+
+    assert!(
+        full_svd.q_factor < 0.35 && full_varpro_1p5.q_factor < 0.32,
+        "expected full-51 Calbindin Yb3+-La3+ SVD Q < 0.35 and VarPro(1.5 Å) Q < 0.32, got svd={:.4}, varpro={:.4}",
+        full_svd.q_factor,
+        full_varpro_1p5.q_factor
+    );
+
+    // 2. Outer-sphere dipolar subset (`r >= 10.8 Å`, N = 47, excluding inner-shell EF-hand II
+    //    coordination residues `[25, 51, 67, 68]` where Yb3+ vs La3+ ionic-radius contraction
+    //    0.86 Å vs 1.03 Å and local reorganization perturb amide geometry; Bertini et al. 2001):
+    //    Note also the two-lab experimental caveat: paramagnetic Yb3+ shifts come from BMRB 15594
+    //    (298 K) while diamagnetic La3+ shifts come from BMRB 6699 (300 K). Because of this slight
+    //    inter-entry temperature/referencing offset + 1KSM crystal-vs-solution coordinates, an
+    //    unconstrained `r_max = 5.0 Å` search drifts `~3.08 Å` out of the EF-hand II Ca2+/Ln3+
+    //    site (`Q ~ 0.139`, inflated `dchi_ax ~ +12.4`), whereas the physical `r_max = 1.5 Å`
+    //    trust radius pins at the boundary (`|dx_M| = 1.500 Å`) and preserves physical literature
+    //    `dchi_ax ~ +8.9 x 10^-32 m^3` (`Q ~ 0.1578`).
+    let mut excluded_inner_seq_ids: Vec<i32> = pre_filtered
+        .iter()
+        .filter(|o| v_dist(o.coord_angstrom, la_metal_pos) < 10.8)
+        .map(|o| o.seq_id)
+        .collect();
+    excluded_inner_seq_ids.sort_unstable();
+    assert_eq!(
+        excluded_inner_seq_ids,
+        vec![25, 51, 67, 68],
+        "expected inner-shell r < 10.8 Å cut to exclude exactly EF-hand II residues [25, 51, 67, 68]"
+    );
+
     let filtered_obs: Vec<PcsObservation> = pre_filtered
         .iter()
         .copied()
         .filter(|o| v_dist(o.coord_angstrom, la_metal_pos) >= 10.8)
         .collect();
-    assert!(
-        filtered_obs.len() >= 45,
-        "expected >= 45 outer-sphere dipolar Yb3+-La3+ 1H PCSs (r >= 10.8 Å), got {}",
-        filtered_obs.len()
-    );
+    assert_eq!(filtered_obs.len(), 47);
 
     let svd_at_la = fit_pcs_tensor_svd(&filtered_obs, la_metal_pos).expect("Calbindin SVD at LA");
     let huber_at_la =
@@ -1772,13 +1812,31 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
         "negative search_radius_angstrom must return Err"
     );
     let refined_yb = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 1.5, 0.5)
-        .expect("Calbindin VarPro metal + DeltaChi refinement");
+        .expect("Calbindin VarPro metal + DeltaChi refinement (r_max=1.5 Å)");
     let metal_shift_ang = v_dist(refined_yb.metal_pos_angstrom, la_metal_pos);
 
+    let unconstrained_yb = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 5.0, 0.5)
+        .expect("Calbindin unconstrained VarPro diagnostic (r_max=5.0 Å)");
+    let unconstrained_shift_ang = v_dist(unconstrained_yb.metal_pos_angstrom, la_metal_pos);
+
     println!(
-        "Calbindin D9k Real Experimental Yb3+-La3+ 1H PCS (BMRB 15594 - BMRB 6699 vs 1KSM, N={} outer-sphere / {} total):\n  SVD@LA105:   dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n  Huber@LA105: dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n  VarPro Yb3+: dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |d_metal|={:.3} Å",
+        "Calbindin D9k Real Experimental Yb3+-La3+ 1H PCS (BMRB 15594 [298 K] - BMRB 6699 [300 K] vs 1KSM):\n  [Full Dataset N={} (r_bleach=5.5 Å removes 0 pts)]:\n    SVD@LA105:         dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105:       dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    VarPro(r<=1.5 Å):  dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n  [Outer-Sphere r>=10.8 Å Subset N={} (excludes inner-shell seq_ids {:?})]:\n    SVD@LA105:         dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105:       dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    VarPro(r<=1.5 Å):  dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å (trust-radius boundary pinned)\n    VarPro(r<=5.0 Å):  dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å (unconstrained EF-hand drift diagnostic)",
+        pre_filtered.len(),
+        full_svd.dchi_ax,
+        full_svd.dchi_rh,
+        full_svd.q_factor,
+        full_svd.rmsd_ppm,
+        full_huber.dchi_ax,
+        full_huber.dchi_rh,
+        full_huber.q_factor,
+        full_huber.rmsd_ppm,
+        full_varpro_1p5.dchi_ax,
+        full_varpro_1p5.dchi_rh,
+        full_varpro_1p5.q_factor,
+        full_varpro_1p5.rmsd_ppm,
+        full_shift_1p5,
         filtered_obs.len(),
-        raw_pcs_obs.len(),
+        excluded_inner_seq_ids,
         svd_at_la.dchi_ax,
         svd_at_la.dchi_rh,
         svd_at_la.q_factor,
@@ -1791,15 +1849,25 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
         refined_yb.dchi_rh,
         refined_yb.q_factor,
         refined_yb.rmsd_ppm,
-        metal_shift_ang
+        metal_shift_ang,
+        unconstrained_yb.dchi_ax,
+        unconstrained_yb.dchi_rh,
+        unconstrained_yb.q_factor,
+        unconstrained_yb.rmsd_ppm,
+        unconstrained_shift_ang,
     );
 
     assert!(
         svd_at_la.q_factor < 0.25 && refined_yb.q_factor < 0.25 && huber_at_la.q_factor < 0.25,
-        "real experimental Calbindin D9k Yb3+ PCS Q-factor exceeded 0.25: svd Q={:.4}, refined Q={:.4}, huber Q={:.4}",
+        "real experimental Calbindin D9k outer-sphere Yb3+ PCS Q-factor exceeded 0.25: svd Q={:.4}, refined Q={:.4}, huber Q={:.4}",
         svd_at_la.q_factor,
         refined_yb.q_factor,
         huber_at_la.q_factor
+    );
+    assert!(
+        unconstrained_yb.q_factor < refined_yb.q_factor && unconstrained_shift_ang > 2.0,
+        "expected unconstrained r_max=5.0 Å search to drift > 2.0 Å (got |dx_M|={unconstrained_shift_ang:.3} Å, Q={:.4})",
+        unconstrained_yb.q_factor
     );
     assert!(
         svd_at_la.dchi_ax > 7.5

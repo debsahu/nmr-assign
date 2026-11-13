@@ -4290,6 +4290,12 @@ impl Mol3dViewerPanel {
         let count = parsed.len();
         self.set_restraints(parsed);
         self.flush_pending_updates();
+        if self.restraint_overlay.unresolved_count > 0 {
+            self.status_banner = format!(
+                "Loaded {count} restraints ({} unresolved atom selector(s) skipped)",
+                self.restraint_overlay.unresolved_count
+            );
+        }
         Ok(count)
     }
 
@@ -4628,11 +4634,20 @@ impl Mol3dViewerPanel {
                 {
                     self.restraints_only_dirty = true;
                 }
-                ui.small(format!(
-                    "RMS {:.2} Å | Max {:.2} Å",
-                    self.restraint_overlay.rms_violation_angstrom,
-                    self.restraint_overlay.max_violation_angstrom
-                ));
+                if self.restraint_overlay.unresolved_count > 0 {
+                    ui.small(format!(
+                        "RMS {:.2} Å | Max {:.2} Å | Unresolved: {}",
+                        self.restraint_overlay.rms_violation_angstrom,
+                        self.restraint_overlay.max_violation_angstrom,
+                        self.restraint_overlay.unresolved_count
+                    ));
+                } else {
+                    ui.small(format!(
+                        "RMS {:.2} Å | Max {:.2} Å",
+                        self.restraint_overlay.rms_violation_angstrom,
+                        self.restraint_overlay.max_violation_angstrom
+                    ));
+                }
             });
         }
 

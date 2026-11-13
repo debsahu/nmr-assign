@@ -162,9 +162,9 @@ impl HisTautomer {
 }
 
 /// High-level chemical regime of a histidine imidazole ring:
-/// - `Resolved(HisTautomer)`: well-resolved Pelton $\tau$ (`Ne2H`), $\pi$ (`Nd1H`), or cationic (`DoublyProtonated`) state.
-/// - `FastExchangeUncommitted`: dynamic neutral $\tau \leftrightarrow \pi$ fast tautomer averaging (`ND1`/`NE2` coalesced into `~195–225 ppm`).
-/// - `MetalCoordinatedCandidate`: `Zn(II)`/`Cu(I)`/`Cu(II)`-ligated imidazole (`=N–M` shifted `20–45 ppm` upfield from `249.5 ppm` with neutral `HE1`, or basic-pH contradiction; Barraud et al., *J. Biomol. NMR* 53, 95–108, 2012).
+/// - `Resolved(HisTautomer)`: well-resolved Pelton $\tau$ (`Ne2H`), $\pi$ (`Nd1H`), or cationic (`DoublyProtonated`) state anchored by $\ge 1$ imidazole `15N` observation (`ND1` or `NE2`) and passing the $\chi^2_{0.95}$ goodness-of-fit gate on both the winning pure state and the Pelton titration manifold.
+/// - `FastExchangeUncommitted`: dynamic neutral $\tau \leftrightarrow \pi$ or neutral $\leftrightarrow$ cationic fast exchange (`ND1`/`NE2` coalesced into intermediate positions), `15N`-unanchored (`CH`/`CG`-only) ring evidence, or $\chi^2_{0.95}$ out-of-distribution misfit (`conf < 0.50`).
+/// - `MetalCoordinatedCandidate`: `Zn(II)`/`Cu(I)`/`Cu(II)`-ligated imidazole detected either by `15N` shifts outside Pelton's neutral$\leftrightarrow$cation simplex envelope with orthogonal residual `d_orth_shift^2 >= 5.5`, or by an unprotonated `=N–M` nitrogen (`>= 194.0 ppm`, `f_prot_n >= 0.35`) paired with an unprotonated `HE1`/`CE1` `CH`-contradiction and large orthogonal Mahalanobis residual off `[0, 1]^2` (`d_orth_joint^2 >= 12.0` or `d_orth_shift^2 >= 8.0`; Barraud et al., *J. Biomol. NMR* 53, 95–108, 2012).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HisStateClassification {
     Resolved(HisTautomer),
@@ -255,11 +255,16 @@ struct PeltonManifoldFit {
     f_prot_map: f64,
     /// MAP neutral tau (`Ne2H`) fraction `p_tau in [0.0, 1.0]` within the `(1 - f_prot)` neutral pool.
     p_tau_map: f64,
+    /// Shift-only minimizer `(f_prot, p_tau)` on `[0, 1]^2`.
+    f_prot_shift: f64,
+    p_tau_shift: f64,
     /// Minimum orthogonal Mahalanobis residual `d_orth^2` off the pure shift manifold `(f_prot, p_tau) in [0, 1]^2`.
     d_orth_sq_shift: f64,
     /// Minimum joint `(shift + Henderson-Hasselbalch pH)` residual `d_orth_joint^2` off `[0, 1]^2`.
     d_orth_sq_joint: f64,
-    ///Protonated fraction `f_prot_n` implied by `(ND1, NE2)` alone (`None` if neither `15N` is observed).
+    /// Minimum orthogonal Mahalanobis residual `d_orth_n^2` of `(ND1, NE2)` off the `15N` Pelton simplex.
+    d_orth_sq_n: Option<f64>,
+    /// Protonated fraction `f_prot_n` implied by `(ND1, NE2)` alone (`None` if neither `15N` is observed).
     f_prot_n_only: Option<f64>,
     /// Number of observed ring shift channels among `(ND1, NE2, CG, CD2, HD2, CE1, HE1)`.
     n_ring_obs: usize,
@@ -333,6 +338,8 @@ fn fit_pelton_titration_manifold(ev: &HisTautomerEvidence) -> PeltonManifoldFit 
     };
 
     let mut d_orth_sq_shift = f64::INFINITY;
+    let mut f_prot_shift = 0.0;
+    let mut p_tau_shift = 0.64;
     let mut d_orth_sq_joint = f64::INFINITY;
     let mut best_map_obj = f64::INFINITY;
     let mut f_prot_map = 0.0;
@@ -341,6 +348,7 @@ fn fit_pelton_titration_manifold(ev: &HisTautomerEvidence) -> PeltonManifoldFit 
     let has_n = ev.nd1_ppm.is_some() || ev.ne2_ppm.is_some();
     let mut best_n_sq = f64::INFINITY;
     let mut best_f_n = 0.0;
+    let mut best_p_n = 0.64;
 
     // Coarse 41 x 41 grid (`0.025` step) + local coordinate refinement (`0.005` step) on `[0, 1]^2`
     const N_GRID: usize = 40;
@@ -351,6 +359,8 @@ fn fit_pelton_titration_manifold(ev: &HisTautomerEvidence) -> PeltonManifoldFit 
             let (d_shift, d_joint, map_obj, d_n) = eval_point(f, p);
             if d_shift < d_orth_sq_shift {
                 d_orth_sq_shift = d_shift;
+                f_prot_shift = f;
+                p_tau_shift = p;
             }
             if d_joint < d_orth_sq_joint {
                 d_orth_sq_joint = d_joint;
@@ -363,26 +373,36 @@ fn fit_pelton_titration_manifold(ev: &HisTautomerEvidence) -> PeltonManifoldFit 
             if has_n && d_n < best_n_sq {
                 best_n_sq = d_n;
                 best_f_n = f;
+                best_p_n = p;
             }
         }
     }
 
-    let (f_c, p_c) = (f_prot_map, p_tau_map);
-    for di in -5..=5_i32 {
-        let f = (f_c + (di as f64) * 0.005).clamp(0.0, 1.0);
-        for dj in -5..=5_i32 {
-            let p = (p_c + (dj as f64) * 0.005).clamp(0.0, 1.0);
-            let (d_shift, d_joint, map_obj, d_n) = eval_point(f, p);
-            d_orth_sq_shift = d_orth_sq_shift.min(d_shift);
-            d_orth_sq_joint = d_orth_sq_joint.min(d_joint);
-            if map_obj < best_map_obj {
-                best_map_obj = map_obj;
-                f_prot_map = f;
-                p_tau_map = p;
-            }
-            if has_n && d_n < best_n_sq {
-                best_n_sq = d_n;
-                best_f_n = f;
+    for &(f_c, p_c) in &[
+        (f_prot_map, p_tau_map),
+        (f_prot_shift, p_tau_shift),
+        (best_f_n, best_p_n),
+    ] {
+        for di in -5..=5_i32 {
+            let f = (f_c + (di as f64) * 0.005).clamp(0.0, 1.0);
+            for dj in -5..=5_i32 {
+                let p = (p_c + (dj as f64) * 0.005).clamp(0.0, 1.0);
+                let (d_shift, d_joint, map_obj, d_n) = eval_point(f, p);
+                if d_shift < d_orth_sq_shift {
+                    d_orth_sq_shift = d_shift;
+                    f_prot_shift = f;
+                    p_tau_shift = p;
+                }
+                d_orth_sq_joint = d_orth_sq_joint.min(d_joint);
+                if map_obj < best_map_obj {
+                    best_map_obj = map_obj;
+                    f_prot_map = f;
+                    p_tau_map = p;
+                }
+                if has_n && d_n < best_n_sq {
+                    best_n_sq = d_n;
+                    best_f_n = f;
+                }
             }
         }
     }
@@ -390,8 +410,11 @@ fn fit_pelton_titration_manifold(ev: &HisTautomerEvidence) -> PeltonManifoldFit 
     PeltonManifoldFit {
         f_prot_map,
         p_tau_map,
+        f_prot_shift,
+        p_tau_shift,
         d_orth_sq_shift,
         d_orth_sq_joint,
+        d_orth_sq_n: has_n.then_some(best_n_sq),
         f_prot_n_only: has_n.then_some(best_f_n),
         n_ring_obs,
     }
@@ -521,14 +544,14 @@ pub fn classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, 
         return (HisStateClassification::FastExchangeUncommitted, 0.0);
     }
 
-    // 1c. Single non-diagnostic CH shift without any Pelton tautomer-diagnostic nucleus (`ND1`, `NE2`, `CG`):
-    //     e.g. `HE1` alone or `CD2` alone cannot establish a static imidazole state -> abstain (`conf < 0.50`).
-    let has_pelton_taut_nucleus =
-        ev.nd1_ppm.is_some() || ev.ne2_ppm.is_some() || ev.cg_ppm.is_some();
-    if !has_pelton_taut_nucleus && fit.n_ring_obs < 2 {
+    // 1c. Require >= 1 imidazole `15N` observation (`ND1` or `NE2`) to emit `Resolved`:
+    //     `CH`-only (`CD2`, `HD2`, `CE1`, `HE1`) or `CG`-only ring shifts without a direct `15N`
+    //     anchor cannot separate fast tautomer/protonation exchange or ring-current shifts from a
+    //     static Pelton tautomer -> abstain (`FastExchangeUncommitted`, `conf <= 0.45 < 0.50`).
+    if ev.nd1_ppm.is_none() && ev.ne2_ppm.is_none() {
         return (
             HisStateClassification::FastExchangeUncommitted,
-            raw_post.min(0.42),
+            raw_post.min(0.45),
         );
     }
 
@@ -599,19 +622,41 @@ pub fn classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, 
         return (HisStateClassification::FastExchangeUncommitted, conf);
     }
 
-    // 4. Pure-state Mahalanobis out-of-distribution (OOD) misfit guard (`d_M^2` & `|z|_max` against
-    //    winning pure state `Ne2H`, `Nd1H`, or `DoublyProtonated`; ~99.9% chi-square gate + 3.5-sigma
-    //    channel guard + joint shift/pH discordance gate when `CE1` does not corroborate protonation).
+    // 4. Pure-state & Pelton-chord chi2_0.95 goodness-of-fit gate (`d_M^2` against winning pure state
+    //    `Ne2H`, `Nd1H`, or `DoublyProtonated`, plus orthogonal chord residual `d_orth_sq_shift` and
+    //    `15N` simplex residual `d_orth_sq_n`): any statistically significant misfit (`p < 0.05`) or
+    //    uncorroborated strong `sample_ph` discordance abstains as `FastExchangeUncommitted` (`conf < 0.50`).
+    #[inline]
+    const fn chi2_95_critical(df: usize) -> f64 {
+        match df {
+            0 | 1 => 3.8415,
+            2 => 5.9915,
+            3 => 7.8147,
+            4 => 9.4877,
+            5 => 11.0705,
+            6 => 12.5916,
+            _ => 14.0671,
+        }
+    }
+
     let (d_m_sq, z_max, m_obs) = pure_his_state_mahalanobis(ev, best_taut);
-    let chi2_999 = match m_obs {
-        0 | 1 => 10.83,
-        2 => 13.82,
-        3 => 16.27,
-        4 => 18.47,
-        5 => 20.52,
-        6 => 22.46,
-        _ => 24.32,
+    let chi2_95_pure = chi2_95_critical(m_obs);
+
+    let active_chord_params = if fit.n_ring_obs <= 2 {
+        1usize
+    } else {
+        let f_interior = usize::from(fit.f_prot_shift > 0.05 && fit.f_prot_shift < 0.95);
+        let p_interior = usize::from(
+            fit.f_prot_shift < 0.95 && fit.p_tau_shift > 0.05 && fit.p_tau_shift < 0.95,
+        );
+        f_interior + p_interior
     };
+    let df_orth = fit.n_ring_obs.saturating_sub(active_chord_params).max(1);
+    let chi2_95_orth = chi2_95_critical(df_orth);
+    let n_pair_orth_exceeded = ev.nd1_ppm.is_some()
+        && ev.ne2_ppm.is_some()
+        && fit.d_orth_sq_n.is_some_and(|dn| dn > 3.8415);
+
     let pure_f_prot = if best_taut == HisTautomer::DoublyProtonated {
         1.0
     } else {
@@ -621,44 +666,61 @@ pub fn classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, 
         .sample_ph
         .filter(|v| v.is_finite())
         .map_or(0.0, |ph| hh_pka_zscore(pure_f_prot, ph));
-    let d_m_joint_pure = d_m_sq + 0.65 * z_ph_pure * z_ph_pure;
-    let uncorroborated_joint_contradiction = best_taut == HisTautomer::DoublyProtonated
-        && d_m_sq >= 7.5
-        && d_m_joint_pure >= 18.0
-        && !ev.ce1_ppm.is_some_and(|c| c <= 136.5);
-    if m_obs > 0 && (z_max > 3.50 || d_m_sq > chi2_999 || uncorroborated_joint_contradiction) {
-        let excess = (d_m_sq - chi2_999)
+    let vp_best = best_taut.variant_priors();
+    let protonation_diagnostic_c = match best_taut {
+        HisTautomer::DoublyProtonated => {
+            ev.ce1_ppm.is_some_and(|c| c <= 136.5)
+                || ev.cg_ppm.is_some_and(|g| (128.3..=131.5).contains(&g))
+        }
+        HisTautomer::Ne2H | HisTautomer::Nd1H => {
+            ev.cg_ppm
+                .is_some_and(|v| ((v - vp_best.cg.0) / vp_best.cg.1).abs() <= 1.5)
+                || ev
+                    .cd2_ppm
+                    .is_some_and(|v| ((v - vp_best.cd2.0) / vp_best.cd2.1).abs() <= 1.5)
+                || ev
+                    .ce1_ppm
+                    .is_some_and(|v| ((v - vp_best.ce1.0) / vp_best.ce1.1).abs() <= 1.5)
+        }
+    };
+    let corroborated_pure_n_and_c = ev
+        .nd1_ppm
+        .is_some_and(|v| ((v - vp_best.nd1.0) / vp_best.nd1.1).abs() <= 1.5)
+        && ev
+            .ne2_ppm
+            .is_some_and(|v| ((v - vp_best.ne2.0) / vp_best.ne2.1).abs() <= 1.5)
+        && protonation_diagnostic_c;
+    let ph_shift_contradiction = !corroborated_pure_n_and_c && z_ph_pure > 2.5 && d_m_sq >= 2.5;
+
+    if m_obs > 0
+        && (z_max > 3.50
+            || d_m_sq > chi2_95_pure
+            || fit.d_orth_sq_shift > chi2_95_orth
+            || n_pair_orth_exceeded
+            || ph_shift_contradiction)
+    {
+        let excess = (d_m_sq - chi2_95_pure)
+            .max(fit.d_orth_sq_shift - chi2_95_orth)
+            .max(fit.d_orth_sq_n.map_or(0.0, |dn| dn - 3.8415))
             .max((z_max - 3.50) * 4.0)
-            .max((d_m_joint_pure - 18.0) * 0.5)
+            .max(if ph_shift_contradiction {
+                z_ph_pure - 2.5
+            } else {
+                0.0
+            })
             .max(0.0);
-        let conf = (0.46 * (-0.08 * excess).exp()).clamp(0.18, 0.47);
+        let conf = (0.45 * (-0.08 * excess).exp()).clamp(0.18, 0.46);
         return (HisStateClassification::FastExchangeUncommitted, conf);
     }
 
-    // Mild Mahalanobis attenuation within the pure state's valid acceptance region
-    let chi2_95 = match m_obs {
-        0 | 1 => 3.84,
-        2 => 5.99,
-        3 => 7.81,
-        4 => 9.49,
-        5 => 11.07,
-        6 => 12.59,
-        _ => 14.07,
-    };
-    let ood_atten = if d_m_sq > chi2_95 {
-        (-0.045 * (d_m_sq - chi2_95)).exp()
-    } else {
-        1.0
-    };
-    let _ = fit.n_ring_obs;
-    let calibrated = (raw_post * ood_atten).clamp(0.0, 1.0);
+    let calibrated = raw_post.clamp(0.0, 1.0);
     (HisStateClassification::Resolved(best_taut), calibrated)
 }
 
 /// Classify histidine `HisTautomer` and compute its calibrated static-tautomer posterior in `[0.0, 1.0]`
 /// from Pelton et al. (1993) `(ND1, NE2, CG)` shifts and corroborating `CD2`/`CE1`/`HE1`/`CB` shifts.
-/// When `classify_his_state` detects `FastExchangeUncommitted` or `MetalCoordinatedCandidate`,
-/// confidence is capped `< 0.80` (`<= 0.55` on fast exchange) so callers never over-commit.
+/// When `classify_his_state` detects `FastExchangeUncommitted` (`conf < 0.50`) or
+/// `MetalCoordinatedCandidate` (`conf < 0.60`), callers never over-commit non-static states.
 pub fn classify_his_tautomer(ev: &HisTautomerEvidence) -> (HisTautomer, f64) {
     let (_probs, best_taut, _raw_post) = raw_pelton_three_state_posterior(ev);
     let (_state, calibrated_conf) = classify_his_state(ev);

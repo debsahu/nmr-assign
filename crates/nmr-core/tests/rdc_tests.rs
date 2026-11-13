@@ -5,13 +5,13 @@ use nmr_core::dihedrals::predict_dihedrals;
 use nmr_core::nef::{read_nef_str, write_nef_str, NefDocument, NefRdcRestraintList};
 use nmr_core::nmrstar::read_star_all_atoms;
 use nmr_core::noesy::{
-    parse_pdb_first_model, simulate_noesy_peaks, v_norm, v_scale, v_sub, NoesySimConfig, PdbChain,
-    PdbResidue,
+    parse_pdb_first_model, reconstruct_ca_substituents, simulate_noesy_peaks, v_dot, v_norm,
+    v_scale, v_sub, NoesySimConfig, PdbChain, PdbResidue,
 };
 use nmr_core::rdc::{
-    calc_rdc_from_unit_vec, cornilescu_q, evaluate_rdc_validation, fit_saupe_tensor_svd,
-    format_rdc_tsv, parse_rdc_tsv_str, partition_rdc_free_set, rdc_q_is_better, read_rdc_tsv,
-    saupe_matrix_from_pas, RdcBondType, RdcMediumSet, RdcRestraint,
+    calc_rdc_from_unit_vec, cornilescu_q, count_unresolved_rdc_restraints, evaluate_rdc_validation,
+    fit_saupe_tensor_svd, format_rdc_tsv, parse_rdc_tsv_str, partition_rdc_free_set,
+    rdc_q_is_better, read_rdc_tsv, saupe_matrix_from_pas, RdcBondType, RdcMediumSet, RdcRestraint,
 };
 use nmr_core::report::{generate_quality_report_html, ReportInput};
 use nmr_core::rng::Rng;
@@ -81,8 +81,28 @@ fn synthesize_all5_rdc_medium(
                 is_free: i % 5 == 4,
             });
         }
-        // 2. 1D_CAHA
-        {
+        // 2. 1D_CAHA (explicit pro-R HA2 and pro-S HA3 on GLY; chiral HA on non-GLY)
+        if r.res_name.eq_ignore_ascii_case("GLY") {
+            let dmax = RdcBondType::CAHA.default_d_max_hz();
+            for (aname, pos_opt) in [("HA2", r.ha2), ("HA3", r.ha3)] {
+                let ha_pos = pos_opt.expect("GLY must carry explicit HA2 and HA3 coordinates");
+                let u = v_scale(v_sub(ha_pos, r.ca), 1.0 / v_norm(v_sub(ha_pos, r.ca)));
+                restraints.push(RdcRestraint {
+                    medium_id: medium_id.to_string(),
+                    seq_id_1: r.seq_id,
+                    res_name_1: r.res_name.clone(),
+                    atom_name_1: "CA".to_string(),
+                    seq_id_2: r.seq_id,
+                    res_name_2: r.res_name.clone(),
+                    atom_name_2: aname.to_string(),
+                    bond_type: RdcBondType::CAHA,
+                    d_obs_hz: calc_rdc_from_unit_vec(u, dmax, s_true),
+                    sigma_hz: 1.0,
+                    d_max_hz: dmax,
+                    is_free: i % 6 == 5 && aname == "HA2",
+                });
+            }
+        } else {
             let u = v_scale(v_sub(r.ha, r.ca), 1.0 / v_norm(v_sub(r.ha, r.ca)));
             let dmax = RdcBondType::CAHA.default_d_max_hz();
             restraints.push(RdcRestraint {
@@ -529,6 +549,7 @@ fn test_adversarial_rdc_parsers_svd_rank_deficiency_and_nan_q_safety() {
             h: Some([ang.cos(), ang.sin(), 0.0]),
             ca: [1.45, 0.0, 0.0],
             ha: [1.45, 1.09, 0.0],
+            ha2: None,
             ha3: None,
             c: [2.5, 0.0, 0.0],
             o: [2.5, -1.2, 0.0],
@@ -778,5 +799,130 @@ fn test_experimental_ubiquitin_1d3z_cross_validated_rdc_refinement() {
     assert!(
         rmsd_after < rmsd_before && mean_after < mean_before,
         "RDC refinement must lower backbone RMSD to 1D3Z vs NOE-only folding (lowE: {rmsd_before:.3} -> {rmsd_after:.3} A; mean: {mean_before:.3} -> {mean_after:.3} A)"
+    );
+}
+
+#[test]
+fn test_p1_6_gly_explicit_ha2_ha3_tetrahedral_rdc_and_unresolved_counts() {
+    let root = workspace_root();
+    let pdb_1d3z = parse_pdb_first_model(root.join("data/pdb_refs/1d3z.pdb")).unwrap();
+    let gly10 = pdb_1d3z
+        .residues
+        .iter()
+        .find(|r| r.seq_id == 10 && r.res_name == "GLY")
+        .expect("1D3Z GLY 10");
+    let ha2_exp = gly10.ha2.expect("1D3Z GLY 10 HA2");
+    let ha3_exp = gly10.ha3.expect("1D3Z GLY 10 HA3");
+
+    // Verify reconstructed GLY HA2 (pro-R) and HA3 (pro-S) match IUPAC 1D3Z stereochemistry (< 0.03 A)
+    let (_, _, rec_ha2, rec_ha3, _) =
+        reconstruct_ca_substituents("GLY", gly10.n, gly10.ca, gly10.c);
+    let d_ha2 = v_norm(v_sub(rec_ha2.unwrap(), ha2_exp));
+    let d_ha3 = v_norm(v_sub(rec_ha3.unwrap(), ha3_exp));
+    assert!(
+        d_ha2 < 0.03 && d_ha3 < 0.03,
+        "GLY 10 pro-R HA2 / pro-S HA3 reconstruction drifted: d_ha2={d_ha2:.4} A, d_ha3={d_ha3:.4} A"
+    );
+
+    // Verify tetrahedral bond lengths (~1.09 A) and H-C-H angle (~109.5 deg, NOT bisector midpoint!)
+    let v2 = v_sub(rec_ha2.unwrap(), gly10.ca);
+    let v3 = v_sub(rec_ha3.unwrap(), gly10.ca);
+    let r2 = v_norm(v2);
+    let r3 = v_norm(v3);
+    let cos_ang = v_dot(v2, v3) / (r2 * r3);
+    let ang_deg = cos_ang.clamp(-1.0, 1.0).acos().to_degrees();
+    assert!((r2 - 1.090).abs() < 1e-6 && (r3 - 1.090).abs() < 1e-6);
+    assert!(
+        (107.5..=111.5).contains(&ang_deg),
+        "GLY HA2-CA-HA3 angle must be tetrahedral (~109.5 deg), got {ang_deg:.2} deg"
+    );
+
+    // Verify RdcRestraint::validate rejects HA3/HA2 on ALA and ambiguous HA on GLY
+    let (_, _, chain) = build_diverse_test_chain();
+    let s_true = saupe_matrix_from_pas(14.0, 0.28, [30.0, 50.0, 105.0]);
+    let med = synthesize_all5_rdc_medium(&chain, "m_gly", &s_true);
+    let fit = fit_saupe_tensor_svd(&chain, &med).unwrap();
+    assert!(
+        fit.q_work < 1e-12,
+        "exact synthetic Saupe SVD with GLY CA-HA2 & CA-HA3 must give Q_work < 1e-12, got {}",
+        fit.q_work
+    );
+    assert_eq!(
+        count_unresolved_rdc_restraints(&chain, std::slice::from_ref(&med)),
+        0
+    );
+
+    let bad_ala_ha3 = RdcRestraint {
+        medium_id: "m_gly".to_string(),
+        seq_id_1: 1,
+        res_name_1: "ALA".to_string(),
+        atom_name_1: "CA".to_string(),
+        seq_id_2: 1,
+        res_name_2: "ALA".to_string(),
+        atom_name_2: "HA3".to_string(),
+        bond_type: RdcBondType::CAHA,
+        d_obs_hz: 5.0,
+        sigma_hz: 1.0,
+        d_max_hz: RdcBondType::CAHA.default_d_max_hz(),
+        is_free: false,
+    };
+    assert!(
+        bad_ala_ha3.validate().is_err(),
+        "HA3 on ALA must fail RdcRestraint::validate"
+    );
+
+    let bad_gly_ha = RdcRestraint {
+        medium_id: "m_gly".to_string(),
+        seq_id_1: 10,
+        res_name_1: "GLY".to_string(),
+        atom_name_1: "CA".to_string(),
+        seq_id_2: 10,
+        res_name_2: "GLY".to_string(),
+        atom_name_2: "HA".to_string(),
+        bond_type: RdcBondType::CAHA,
+        d_obs_hz: 5.0,
+        sigma_hz: 1.0,
+        d_max_hz: RdcBondType::CAHA.default_d_max_hz(),
+        is_free: false,
+    };
+    assert!(
+        bad_gly_ha.validate().is_err(),
+        "ambiguous HA on GLY must fail RdcRestraint::validate"
+    );
+
+    // Wildcard residue name "." with HA3 on non-GLY residue (seq_id=1 MET) + out-of-range seq_id=999
+    // must NOT resolve and must be counted by `count_unresolved_rdc_restraints`.
+    let mut med_with_drops = med;
+    med_with_drops.restraints.push(RdcRestraint {
+        medium_id: "m_gly".to_string(),
+        seq_id_1: 1,
+        res_name_1: ".".to_string(),
+        atom_name_1: "CA".to_string(),
+        seq_id_2: 1,
+        res_name_2: ".".to_string(),
+        atom_name_2: "HA3".to_string(),
+        bond_type: RdcBondType::CAHA,
+        d_obs_hz: 4.0,
+        sigma_hz: 1.0,
+        d_max_hz: RdcBondType::CAHA.default_d_max_hz(),
+        is_free: false,
+    });
+    med_with_drops.restraints.push(RdcRestraint {
+        medium_id: "m_gly".to_string(),
+        seq_id_1: 999,
+        res_name_1: "ILE".to_string(),
+        atom_name_1: "N".to_string(),
+        seq_id_2: 999,
+        res_name_2: "ILE".to_string(),
+        atom_name_2: "H".to_string(),
+        bond_type: RdcBondType::NH,
+        d_obs_hz: 7.0,
+        sigma_hz: 0.5,
+        d_max_hz: RdcBondType::NH.default_d_max_hz(),
+        is_free: false,
+    });
+    assert_eq!(
+        count_unresolved_rdc_restraints(&chain, &[med_with_drops]),
+        2
     );
 }

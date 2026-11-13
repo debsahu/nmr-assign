@@ -22,7 +22,7 @@ use nmr_core::rdc::{
 use nmr_core::rng::Rng;
 use nmr_core::structure::{
     build_backbone_from_torsions, evaluate_rdc_torsion_energy_and_gradients_fixed_saupe,
-    superpose_chain_onto, StructureConformer,
+    refine_ensemble_with_rdcs, superpose_chain_onto, StructureConformer,
 };
 use nmr_gpu::rdc_gpu::{
     evaluate_rdc_batch_gpu, refine_ensemble_with_rdcs_gpu, RdcGpuConformerInput,
@@ -56,7 +56,27 @@ fn build_all5_medium(chain: &PdbChain, medium_id: &str, s_mat: &[[f64; 3]; 3]) -
                 is_free: i % 5 == 4,
             });
         }
-        {
+        if r.res_name.eq_ignore_ascii_case("GLY") {
+            let dmax = RdcBondType::CAHA.default_d_max_hz();
+            for (aname, pos_opt) in [("HA2", r.ha2), ("HA3", r.ha3)] {
+                let ha_pos = pos_opt.expect("GLY must carry explicit HA2 and HA3 coordinates");
+                let u = v_scale(v_sub(ha_pos, r.ca), 1.0 / v_norm(v_sub(ha_pos, r.ca)));
+                restraints.push(RdcRestraint {
+                    medium_id: medium_id.to_string(),
+                    seq_id_1: r.seq_id,
+                    res_name_1: r.res_name.clone(),
+                    atom_name_1: "CA".to_string(),
+                    seq_id_2: r.seq_id,
+                    res_name_2: r.res_name.clone(),
+                    atom_name_2: aname.to_string(),
+                    bond_type: RdcBondType::CAHA,
+                    d_obs_hz: calc_rdc_from_unit_vec(u, dmax, s_mat),
+                    sigma_hz: 1.0,
+                    d_max_hz: dmax,
+                    is_free: false,
+                });
+            }
+        } else {
             let u = v_scale(v_sub(r.ha, r.ca), 1.0 / v_norm(v_sub(r.ha, r.ca)));
             let dmax = RdcBondType::CAHA.default_d_max_hz();
             restraints.push(RdcRestraint {
@@ -323,6 +343,21 @@ fn test_rdc_gpu_ensemble_refinement_ubiquitin_1d3z() {
     let ordered_mask: Vec<bool> = (0..l).map(|i| i < 71).collect();
     let rmsd_before = superpose_chain_onto(&mut c0_before, &pdb_1d3z, Some(&ordered_mask));
 
+    // Matched-input, matched-`free_seed = 4242` CPU vs WebGPU comparison on the exact same 6 starting conformers
+    let (cpu_refined, cpu_val_after) = refine_ensemble_with_rdcs(
+        &init_confs,
+        &seq,
+        &seq_ids,
+        &noe_adrs,
+        &fw_dihs,
+        &media,
+        0.55,
+        110,
+    )
+    .expect("CPU 1D3Z RDC ensemble refinement on matched inputs");
+    let mut c0_cpu_after = cpu_refined[0].chain.clone();
+    let cpu_rmsd_after = superpose_chain_onto(&mut c0_cpu_after, &pdb_1d3z, Some(&ordered_mask));
+
     let (refined, val_after) = refine_ensemble_with_rdcs_gpu(
         &engine,
         &init_confs,
@@ -340,10 +375,26 @@ fn test_rdc_gpu_ensemble_refinement_ubiquitin_1d3z() {
     let rmsd_after = superpose_chain_onto(&mut c0_after, &pdb_1d3z, Some(&ordered_mask));
 
     println!(
-        "[RDC GPU 1D3Z REFINEMENT] Q_free: {:.4} -> {:.4} (Q_work={:.4}) | Ordered BB RMSD (1..71): {:.3} A -> {:.3} A",
-        val_before.overall_q_free, val_after.overall_q_free, val_after.overall_q_work, rmsd_before, rmsd_after
+        "[RDC MATCHED-INPUT 1D3Z REFINEMENT (free_seed=4242, 6 conformers, w_rdc=0.55, iters=110)]"
+    );
+    println!(
+        "  Initial           : Q_work={:.4}, Q_free={:.4} | Ordered BB RMSD (1..71) = {:.3} A",
+        val_before.overall_q_work, val_before.overall_q_free, rmsd_before
+    );
+    println!(
+        "  CPU (f64 L-BFGS)  : Q_work={:.4}, Q_free={:.4} | Ordered BB RMSD (1..71) = {:.3} A",
+        cpu_val_after.overall_q_work, cpu_val_after.overall_q_free, cpu_rmsd_after
+    );
+    println!(
+        "  WebGPU + polish   : Q_work={:.4}, Q_free={:.4} | Ordered BB RMSD (1..71) = {:.3} A",
+        val_after.overall_q_work, val_after.overall_q_free, rmsd_after
     );
 
+    assert!(
+        cpu_val_after.overall_q_free < 0.25 && cpu_rmsd_after < rmsd_before,
+        "CPU matched-input RDC refinement failed gate: Q_free={:.4}, RMSD={cpu_rmsd_after:.3} A",
+        cpu_val_after.overall_q_free
+    );
     assert!(
         val_after.overall_q_free < 0.25 && val_after.overall_q_free < val_before.overall_q_free,
         "GPU RDC refinement failed Q_free gate: {:.4} -> {:.4}",

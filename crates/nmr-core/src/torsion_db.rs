@@ -1,7 +1,7 @@
 //! Strictly post-assignment backbone & sidechain `(phi, psi, chi1)` torsion-angle predictor
 //! from secondary chemical shifts (`HN, N, CA, CB, C', HA`) and sequence similarity, with
 //! unlabelled global chemical-shift offset estimation, Berjanskii-Wishart `RCI` / `S^2`
-//! flexibility classification, and the 5-layer `HomologFirewall` (`Q5`).
+//! flexibility classification, and the 4-layer `HomologFirewall` + Audit Digest & Identity Stratification (`Q5`).
 //!
 //! Provenance: Clean-room implementation from peer-reviewed NMR and structural bioinformatics literature:
 //! - Shen, Y., Vernon, R., Baker, D. & Bax, A. (2008). "Consistent blind protein structure
@@ -247,7 +247,8 @@ impl GlobalShiftOffsets {
     }
 }
 
-/// 5-Layer `HomologFirewall` (`Q5`) query descriptor for strict non-homologous evaluation.
+/// 4-Layer `HomologFirewall` (`L1`–`L4` exclusion filters + Audit Digest & Identity Stratification, `Q5`)
+/// query descriptor for strict non-homologous evaluation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HomologFirewallQuery {
     /// PDB IDs of the query protein, mutants, or complexes (`Layer 1`).
@@ -303,10 +304,27 @@ pub struct TorsionPredictionReport {
     pub nearest_template_seq_identities: Vec<f64>,
 }
 
+/// Export options controlling whether sidechain `chi1` rotamer consensus predictions (`~33.6 deg`
+/// circular MAE from backbone chemical shifts alone) are included alongside `(phi, psi)` restraints.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorsionExportOptions {
+    /// When `false` (default), omit `CHI1` from dihedral restraint exports, TSV/JSON outputs, and NEF lists.
+    pub include_chi1: bool,
+}
+
 impl TorsionPredictionReport {
-    /// Convert predicted torsions into `DihedralRestraint` rows for `nmr_core::structure` folding.
-    /// Only `Good` residues actively restrain `(phi, psi)`; half-widths are `max(2 * std, 15 deg)`.
+    /// Convert predicted torsions into `DihedralRestraint` rows for `nmr_core::structure` folding,
+    /// omitting `chi1` by default (`include_chi1 = false`).
+    /// Only `Good` residues actively restrain `(phi, psi)`; half-widths are `max(2 * std, 20 deg)`.
     pub fn to_dihedral_restraints(&self) -> Vec<DihedralRestraint> {
+        self.to_dihedral_restraints_with_options(TorsionExportOptions::default())
+    }
+
+    /// Convert predicted torsions into `DihedralRestraint` rows with explicit [`TorsionExportOptions`].
+    pub fn to_dihedral_restraints_with_options(
+        &self,
+        opts: TorsionExportOptions,
+    ) -> Vec<DihedralRestraint> {
         let mut out = Vec::with_capacity(self.residues.len());
         for r in &self.residues {
             let is_good = r.class == TorsionPredictionClass::Good
@@ -327,6 +345,22 @@ impl TorsionPredictionReport {
             } else {
                 0.0
             };
+            let (chi1_deg, chi1_err_deg, restrained_chi1) = if opts.include_chi1 && is_good {
+                match r.chi1_deg {
+                    Some(c1) => (
+                        Some(c1),
+                        Some(
+                            r.chi1_std_deg
+                                .map(|s| (2.0 * s).clamp(18.0, 35.0))
+                                .unwrap_or(24.0),
+                        ),
+                        true,
+                    ),
+                    None => (None, None, false),
+                }
+            } else {
+                (None, None, false)
+            };
             out.push(DihedralRestraint {
                 seq_id: r.seq_id,
                 res_name: r.res_name.clone(),
@@ -343,16 +377,34 @@ impl TorsionPredictionReport {
                 },
                 restrained_phi: is_good,
                 restrained_psi: is_good,
+                chi1_deg,
+                chi1_err_deg,
+                restrained_chi1,
             });
         }
         out
     }
 
-    /// Export `Good` `(phi, psi, chi1)` torsion restraints to a canonical NEF v1.1 `NefDihedralRestraintList`.
+    /// Export `Good` `(phi, psi)` torsion restraints to a canonical NEF v1.1 `NefDihedralRestraintList`
+    /// (`CHI1` is omitted by default; use [`Self::to_nef_dihedral_restraint_list_with_options`] to opt in).
     pub fn to_nef_dihedral_restraint_list(
         &self,
         chain_code: &str,
         list_name: &str,
+    ) -> NefDihedralRestraintList {
+        self.to_nef_dihedral_restraint_list_with_options(
+            chain_code,
+            list_name,
+            TorsionExportOptions::default(),
+        )
+    }
+
+    /// Export `Good` `(phi, psi[, chi1])` torsion restraints to a canonical NEF v1.1 `NefDihedralRestraintList`.
+    pub fn to_nef_dihedral_restraint_list_with_options(
+        &self,
+        chain_code: &str,
+        list_name: &str,
+        opts: TorsionExportOptions,
     ) -> NefDihedralRestraintList {
         let mut rows = Vec::new();
         let n = self.residues.len();
@@ -403,23 +455,25 @@ impl TorsionPredictionReport {
                     ));
                 }
             }
-            if let Some(chi1) = r.chi1_deg {
-                let hw = r
-                    .chi1_std_deg
-                    .map(|s| (2.0 * s).clamp(18.0, 35.0))
-                    .unwrap_or(24.0);
-                let idx = rows.len() + 1;
-                if let Some(cr) = NefDihedralRestraint::chi1(
-                    idx,
-                    idx,
-                    chain_code,
-                    r.seq_id,
-                    &r.res_name,
-                    chi1,
-                    hw,
-                    1.0,
-                ) {
-                    rows.push(cr);
+            if opts.include_chi1 {
+                if let Some(chi1) = r.chi1_deg {
+                    let hw = r
+                        .chi1_std_deg
+                        .map(|s| (2.0 * s).clamp(18.0, 35.0))
+                        .unwrap_or(24.0);
+                    let idx = rows.len() + 1;
+                    if let Some(cr) = NefDihedralRestraint::chi1(
+                        idx,
+                        idx,
+                        chain_code,
+                        r.seq_id,
+                        &r.res_name,
+                        chi1,
+                        hw,
+                        1.0,
+                    ) {
+                        rows.push(cr);
+                    }
                 }
             }
         }
@@ -1302,7 +1356,8 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
     best_overall_tm.clamp(0.0, 1.0)
 }
 
-/// Apply all 5 layers of `HomologFirewall` (`Q5`), returning `(retained_chains, excluded_records, exclusion_list_sha256, max_retained_seq_id)`.
+/// Apply all 4 exclusion layers (`L1`–`L4`) of `HomologFirewall` plus Audit Digest & Identity Stratification (`Q5`),
+/// returning `(retained_chains, excluded_records, exclusion_list_sha256, max_retained_seq_id)`.
 pub fn apply_homolog_firewall<'a>(
     db: &'a TorsionDb,
     query_seq1: &[u8],
@@ -1442,7 +1497,7 @@ pub fn apply_homolog_firewall<'a>(
         }
     }
 
-    // Layer 5: Deterministic SHA-256 digest of sorted excluded template manifest
+    // Audit Digest & Identity Stratification: Deterministic SHA-256 digest of sorted excluded template manifest
     excluded.sort_by(|a, b| a.chain_key.cmp(&b.chain_key));
     let mut manifest = String::new();
     for ex in &excluded {
@@ -1658,6 +1713,38 @@ pub fn compute_rci_and_s2(sec_shifts: &[[Option<f64>; 6]]) -> (Vec<f64>, Vec<f64
     (rci_out, s2_out)
 }
 
+/// Canonical Ramachandran `(phi, psi)` conformational basin (Zimmerman et al., *Macromolecules* 1977;
+/// Lovell et al., *Proteins* 2003) used for non-tautological ground-truth basin-mismatch evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RamaBasin {
+    /// Right-handed helical (`alpha_R` / `3_10` / `pi`) basin (`phi < 0 deg`, `-115 deg <= psi < 50 deg`).
+    AlphaR,
+    /// Extended `beta` / `PPII` basin (`phi < 0 deg`, `psi >= 50 deg` or `psi < -115 deg`).
+    BetaPpii,
+    /// Left-handed `alpha_L` basin (`phi >= 0 deg`, `-60 deg <= psi <= 120 deg`).
+    AlphaL,
+    /// Positive-`phi` extended / `gamma'` / `Gly`-like basin (`phi >= 0 deg` outside `AlphaL`).
+    PositivePhiOther,
+}
+
+/// Partition `(phi_deg, psi_deg)` on `[-180, 180)^2` into its canonical [`RamaBasin`].
+#[inline]
+pub fn classify_rama_basin(phi_deg: f64, psi_deg: f64) -> RamaBasin {
+    let phi = wrap_deg(phi_deg);
+    let psi = wrap_deg(psi_deg);
+    if phi < 0.0 {
+        if (-115.0..50.0).contains(&psi) {
+            RamaBasin::AlphaR
+        } else {
+            RamaBasin::BetaPpii
+        }
+    } else if (-60.0..=120.0).contains(&psi) {
+        RamaBasin::AlphaL
+    } else {
+        RamaBasin::PositivePhiOther
+    }
+}
+
 /// Check whether `(phi_deg, psi_deg)` is a Lovell et al. (*Proteins* 2003) Ramachandran basin outlier.
 pub fn is_ramachandran_outlier(res_name: &str, phi_deg: f64, psi_deg: f64) -> bool {
     let up = res_name.trim().to_ascii_uppercase();
@@ -1691,7 +1778,7 @@ fn classify_torsion_ss(phi_deg: f64, psi_deg: f64) -> SecondaryStructure {
 }
 
 /// Predict `(phi, psi, chi1)` torsions from assigned chemical shifts using the embedded `TorsionDb`
-/// without benchmark firewall exclusions (production mode; Layer 5 audit SHA-256 still recorded).
+/// without benchmark firewall exclusions (production mode; Audit Digest & Identity Stratification SHA-256 still recorded).
 pub fn predict_torsions(shifts: &Reference) -> TorsionPredictionReport {
     predict_torsions_with_db(
         TorsionDb::embedded(),
@@ -1700,8 +1787,8 @@ pub fn predict_torsions(shifts: &Reference) -> TorsionPredictionReport {
     )
 }
 
-/// Predict `(phi, psi, chi1)` torsions from assigned chemical shifts enforcing all 5 layers
-/// of `HomologFirewall` (`Q5`).
+/// Predict `(phi, psi, chi1)` torsions from assigned chemical shifts enforcing all 4 exclusion layers
+/// (`L1`–`L4`) plus Audit Digest & Identity Stratification of `HomologFirewall` (`Q5`).
 pub fn predict_torsions_with_firewall(
     shifts: &Reference,
     firewall: &HomologFirewallQuery,
@@ -2109,8 +2196,17 @@ pub fn predict_torsions_with_db(
     }
 }
 
-/// Format a `TorsionPredictionReport` as canonical TSV text including provenance & firewall SHA-256 header.
+/// Format a `TorsionPredictionReport` as canonical TSV text (`CHI1` omitted by default; pass
+/// [`TorsionExportOptions`] via [`format_torsions_tsv_with_options`] to include `chi1`).
 pub fn format_torsions_tsv(report: &TorsionPredictionReport) -> String {
+    format_torsions_tsv_with_options(report, TorsionExportOptions::default())
+}
+
+/// Format a `TorsionPredictionReport` as canonical TSV text with explicit [`TorsionExportOptions`].
+pub fn format_torsions_tsv_with_options(
+    report: &TorsionPredictionReport,
+    opts: TorsionExportOptions,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# exclusion_list_sha256: {}\n# excluded_templates: {}\n# max_retained_seq_identity: {:.4}\n",
@@ -2140,6 +2236,11 @@ pub fn format_torsions_tsv(report: &TorsionPredictionReport) -> String {
             SecondaryStructure::Sheet => "E",
             SecondaryStructure::Coil => "C",
         };
+        let (chi1_v, chi1_sd) = if opts.include_chi1 {
+            (r.chi1_deg, r.chi1_std_deg)
+        } else {
+            (None, None)
+        };
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.3}\t{:.2}\t{}\n",
             r.seq_id,
@@ -2149,8 +2250,8 @@ pub fn format_torsions_tsv(report: &TorsionPredictionReport) -> String {
             fmt_opt(r.phi_std_deg),
             fmt_opt(r.psi_deg),
             fmt_opt(r.psi_std_deg),
-            fmt_opt(r.chi1_deg),
-            fmt_opt(r.chi1_std_deg),
+            fmt_opt(chi1_v),
+            fmt_opt(chi1_sd),
             r.rci,
             r.rci_s2,
             r.consensus_fraction,
@@ -2164,7 +2265,19 @@ pub fn write_torsions_tsv(
     path: impl AsRef<Path>,
     report: &TorsionPredictionReport,
 ) -> Result<(), String> {
-    fs::write(path.as_ref(), format_torsions_tsv(report)).map_err(|e| {
+    write_torsions_tsv_with_options(path, report, TorsionExportOptions::default())
+}
+
+pub fn write_torsions_tsv_with_options(
+    path: impl AsRef<Path>,
+    report: &TorsionPredictionReport,
+    opts: TorsionExportOptions,
+) -> Result<(), String> {
+    fs::write(
+        path.as_ref(),
+        format_torsions_tsv_with_options(report, opts),
+    )
+    .map_err(|e| {
         format!(
             "failed to write torsions TSV '{}': {e}",
             path.as_ref().display()
@@ -2173,5 +2286,22 @@ pub fn write_torsions_tsv(
 }
 
 pub fn format_torsions_json(report: &TorsionPredictionReport) -> Result<String, String> {
-    serde_json::to_string_pretty(report).map_err(|e| format!("JSON serialization error: {e}"))
+    format_torsions_json_with_options(report, TorsionExportOptions::default())
+}
+
+pub fn format_torsions_json_with_options(
+    report: &TorsionPredictionReport,
+    opts: TorsionExportOptions,
+) -> Result<String, String> {
+    if opts.include_chi1 {
+        serde_json::to_string_pretty(report).map_err(|e| format!("JSON serialization error: {e}"))
+    } else {
+        let mut sanitized = report.clone();
+        for r in &mut sanitized.residues {
+            r.chi1_deg = None;
+            r.chi1_std_deg = None;
+        }
+        serde_json::to_string_pretty(&sanitized)
+            .map_err(|e| format!("JSON serialization error: {e}"))
+    }
 }

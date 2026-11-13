@@ -1168,6 +1168,7 @@ pub struct RestraintOverlayBuild {
     pub satisfied_count: usize,
     pub minor_violation_count: usize,
     pub major_violation_count: usize,
+    pub unresolved_count: usize,
     pub max_violation_angstrom: f64,
     pub rms_violation_angstrom: f64,
 }
@@ -1485,7 +1486,6 @@ impl AtomCoordLookup {
         let mut count = 0usize;
         let mut heavy_count = 0usize;
         let mut heavy_rel = [0u16; 12];
-        let mut fallback_ca_rel: Option<u16> = None;
 
         for (rel_i, entry) in candidates.iter().enumerate() {
             if let Some(ch) = sel.chain_id {
@@ -1499,13 +1499,12 @@ impl AtomCoordLookup {
                     out_rel[count] = rel_i as u16;
                     count += 1;
                 }
-            } else if count == 0 {
-                if matches_heavy_parent_fallback(target, aname) && heavy_count < heavy_rel.len() {
-                    heavy_rel[heavy_count] = rel_i as u16;
-                    heavy_count += 1;
-                } else if fallback_ca_rel.is_none() && aname == "CA" {
-                    fallback_ca_rel = Some(rel_i as u16);
-                }
+            } else if count == 0
+                && matches_heavy_parent_fallback(target, aname)
+                && heavy_count < heavy_rel.len()
+            {
+                heavy_rel[heavy_count] = rel_i as u16;
+                heavy_count += 1;
             }
         }
 
@@ -1515,10 +1514,6 @@ impl AtomCoordLookup {
         if heavy_count > 0 {
             out_rel[..heavy_count].copy_from_slice(&heavy_rel[..heavy_count]);
             return heavy_count;
-        }
-        if let Some(ca_i) = fallback_ca_rel {
-            out_rel[0] = ca_i;
-            return 1;
         }
         0
     }
@@ -1695,6 +1690,7 @@ impl AtomCoordLookup {
                 ..
             }) = anchor_best
             else {
+                out.unresolved_count += 1;
                 continue;
             };
             let mut ensemble_inv6_sum = 0.0f64;
@@ -1706,6 +1702,7 @@ impl AtomCoordLookup {
                 }
             }
             if valid_models == 0 || ensemble_inv6_sum <= 0.0 {
+                out.unresolved_count += 1;
                 continue;
             }
             let mean_inv6 = ensemble_inv6_sum / (valid_models as f64);
@@ -1881,4 +1878,60 @@ pub fn parse_distance_restraints_tsv(text: &str) -> Result<Vec<DistanceRestraint
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p1_6_unresolved_atom_selector_never_silently_substitutes_ca() {
+        let lookup = AtomCoordLookup::from_atom_tuples([
+            ('A', 1, Some(0), "ALA", "N", [0.0, 0.0, 0.0]),
+            ('A', 1, Some(0), "ALA", "CA", [1.46, 0.0, 0.0]),
+            ('A', 1, Some(0), "ALA", "CB", [1.95, 1.42, 0.0]),
+            ('A', 2, Some(1), "GLY", "N", [3.20, 0.0, 0.0]),
+            ('A', 2, Some(1), "GLY", "CA", [4.65, 0.0, 0.0]),
+        ]);
+
+        // 1. Invalid atom selector `NOTANATOM` must emit 0 cylinders and `unresolved_count == 1`!
+        let bad = vec![DistanceRestraint3d::pair(
+            0,
+            RestraintKind::Noe,
+            RestraintAtomSelector::new(Some('A'), 1, "NOTANATOM"),
+            RestraintAtomSelector::new(Some('A'), 2, "N"),
+            1.8,
+            5.0,
+        )];
+        let built_bad = lookup.evaluate_restraints(&bad, &RestraintFilterConfig::default());
+        assert_eq!(built_bad.cylinders.len(), 0);
+        assert_eq!(built_bad.evaluated.len(), 0);
+        assert_eq!(built_bad.unresolved_count, 1);
+
+        // 2. Wrong sidechain atom for residue (`HB` on `GLY`, which has no `CB`) must also be unresolved!
+        let gly_hb = vec![DistanceRestraint3d::pair(
+            1,
+            RestraintKind::Noe,
+            RestraintAtomSelector::new(Some('A'), 1, "N"),
+            RestraintAtomSelector::new(Some('A'), 2, "HB"),
+            1.8,
+            5.0,
+        )];
+        let built_gly_hb = lookup.evaluate_restraints(&gly_hb, &RestraintFilterConfig::default());
+        assert_eq!(built_gly_hb.cylinders.len(), 0);
+        assert_eq!(built_gly_hb.unresolved_count, 1);
+
+        // 3. Valid heavy-parent fallback (`HB` -> `CB` on `ALA`, `HA2` -> `CA` on `GLY`) still resolves cleanly!
+        let ok = vec![DistanceRestraint3d::pair(
+            2,
+            RestraintKind::Noe,
+            RestraintAtomSelector::new(Some('A'), 1, "HB"),
+            RestraintAtomSelector::new(Some('A'), 2, "HA2"),
+            1.8,
+            5.0,
+        )];
+        let built_ok = lookup.evaluate_restraints(&ok, &RestraintFilterConfig::default());
+        assert_eq!(built_ok.cylinders.len(), 1);
+        assert_eq!(built_ok.unresolved_count, 0);
+    }
 }

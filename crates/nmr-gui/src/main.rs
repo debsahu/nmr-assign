@@ -792,6 +792,29 @@ fn merge_gui_aromatic_with_options(
     sc_priors: &SidechainPriors,
     overwrite_curated_rings: bool,
 ) -> Reference {
+    merge_gui_aromatic_with_ph(
+        working_ref,
+        prior_user_ref,
+        prior_amb,
+        pred_conf,
+        arom_peaks,
+        sc_priors,
+        overwrite_curated_rings,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_gui_aromatic_with_ph(
+    working_ref: &Reference,
+    prior_user_ref: Option<&Reference>,
+    prior_amb: &BTreeMap<(usize, String), u8>,
+    pred_conf: Option<&BTreeMap<usize, f64>>,
+    arom_peaks: &[Peak],
+    sc_priors: &SidechainPriors,
+    overwrite_curated_rings: bool,
+    sample_ph: Option<f64>,
+) -> Reference {
     const RING_ATOMS: &[&str] = &[
         "CG", "CD1", "CD2", "HD1", "HD2", "CE1", "CE2", "HE1", "HE2", "CZ", "HZ", "CE3", "HE3",
         "CZ2", "HZ2", "CZ3", "HZ3", "CH2", "HH2", "ND1", "NE1", "NE2",
@@ -823,7 +846,10 @@ fn merge_gui_aromatic_with_options(
         }
     }
 
-    let cfg = AromaticSolverConfig::default();
+    let cfg = AromaticSolverConfig {
+        sample_ph: sample_ph.filter(|v| v.is_finite() && (0.0..=14.0).contains(v)),
+        ..AromaticSolverConfig::default()
+    };
 
     if overwrite_curated_rings {
         let mut backbone_for_arom = curated_ref.clone();
@@ -2213,7 +2239,9 @@ impl NmrWorkbenchApp {
         self.seq_ids = ref_data.seq_ids.clone();
         self.octet_app
             .set_loaded_protein_sequence(self.sequence.clone());
+        let saved_ph = self.sidechain_ribbon_state.sample_ph;
         self.sidechain_ribbon_state = SequenceRibbonState::new();
+        self.sidechain_ribbon_state.set_sample_ph(saved_ph);
         self.sidechain_ribbon_state
             .sync_inferred_variants_from_reference(&ref_data);
         self.reference = Some(ref_data);
@@ -4299,7 +4327,7 @@ impl NmrWorkbenchApp {
         };
 
         if !loaded_arom_peaks.is_empty() {
-            working_ref = merge_gui_aromatic_with_options(
+            working_ref = merge_gui_aromatic_with_ph(
                 &working_ref,
                 prior_user_ref.as_ref(),
                 &prior_amb,
@@ -4307,6 +4335,7 @@ impl NmrWorkbenchApp {
                 &loaded_arom_peaks,
                 &self.sidechain_priors,
                 self.overwrite_curated_rings,
+                self.sidechain_ribbon_state.sample_ph,
             );
         }
 
@@ -5724,7 +5753,9 @@ impl NmrWorkbenchApp {
                 self.pred_ref = None;
                 self.pred_conf.clear();
                 self.pred_ambiguity_codes.clear();
+                let saved_ph = self.sidechain_ribbon_state.sample_ph;
                 self.sidechain_ribbon_state = SequenceRibbonState::new();
+                self.sidechain_ribbon_state.set_sample_ph(saved_ph);
                 self.c13_picked_dataset = None;
                 self.propensity_report = None;
                 self.metrics = None;
@@ -6632,7 +6663,8 @@ mod tests {
 
     use super::{
         build_synthetic_ubiquitin, merge_gui_aromatic_preserving_user_rings,
-        merge_gui_aromatic_with_options, parse_gui_c13_tsv_str, GuiRegimeKind, GuiSolverKind,
+        merge_gui_aromatic_with_options, merge_gui_aromatic_with_ph, parse_gui_c13_tsv_str,
+        GuiRegimeKind, GuiSolverKind,
     };
 
     #[test]
@@ -7156,5 +7188,48 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
                 .is_some_and(|v| (v - 7.020).abs() < 0.03),
             "Uncurated TYR #3 should still receive its calibrated aromatic assignment"
         );
+    }
+
+    #[test]
+    fn test_gui_p1_2_sample_ph_plumbing_into_aromatic_and_inspector() {
+        let sc_priors = SidechainPriors::empirical_bmrb();
+        let seq = vec!["ALA".to_string(), "HIS".to_string()];
+        let seq_ids = vec![1, 2];
+        let mut base = Reference::new(seq.clone(), seq_ids);
+        base.shifts.insert((0, "CA".to_string()), 52.5);
+        base.shifts.insert((0, "CB".to_string()), 19.1);
+        base.shifts.insert((1, "CA".to_string()), 55.4);
+        base.shifts.insert((1, "CB".to_string()), 29.0);
+        base.shifts.insert((1, "HB2".to_string()), 3.12);
+        base.shifts.insert((1, "HB3".to_string()), 3.04);
+
+        let all_ref = synthesize_all_atom_reference(&base, &sc_priors, 12);
+        let mut his_map = BTreeMap::new();
+        his_map.insert(1, nmr_core::aromatic::HisTautomer::Ne2H);
+        let truth_ref = synthesize_aromatic_reference(&all_ref, &sc_priors, &his_map, 12);
+        let (arom_peaks, _) = simulate_aromatic_peaks(
+            &truth_ref,
+            &his_map,
+            &AromaticSimConfig {
+                seed: 12,
+                ..AromaticSimConfig::default()
+            },
+        );
+
+        let mut state = SequenceRibbonState::new();
+        state.set_sample_ph(Some(6.8));
+        let solved = merge_gui_aromatic_with_ph(
+            &base,
+            None,
+            &BTreeMap::new(),
+            None,
+            &arom_peaks,
+            &sc_priors,
+            false,
+            state.sample_ph,
+        );
+        state.sync_inferred_variants_from_reference(&solved);
+        assert_eq!(state.sample_ph, Some(6.8));
+        assert_eq!(state.variant_for(1), ResidueVariant::HisNe2H);
     }
 }

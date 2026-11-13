@@ -922,7 +922,22 @@ fn test_p1_11_pelton_1993_hmqc_coupling_intensities_and_quaternary_cg() {
     }
 
     // 3. Quaternary 13CG shift evidence (`~135.5` Ne2H vs `~127.2` Nd1H vs `~129.8` DoublyProtonated)
+    //    (a) Without any 15N anchor (`ND1 == None && NE2 == None`), `classify_his_state` MUST abstain
+    //        as `FastExchangeUncommitted` (`conf <= 0.45 < 0.50`, P1-2);
+    //    (b) Paired with >= 1 pyrrole-like 15N anchor (`~171-174 ppm`, which alone is ambiguous between
+    //        `Ne2H` NE2, `Nd1H` ND1, and `DoublyProtonated`), `13CG` cleanly disambiguates all 3 states!
+    let (st_no_n, conf_no_n) = classify_his_state(&HisTautomerEvidence {
+        cg_ppm: Some(135.6),
+        cd2_ppm: Some(118.1),
+        he1_ppm: Some(7.78),
+        cb_ppm: Some(30.4),
+        ..Default::default()
+    });
+    assert_eq!(st_no_n, HisStateClassification::FastExchangeUncommitted);
+    assert!(conf_no_n <= 0.45, "got {conf_no_n}");
+
     let (st_ne2, conf_ne2) = classify_his_state(&HisTautomerEvidence {
+        ne2_ppm: Some(171.0),
         cg_ppm: Some(135.6),
         cd2_ppm: Some(118.1),
         he1_ppm: Some(7.78),
@@ -933,6 +948,7 @@ fn test_p1_11_pelton_1993_hmqc_coupling_intensities_and_quaternary_cg() {
     assert!(conf_ne2 >= 0.85, "got {conf_ne2}");
 
     let (st_nd1, conf_nd1) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(171.5),
         cg_ppm: Some(127.1),
         cd2_ppm: Some(125.1),
         he1_ppm: Some(7.80),
@@ -943,6 +959,7 @@ fn test_p1_11_pelton_1993_hmqc_coupling_intensities_and_quaternary_cg() {
     assert!(conf_nd1 >= 0.85, "got {conf_nd1}");
 
     let (st_dp, conf_dp) = classify_his_state(&HisTautomerEvidence {
+        ne2_ppm: Some(173.2),
         cg_ppm: Some(129.8),
         cd2_ppm: Some(118.4),
         he1_ppm: Some(8.60),
@@ -3020,5 +3037,79 @@ fn test_p1_10_tyr_his_two_pos_completion_dangling_conf_invariant_and_cloned_ref_
             .shifts
             .contains_key(&(1, "CE1".to_string())),
         "standalone merge_aromatic_into_shifts must reject disconnected 1-slot CE on cloned curated TYR"
+    );
+}
+
+#[test]
+fn test_p1_2_his_require_15n_chi2_95_gate_and_sample_ph_contradiction() {
+    // 1. Bare `ND1 = 170.0, NE2 = 170.0` (both pyrrole-like upfield of cationic HisH2+, no pure state fits):
+    //    must abstain as `FastExchangeUncommitted` with `conf < 0.50` (not `DoublyProtonated` `0.759`!).
+    let (cls_170_bare, conf_170_bare) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(170.0),
+        ne2_ppm: Some(170.0),
+        ..Default::default()
+    });
+    assert_eq!(
+        cls_170_bare,
+        HisStateClassification::FastExchangeUncommitted
+    );
+    assert!(
+        conf_170_bare < 0.50,
+        "ND1=170, NE2=170 bare must return conf < 0.50, got {conf_170_bare}"
+    );
+
+    // 1b. `ND1 = 170.0, NE2 = 170.0` even when diluted by 4 exact cationic CH channels:
+    //     15N simplex orthogonal residual `d_orth_sq_n = 5.98 > chi2_95(1) = 3.84` still abstains!
+    let (cls_170_ch, conf_170_ch) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(170.0),
+        ne2_ppm: Some(170.0),
+        cd2_ppm: Some(119.0),
+        hd2_ppm: Some(7.34),
+        ce1_ppm: Some(135.8),
+        he1_ppm: Some(8.58),
+        ..Default::default()
+    });
+    assert_eq!(cls_170_ch, HisStateClassification::FastExchangeUncommitted);
+    assert!(
+        conf_170_ch < 0.50,
+        "ND1=170, NE2=170 + CH must return conf < 0.50, got {conf_170_ch}"
+    );
+
+    // 2. `CD2 + HE1` alone (`0` 15N observations): must abstain (`FastExchangeUncommitted`, `conf <= 0.45`).
+    let (cls_cd2_he1, conf_cd2_he1) = classify_his_state(&HisTautomerEvidence {
+        cd2_ppm: Some(125.4),
+        he1_ppm: Some(7.82),
+        ..Default::default()
+    });
+    assert_eq!(cls_cd2_he1, HisStateClassification::FastExchangeUncommitted);
+    assert!(
+        conf_cd2_he1 <= 0.45,
+        "CD2+HE1 without 15N must cap conf <= 0.45, got {conf_cd2_he1}"
+    );
+
+    // 3. `CG` alone (`0` 15N observations): must abstain (`FastExchangeUncommitted`, `conf <= 0.45`).
+    let (cls_cg_only, conf_cg_only) = classify_his_state(&HisTautomerEvidence {
+        cg_ppm: Some(135.8),
+        ..Default::default()
+    });
+    assert_eq!(cls_cg_only, HisStateClassification::FastExchangeUncommitted);
+    assert!(
+        conf_cg_only <= 0.45,
+        "CG alone without 15N must cap conf <= 0.45, got {conf_cg_only}"
+    );
+
+    // 4. Incipient `tau <-> cat` titration (`f_prot = 0.10`, `ND1 = 242.25 ppm`) under acidic `sample_ph = 5.3`:
+    //    must abstain rather than falsely committing static `Ne2H`.
+    let (cls_tit, conf_tit) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(242.25),
+        ne2_ppm: Some(169.0),
+        he1_ppm: Some(7.88),
+        sample_ph: Some(5.3),
+        ..Default::default()
+    });
+    assert_eq!(cls_tit, HisStateClassification::FastExchangeUncommitted);
+    assert!(
+        conf_tit < 0.50,
+        "incipient tau<->cat titration at pH 5.3 must return conf < 0.50, got {conf_tit}"
     );
 }

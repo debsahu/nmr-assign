@@ -42,6 +42,15 @@ pub struct DihedralRestraint {
     pub restrained_phi: bool,
     /// Whether `psi` is confident enough to be actively restrained during 3D structure folding.
     pub restrained_psi: bool,
+    /// Optional sidechain `chi1` target angle in degrees (populated only when `--include-chi1` is enabled).
+    #[serde(default)]
+    pub chi1_deg: Option<f64>,
+    /// Optional sidechain `chi1` restraint half-width in degrees.
+    #[serde(default)]
+    pub chi1_err_deg: Option<f64>,
+    /// Whether `chi1` is actively exported/restrained (default `false`).
+    #[serde(default)]
+    pub restrained_chi1: bool,
 }
 
 /// DSS-referenced random-coil chemical shifts (ppm) per standard residue type.
@@ -420,6 +429,9 @@ pub fn predict_dihedrals(reference: &Reference) -> Vec<DihedralRestraint> {
             secondary_shift_score: sc,
             restrained_phi,
             restrained_psi,
+            chi1_deg: None,
+            chi1_err_deg: None,
+            restrained_chi1: false,
         });
     }
 

@@ -132,6 +132,7 @@ pub struct PdbResidue {
     pub h: Option<Vec3>,
     pub ca: Vec3,
     pub ha: Vec3,
+    pub ha2: Option<Vec3>,
     pub ha3: Option<Vec3>,
     pub c: Vec3,
     pub o: Vec3,
@@ -157,36 +158,43 @@ pub struct PdbChain {
     pub residues: Vec<PdbResidue>,
 }
 
-/// Reconstruct chiral L-amino acid `CB`, `HA`, and `QB` positions from `(N, CA, C)` when absent in X-ray PDBs.
+/// Reconstruct chiral L-amino acid `CB`, `HA`, prochiral `GLY` `(HA2, HA3)`, and `QB` positions
+/// from `(N, CA, C)` when absent in X-ray PDBs.
+///
+/// Returns `(cb, ha, ha2, ha3, qb)`:
+/// - On `GLY`, `ha2` (`pro-R`, L-`HA` tetrahedral site) and `ha3` (`pro-S`, L-`CB` tetrahedral site)
+///   are placed at `r(CA-HA) = 1.090 A`, while `ha` holds the `(ha2 + ha3) / 2` centroid for
+///   degenerate `NoeProton::AlphaHA` distance matching.
+/// - On non-`GLY` residues, `ha2` and `ha3` are `None` and `ha` is the chiral L-`HA` site.
 pub fn reconstruct_ca_substituents(
     res_name: &str,
     n: Vec3,
     ca: Vec3,
     c: Vec3,
-) -> (Option<Vec3>, Vec3, Option<Vec3>, Option<Vec3>) {
+) -> (Option<Vec3>, Vec3, Option<Vec3>, Option<Vec3>, Option<Vec3>) {
     let b1 = v_unit(v_sub(n, ca));
     let b2 = v_unit(v_sub(c, ca));
     let u = v_unit(v_add(b1, b2));
     let normal = v_unit(v_cross(b1, b2));
 
     // Exact tetrahedral L-amino acid projections validated against NMR 1D3Z (< 0.05 A):
-    // L-CB direction: unit(-0.581 * u + 0.814 * normal), d(CA-CB) = 1.526 A
-    // L-HA direction: unit(-0.581 * u - 0.814 * normal), d(CA-HA) = 1.090 A
+    // L-CB direction: unit(-0.581 * u + 0.814 * normal), d(CA-CB) = 1.526 A (Gly pro-S HA3 at 1.090 A)
+    // L-HA direction: unit(-0.581 * u - 0.814 * normal), d(CA-HA) = 1.090 A (Gly pro-R HA2 at 1.090 A)
     let dir_l_cb = v_unit(v_add(v_scale(u, -0.5810), v_scale(normal, 0.8139)));
     let dir_l_ha = v_unit(v_add(v_scale(u, -0.5810), v_scale(normal, -0.8139)));
 
     if res_name.eq_ignore_ascii_case("GLY") {
-        let ha2 = v_add(ca, v_scale(dir_l_cb, 1.090));
-        let ha3 = v_add(ca, v_scale(dir_l_ha, 1.090));
-        // Centroid of prochiral HA2/HA3 for degenerate Gly HA matching, plus individual ha3 stored
+        let ha2 = v_add(ca, v_scale(dir_l_ha, 1.090));
+        let ha3 = v_add(ca, v_scale(dir_l_cb, 1.090));
+        // Centroid of prochiral HA2/HA3 for degenerate Gly NOE HA matching; explicit ha2/ha3 stored separately
         let ha_mid = v_scale(v_add(ha2, ha3), 0.5);
-        (None, ha_mid, Some(ha3), None)
+        (None, ha_mid, Some(ha2), Some(ha3), None)
     } else {
         let cb = v_add(ca, v_scale(dir_l_cb, 1.526));
         let ha = v_add(ca, v_scale(dir_l_ha, 1.090));
         // Tetrahedral beta-proton centroid along CA -> CB axis: CB + 1.09 * cos(70.53 deg) * dir = CB + 0.363 * dir
         let qb = v_add(cb, v_scale(dir_l_cb, 0.3633));
-        (Some(cb), ha, None, Some(qb))
+        (Some(cb), ha, None, None, Some(qb))
     }
 }
 
@@ -347,7 +355,8 @@ pub fn parse_pdb_str_first_model(pdb_text: &str) -> Result<PdbChain, String> {
         let ca = r.ca.unwrap();
         let c = r.c.unwrap();
 
-        let (rec_cb, rec_ha, rec_ha3, rec_qb) = reconstruct_ca_substituents(&r.res_name, n, ca, c);
+        let (rec_cb, rec_ha, rec_ha2, rec_ha3, rec_qb) =
+            reconstruct_ca_substituents(&r.res_name, n, ca, c);
 
         let cb = if r.res_name == "GLY" {
             None
@@ -372,17 +381,18 @@ pub fn parse_pdb_str_first_model(pdb_text: &str) -> Result<PdbChain, String> {
             rec_qb
         };
 
-        let ha = if r.res_name == "GLY" {
-            match (r.ha2, r.ha3) {
+        let (ha, ha2, ha3) = if r.res_name == "GLY" {
+            let g_ha2 = r.ha2.or(rec_ha2);
+            let g_ha3 = r.ha3.or(rec_ha3);
+            let g_mid = match (g_ha2, g_ha3) {
                 (Some(a2), Some(a3)) => v_scale(v_add(a2, a3), 0.5),
                 (Some(a2), None) => a2,
                 _ => r.ha.unwrap_or(rec_ha),
-            }
+            };
+            (g_mid, g_ha2, g_ha3)
         } else {
-            r.ha.or(r.ha2).unwrap_or(rec_ha)
+            (r.ha.or(r.ha2).unwrap_or(rec_ha), None, None)
         };
-
-        let ha3 = r.ha3.or(rec_ha3);
 
         // Reconstruct carbonyl O if missing
         let o = if let Some(o_pos) = r.o {
@@ -418,6 +428,7 @@ pub fn parse_pdb_str_first_model(pdb_text: &str) -> Result<PdbChain, String> {
             h,
             ca,
             ha,
+            ha2,
             ha3,
             c,
             o,

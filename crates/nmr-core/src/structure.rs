@@ -235,7 +235,7 @@ pub fn build_backbone_from_torsions_rad(
 
     let mut residues = Vec::with_capacity(l);
     for i in 0..l {
-        let (cb, ha, ha3, qb) =
+        let (cb, ha, ha2, ha3, qb) =
             reconstruct_ca_substituents(&sequence[i], n_pos[i], ca_pos[i], c_pos[i]);
         residues.push(PdbResidue {
             seq_id: seq_ids[i],
@@ -245,6 +245,7 @@ pub fn build_backbone_from_torsions_rad(
             h: h_pos[i],
             ca: ca_pos[i],
             ha,
+            ha2,
             ha3,
             c: c_pos[i],
             o: o_pos[i],
@@ -2067,6 +2068,9 @@ pub fn refine_ensemble_with_rdcs(
                     secondary_shift_score: 0.0,
                     restrained_phi: k > 0,
                     restrained_psi: k + 1 < l,
+                    chi1_deg: None,
+                    chi1_err_deg: None,
+                    restrained_chi1: false,
                 })
                 .collect()
         };
@@ -3193,6 +3197,7 @@ pub fn superpose_chain_onto(
         r.h = r.h.map(xform);
         r.ca = xform(r.ca);
         r.ha = xform(r.ha);
+        r.ha2 = r.ha2.map(xform);
         r.ha3 = r.ha3.map(xform);
         r.c = xform(r.c);
         r.o = xform(r.o);
@@ -3576,7 +3581,7 @@ pub fn format_pdb_ensemble(conformers: &[StructureConformer], title: &str) -> St
                     &r.res_name,
                     r.chain_id,
                     r.seq_id,
-                    r.ha,
+                    r.ha2.unwrap_or(r.ha),
                     "H",
                 );
                 if let Some(ha3) = r.ha3 {

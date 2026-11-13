@@ -6,10 +6,12 @@ use nmr_core::dihedrals::{align_by_res_names, periodic_angle_abs_diff_deg};
 use nmr_core::nef::{read_nef_str, write_nef_str, NefDocument};
 use nmr_core::nmrstar::{read_star_all_atoms, Reference};
 use nmr_core::torsion_db::{
-    apply_homolog_firewall, estimate_global_shift_offsets, format_torsions_json,
-    format_torsions_tsv, is_ramachandran_outlier, needleman_wunsch_stats, predict_torsions,
-    predict_torsions_with_firewall, sha256_hex, shares_7mer_within_1_mismatch,
-    smith_waterman_stats, tm_score_ca, HomologFirewallQuery, TorsionDb, TorsionPredictionClass,
+    apply_homolog_firewall, classify_rama_basin, estimate_global_shift_offsets,
+    format_torsions_json, format_torsions_json_with_options, format_torsions_tsv,
+    format_torsions_tsv_with_options, is_ramachandran_outlier, needleman_wunsch_stats,
+    predict_torsions, predict_torsions_with_firewall, sha256_hex, shares_7mer_within_1_mismatch,
+    smith_waterman_stats, tm_score_ca, HomologFirewallQuery, TorsionDb, TorsionExportOptions,
+    TorsionPredictionClass,
 };
 
 fn workspace_root() -> PathBuf {
@@ -350,7 +352,7 @@ fn test_homolog_firewall_all_five_layers_independently() {
     let (_, _, sha_tm2, _) = apply_homolog_firewall(db, &poly_w, &fw_tm);
     assert_eq!(
         sha_tm1, sha_tm2,
-        "Layer 5 SHA-256 exclusion digest must be deterministic"
+        "Audit Digest & Identity Stratification SHA-256 exclusion digest must be deterministic"
     );
     assert!(
         ex_tm
@@ -565,13 +567,17 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
     let mut folded_psi_errs = Vec::new();
     let mut folded_circ_errs = Vec::new();
     let mut folded_chi1_errs = Vec::new();
+    let mut wrong_basin_vs_truth_count = 0usize;
+    let mut n_good_compared_truth = 0usize;
 
     // Sequence identity stratification bins: [0,0.10), [0.10,0.15), [0.15,0.20), [0.20,0.25]
     let mut strat_bins: [Vec<f64>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-    println!("\n=== T12.3 + Q5 12-PROTEIN BMRB BENCHMARK (5-LAYER HOMOLOG FIREWALL) ===");
     println!(
-        "{:<10} {:<6} {:<6} {:>4} {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>8} {:>16}",
+        "\n=== T12.3 + Q5 12-PROTEIN BMRB BENCHMARK (4-LAYER HOMOLOG FIREWALL + AUDIT DIGEST & IDENTITY STRATIFICATION) ==="
+    );
+    println!(
+        "{:<10} {:<6} {:<6} {:>4} {:>5} {:>6} {:>6} {:>6} {:>9} {:>7} {:>7} {:>7} {:>8} {:>16}",
         "BMRB",
         "PDB",
         "State",
@@ -580,7 +586,9 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
         "MaxId",
         "Good%",
         "Dyn%",
-        "RamaOut",
+        "WrongBsn%",
+        "PhiMAE",
+        "PsiMAE",
         "CircMAE",
         "Chi1MAE",
         "ExclSHA256[..12]"
@@ -641,7 +649,7 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
         if !bref.is_folded {
             let abstain_pct = 100.0 * ((n_res - n_good) as f64) / (n_res as f64);
             println!(
-                "{:<10} {:<6} {:<6} {:>4} {:>5} {:>5.1}% {:>5.1}% {:>5.1}% {:>7} {:>7} {:>8} {}",
+                "{:<10} {:<6} {:<6} {:>4} {:>5} {:>5.1}% {:>5.1}% {:>5.1}% {:>9} {:>7} {:>7} {:>7} {:>8} {}",
                 bmrb_id,
                 bref.pdb_id,
                 "IDP/UF",
@@ -650,6 +658,8 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
                 rep.max_retained_seq_identity * 100.0,
                 100.0 * (n_good as f64) / (n_res as f64),
                 100.0 * (n_dyn as f64) / (n_res as f64),
+                "-",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -674,9 +684,12 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
             .collect();
         let pairs = align_by_res_names(&p_keys, &t_keys);
 
+        let mut prot_phi = Vec::new();
+        let mut prot_psi = Vec::new();
         let mut prot_circ = Vec::new();
         let mut prot_chi1 = Vec::new();
-        let mut prot_out = 0usize;
+        let mut prot_wrong_basin = 0usize;
+        let mut prot_good_truth = 0usize;
 
         for r in &rep.residues {
             folded_total_res += 1;
@@ -690,7 +703,6 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
                 folded_good_res += 1;
                 if is_ramachandran_outlier(&r.res_name, r.phi_deg.unwrap(), r.psi_deg.unwrap()) {
                     folded_rama_outliers += 1;
-                    prot_out += 1;
                 }
             }
         }
@@ -718,8 +730,17 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
                     folded_phi_errs.push(ep);
                     folded_psi_errs.push(es);
                     folded_circ_errs.push(ec);
+                    prot_phi.push(ep);
+                    prot_psi.push(es);
                     prot_circ.push(ec);
                     strat_bins[bin_idx].push(ec);
+
+                    n_good_compared_truth += 1;
+                    prot_good_truth += 1;
+                    if classify_rama_basin(pp, ps) != classify_rama_basin(tp, ts) {
+                        wrong_basin_vs_truth_count += 1;
+                        prot_wrong_basin += 1;
+                    }
                 }
                 if let (Some(pc), Some(tc)) = (pr.chi1_deg, tr.chi1_deg) {
                     let ech = periodic_angle_abs_diff_deg(pc, tc);
@@ -729,6 +750,8 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
             }
         }
 
+        let p_phi_mae = prot_phi.iter().sum::<f64>() / (prot_phi.len().max(1) as f64);
+        let p_psi_mae = prot_psi.iter().sum::<f64>() / (prot_psi.len().max(1) as f64);
         let p_mae = prot_circ.iter().sum::<f64>() / (prot_circ.len().max(1) as f64);
         let c_mae_str = if prot_chi1.is_empty() {
             "-".to_string()
@@ -739,7 +762,7 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
             )
         };
         println!(
-            "{:<10} {:<6} {:<6} {:>4} {:>5} {:>5.1}% {:>5.1}% {:>5.1}% {:>6.2}% {:>7.2} {:>8} {}",
+            "{:<10} {:<6} {:<6} {:>4} {:>5} {:>5.1}% {:>5.1}% {:>5.1}% {:>8.2}% {:>7.2} {:>7.2} {:>7.2} {:>8} {}",
             bmrb_id,
             bref.pdb_id,
             "Folded",
@@ -748,7 +771,9 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
             rep.max_retained_seq_identity * 100.0,
             100.0 * (n_good as f64) / (n_res as f64),
             100.0 * (n_dyn as f64) / (n_res as f64),
-            100.0 * (prot_out as f64) / (n_good.max(1) as f64),
+            100.0 * (prot_wrong_basin as f64) / (prot_good_truth.max(1) as f64),
+            p_phi_mae,
+            p_psi_mae,
             p_mae,
             c_mae_str,
             &rep.exclusion_list_sha256[..12]
@@ -758,6 +783,8 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
     let overall_good_pct = 100.0 * (folded_good_res as f64) / (folded_total_res as f64);
     let struct_good_pct = 100.0 * (folded_struct_good_res as f64) / (folded_struct_res as f64);
     let rama_outlier_pct = 100.0 * (folded_rama_outliers as f64) / (folded_good_res as f64);
+    let wrong_basin_pct =
+        100.0 * (wrong_basin_vs_truth_count as f64) / (n_good_compared_truth.max(1) as f64);
     let phi_mae = folded_phi_errs.iter().sum::<f64>() / (folded_phi_errs.len() as f64);
     let psi_mae = folded_psi_errs.iter().sum::<f64>() / (folded_psi_errs.len() as f64);
     let circ_mae = folded_circ_errs.iter().sum::<f64>() / (folded_circ_errs.len() as f64);
@@ -769,13 +796,14 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
         folded_struct_good_res, folded_struct_res, struct_good_pct
     );
     println!(
-        "[SUMMARY ACCURACY] Circular (phi,psi) MAE = {:.2} deg (phi={:.2} deg, psi={:.2} deg), chi1 MAE = {:.2} deg (n={}), Rama outliers = {}/{} ({:.2}%)",
-        circ_mae, phi_mae, psi_mae, chi1_mae, folded_chi1_errs.len(),
+        "[SUMMARY ACCURACY] phi_mae_deg = {:.2} deg, psi_mae_deg = {:.2} deg, combined Circular (phi,psi) MAE = {:.2} deg, chi1_mae_deg = {:.2} deg (n={}), wrong_basin_vs_truth = {}/{} ({:.2}%), pred Rama outliers = {}/{} ({:.2}%)",
+        phi_mae, psi_mae, circ_mae, chi1_mae, folded_chi1_errs.len(),
+        wrong_basin_vs_truth_count, n_good_compared_truth, wrong_basin_pct,
         folded_rama_outliers, folded_good_res, rama_outlier_pct
     );
 
     let bin_labels = ["[0-10%)", "[10-15%)", "[15-20%)", "[20-25%]"];
-    println!("\n[LAYER 5 SEQUENCE-IDENTITY STRATIFICATION]");
+    println!("\n[AUDIT DIGEST & IDENTITY STRATIFICATION]");
     for (b, label) in bin_labels.iter().enumerate() {
         let n = strat_bins[b].len();
         let m = if n > 0 {
@@ -799,8 +827,12 @@ fn test_12_protein_bmrb_suite_with_q5_firewall_and_stratification() {
         "Ramachandran outliers {rama_outlier_pct:.2}% >= 2.5% gate!"
     );
     assert!(
-        circ_mae <= 14.0,
-        "Circular (phi, psi) MAE {circ_mae:.2} deg > 14.0 deg gate!"
+        wrong_basin_pct < 8.0,
+        "Wrong Ramachandran basin vs PDB ground truth {wrong_basin_pct:.2}% >= 8.0%!"
+    );
+    assert!(
+        phi_mae <= 13.5 && psi_mae <= 17.0 && circ_mae <= 14.0,
+        "Torsion MAE regression: phi={phi_mae:.2}, psi={psi_mae:.2}, circ={circ_mae:.2} deg"
     );
 }
 
@@ -810,20 +842,66 @@ fn test_torsions_tsv_json_and_nef_roundtrip() {
     let shifts = read_star_all_atoms(root.join("data/benchmark/bmr17769.str"), None).unwrap();
     let rep = predict_torsions(&shifts);
 
+    // 1. Default export (`include_chi1: false`) MUST omit CHI1 across TSV, JSON, DihedralRestraint, and NEF!
     let tsv = format_torsions_tsv(&rep);
     assert!(tsv.contains("# exclusion_list_sha256:"));
     assert!(tsv.contains("seq_id\tres_name\tclass\tphi_deg"));
+    for line in tsv.lines().skip(5) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            cols[7], ".",
+            "default TSV must omit chi1_deg, got {}",
+            cols[7]
+        );
+        assert_eq!(
+            cols[8], ".",
+            "default TSV must omit chi1_std_deg, got {}",
+            cols[8]
+        );
+    }
 
     let js = format_torsions_json(&rep).unwrap();
     assert!(js.contains("\"exclusion_list_sha256\""));
+    assert!(
+        !js.lines()
+            .any(|l| l.contains("\"chi1_deg\":") && !l.contains("null")),
+        "default JSON must omit non-null chi1_deg unless include_chi1=true"
+    );
 
     let dihs = rep.to_dihedral_restraints();
     assert_eq!(dihs.len(), shifts.sequence.len());
+    assert!(
+        dihs.iter()
+            .all(|d| !d.restrained_chi1 && d.chi1_deg.is_none()),
+        "default to_dihedral_restraints() must omit CHI1"
+    );
 
     let nef_list = rep.to_nef_dihedral_restraint_list("A", "torsion_db_restraints");
     assert!(nef_list.restraints.iter().any(|r| r.name == "PHI"));
     assert!(nef_list.restraints.iter().any(|r| r.name == "PSI"));
-    assert!(nef_list.restraints.iter().any(|r| r.name == "CHI1"));
+    assert!(
+        !nef_list.restraints.iter().any(|r| r.name == "CHI1"),
+        "default NEF export must omit CHI1 unless include_chi1=true"
+    );
+
+    // 2. Opt-in `include_chi1: true` emits CHI1 across TSV, JSON, DihedralRestraint, and NEF!
+    let opt_chi1 = TorsionExportOptions { include_chi1: true };
+    let tsv_chi1 = format_torsions_tsv_with_options(&rep, opt_chi1);
+    assert!(tsv_chi1
+        .lines()
+        .skip(5)
+        .any(|l| l.split('\t').nth(7).is_some_and(|c| c != ".")));
+    let js_chi1 = format_torsions_json_with_options(&rep, opt_chi1).unwrap();
+    assert!(js_chi1
+        .lines()
+        .any(|l| l.contains("\"chi1_deg\":") && !l.contains("null")));
+    let dihs_chi1 = rep.to_dihedral_restraints_with_options(opt_chi1);
+    assert!(dihs_chi1
+        .iter()
+        .any(|d| d.restrained_chi1 && d.chi1_deg.is_some()));
+    let nef_chi1 =
+        rep.to_nef_dihedral_restraint_list_with_options("A", "torsion_db_restraints", opt_chi1);
+    assert!(nef_chi1.restraints.iter().any(|r| r.name == "CHI1"));
 
     let mut doc = NefDocument::new("ubq_torsions");
     doc.dihedral_restraint_lists.push(nef_list.clone());
