@@ -16,17 +16,22 @@ use nmr_core::paramagnetic::{
     assign_paramagnetic_backbone, assign_paramagnetic_from_peaks,
     compute_bleaching_probabilities_3d, compute_bleaching_probabilities_3d_per_site,
     compute_bleaching_probabilities_from_pdb, compute_bleaching_probabilities_sequence,
-    coordinating_histidine_indices, detect_metal_coordination_motifs,
+    coordinating_histidine_indices, detect_metal_coordination_motifs, effective_pcs_sigma_ppm,
     filter_pcs_observations_blind_zone, fit_pcs_tensor_paramagnetic, fit_pcs_tensor_robust,
-    fit_pcs_tensor_svd, parse_metal_ligands, parse_paramagnetic_pdb_sites, predict_pcs_from_tensor,
-    predict_pcs_spherical_ppm, refine_metal_position_and_tensor, rotation_matrix_from_zyz,
-    MetalClusterSite, MetalMotifKind, MetalParamagneticClass, ParamagneticAssignConfig,
-    ParamagneticSolverMode, PcsObservation,
+    fit_pcs_tensor_svd, fit_pcs_tensor_with_options, parse_metal_ligands,
+    parse_paramagnetic_pdb_sites, pcs_gaussian_two_nll, predict_pcs_from_tensor,
+    predict_pcs_spherical_ppm, refine_metal_position_and_tensor,
+    refine_metal_position_and_tensor_with_options, rotation_matrix_from_zyz, MetalClusterSite,
+    MetalMotifKind, MetalParamagneticClass, ParamagneticAssignConfig, ParamagneticSolverMode,
+    PcsFitOptions, PcsObservation,
 };
+use nmr_core::peaks::Peak;
 use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
 use nmr_core::priors::{one_to_three, Priors};
 use nmr_core::rng::Rng;
-use nmr_core::simulate::{simulate, SimConfig};
+use nmr_core::simulate::{
+    render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
+};
 use nmr_core::solver::{AnnealConfig, ScoreConfig};
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d};
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
@@ -1753,18 +1758,48 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
         "Yb3+ blind-sphere filter (r_bleach = 5.5 Å, p_bleach >= 0.85) must remove 0 of 51 experimental points"
     );
 
+    let opts_off_svd = PcsFitOptions {
+        fit_offset: true,
+        huber_k: None,
+        max_irls_iters: 25,
+    };
+    let opts_off_huber = PcsFitOptions {
+        fit_offset: true,
+        huber_k: Some(1.65),
+        max_irls_iters: 25,
+    };
+
     let full_svd = fit_pcs_tensor_svd(&pre_filtered, la_metal_pos).expect("Calbindin full-51 SVD");
+    let full_svd_off = fit_pcs_tensor_with_options(&pre_filtered, la_metal_pos, &opts_off_svd)
+        .expect("Calbindin full-51 SVD + offset");
     let full_huber = fit_pcs_tensor_robust(&pre_filtered, la_metal_pos, 1.65, 25)
         .expect("Calbindin full-51 Huber IRLS");
+    let full_huber_off = fit_pcs_tensor_with_options(&pre_filtered, la_metal_pos, &opts_off_huber)
+        .expect("Calbindin full-51 Huber IRLS + offset");
     let full_varpro_1p5 = refine_metal_position_and_tensor(&pre_filtered, la_metal_pos, 1.5, 0.5)
         .expect("Calbindin full-51 VarPro r_max=1.5 Å");
+    let full_varpro_1p5_off = refine_metal_position_and_tensor_with_options(
+        &pre_filtered,
+        la_metal_pos,
+        1.5,
+        0.5,
+        &opts_off_svd,
+    )
+    .expect("Calbindin full-51 VarPro + offset r_max=1.5 Å");
     let full_shift_1p5 = v_dist(full_varpro_1p5.metal_pos_angstrom, la_metal_pos);
+    let full_shift_1p5_off = v_dist(full_varpro_1p5_off.metal_pos_angstrom, la_metal_pos);
 
     assert!(
-        full_svd.q_factor < 0.35 && full_varpro_1p5.q_factor < 0.32,
-        "expected full-51 Calbindin Yb3+-La3+ SVD Q < 0.35 and VarPro(1.5 Å) Q < 0.32, got svd={:.4}, varpro={:.4}",
+        full_svd.q_factor < 0.35
+            && full_svd_off.q_factor < 0.35
+            && full_varpro_1p5.q_factor < 0.32
+            && full_varpro_1p5_off.q_factor < 0.32
+            && full_svd_off.pcs_offset_ppm.abs() < 0.25,
+        "expected full-51 Calbindin Yb3+-La3+ SVD Q < 0.35 and VarPro(1.5 Å) Q < 0.32, got svd={:.4}, svd_off={:.4}, varpro={:.4}, varpro_off={:.4}",
         full_svd.q_factor,
-        full_varpro_1p5.q_factor
+        full_svd_off.q_factor,
+        full_varpro_1p5.q_factor,
+        full_varpro_1p5_off.q_factor
     );
 
     // 2. Outer-sphere dipolar subset (`r >= 10.8 Å`, N = 47, excluding inner-shell EF-hand II
@@ -1797,8 +1832,12 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
     assert_eq!(filtered_obs.len(), 47);
 
     let svd_at_la = fit_pcs_tensor_svd(&filtered_obs, la_metal_pos).expect("Calbindin SVD at LA");
+    let svd_at_la_off = fit_pcs_tensor_with_options(&filtered_obs, la_metal_pos, &opts_off_svd)
+        .expect("Calbindin SVD + offset at LA");
     let huber_at_la =
         fit_pcs_tensor_robust(&filtered_obs, la_metal_pos, 1.65, 25).expect("Calbindin Huber IRLS");
+    let huber_at_la_off = fit_pcs_tensor_with_options(&filtered_obs, la_metal_pos, &opts_off_huber)
+        .expect("Calbindin Huber IRLS + offset");
     let zero_rad = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 0.0, 0.5)
         .expect("Calbindin zero-radius VarPro must pin initial metal position");
     assert!(
@@ -1813,54 +1852,123 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
     );
     let refined_yb = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 1.5, 0.5)
         .expect("Calbindin VarPro metal + DeltaChi refinement (r_max=1.5 Å)");
+    let refined_yb_off = refine_metal_position_and_tensor_with_options(
+        &filtered_obs,
+        la_metal_pos,
+        1.5,
+        0.5,
+        &opts_off_svd,
+    )
+    .expect("Calbindin VarPro + offset refinement (r_max=1.5 Å)");
     let metal_shift_ang = v_dist(refined_yb.metal_pos_angstrom, la_metal_pos);
+    let metal_shift_ang_off = v_dist(refined_yb_off.metal_pos_angstrom, la_metal_pos);
 
     let unconstrained_yb = refine_metal_position_and_tensor(&filtered_obs, la_metal_pos, 5.0, 0.5)
         .expect("Calbindin unconstrained VarPro diagnostic (r_max=5.0 Å)");
+    let unconstrained_yb_off = refine_metal_position_and_tensor_with_options(
+        &filtered_obs,
+        la_metal_pos,
+        5.0,
+        0.5,
+        &opts_off_svd,
+    )
+    .expect("Calbindin unconstrained VarPro + offset diagnostic (r_max=5.0 Å)");
     let unconstrained_shift_ang = v_dist(unconstrained_yb.metal_pos_angstrom, la_metal_pos);
+    let unconstrained_shift_ang_off = v_dist(unconstrained_yb_off.metal_pos_angstrom, la_metal_pos);
 
     println!(
-        "Calbindin D9k Real Experimental Yb3+-La3+ 1H PCS (BMRB 15594 [298 K] - BMRB 6699 [300 K] vs 1KSM):\n  [Full Dataset N={} (r_bleach=5.5 Å removes 0 pts)]:\n    SVD@LA105:         dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105:       dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    VarPro(r<=1.5 Å):  dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n  [Outer-Sphere r>=10.8 Å Subset N={} (excludes inner-shell seq_ids {:?})]:\n    SVD@LA105:         dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105:       dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm\n    VarPro(r<=1.5 Å):  dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å (trust-radius boundary pinned)\n    VarPro(r<=5.0 Å):  dchi_ax={:+.3}, dchi_rh={:+.3}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å (unconstrained EF-hand drift diagnostic)",
+        "Calbindin D9k Real Experimental Yb3+-La3+ 1H PCS (BMRB 15594 [298 K] - BMRB 6699 [300 K] vs 1KSM):\n  [Full Unfiltered Dataset N={} (r_bleach=5.5 Å removes 0 pts)]:\n    SVD@LA105 (off=0):       dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    SVD@LA105 (+fit_off):    dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105 (off=0):     dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105 (+fit_off):  dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    VarPro<=1.5Å (off=0):    dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n    VarPro<=1.5Å (+fit_off): dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n  [Outer-Sphere r>=10.8 Å Subset N={} (excludes inner-shell seq_ids {:?})]:\n    SVD@LA105 (off=0):       dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    SVD@LA105 (+fit_off):    dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105 (off=0):     dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    Huber@LA105 (+fit_off):  dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm\n    VarPro<=1.5Å (off=0):    dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n    VarPro<=1.5Å (+fit_off): dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n    VarPro<=5.0Å (off=0):    dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å\n    VarPro<=5.0Å (+fit_off): dchi_ax={:+.3}, dchi_rh={:+.3}, off={:+.4}, Q={:.4}, RMSD={:.4} ppm, |dx_M|={:.3} Å",
         pre_filtered.len(),
         full_svd.dchi_ax,
         full_svd.dchi_rh,
+        full_svd.pcs_offset_ppm,
         full_svd.q_factor,
         full_svd.rmsd_ppm,
+        full_svd_off.dchi_ax,
+        full_svd_off.dchi_rh,
+        full_svd_off.pcs_offset_ppm,
+        full_svd_off.q_factor,
+        full_svd_off.rmsd_ppm,
         full_huber.dchi_ax,
         full_huber.dchi_rh,
+        full_huber.pcs_offset_ppm,
         full_huber.q_factor,
         full_huber.rmsd_ppm,
+        full_huber_off.dchi_ax,
+        full_huber_off.dchi_rh,
+        full_huber_off.pcs_offset_ppm,
+        full_huber_off.q_factor,
+        full_huber_off.rmsd_ppm,
         full_varpro_1p5.dchi_ax,
         full_varpro_1p5.dchi_rh,
+        full_varpro_1p5.pcs_offset_ppm,
         full_varpro_1p5.q_factor,
         full_varpro_1p5.rmsd_ppm,
         full_shift_1p5,
+        full_varpro_1p5_off.dchi_ax,
+        full_varpro_1p5_off.dchi_rh,
+        full_varpro_1p5_off.pcs_offset_ppm,
+        full_varpro_1p5_off.q_factor,
+        full_varpro_1p5_off.rmsd_ppm,
+        full_shift_1p5_off,
         filtered_obs.len(),
         excluded_inner_seq_ids,
         svd_at_la.dchi_ax,
         svd_at_la.dchi_rh,
+        svd_at_la.pcs_offset_ppm,
         svd_at_la.q_factor,
         svd_at_la.rmsd_ppm,
+        svd_at_la_off.dchi_ax,
+        svd_at_la_off.dchi_rh,
+        svd_at_la_off.pcs_offset_ppm,
+        svd_at_la_off.q_factor,
+        svd_at_la_off.rmsd_ppm,
         huber_at_la.dchi_ax,
         huber_at_la.dchi_rh,
+        huber_at_la.pcs_offset_ppm,
         huber_at_la.q_factor,
         huber_at_la.rmsd_ppm,
+        huber_at_la_off.dchi_ax,
+        huber_at_la_off.dchi_rh,
+        huber_at_la_off.pcs_offset_ppm,
+        huber_at_la_off.q_factor,
+        huber_at_la_off.rmsd_ppm,
         refined_yb.dchi_ax,
         refined_yb.dchi_rh,
+        refined_yb.pcs_offset_ppm,
         refined_yb.q_factor,
         refined_yb.rmsd_ppm,
         metal_shift_ang,
+        refined_yb_off.dchi_ax,
+        refined_yb_off.dchi_rh,
+        refined_yb_off.pcs_offset_ppm,
+        refined_yb_off.q_factor,
+        refined_yb_off.rmsd_ppm,
+        metal_shift_ang_off,
         unconstrained_yb.dchi_ax,
         unconstrained_yb.dchi_rh,
+        unconstrained_yb.pcs_offset_ppm,
         unconstrained_yb.q_factor,
         unconstrained_yb.rmsd_ppm,
         unconstrained_shift_ang,
+        unconstrained_yb_off.dchi_ax,
+        unconstrained_yb_off.dchi_rh,
+        unconstrained_yb_off.pcs_offset_ppm,
+        unconstrained_yb_off.q_factor,
+        unconstrained_yb_off.rmsd_ppm,
+        unconstrained_shift_ang_off,
     );
 
     assert!(
-        svd_at_la.q_factor < 0.25 && refined_yb.q_factor < 0.25 && huber_at_la.q_factor < 0.25,
-        "real experimental Calbindin D9k outer-sphere Yb3+ PCS Q-factor exceeded 0.25: svd Q={:.4}, refined Q={:.4}, huber Q={:.4}",
+        svd_at_la.q_factor < 0.25
+            && svd_at_la_off.q_factor < 0.25
+            && refined_yb.q_factor < 0.25
+            && refined_yb_off.q_factor < 0.25
+            && huber_at_la.q_factor < 0.25
+            && huber_at_la_off.q_factor < 0.25,
+        "real experimental Calbindin D9k outer-sphere Yb3+ PCS Q-factor exceeded 0.25: svd Q={:.4}, svd_off Q={:.4}, refined Q={:.4}, huber Q={:.4}",
         svd_at_la.q_factor,
+        svd_at_la_off.q_factor,
         refined_yb.q_factor,
         huber_at_la.q_factor
     );
@@ -1874,9 +1982,492 @@ fn test_real_calbindin_d9k_yb3_la3_experimental_pcs_bmr15594_bmr6699_1ksm() {
             && svd_at_la.dchi_ax < 10.5
             && refined_yb.dchi_ax > 7.0
             && refined_yb.dchi_ax < 11.5
-            && metal_shift_ang <= 1.5001,
+            && metal_shift_ang <= 1.5001
+            && metal_shift_ang_off <= 1.5001,
         "expected literature Yb3+ dchi_ax ~ +8.5..9.0e-32 m^3 and strictly bounded |d_metal| <= 1.5001 Å (got svd_ax={:.3}, varpro_ax={:.3}, shift={metal_shift_ang:.4} Å)",
         svd_at_la.dchi_ax,
         refined_yb.dchi_ax
+    );
+}
+
+#[test]
+fn test_varpro_gaussian_two_nll_penalizes_variance_inflation_and_fits_pcs_offset() {
+    let true_metal = [1.5_f64, -2.0, 0.8];
+    let true_ax = 24.0_f64;
+    let true_rh = 6.2_f64;
+    let true_euler = [0.65_f64, 1.05, 2.15];
+    let true_offset = 0.185_f64;
+
+    let mut rng = Rng::new(0x516A_2411_u64);
+    let mut coords = Vec::with_capacity(28);
+    while coords.len() < 28 {
+        let c = [
+            true_metal[0] + rng.uniform(-18.0, 18.0),
+            true_metal[1] + rng.uniform(-18.0, 18.0),
+            true_metal[2] + rng.uniform(-18.0, 18.0),
+        ];
+        let r = v_dist(c, true_metal);
+        if (9.5..=22.0).contains(&r) {
+            coords.push(c);
+        }
+    }
+
+    // 1. Prove `pcs_gaussian_two_nll` strictly increases (worsens) when `sigma_eff` is artificially
+    //    inflated at small/moderate residuals, whereas bare unweighted `sum (r_i / sigma_eff_i)^2`
+    //    spuriously decreases!
+    let mut obs_tight = Vec::new();
+    let mut obs_inflated = Vec::new();
+    for (idx, &c) in coords.iter().enumerate() {
+        let exact = predict_pcs_spherical_ppm(c, true_metal, true_ax, true_rh, true_euler);
+        let noisy = exact + rng.normal(0.0, 0.035);
+        obs_tight.push(
+            PcsObservation::new((idx + 1) as i32, c, noisy)
+                .with_uncertainty(0.04)
+                .with_coord_uncertainty(0.15),
+        );
+        obs_inflated.push(
+            PcsObservation::new((idx + 1) as i32, c, noisy)
+                .with_uncertainty(0.35)
+                .with_coord_uncertainty(0.95),
+        );
+    }
+    let t_tight = fit_pcs_tensor_svd(&obs_tight, true_metal).expect("tight SVD");
+    let bare_chi2 = |obs_slice: &[PcsObservation]| -> f64 {
+        obs_slice
+            .iter()
+            .map(|o| {
+                let pred = predict_pcs_from_tensor(o.coord_angstrom, &t_tight);
+                let sig =
+                    effective_pcs_sigma_ppm(o, t_tight.metal_pos_angstrom, &t_tight.components_5);
+                ((o.pcs_ppm - pred) / sig).powi(2)
+            })
+            .sum()
+    };
+    let chi2_tight = bare_chi2(&obs_tight);
+    let chi2_inflated = bare_chi2(&obs_inflated);
+    let nll_tight = pcs_gaussian_two_nll(&obs_tight, &t_tight);
+    let nll_inflated = pcs_gaussian_two_nll(&obs_inflated, &t_tight);
+    assert!(
+        chi2_inflated < chi2_tight,
+        "bare chi2 shrinks under sigma_eff inflation ({chi2_inflated:.3} vs {chi2_tight:.3})"
+    );
+    assert!(
+        nll_inflated > nll_tight + 50.0,
+        "Gaussian 2*NLL must strictly penalize inflated sigma_eff via +2*ln(sigma_eff) ({nll_inflated:.3} vs {nll_tight:.3})"
+    );
+
+    // Also place an uncertain coordinate near a decoy site (`r ~ 2.3 Å` from decoy, `11.5 Å` from true_metal)
+    // and verify VarPro with `2*NLL` recovers `true_metal` (< 0.15 Å) instead of collapsing onto the decoy!
+    let mut obs_with_probe = obs_tight.clone();
+    let probe_coord = [
+        true_metal[0] + 7.5,
+        true_metal[1] + 6.5,
+        true_metal[2] - 5.5,
+    ];
+    let probe_pcs =
+        predict_pcs_spherical_ppm(probe_coord, true_metal, true_ax, true_rh, true_euler);
+    obs_with_probe.push(
+        PcsObservation::new(99, probe_coord, probe_pcs)
+            .with_uncertainty(0.04)
+            .with_coord_uncertainty(0.65),
+    );
+    let decoy_init = [probe_coord[0] - 2.3, probe_coord[1], probe_coord[2]];
+    let search_r = v_dist(decoy_init, true_metal) + 1.2;
+    let recovered = refine_metal_position_and_tensor(&obs_with_probe, decoy_init, search_r, 1.0)
+        .expect("VarPro 2*NLL recovery past high-coord-uncertainty probe");
+    assert!(
+        v_dist(recovered.metal_pos_angstrom, true_metal) < 0.20,
+        "VarPro 2*NLL must converge to true_metal rather than decoy gradient-inflation trap (err={:.4} Å)",
+        v_dist(recovered.metal_pos_angstrom, true_metal)
+    );
+
+    // 2. Verify `PcsFitOptions { fit_offset: true }` recovers exact constant referencing offset
+    //    in both 6-param fixed-metal SVD, Huber IRLS, and 9-param VarPro (and enforces DoF bounds N>=7 / N>=9)
+    let obs_shifted: Vec<PcsObservation> = coords
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let pcs = predict_pcs_spherical_ppm(c, true_metal, true_ax, true_rh, true_euler)
+                + true_offset;
+            PcsObservation::new((i + 1) as i32, c, pcs).with_uncertainty(0.03)
+        })
+        .collect();
+
+    assert!(
+        fit_pcs_tensor_with_options(
+            &obs_shifted[..6],
+            true_metal,
+            &PcsFitOptions {
+                fit_offset: true,
+                ..Default::default()
+            }
+        )
+        .is_err(),
+        "6-param fixed-metal PCS fit + offset must reject N=6 (< 7)"
+    );
+    assert!(
+        refine_metal_position_and_tensor_with_options(
+            &obs_shifted[..8],
+            true_metal,
+            1.5,
+            0.5,
+            &PcsFitOptions {
+                fit_offset: true,
+                ..Default::default()
+            }
+        )
+        .is_err(),
+        "9-param VarPro PCS fit + offset must reject N=8 (< 9)"
+    );
+
+    let fit_no_off = fit_pcs_tensor_svd(&obs_shifted, true_metal).expect("shifted without offset");
+    let fit_with_off = fit_pcs_tensor_with_options(
+        &obs_shifted,
+        true_metal,
+        &PcsFitOptions {
+            fit_offset: true,
+            ..Default::default()
+        },
+    )
+    .expect("shifted with offset");
+    assert!(
+        fit_no_off.q_factor > 0.10 && fit_with_off.q_factor < 1e-12,
+        "expected un-corrected offset Q > 0.10 and 6-param SVD Q < 1e-12 (got {:.4} vs {:.3e})",
+        fit_no_off.q_factor,
+        fit_with_off.q_factor
+    );
+    assert!(
+        (fit_with_off.pcs_offset_ppm - true_offset).abs() < 1e-11
+            && (fit_with_off.dchi_ax - true_ax).abs() < 1e-10
+            && (fit_with_off.dchi_rh - true_rh).abs() < 1e-10,
+        "exact 6-param SVD offset/tensor recovery mismatch: off={:.6}, ax={:.6}, rh={:.6}",
+        fit_with_off.pcs_offset_ppm,
+        fit_with_off.dchi_ax,
+        fit_with_off.dchi_rh
+    );
+
+    let init_guess = [
+        true_metal[0] + 1.1,
+        true_metal[1] - 0.9,
+        true_metal[2] + 0.8,
+    ];
+    let vp_off = refine_metal_position_and_tensor_with_options(
+        &obs_shifted,
+        init_guess,
+        2.5,
+        0.6,
+        &PcsFitOptions {
+            fit_offset: true,
+            ..Default::default()
+        },
+    )
+    .expect("9-param VarPro with offset");
+    assert!(
+        v_dist(vp_off.metal_pos_angstrom, true_metal) < 1e-4
+            && (vp_off.pcs_offset_ppm - true_offset).abs() < 1e-4
+            && (vp_off.dchi_ax - true_ax).abs() / true_ax < 1e-4,
+        "9-param VarPro recovery mismatch: pos_err={:.6} Å, off={:.6}, ax={:.4}",
+        v_dist(vp_off.metal_pos_angstrom, true_metal),
+        vp_off.pcs_offset_ppm,
+        vp_off.dchi_ax
+    );
+}
+
+#[test]
+fn test_volumetric_solomon_pre_attenuated_2d_3d_picked_paramagnetic_benchmark() {
+    let fixtures = workspace_root().join("data/fixtures");
+    let ferr_bmrb = read_star(fixtures.join("bmr19273_ferredoxin_2fe2s.str"), None)
+        .expect("read BMRB 19273 ferredoxin");
+    let pdb_1i7h =
+        fs::read_to_string(fixtures.join("ferredoxin_1i7h_xray.pdb")).expect("read 1I7H.pdb");
+    let priors = Priors::bmrb();
+
+    let (chain_a, sites) =
+        parse_paramagnetic_pdb_sites(&pdb_1i7h, &ferr_bmrb.sequence).expect("parse 1I7H");
+    assert_eq!(sites.len(), 1);
+    let metal_center = sites[0].centroid;
+
+    // 1. Build a COMPLETE pre-PRE shift table covering ALL 110 residues (including the 16
+    //    inner-sphere blind-zone residues absent from BMRB 19273!) by filling any unrecorded
+    //    shifts from `Priors::bmrb()` + deterministic scatter BEFORE physical PRE volume rendering.
+    //    Zero blind-zone residues are pre-deleted from the input shift table!
+    let mut full_ref = ferr_bmrb.clone();
+    let mut rng_fill = Rng::new(0xFE25_1174_u64);
+    for k in 0..full_ref.sequence.len() {
+        let res_name = &full_ref.sequence[k];
+        for &atom in &["H", "N", "CA", "CB", "C"] {
+            if (res_name == "PRO" && atom == "H") || (res_name == "GLY" && atom == "CB") {
+                continue;
+            }
+            let key = (k, atom.to_string());
+            if let std::collections::btree_map::Entry::Vacant(e) = full_ref.shifts.entry(key) {
+                if let Some((mu, sd)) = priors.get(res_name, atom) {
+                    e.insert(mu + rng_fill.normal(0.0, 0.35 * sd));
+                }
+            }
+        }
+    }
+
+    let total_non_pro_amides = (1..full_ref.sequence.len())
+        .filter(|&k| {
+            full_ref.sequence[k] != "PRO"
+                && full_ref.shifts.contains_key(&(k, "H".to_string()))
+                && full_ref.shifts.contains_key(&(k, "N".to_string()))
+        })
+        .count();
+    assert!(
+        total_non_pro_amides >= 100,
+        "complete pre-bleach ferredoxin shift table must contain all >=100 non-Pro amides (got {total_non_pro_amides})"
+    );
+
+    // Compute exact 3D amide-to-metal distance `r_M[k]` (Å) for every residue in 1I7H
+    let mut r_metal_ang = vec![25.0_f64; full_ref.sequence.len()];
+    for res in &chain_a.residues {
+        let k = (res.seq_id - 1) as usize;
+        if k < r_metal_ang.len() {
+            let coord = res.h.unwrap_or(res.n);
+            r_metal_ang[k] = v_dist(coord, metal_center);
+        }
+    }
+
+    let cfg_3d = ParamagneticAssignConfig {
+        pdb_coordinates: Some(pdb_1i7h.clone()),
+        ..Default::default()
+    };
+    let (_, rep_3d) = assign_paramagnetic_backbone(&[], &full_ref.sequence, &priors, &cfg_3d);
+
+    // Physical Solomon-Bloembergen transverse PRE relaxation rate & INEPT amplitude transfer:
+    //   R2_PRE(r_M) = R2_ref * (r_bleach / r_M)^6
+    //   I(r_M) / I_0 = exp(-R2_PRE * tau_INEPT) * R2_0 / (R2_0 + R2_PRE)
+    // (`Solomon, Phys. Rev. 1955, 99, 559`; `Battiste & Wagner, Biochemistry 2000, 39, 5355`)
+    let r_bleach = MetalParamagneticClass::FeSClusterOrHighSpin3d.default_r_bleach_angstrom(); // 8.5 Å
+    let r2_0 = 20.0_f64; // s^-1 diamagnetic transverse relaxation
+    let r2_pre_at_bleach = 95.0_f64; // s^-1 at r_M = 8.5 Å
+    let tau_2d_s = 0.0108_f64; // 10.8 ms 2D 15N-HSQC INEPT + reverse-INEPT
+    let tau_3d_s = 0.0250_f64; // 25.0 ms 3D out-and-back triple-resonance transfer
+
+    let pre_atten = |r_m: f64, tau_s: f64| -> f64 {
+        let r_eff = r_m.max(2.0);
+        let r2_pre = r2_pre_at_bleach * (r_bleach / r_eff).powi(6);
+        (-r2_pre * tau_s).exp() * (r2_0 / (r2_0 + r2_pre))
+    };
+
+    // Verify physical regime separation before rendering
+    assert!(
+        pre_atten(7.2, tau_2d_s) * 58.0 < 2.0,
+        "core blind-zone amide (r_M = 7.2 Å) must physically decay below 2.0x thermal noise"
+    );
+    assert!(
+        pre_atten(9.2, tau_2d_s) * 58.0 > 6.5 && pre_atten(9.2, tau_3d_s) * 28.0 < 4.8,
+        "twilight-zone amide (r_M = 9.2 Å) must survive 2D HSQC while attenuating in 3D triple-resonance"
+    );
+
+    let pcfg = PickerConfig {
+        snr_threshold: 5.5,
+        ..PickerConfig::default()
+    };
+
+    let mut glob_fps = 0usize;
+    let mut para_fps = 0usize;
+    let mut glob_precs = Vec::new();
+    let mut para_precs = Vec::new();
+    let mut para_hcps = Vec::new();
+    let mut picked_core_blind = 0usize;
+    let mut picked_twilight = 0usize;
+    let mut picked_outer = 0usize;
+
+    for seed in 0..3u64 {
+        // Synthesize full backbone peak table for ALL residues (including inner-sphere blind zone!)
+        let mut all_peaks: Vec<Peak> = Vec::new();
+        for (k, &r_ang) in r_metal_ang.iter().enumerate().skip(1) {
+            if full_ref.sequence[k] == "PRO" {
+                continue;
+            }
+            let h = full_ref.shifts[&(k, "H".to_string())];
+            let n = full_ref.shifts[&(k, "N".to_string())];
+            let f2d = pre_atten(r_ang, tau_2d_s);
+            let f3d = pre_atten(r_ang, tau_3d_s);
+
+            let snr_hsqc = 58.0 * f2d;
+            all_peaks.push(Peak::hsqc(h, n).with_intensity(snr_hsqc, Some(snr_hsqc)));
+
+            if let Some(&ca_i) = full_ref.shifts.get(&(k, "CA".to_string())) {
+                all_peaks.push(
+                    Peak::triple("HNCA", h, n, ca_i, 1)
+                        .with_intensity(34.0 * f3d, Some(34.0 * f3d)),
+                );
+                all_peaks.push(
+                    Peak::triple("HNCACB", h, n, ca_i, 1)
+                        .with_intensity(28.0 * f3d, Some(28.0 * f3d)),
+                );
+            }
+            if let Some(&cb_i) = full_ref.shifts.get(&(k, "CB".to_string())) {
+                all_peaks.push(
+                    Peak::triple("HNCACB", h, n, cb_i, -1)
+                        .with_intensity(25.0 * f3d, Some(25.0 * f3d)),
+                );
+            }
+            if let Some(&ca_im1) = full_ref.shifts.get(&(k - 1, "CA".to_string())) {
+                all_peaks.push(
+                    Peak::triple("HNCA", h, n, ca_im1, 1)
+                        .with_intensity(20.0 * f3d, Some(20.0 * f3d)),
+                );
+                all_peaks.push(
+                    Peak::triple("CBCACONH", h, n, ca_im1, 1)
+                        .with_intensity(32.0 * f3d, Some(32.0 * f3d)),
+                );
+                all_peaks.push(
+                    Peak::triple("HNCACB", h, n, ca_im1, 1)
+                        .with_intensity(16.0 * f3d, Some(16.0 * f3d)),
+                );
+            }
+            if let Some(&cb_im1) = full_ref.shifts.get(&(k - 1, "CB".to_string())) {
+                all_peaks.push(
+                    Peak::triple("CBCACONH", h, n, cb_im1, 1)
+                        .with_intensity(30.0 * f3d, Some(30.0 * f3d)),
+                );
+                all_peaks.push(
+                    Peak::triple("HNCACB", h, n, cb_im1, -1)
+                        .with_intensity(15.0 * f3d, Some(15.0 * f3d)),
+                );
+            }
+            if let Some(&c_im1) = full_ref.shifts.get(&(k - 1, "C".to_string())) {
+                all_peaks.push(
+                    Peak::triple("HNCO", h, n, c_im1, 1)
+                        .with_intensity(38.0 * f3d, Some(38.0 * f3d)),
+                );
+            }
+        }
+
+        // Render genuine noisy 2D HSQC (including Asn/Gln sidechain NH2 doublets lacking 3D
+        // backbone carbon relays) + four 3D triple-resonance volumes (`noise_level = 1.0`)
+        let mut hsqc_render_peaks = all_peaks.clone();
+        for &(nh_a, nh_b, n_sc) in &[
+            (6.92_f64, 7.56_f64, 112.1_f64),
+            (7.04, 7.64, 112.8),
+            (6.86, 7.48, 111.6),
+            (7.12, 7.71, 113.4),
+        ] {
+            hsqc_render_peaks.push(Peak::hsqc(nh_a, n_sc).with_intensity(26.0, Some(26.0)));
+            hsqc_render_peaks.push(Peak::hsqc(nh_b, n_sc).with_intensity(26.0, Some(26.0)));
+        }
+        let rcfg_base = SpectrumRenderConfig {
+            nx_h: 512,
+            ny_n: 256,
+            nz_c: 128,
+            noise_level: 1.0,
+            seed: 4200 + seed * 17,
+            ..SpectrumRenderConfig::default()
+        };
+        let hsqc_vol = render_hsqc_2d(&hsqc_render_peaks, &rcfg_base);
+        let picked_roots = pick_hsqc_2d(&hsqc_vol, &pcfg);
+
+        if seed == 0 {
+            for r in &picked_roots {
+                if let Some(best_k) = (1..full_ref.sequence.len())
+                    .filter(|&k| full_ref.sequence[k] != "PRO")
+                    .min_by(|&a, &b| {
+                        let da = ((r.h - full_ref.shifts[&(a, "H".to_string())]) / 0.03).powi(2)
+                            + ((r.n - full_ref.shifts[&(a, "N".to_string())]) / 0.25).powi(2);
+                        let db = ((r.h - full_ref.shifts[&(b, "H".to_string())]) / 0.03).powi(2)
+                            + ((r.n - full_ref.shifts[&(b, "N".to_string())]) / 0.25).powi(2);
+                        da.total_cmp(&db)
+                    })
+                {
+                    let dh = (r.h - full_ref.shifts[&(best_k, "H".to_string())]).abs();
+                    let dn = (r.n - full_ref.shifts[&(best_k, "N".to_string())]).abs();
+                    if dh <= 0.04 && dn <= 0.30 {
+                        let rm = r_metal_ang[best_k];
+                        if rm < 7.6 {
+                            picked_core_blind += 1;
+                        } else if rm <= 10.0 {
+                            picked_twilight += 1;
+                        } else {
+                            picked_outer += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut picked_all = picked_roots.clone();
+        for (e_idx, exp_name) in ["HNCA", "HNCACB", "CBCACONH", "HNCO"].iter().enumerate() {
+            let mut rcfg_3d = rcfg_base.clone();
+            rcfg_3d.seed = 5200 + seed * 31 + (e_idx as u64);
+            let vol_3d = render_triple_3d(exp_name, &all_peaks, &rcfg_3d);
+            picked_all.extend(pick_triple_3d(&vol_3d, &picked_roots, &pcfg));
+        }
+
+        let count_wrong_blind_zone = |positions: &[i32], truth: &[i32]| -> usize {
+            positions
+                .iter()
+                .zip(truth.iter())
+                .filter(|&(&pos, &tr)| {
+                    pos >= 0
+                        && pos != tr
+                        && rep_3d
+                            .p_bleach
+                            .get(pos as usize)
+                            .is_some_and(|&pb| pb >= cfg_3d.blind_zone_threshold)
+                })
+                .count()
+        };
+
+        // Globular baseline vs Paramagnetic-aware solver on identical volumetrically picked peaks
+        let glob_cfg = ParamagneticAssignConfig {
+            mode: ParamagneticSolverMode::EvoGraph,
+            auto_detect_motifs: false,
+            enable_generic_ca_less_filter: false,
+            enable_u_para_bleach_prior: false,
+            seed,
+            ..Default::default()
+        };
+        let (g_sys, g_res, _) =
+            assign_paramagnetic_from_peaks(&picked_all, &full_ref.sequence, &priors, &glob_cfg);
+        let g_truth = map_spin_systems_to_truth(&g_sys, &full_ref);
+        glob_fps += count_wrong_blind_zone(&g_res.position, &g_truth);
+        let gm = score(&g_res, &g_truth, 0.80);
+        glob_precs.push(gm.accuracy() * 100.0);
+
+        let para_cfg = ParamagneticAssignConfig {
+            mode: ParamagneticSolverMode::EvoGraph,
+            pdb_coordinates: Some(pdb_1i7h.clone()),
+            seed,
+            ..Default::default()
+        };
+        let (p_sys, p_res, _) =
+            assign_paramagnetic_from_peaks(&picked_all, &full_ref.sequence, &priors, &para_cfg);
+        let p_truth = map_spin_systems_to_truth(&p_sys, &full_ref);
+        para_fps += count_wrong_blind_zone(&p_res.position, &p_truth);
+        let pm = score(&p_res, &p_truth, 0.80);
+        para_precs.push(pm.accuracy() * 100.0);
+        para_hcps.push(pm.hc_precision() * 100.0);
+    }
+
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / (v.len() as f64);
+    println!(
+        "[Volumetric Solomon-PRE 2D+3D Picked Ferredoxin (3 seeds, 1I7H)]:\n  Seed-0 2D HSQC picked shells: core_blind(r<7.6Å)={picked_core_blind}, twilight(7.6..10Å)={picked_twilight}, outer(r>10Å)={picked_outer}\n  Globular EvoGraph: prec={:.2}% | blind_zone_FP={glob_fps}\n  Paramagnetic EvoGraph: prec={:.2}% | HC_prec={:.2}% | blind_zone_FP={para_fps}",
+        mean(&glob_precs),
+        mean(&para_precs),
+        mean(&para_hcps),
+    );
+    assert_eq!(
+        picked_core_blind, 0,
+        "core blind-zone amides (r_M < 7.6 Å) must naturally attenuate below the volumetric 2D HSQC picker threshold"
+    );
+    assert!(
+        picked_twilight >= 2 && picked_outer >= 55,
+        "expected volumetric picker to recover twilight-zone and outer-shell amides (twilight={picked_twilight}, outer={picked_outer})"
+    );
+    assert!(
+        glob_fps > 0 && para_fps == 0,
+        "volumetrically picked paramagnetic benchmark must show globular blind-zone FPs ({glob_fps} > 0) eliminated to 0 by paramagnetic solver ({para_fps})"
+    );
+    assert!(
+        mean(&para_precs) >= mean(&glob_precs) && mean(&para_hcps) >= 95.0,
+        "volumetric paramagnetic solver must outperform globular precision and maintain >=95% HC precision (glob={:.2}%, para={:.2}%, HC={:.2}%)",
+        mean(&glob_precs),
+        mean(&para_precs),
+        mean(&para_hcps)
     );
 }

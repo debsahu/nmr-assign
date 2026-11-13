@@ -1555,7 +1555,7 @@ fn test_idp_p2_cb_multi_candidate_size_cap_and_carrier_drift_clamp_warnings() {
     let systems_base = register_and_build_con_dipeptide_systems(&picked);
     let off_base = estimate_idp_reference_offsets(&systems_base, &p53.sequence, &cfg);
 
-    let dcb_extra = 0.62f64;
+    let dcb_extra = 1.42f64;
     let mut extra_artifacts = Vec::new();
     for p in &mut picked.strip_peaks {
         if p.exp == C13DetectedExp::Cbcaco3D && p.sign < 0 {
@@ -2157,5 +2157,504 @@ fn test_no_cccon_5spectrum_3x_noise_and_midband_0_054_ppm_qc_triggers() {
     assert_eq!(
         mid_warn, mid_runs,
         "All {mid_runs}/{mid_runs} sigma_seq_CA=0.054 ppm + 15% equal-height spurious runs must trigger QC Warn (got {mid_warn}/{mid_runs})!"
+    );
+}
+
+#[test]
+fn test_idp_offset_and_ncaco_look_elsewhere_null_fpr_and_dss_recovery() {
+    let root = workspace_root();
+    let p53 = read_star_all_atoms(
+        root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+        None,
+    )
+    .unwrap();
+    let darpp = read_star_all_atoms(root.join("data/benchmark/bmr15176.str"), None).unwrap();
+
+    // 1. Zero-offset null-hypothesis Monte Carlo (`250` noisy runs across two real IDP sequences):
+    //    Generate synthetic picked datasets directly around `ncIDP` random-coil predictions with
+    //    `d_true = (0, 0, 0, 0)` global offset AND `d_inter = 0` inter-experiment drift, plus
+    //    realistic per-residue secondary-shift / conformational scatter (`0.16..0.35 ppm`),
+    //    experimental peak jitter, 10% 3D dropout, and 8% spurious 3D peaks (including unanchored
+    //    spurious NCACO peaks). Verify look-elsewhere correction keeps false non-zero offset shifts
+    //    strictly `< 5%` (`< 12 / 250`) both per-axis and family-wise, with zero false clamp warnings.
+    let n_null_trials = 250usize;
+    let mut fp_n = 0usize;
+    let mut fp_c = 0usize;
+    let mut fp_ca = 0usize;
+    let mut fp_cb = 0usize;
+    let mut fp_any = 0usize;
+    let mut fp_reg_warn = 0usize;
+
+    for trial in 0..n_null_trials {
+        let (ref_seq, temp_k, ph) = if trial % 2 == 0 {
+            (&p53.sequence, 298.15, 6.0)
+        } else {
+            (&darpp.sequence, 298.15, 6.5)
+        };
+        let cfg = IdpSolverConfig {
+            temperature_k: temp_k,
+            ph,
+            ..IdpSolverConfig::default()
+        };
+        let preds = predict_ncidp_shifts(ref_seq, &cfg);
+        let mut rng = Rng::new(0x9110_0FF5_E700_u64 + trial as u64);
+
+        // Per-residue zero-mean conformational scatter around ncIDP
+        let seq_len = ref_seq.len();
+        let n_true: Vec<f64> = (0..seq_len)
+            .map(|k| preds[k].n_ppm + rng.normal(0.0, 0.34))
+            .collect();
+        let c_true: Vec<f64> = (0..seq_len)
+            .map(|k| preds[k].c_ppm + rng.normal(0.0, 0.16))
+            .collect();
+        let ca_true: Vec<f64> = (0..seq_len)
+            .map(|k| preds[k].ca_ppm + rng.normal(0.0, 0.20))
+            .collect();
+        let cb_true: Vec<Option<f64>> = (0..seq_len)
+            .map(|k| preds[k].cb_ppm.map(|v| v + rng.normal(0.0, 0.22)))
+            .collect();
+
+        let mut con_roots = Vec::with_capacity(seq_len);
+        let mut strip_peaks = Vec::new();
+        let mut caco_peaks = Vec::with_capacity(seq_len);
+
+        for i in 0..seq_len {
+            let is_gly = ref_seq[i].eq_ignore_ascii_case("GLY");
+            let sign = if is_gly { -1 } else { 1 };
+            let ca_obs = ca_true[i] + rng.normal(0.0, 0.022);
+            caco_peaks.push(Caco2DPeak {
+                c_curr_ppm: c_true[i] + rng.normal(0.0, 0.015),
+                ca_curr_ppm: ca_obs,
+                sign,
+                height: 95.0 * (sign as f64),
+                volume: 95.0 * (sign as f64),
+                kind: if is_gly {
+                    CacoPeakKind::GlyOppositePhase
+                } else if ca_obs >= 58.0 {
+                    CacoPeakKind::SerThrProDownfield
+                } else {
+                    CacoPeakKind::GeneralAliphatic
+                },
+            });
+        }
+
+        for k in 1..seq_len {
+            let r_idx = con_roots.len();
+            let cp = c_true[k - 1] + rng.normal(0.0, 0.015);
+            let np = n_true[k] + rng.normal(0.0, 0.030);
+            con_roots.push(Con2DPeak {
+                c_prev_ppm: cp,
+                n_curr_ppm: np,
+                height: 100.0,
+                volume: 100.0,
+                is_proline_imino_region: np >= 131.5,
+                deconvolved_from_cluster: false,
+            });
+            if rng.f64() >= 0.10 {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Canco3D,
+                    c_prime_ppm: cp,
+                    n_ppm: np,
+                    c_indirect_ppm: ca_true[k] + rng.normal(0.0, 0.025),
+                    sign: 1,
+                    height: 92.0,
+                    volume: 92.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+            if rng.f64() >= 0.10 {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Canco3D,
+                    c_prime_ppm: cp,
+                    n_ppm: np,
+                    c_indirect_ppm: ca_true[k - 1] + rng.normal(0.0, 0.025),
+                    sign: 1,
+                    height: 68.0,
+                    volume: 68.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+            if rng.f64() >= 0.10 {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Cbcaco3D,
+                    c_prime_ppm: cp,
+                    n_ppm: np,
+                    c_indirect_ppm: ca_true[k - 1] + rng.normal(0.0, 0.025),
+                    sign: 1,
+                    height: 88.0,
+                    volume: 88.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+            if let Some(cb_v) = cb_true[k - 1] {
+                if rng.f64() >= 0.10 {
+                    strip_peaks.push(C13Strip3DPeak {
+                        exp: C13DetectedExp::Cbcaco3D,
+                        c_prime_ppm: cp,
+                        n_ppm: np,
+                        c_indirect_ppm: cb_v + rng.normal(0.0, 0.030),
+                        sign: -1,
+                        height: -82.0,
+                        volume: -82.0,
+                        anchor_root_idx: Some(r_idx),
+                    });
+                }
+            }
+            if rng.f64() >= 0.10 {
+                strip_peaks.push(C13Strip3DPeak {
+                    exp: C13DetectedExp::Ncaco3D,
+                    c_prime_ppm: c_true[k] + rng.normal(0.0, 0.016),
+                    n_ppm: n_true[k] + rng.normal(0.0, 0.030),
+                    c_indirect_ppm: ca_true[k] + rng.normal(0.0, 0.025),
+                    sign: 1,
+                    height: 86.0,
+                    volume: 86.0,
+                    anchor_root_idx: Some(r_idx),
+                });
+            }
+        }
+
+        // Inject 6 unanchored spurious NCACO noise peaks (mimicking volumetric background spikes
+        // that previously triggered bogus -0.756 ppm NCACO_unanch_C' clamp drift!)
+        for _ in 0..6 {
+            strip_peaks.push(C13Strip3DPeak {
+                exp: C13DetectedExp::Ncaco3D,
+                c_prime_ppm: 170.5 + rng.f64() * 8.0,
+                n_ppm: 112.0 + rng.f64() * 24.0,
+                c_indirect_ppm: 46.0 + rng.f64() * 19.0,
+                sign: 1,
+                height: 35.0,
+                volume: 35.0,
+                anchor_root_idx: None,
+            });
+        }
+
+        let picked = C13PickedDataset {
+            con_roots,
+            caco_peaks,
+            strip_peaks,
+        };
+        let systems = register_and_build_con_dipeptide_systems(&picked);
+        if systems.iter().any(|s| !s.registration_warnings.is_empty()) {
+            fp_reg_warn += 1;
+        }
+        let off = estimate_idp_reference_offsets(&systems, ref_seq, &cfg);
+        let nz_n = off.d_n.abs() > 0.0;
+        let nz_c = off.d_c.abs() > 0.0;
+        let nz_ca = off.d_ca.abs() > 0.0;
+        let nz_cb = off.d_cb.abs() > 0.0;
+        if nz_n {
+            fp_n += 1;
+        }
+        if nz_c {
+            fp_c += 1;
+        }
+        if nz_ca {
+            fp_ca += 1;
+        }
+        if nz_cb {
+            fp_cb += 1;
+        }
+        if nz_n || nz_c || nz_ca || nz_cb {
+            fp_any += 1;
+        }
+    }
+
+    let rate_any = (fp_any as f64) / (n_null_trials as f64);
+    println!(
+        "[Zero-Offset Null MC N={n_null_trials}] false non-zero rates: dN={fp_n}/{n_null_trials} ({:.2}%), dC'={fp_c}/{n_null_trials} ({:.2}%), dCA={fp_ca}/{n_null_trials} ({:.2}%), dCB={fp_cb}/{n_null_trials} ({:.2}%), family-wise={fp_any}/{n_null_trials} ({:.2}%), reg_clamp_FP={fp_reg_warn}/{n_null_trials}",
+        100.0 * (fp_n as f64) / (n_null_trials as f64),
+        100.0 * (fp_c as f64) / (n_null_trials as f64),
+        100.0 * (fp_ca as f64) / (n_null_trials as f64),
+        100.0 * (fp_cb as f64) / (n_null_trials as f64),
+        100.0 * rate_any,
+    );
+    assert_eq!(
+        fp_reg_warn, 0,
+        "Unanchored NCACO background noise spikes must trigger 0 false carrier-drift clamp warnings!"
+    );
+    assert!(
+        rate_any < 0.05,
+        "Zero-offset null family-wise false non-zero shift rate {:.2}% ({fp_any}/{n_null_trials}) >= 5.0%!",
+        rate_any * 100.0
+    );
+
+    // 2. Genuine DSS/TSP referencing offset (`+2.00 ppm 13C`, `+1.50 ppm 15N`): 100% recovery across 20 seeds
+    let cfg_p53 = IdpSolverConfig {
+        temperature_k: 298.15,
+        ph: 6.0,
+        ..IdpSolverConfig::default()
+    };
+    let preds_p53 = predict_ncidp_shifts(&p53.sequence, &cfg_p53);
+    for sd in 0..20u64 {
+        let mut rng = Rng::new(0xD55_7590_u64 + sd);
+        let mut systems = Vec::new();
+        for k in 1..p53.sequence.len() {
+            let mut s = ConDipeptideSystem::new(
+                k - 1,
+                preds_p53[k - 1].c_ppm + 2.00 + rng.normal(0.0, 0.16),
+                preds_p53[k].n_ppm + 1.50 + rng.normal(0.0, 0.34),
+                100.0,
+            );
+            s.ca_curr
+                .push(preds_p53[k].ca_ppm + 2.00 + rng.normal(0.0, 0.20));
+            s.ca_prev
+                .push(preds_p53[k - 1].ca_ppm + 2.00 + rng.normal(0.0, 0.20));
+            if let Some(cb) = preds_p53[k - 1].cb_ppm {
+                s.cb_prev.push(cb + 2.00 + rng.normal(0.0, 0.22));
+            }
+            systems.push(s);
+        }
+        let off = estimate_idp_reference_offsets(&systems, &p53.sequence, &cfg_p53);
+        assert!(
+            (off.d_n - 1.50).abs() <= 0.18
+                && (off.d_c - 2.00).abs() <= 0.10
+                && (off.d_ca - 2.00).abs() <= 0.10
+                && (off.d_cb - 2.00).abs() <= 0.12,
+            "Seed {sd}: genuine DSS/TSP (+2.0 13C, +1.5 15N) offset recovery failed: {off:?}"
+        );
+    }
+}
+
+#[test]
+fn test_idp_qc_gate_d_clean_realistic_noise_pass_vs_3x_degraded_warn() {
+    let root = workspace_root();
+    let entries = [
+        (
+            root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+            "bmr51984 (p53-TAD-PRR)",
+            298.15,
+            6.0,
+        ),
+        (
+            root.join("data/benchmark/bmr15176.str"),
+            "bmr15176 (DARPP-32)",
+            298.15,
+            6.5,
+        ),
+    ];
+
+    let mut clean_pass = 0usize;
+    let mut degraded_warn = 0usize;
+    let mut total = 0usize;
+
+    for (idx, (path, label, temp_k, ph)) in entries.iter().enumerate() {
+        let ref_data = read_star_all_atoms(path, None).unwrap();
+        for sd in 0..5u64 {
+            total += 1;
+            let seed = 71_000 + (idx as u64) * 31 + sd;
+            // Clean 1x realistic per-peak 13CA resolution noise (`sigma_peak = 0.036 ppm`, where
+            // single-pair sqrt(2)*sigma = 0.051 ppm > legacy 0.034 ppm gate!) with low-amplitude
+            // thermal clutter (`ht = 22.0`, filtered cleanly below `0.35 * max_height`).
+            let (picked_clean, _) = simulate_realistic_noise_bmrb_dataset_custom(
+                &ref_data, 0.036, 0.08, 0.06, 22.0, true, seed,
+            );
+            let cfg = IdpSolverConfig {
+                temperature_k: *temp_k,
+                ph: *ph,
+                replicas: 28,
+                islands: 4,
+                generations: 2,
+                steps_per_system: 1_800,
+                seed,
+                ..IdpSolverConfig::default()
+            };
+            let (_, res_clean) =
+                assign_idp_13c_from_picked(&picked_clean, &ref_data.sequence, &cfg);
+            if res_clean.qc_verdict == DatasetQcVerdict::Pass {
+                clean_pass += 1;
+            } else {
+                println!(
+                    "UNEXPECTED CLEAN WARN on {label} sd={sd}: reasons={:?}",
+                    res_clean.qc_reasons
+                );
+            }
+
+            // Pure 3x degraded per-peak broadening (`sigma_peak = 0.082 ppm`, `emp_rms_seq_ca ~ 0.085..0.105 ppm`,
+            // even with 0% spurious peaks!) must reliably trigger `DatasetQcVerdict::Warn` via gate (d).
+            let (picked_deg, _) = simulate_realistic_noise_bmrb_dataset_custom(
+                &ref_data,
+                0.082,
+                0.08,
+                0.0,
+                22.0,
+                true,
+                seed + 500,
+            );
+            let (_, res_deg) = assign_idp_13c_from_picked(&picked_deg, &ref_data.sequence, &cfg);
+            if res_deg.qc_verdict == DatasetQcVerdict::Warn {
+                degraded_warn += 1;
+            } else {
+                println!(
+                    "MISSED DEGRADED 3x WARN on {label} sd={sd}: verdict={} reasons={:?}",
+                    res_deg.qc_verdict, res_deg.qc_reasons
+                );
+            }
+        }
+    }
+
+    println!(
+        "[IDP QC Gate (d) Noise-Floor Audit] clean sigma_peak=0.036 ppm Pass={clean_pass}/{total}, pure 3x sigma_peak=0.082 ppm Warn={degraded_warn}/{total}"
+    );
+    assert_eq!(
+        clean_pass, total,
+        "Clean 1x realistic-resolution (sigma_peak=0.036 ppm) runs must Pass QC ({clean_pass}/{total})"
+    );
+    assert_eq!(
+        degraded_warn, total,
+        "Degraded 3x broadening (sigma_peak=0.082 ppm) runs must Warn QC ({degraded_warn}/{total})"
+    );
+}
+
+#[test]
+fn test_3seed_multi_protein_volumetric_con_and_3d_e2e_calibration() {
+    let root = workspace_root();
+    let p53_full = read_star_all_atoms(
+        root.join("data/fixtures/bmr51984_idp_p53_tad_prr.str"),
+        None,
+    )
+    .unwrap();
+    let darpp_full = read_star_all_atoms(root.join("data/benchmark/bmr15176.str"), None).unwrap();
+
+    // Two distinct real BMRB IDPs (`p53 TAD+PRR` 62-aa N-terminal domain with 14 Prolines, and
+    // `DARPP-32` 65-aa disordered phosphatase-inhibitor domain) x 3 volumetric seeds = 6 full 2D+3D cubes
+    let make_sub = |full: &Reference, len: usize| -> Reference {
+        let n = len.min(full.sequence.len());
+        let mut sub = Reference::new(full.sequence[..n].to_vec(), full.seq_ids[..n].to_vec());
+        for ((i, atom), &val) in &full.shifts {
+            if *i < n {
+                sub.shifts.insert((*i, atom.clone()), val);
+            }
+        }
+        sub
+    };
+
+    let proteins = [
+        ("bmr51984 (p53-62aa)", make_sub(&p53_full, 62), 298.15, 6.0),
+        (
+            "bmr15176 (DARPP32-65aa)",
+            make_sub(&darpp_full, 65),
+            298.15,
+            6.5,
+        ),
+    ];
+
+    let mut exp_offsets = BTreeMap::new();
+    exp_offsets.insert(C13DetectedExp::Caco2D, (-0.10, 0.0, 0.12));
+    exp_offsets.insert(C13DetectedExp::Canco3D, (0.11, -0.14, -0.09));
+    exp_offsets.insert(C13DetectedExp::Cbcaco3D, (-0.09, 0.12, 0.11));
+    exp_offsets.insert(C13DetectedExp::Ncaco3D, (0.08, 0.10, -0.08));
+
+    let pcfg = C13PickerConfig::default();
+    let mut pooled_cal: Vec<(f64, bool)> = Vec::new();
+    let mut tot_corr = 0usize;
+    let mut tot_ass = 0usize;
+    let mut tot_hc_c = 0usize;
+    let mut tot_hc_a = 0usize;
+
+    for (p_idx, (label, sub, temp_k, ph)) in proteins.iter().enumerate() {
+        let mut p_corr = 0usize;
+        let mut p_ass = 0usize;
+        let mut p_hc_c = 0usize;
+        let mut p_hc_a = 0usize;
+        let mut p_cal: Vec<(f64, bool)> = Vec::new();
+
+        for sd in 0..3u64 {
+            let seed = 3100 + (p_idx as u64) * 97 + sd;
+            let sim_cfg = IdpCubeSimConfig {
+                proton_mhz: 700.0,
+                temperature_k: *temp_k,
+                ph: *ph,
+                snr_2d: 40.0,
+                snr_3d: 24.0,
+                con_grid: (1024, 1024),
+                caco_grid: (512, 512),
+                cube_3d_grid: (128, 128, 144),
+                exp_offsets: exp_offsets.clone(),
+                per_peak_jitter_ppm: Some((0.020, 0.048, 0.055)),
+                spurious_con_rate: 0.03,
+                spurious_3d_rel_amp: 0.85,
+                spurious_strip_artifact_rate: 0.18,
+                seed,
+                ..IdpCubeSimConfig::default()
+            };
+            let cubes = simulate_idp_13c_cubes(sub, &sim_cfg);
+            let (picked, diags) = pick_simulated_c13_dataset_with_diagnostics(&cubes, &pcfg);
+            let picker_warnings: Vec<String> =
+                diags.into_iter().filter_map(|d| d.warning).collect();
+
+            let truth: Vec<i32> = picked
+                .con_roots
+                .iter()
+                .map(|r| {
+                    cubes
+                        .ground_truth_con
+                        .iter()
+                        .find(|&&(_, cp, np, _, _)| {
+                            (r.c_prev_ppm - cp).abs() <= 0.055 && (r.n_curr_ppm - np).abs() <= 0.22
+                        })
+                        .map(|&(k, _, _, _, _)| k as i32)
+                        .unwrap_or(-1)
+                })
+                .collect();
+
+            let solver_cfg = IdpSolverConfig {
+                temperature_k: *temp_k,
+                ph: *ph,
+                picker_warnings,
+                seed,
+                ..IdpSolverConfig::default()
+            };
+            let (_, res) = assign_idp_13c_from_picked(&picked, &sub.sequence, &solver_cfg);
+            let m = evaluate_metrics(&res.as_assign_result(), &truth, 0.80);
+            p_corr += m.correct;
+            p_ass += m.assigned;
+            p_hc_c += m.hc_correct;
+            p_hc_a += m.hc_assigned;
+            tot_corr += m.correct;
+            tot_ass += m.assigned;
+            tot_hc_c += m.hc_correct;
+            tot_hc_a += m.hc_assigned;
+
+            for (s, &pos) in res.position.iter().enumerate() {
+                if pos >= 0 {
+                    let ok = pos == truth[s];
+                    p_cal.push((res.confidence[s], ok));
+                    pooled_cal.push((res.confidence[s], ok));
+                }
+            }
+        }
+        let p_rel = ProteinReliabilityCurve::from_predictions(&p_cal, 0.80);
+        println!(
+            "[3-Seed Volumetric E2E {label}] Acc={:.2}% ({p_corr}/{p_ass}) HC_prec={:.2}% ({p_hc_c}/{p_hc_a}) ECE={:.4}",
+            100.0 * (p_corr as f64) / (p_ass.max(1) as f64),
+            100.0 * (p_hc_c as f64) / (p_hc_a.max(1) as f64),
+            p_rel.ece,
+        );
+    }
+
+    let pooled_acc = (tot_corr as f64) / (tot_ass.max(1) as f64);
+    let pooled_hc = (tot_hc_c as f64) / (tot_hc_a.max(1) as f64);
+    let pooled_rel = ProteinReliabilityCurve::from_predictions(&pooled_cal, 0.80);
+    println!(
+        "[Pooled 6-Run (3-Seed x 2-Protein) Volumetric 2D CON + 3D E2E] Acc={:.2}% ({tot_corr}/{tot_ass}) HC_prec={:.2}% ({tot_hc_c}/{tot_hc_a}) ECE={:.4}",
+        pooled_acc * 100.0,
+        pooled_hc * 100.0,
+        pooled_rel.ece,
+    );
+    assert!(
+        pooled_acc >= 0.90,
+        "Pooled 3-seed volumetric E2E accuracy {:.2}% < 90.0%!",
+        pooled_acc * 100.0
+    );
+    assert!(
+        pooled_hc >= 0.95,
+        "Pooled 3-seed volumetric E2E HC precision {:.2}% < 95.0%!",
+        pooled_hc * 100.0
+    );
+    assert!(
+        pooled_rel.ece <= 0.06,
+        "Pooled 3-seed volumetric E2E ECE {:.4} > 0.06!",
+        pooled_rel.ece
     );
 }
