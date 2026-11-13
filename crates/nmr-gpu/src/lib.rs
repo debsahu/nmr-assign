@@ -98,14 +98,18 @@ struct BufferMapState {
 }
 
 struct BufferMapFuture<'a> {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     device: &'a wgpu::Device,
     state: Arc<Mutex<BufferMapState>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    submission_index: Option<wgpu::SubmissionIndex>,
 }
 
 impl Future for BufferMapFuture<'_> {
     type Output = Result<(), String>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         {
             let mut guard = self
                 .state
@@ -119,23 +123,25 @@ impl Future for BufferMapFuture<'_> {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = self.device.poll(wgpu::PollType::Poll);
+            let sub_idx = self.submission_index.clone();
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: sub_idx,
+                timeout: Some(std::time::Duration::from_millis(50)),
+            });
             let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| "GPU map state mutex poisoned".to_string())?;
             if let Some(res) = guard.result.take() {
                 guard.waker = None;
+                drop(guard);
+                self.submission_index = None;
                 return Poll::Ready(res.map_err(|e| format!("GPU buffer map failed: {e}")));
             }
             let waker = cx.waker().clone();
             drop(guard);
-            std::thread::yield_now();
             waker.wake();
         }
-
-        #[cfg(target_arch = "wasm32")]
-        let _ = self.device;
 
         Poll::Pending
     }
@@ -439,7 +445,8 @@ impl GpuEngine {
     }
 
     /// Non-blocking asynchronous GPU buffer readback (`wasm32`-compatible via `Future` + `Waker`
-    /// around `wgpu::BufferSlice::map_async`, with non-blocking `PollType::Poll` driving on native).
+    /// around `wgpu::BufferSlice::map_async`, using OS-fenced `wgpu::PollType::Wait` on native
+    /// so awaiting callers never busy-spin a CPU core).
     pub async fn read_buffer_vec_async<T: Pod>(
         &self,
         src: &wgpu::Buffer,
@@ -484,7 +491,9 @@ impl GpuEngine {
                 label: Some("nmr-readback-async-enc"),
             });
         encoder.copy_buffer_to_buffer(src, 0, &staging, 0, aligned_bytes);
-        self.queue.submit(Some(encoder.finish()));
+        let submission_index = self.queue.submit(Some(encoder.finish()));
+        #[cfg(target_arch = "wasm32")]
+        let _ = submission_index;
 
         let slice = staging.slice(0..aligned_bytes);
         let state = Arc::new(Mutex::new(BufferMapState {
@@ -505,6 +514,8 @@ impl GpuEngine {
         BufferMapFuture {
             device: &self.device,
             state,
+            #[cfg(not(target_arch = "wasm32"))]
+            submission_index: Some(submission_index),
         }
         .await?;
 

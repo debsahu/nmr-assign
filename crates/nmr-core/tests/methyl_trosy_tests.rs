@@ -784,29 +784,31 @@ fn build_synthetic_mcmc_test_problem(s_len: usize, m_len: usize) -> MethylContac
 
 fn enumerate_boltzmann_distribution(
     prob: &MethylContactProblem,
-    k_assigned: usize,
+    k_assigned: Option<usize>,
     temp: f64,
 ) -> BTreeMap<Vec<i32>, f64> {
     fn rec(
         s: usize,
         assigned_so_far: usize,
-        k_assigned: usize,
+        k_assigned: Option<usize>,
         prob: &MethylContactProblem,
         used_m: &mut [bool],
         cur: &mut Vec<i32>,
         states: &mut Vec<Vec<i32>>,
     ) {
         if s == prob.s_len {
-            if assigned_so_far == k_assigned {
+            if k_assigned.is_none_or(|k| assigned_so_far == k) {
                 states.push(cur.clone());
             }
             return;
         }
         let rem = prob.s_len - s;
-        if assigned_so_far + rem < k_assigned {
-            return;
+        if let Some(k) = k_assigned {
+            if assigned_so_far + rem < k {
+                return;
+            }
         }
-        if assigned_so_far < k_assigned {
+        if k_assigned.is_none_or(|k| assigned_so_far < k) {
             for &m_u32 in &prob.slots[s] {
                 let m = m_u32 as usize;
                 if !used_m[m] {
@@ -826,7 +828,7 @@ fn enumerate_boltzmann_distribution(
                 }
             }
         }
-        if assigned_so_far + (rem - 1) >= k_assigned {
+        if k_assigned.is_none_or(|k| assigned_so_far + (rem - 1) >= k) {
             cur.push(-1);
             rec(
                 s + 1,
@@ -869,17 +871,17 @@ fn enumerate_boltzmann_distribution(
 fn p1_10_cpu_mcmc_exact_boltzmann_stationary_distribution_all_four_moves() {
     let temp = 2.5;
 
-    // Case A (`S = 4 <= M = 5`): exercises Move 1B/1C, Move 2 asymmetric contact extension,
-    // Move 3 4-body geminal involution, and Move 4 prochiral 2-flip involution.
+    // Case A (`S = 4 <= M = 5`): exercises variable-cardinality Omega = U_{k=0..=4} Omega_k
+    // across Move 1, Move 2, Move 3 (4-body & 2-flip geminal involutions), and Move 4 (Birth/Death).
     let prob_a = build_synthetic_mcmc_test_problem(4, 5);
-    let exact_a = enumerate_boltzmann_distribution(&prob_a, 4, temp);
-    let n_samples = 24_000usize;
-    let samples_a = sample_methyl_mcmc_terminal_cpu(&prob_a, temp, 520, n_samples, 20261113);
+    let exact_a = enumerate_boltzmann_distribution(&prob_a, None, temp);
+    let n_samples = 96_000usize;
+    let samples_a = sample_methyl_mcmc_terminal_cpu(&prob_a, temp, 960, n_samples, 20261113);
     let mut counts_a: BTreeMap<Vec<i32>, usize> = BTreeMap::new();
     for st in samples_a {
         assert!(
             exact_a.contains_key(&st),
-            "sampled invalid state outside Omega_4: {st:?}"
+            "sampled invalid state outside variable-cardinality Omega: {st:?}"
         );
         *counts_a.entry(st).or_insert(0) += 1;
     }
@@ -892,24 +894,24 @@ fn p1_10_cpu_mcmc_exact_boltzmann_stationary_distribution_all_four_moves() {
             })
             .sum::<f64>();
     println!(
-        "[P1-10 CPU MCMC Stationary Boltzmann S=4,M=5] |Omega|={} | TVD={tvd_a:.4}",
+        "[P1-10/P1-6 CPU MCMC Stationary Boltzmann S=4,M=5] |Omega|={} | TVD={tvd_a:.4}",
         exact_a.len()
     );
     assert!(
-        tvd_a < 0.025,
-        "CPU MCMC stationary Boltzmann TVD (S=4,M=5) {tvd_a:.4} >= 0.025 (detailed balance violation!)"
+        tvd_a <= 0.025,
+        "CPU MCMC stationary Boltzmann TVD (S=4,M=5) {tvd_a:.4} > 0.025 (detailed balance violation!)"
     );
 
-    // Case B (`S = 5 > M = 4`): exercises Move 1E (`ms < 0, t >= 0` displace-occupied with unequal
-    // `|slots[s]| != |slots[t]|` up to 2x ratio) alongside Moves 1C, 2, 3, 4.
+    // Case B (`S = 5 > M = 4`): exercises Move 1E (`ms < 0, t >= 0` displace-occupied) + Move 4
+    // paired assign/unassign over Omega = U_{k=0..=4} Omega_k.
     let prob_b = build_synthetic_mcmc_test_problem(5, 4);
-    let exact_b = enumerate_boltzmann_distribution(&prob_b, 4, temp);
-    let samples_b = sample_methyl_mcmc_terminal_cpu(&prob_b, temp, 520, n_samples, 20261114);
+    let exact_b = enumerate_boltzmann_distribution(&prob_b, None, temp);
+    let samples_b = sample_methyl_mcmc_terminal_cpu(&prob_b, temp, 960, n_samples, 20261114);
     let mut counts_b: BTreeMap<Vec<i32>, usize> = BTreeMap::new();
     for st in samples_b {
         assert!(
             exact_b.contains_key(&st),
-            "sampled invalid state outside Omega_4 (S=5,M=4): {st:?}"
+            "sampled invalid state outside variable-cardinality Omega (S=5,M=4): {st:?}"
         );
         *counts_b.entry(st).or_insert(0) += 1;
     }
@@ -922,12 +924,12 @@ fn p1_10_cpu_mcmc_exact_boltzmann_stationary_distribution_all_four_moves() {
             })
             .sum::<f64>();
     println!(
-        "[P1-10 CPU MCMC Stationary Boltzmann S=5,M=4] |Omega|={} | TVD={tvd_b:.4}",
+        "[P1-10/P1-6 CPU MCMC Stationary Boltzmann S=5,M=4] |Omega|={} | TVD={tvd_b:.4}",
         exact_b.len()
     );
     assert!(
-        tvd_b < 0.025,
-        "CPU MCMC stationary Boltzmann TVD (S=5,M=4) {tvd_b:.4} >= 0.025 (Move 1E Hastings violation!)"
+        tvd_b <= 0.025,
+        "CPU MCMC stationary Boltzmann TVD (S=5,M=4) {tvd_b:.4} > 0.025 (detailed balance violation!)"
     );
 }
 

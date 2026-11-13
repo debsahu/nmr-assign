@@ -18,7 +18,8 @@ use nmr_core::methyl_solver::{
     build_initial_replica_states, build_methyl_contact_problem, evaluate_methyl_assignment,
     evaluate_methyl_assignment_against_truth, evaluate_methyl_objective, evaluate_methyl_raw_score,
     MethylAnnealConfig, MethylContactProblem, MethylScoreConfig, ObsAdjEntry, ObsNoeEdge,
-    StructShortAdjEntry, StructShortEdge, METHYL_FORBID,
+    StructShortAdjEntry, StructShortEdge, METHYL_FORBID, METHYL_MOVE_ALL, METHYL_MOVE_BIRTH_DEATH,
+    METHYL_MOVE_CONTACT, METHYL_MOVE_GEMINAL, METHYL_MOVE_SLOT,
 };
 use nmr_core::methyl_trosy::{
     attach_hmcmcbca_records, build_c2_homodimer_methyl_model, build_cn_homooligomer_methyl_model,
@@ -469,29 +470,31 @@ fn build_gpu_mcmc_test_problem(s_len: usize, m_len: usize) -> MethylContactProbl
 
 fn enumerate_gpu_boltzmann(
     prob: &MethylContactProblem,
-    k_assigned: usize,
+    k_assigned: Option<usize>,
     temp: f64,
 ) -> BTreeMap<Vec<i32>, f64> {
     fn rec(
         s: usize,
         assigned_so_far: usize,
-        k_assigned: usize,
+        k_assigned: Option<usize>,
         prob: &MethylContactProblem,
         used_m: &mut [bool],
         cur: &mut Vec<i32>,
         states: &mut Vec<Vec<i32>>,
     ) {
         if s == prob.s_len {
-            if assigned_so_far == k_assigned {
+            if k_assigned.is_none_or(|k| assigned_so_far == k) {
                 states.push(cur.clone());
             }
             return;
         }
         let rem = prob.s_len - s;
-        if assigned_so_far + rem < k_assigned {
-            return;
+        if let Some(k) = k_assigned {
+            if assigned_so_far + rem < k {
+                return;
+            }
         }
-        if assigned_so_far < k_assigned {
+        if k_assigned.is_none_or(|k| assigned_so_far < k) {
             for &m_u32 in &prob.slots[s] {
                 let m = m_u32 as usize;
                 if !used_m[m] {
@@ -511,7 +514,7 @@ fn enumerate_gpu_boltzmann(
                 }
             }
         }
-        if assigned_so_far + (rem - 1) >= k_assigned {
+        if k_assigned.is_none_or(|k| assigned_so_far + (rem - 1) >= k) {
             cur.push(-1);
             rec(
                 s + 1,
@@ -547,6 +550,25 @@ fn enumerate_gpu_boltzmann(
         .collect()
 }
 
+fn compute_gpu_tvd(exact: &BTreeMap<Vec<i32>, f64>, samples: &[Vec<i32>]) -> f64 {
+    let mut counts: BTreeMap<&[i32], usize> = BTreeMap::new();
+    for st in samples {
+        assert!(
+            exact.contains_key(st),
+            "WebGPU MCMC sampled invalid or out-of-manifold state: {st:?}"
+        );
+        *counts.entry(st.as_slice()).or_insert(0) += 1;
+    }
+    let inv_n = 1.0 / (samples.len() as f64);
+    0.5 * exact
+        .iter()
+        .map(|(st, &p_true)| {
+            let p_emp = (*counts.get(st.as_slice()).unwrap_or(&0) as f64) * inv_n;
+            (p_emp - p_true).abs()
+        })
+        .sum::<f64>()
+}
+
 #[test]
 fn p1_10_webgpu_bounds_guard_tdr_chunking_and_stationary_boltzmann_tvd() {
     // 1. TDR chunk size invariant (`<= 4,096` across all kernel regimes)
@@ -580,43 +602,278 @@ fn p1_10_webgpu_bounds_guard_tdr_chunking_and_stationary_boltzmann_tvd() {
         );
     }
 
-    // 3. WebGPU stationary Boltzmann distribution verification across all 4 moves
+    // 3. WebGPU stationary Boltzmann distribution verification across variable-cardinality Omega = U_k Omega_k
     let temp = 2.5;
-    let n_samples = 24_000usize;
-    for (tag, s_len, m_len, k_ass, seed) in [
-        ("S=4,M=5", 4usize, 5usize, 4usize, 20261113u64),
-        ("S=5,M=4", 5usize, 4usize, 4usize, 20261114u64),
+    let n_samples = 96_000usize;
+    for (tag, s_len, m_len, seed) in [
+        ("S=4,M=5", 4usize, 5usize, 20261113u64),
+        ("S=5,M=4", 5usize, 4usize, 20261114u64),
     ] {
         let prob = build_gpu_mcmc_test_problem(s_len, m_len);
-        let exact = enumerate_gpu_boltzmann(&prob, k_ass, temp);
+        let exact = enumerate_gpu_boltzmann(&prob, None, temp);
         let samples = solver
-            .sample_mcmc_terminal_states(&prob, temp, 520, n_samples, seed)
+            .sample_mcmc_terminal_states(&prob, temp, 960, n_samples, seed)
             .unwrap();
-        let mut counts: BTreeMap<Vec<i32>, usize> = BTreeMap::new();
-        for st in samples {
-            assert!(
-                exact.contains_key(&st),
-                "WebGPU MCMC sampled invalid state ({tag}): {st:?}"
-            );
-            *counts.entry(st).or_insert(0) += 1;
-        }
-        let tvd: f64 = 0.5
-            * exact
-                .iter()
-                .map(|(st, &p_true)| {
-                    let p_emp = (*counts.get(st).unwrap_or(&0) as f64) / (n_samples as f64);
-                    (p_emp - p_true).abs()
-                })
-                .sum::<f64>();
+        let tvd = compute_gpu_tvd(&exact, &samples);
         println!(
-            "[P1-10 WebGPU MCMC Stationary Boltzmann {tag}] |Omega|={} | TVD={tvd:.4}",
+            "[P1-10/P1-6 WebGPU MCMC Stationary Boltzmann {tag}] |Omega|={} | TVD={tvd:.4}",
             exact.len()
         );
         assert!(
-            tvd < 0.025,
-            "WebGPU MCMC stationary Boltzmann TVD ({tag}) {tvd:.4} >= 0.025"
+            tvd <= 0.025,
+            "WebGPU MCMC stationary Boltzmann TVD ({tag}) {tvd:.4} > 0.025"
         );
     }
+}
+
+#[test]
+fn p1_6_webgpu_variable_cardinality_multi_seed_per_move_and_combined_boltzmann_tvd() {
+    let engine = GpuEngine::new_headless().expect("WebGPU adapter required");
+    let solver = MethylGpuSolver::new(&engine);
+    let temp = 2.6;
+    let seeds: [u64; 5] = [202601, 202602, 202603, 202604, 202605];
+    let n_samples = 48_000usize;
+
+    let apply_slots = |prob: &mut MethylContactProblem, allowed: &[&[u32]]| {
+        for (s, &sl) in allowed.iter().enumerate() {
+            prob.slots[s] = sl.to_vec();
+            for m in 0..prob.m_len {
+                if !sl.contains(&(m as u32)) {
+                    prob.u_mat[s * prob.m_len + m] = METHYL_FORBID;
+                }
+            }
+        }
+    };
+
+    let mut prob_vacant = build_gpu_mcmc_test_problem(4, 5); // S < M (vacant sites)
+    apply_slots(
+        &mut prob_vacant,
+        &[&[0, 1, 2, 4], &[0, 1, 3], &[0, 2, 3, 4], &[1, 3]],
+    );
+    let mut prob_artifact = build_gpu_mcmc_test_problem(5, 4); // S > M (artifact root)
+    apply_slots(
+        &mut prob_artifact,
+        &[&[0, 1, 2], &[0, 1, 3], &[0, 2, 3], &[1, 2, 3], &[0, 3]],
+    );
+    // Shift unary offset slightly so k = 2, 3, 4 all hold substantial Boltzmann weight
+    for u in &mut prob_vacant.u_mat {
+        if *u > METHYL_FORBID * 0.5 {
+            *u -= 0.85;
+        }
+    }
+    for s in 0..prob_artifact.s_len {
+        for m in 0..prob_artifact.m_len {
+            let v = &mut prob_artifact.u_mat[s * prob_artifact.m_len + m];
+            if *v > METHYL_FORBID * 0.5 {
+                *v -= if s == 4 { 1.60 } else { 0.75 };
+            }
+        }
+    }
+
+    let exact_vac_var = enumerate_gpu_boltzmann(&prob_vacant, None, temp);
+    let exact_art_var = enumerate_gpu_boltzmann(&prob_artifact, None, temp);
+    let exact_vac_fix = enumerate_gpu_boltzmann(&prob_vacant, Some(4), temp);
+    let exact_art_fix = enumerate_gpu_boltzmann(&prob_artifact, Some(4), temp);
+
+    for (label, prob, exact, mask, steps) in [
+        (
+            "Move4_BirthDeath_Only (S=4<M=5)",
+            &prob_vacant,
+            &exact_vac_var,
+            METHYL_MOVE_BIRTH_DEATH,
+            2_000u32,
+        ),
+        (
+            "Move4_BirthDeath_Only (S=5>M=4)",
+            &prob_artifact,
+            &exact_art_var,
+            METHYL_MOVE_BIRTH_DEATH,
+            2_200u32,
+        ),
+        (
+            "Move1+Move4 (S=4<M=5)",
+            &prob_vacant,
+            &exact_vac_var,
+            METHYL_MOVE_SLOT | METHYL_MOVE_BIRTH_DEATH,
+            900u32,
+        ),
+        (
+            "Move2+Move4 (S=4<M=5)",
+            &prob_vacant,
+            &exact_vac_var,
+            METHYL_MOVE_CONTACT | METHYL_MOVE_BIRTH_DEATH,
+            900u32,
+        ),
+        (
+            "Move3_Geminal+Move4 (S=4<M=5)",
+            &prob_vacant,
+            &exact_vac_var,
+            METHYL_MOVE_GEMINAL | METHYL_MOVE_BIRTH_DEATH,
+            2_000u32,
+        ),
+        (
+            "Move1_Slot_FixedK (S=5>M=4)",
+            &prob_artifact,
+            &exact_art_fix,
+            METHYL_MOVE_SLOT,
+            800u32,
+        ),
+        (
+            "Move2_Contact_FixedK (S=4<M=5)",
+            &prob_vacant,
+            &exact_vac_fix,
+            METHYL_MOVE_CONTACT,
+            800u32,
+        ),
+        (
+            "Combined_AllMoves_0xF (S=4<M=5)",
+            &prob_vacant,
+            &exact_vac_var,
+            METHYL_MOVE_ALL,
+            900u32,
+        ),
+        (
+            "Combined_AllMoves_0xF (S=5>M=4)",
+            &prob_artifact,
+            &exact_art_var,
+            METHYL_MOVE_ALL,
+            900u32,
+        ),
+    ] {
+        let mut max_tvd = 0.0f64;
+        let mut mean_tvd = 0.0f64;
+        for &sd in &seeds {
+            let samples = solver
+                .sample_mcmc_terminal_states_with_mask(prob, temp, steps, n_samples, sd, mask)
+                .unwrap();
+            let tvd = compute_gpu_tvd(exact, &samples);
+            assert!(
+                tvd <= 0.025,
+                "[WebGPU {label} seed={sd}] Boltzmann TVD {tvd:.4} > 0.025 (|Omega|={})",
+                exact.len()
+            );
+            max_tvd = max_tvd.max(tvd);
+            mean_tvd += tvd / (seeds.len() as f64);
+        }
+        println!(
+            "[P1-6 WebGPU 5-Seed Boltzmann {label}] |Omega|={} | mean_TVD={mean_tvd:.4} | max_TVD={max_tvd:.4}",
+            exact.len()
+        );
+    }
+}
+
+#[test]
+fn p1_6_webgpu_10000_steps_chunked_4096_vs_unchunked_bit_exact_trajectory_and_async_wait() {
+    let engine = GpuEngine::new_headless().expect("WebGPU adapter required");
+    let solver = MethylGpuSolver::new(&engine);
+    let root = repo_root();
+
+    // 1. Test on real Ubiquitin `ILVMAT` (`anneal_methyl_256` kernel, `10,000 > 2 * 4,096` TDR chunks)
+    let ubq_model = extract_methyl_structure_from_pdb_file(
+        root.join("data/pdb_refs/1d3z.pdb"),
+        &MethylLabelingScheme::Ilvmat,
+    )
+    .unwrap();
+    let ubq_ref = read_star_all_atoms(
+        root.join("data/fixtures/ubiquitin_bmr5387_methyl.str"),
+        None,
+    )
+    .unwrap();
+    let sim_cfg = MethylSimConfig::default();
+    let picker_cfg = MethylPickerConfig::default();
+    let score_cfg = MethylScoreConfig::default();
+    let true_hc = extract_true_site_shifts(&ubq_model, &ubq_ref);
+    let mut roots = pick_methyl_hmqc_2d(&simulate_methyl_hmqc_2d(&true_hc, &sim_cfg), &picker_cfg);
+    attach_hmcmcbca_records(
+        &mut roots,
+        &extract_hmcmcbca_from_reference(&ubq_model, &ubq_ref),
+        0.045,
+        0.14,
+    );
+    let noes = pick_methyl_noesy_3d(
+        &simulate_methyl_noesy_3d(&ubq_model, &true_hc, &sim_cfg),
+        &roots,
+        &picker_cfg,
+    );
+    let prob = build_methyl_contact_problem(&ubq_model, &roots, &noes, &score_cfg);
+
+    let total_steps = 10_000u32;
+    let replicas = 48usize;
+    let chunked_4096 = solver
+        .run_anneal_trajectory_with_chunk_steps(
+            &prob,
+            replicas,
+            total_steps,
+            22.0,
+            0.15,
+            7777,
+            4_096,
+        )
+        .unwrap();
+    let unchunked_10000 = solver
+        .run_anneal_trajectory_with_chunk_steps(
+            &prob,
+            replicas,
+            total_steps,
+            22.0,
+            0.15,
+            7777,
+            10_000,
+        )
+        .unwrap();
+
+    assert_eq!(
+        chunked_4096.cur_positions, unchunked_10000.cur_positions,
+        "10,000-step chunked(4096) vs unchunked(10000) terminal cur_positions diverged!"
+    );
+    assert_eq!(
+        chunked_4096.best_positions, unchunked_10000.best_positions,
+        "10,000-step chunked(4096) vs unchunked(10000) best_positions diverged!"
+    );
+    for (r, (sc_c, sc_u)) in chunked_4096
+        .scores_state
+        .iter()
+        .zip(&unchunked_10000.scores_state)
+        .enumerate()
+    {
+        assert_eq!(
+            sc_c[0].to_bits(),
+            sc_u[0].to_bits(),
+            "replica {r} cur score bits diverged across 4096-step TDR chunks: {} vs {}",
+            sc_c[0],
+            sc_u[0]
+        );
+        assert_eq!(
+            sc_c[1].to_bits(),
+            sc_u[1].to_bits(),
+            "replica {r} best_sc bits diverged across 4096-step TDR chunks: {} vs {}",
+            sc_c[1],
+            sc_u[1]
+        );
+    }
+
+    // 2. Also exercise async `evaluate_objectives_async` & `assign_async` (`wgpu::PollType::Wait` path)
+    let async_scores = pollster::block_on(
+        solver.evaluate_objectives_async(&prob, &chunked_4096.best_positions[..8]),
+    )
+    .unwrap();
+    let sync_scores = solver
+        .evaluate_objectives(&prob, &chunked_4096.best_positions[..8])
+        .unwrap();
+    for (&sa, &ss) in async_scores.iter().zip(&sync_scores) {
+        assert_eq!(sa.to_bits(), ss.to_bits());
+    }
+    let async_res = pollster::block_on(solver.assign_async(
+        &prob,
+        &MethylAnnealConfig {
+            replicas: 16,
+            steps_per_root: 120,
+            seed: 7777,
+            ..MethylAnnealConfig::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(async_res.position.len(), prob.s_len);
 }
 
 /// Subset a monomer `MethylStructureModel` to the first `target_sites` sites that have deposited
@@ -1240,11 +1497,13 @@ fn p0_2_non_circular_xray_vs_nmr_cross_structure_methyl_benchmarks() {
         }
 
         println!(
-            "[P0-2 Cross-Structure {label}] acc={:.2}% ({}/{}) | HC(>=0.80)={} | ECE={:.4}",
+            "[P0-2 Cross-Structure {label}] acc={:.2}% ({}/{}) | hc_total={} | HC(>=0.80)={} ({:.2}%) | ECE={:.4}",
             m.accuracy_pct,
             m.correct,
             m.total_matched_roots,
+            m.hc_total,
             m.reliability.hc_status,
+            m.hc_precision_pct,
             m.reliability.ece
         );
 
@@ -1254,7 +1513,13 @@ fn p0_2_non_circular_xray_vs_nmr_cross_structure_methyl_benchmarks() {
                 m.accuracy_pct
             ));
         }
-        if !m.hc_abstained && m.hc_precision_pct < min_hc {
+        if m.hc_abstained || m.hc_total < 10 {
+            deferred_failures.push(format!(
+                "{label}: cross-structure hc_total={} < 10 (abstained={})!",
+                m.hc_total, m.hc_abstained
+            ));
+        }
+        if m.hc_precision_pct < min_hc {
             deferred_failures.push(format!(
                 "{label}: cross-structure HC precision {:.2}% < {min_hc:.1}%",
                 m.hc_precision_pct
@@ -1262,12 +1527,24 @@ fn p0_2_non_circular_xray_vs_nmr_cross_structure_methyl_benchmarks() {
         }
     }
 
+    let pooled_hc_total = pooled_samples.iter().filter(|&&(c, _)| c >= 0.80).count();
+    let pooled_hc_correct = pooled_samples
+        .iter()
+        .filter(|&&(c, ok)| c >= 0.80 && ok)
+        .count();
+    let pooled_hc_prec = if pooled_hc_total > 0 {
+        100.0 * (pooled_hc_correct as f64) / (pooled_hc_total as f64)
+    } else {
+        0.0
+    };
     let pooled_rel = ProteinReliabilityCurve::from_predictions(&pooled_samples, 0.80);
     println!(
-        "[P0-2 Pooled Non-Circular Cross-Structure Calibration] N={} | ECE={:.4} | HC(>=0.80)={} | bins={:?}",
+        "[P0-2 Pooled Non-Circular Cross-Structure Calibration] N={} | ECE={:.4} | HC(>=0.80)={:.2}% ({}/{}) | bins={:?}",
         pooled_rel.total_predictions,
         pooled_rel.ece,
-        pooled_rel.hc_status,
+        pooled_hc_prec,
+        pooled_hc_correct,
+        pooled_hc_total,
         pooled_rel
             .bins
             .iter()
@@ -1278,6 +1555,13 @@ fn p0_2_non_circular_xray_vs_nmr_cross_structure_methyl_benchmarks() {
         deferred_failures.is_empty(),
         "Cross-structure failures:\n{}",
         deferred_failures.join("\n")
+    );
+    assert!(
+        pooled_hc_prec >= 92.0,
+        "Pooled non-circular cross-structure HC precision {:.2}% < 92.0% ({}/{})!",
+        pooled_hc_prec,
+        pooled_hc_correct,
+        pooled_hc_total
     );
     assert!(
         pooled_rel.ece <= 0.06,

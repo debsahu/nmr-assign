@@ -15,20 +15,25 @@
 //!   & Kay, L. E. (*J. Am. Chem. Soc.* 2017, 139, 9523–9533 — probabilistic methyl NOE contact-graph
 //!   matching).
 
-#[cfg(not(target_arch = "wasm32"))]
 use bytemuck::{Pod, Zeroable};
-#[cfg(not(target_arch = "wasm32"))]
 use nmr_core::methyl_solver::{
     build_geminal_move_table, build_initial_replica_states, consensus_and_calibrate_methyl,
-    evaluate_methyl_raw_score,
+    evaluate_methyl_raw_score, MethylAnnealConfig, MethylAssignResult, MethylContactProblem,
+    METHYL_MOVE_ALL,
 };
-use nmr_core::methyl_solver::{MethylAnnealConfig, MethylAssignResult, MethylContactProblem};
-#[cfg(not(target_arch = "wasm32"))]
 use nmr_core::rng::Rng;
-#[cfg(not(target_arch = "wasm32"))]
 use wgpu::util::DeviceExt;
 
 use crate::GpuEngine;
+
+/// Output of a raw WebGPU annealing trajectory run (`pos_cur`, `pos_best`, and `[cur, best_sc]`
+/// `f32` state per replica) for chunked-vs-unchunked TDR equivalence verification.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MethylGpuRawTrajectory {
+    pub cur_positions: Vec<Vec<i32>>,
+    pub best_positions: Vec<Vec<i32>>,
+    pub scores_state: Vec<[f32; 2]>,
+}
 
 /// Maximum MCMC steps per single WebGPU command-buffer submission (`<= 4,096` to prevent WDDM TDR).
 pub const MAX_CHUNK_STEPS: u32 = 4_096;
@@ -46,7 +51,6 @@ pub const fn chunk_steps_for_dim(max_dim: usize) -> u32 {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct MethylParamsGpu {
@@ -88,7 +92,7 @@ struct MethylParamsGpu {
     off_gem_pairs: u32,
     off_gem_nbr_offs: u32,
     off_gem_nbr_vals: u32,
-    _pad_u1: u32,
+    move_mask: u32,
 
     d_cutoff: f32,
     sigma_d: f32,
@@ -101,14 +105,12 @@ struct MethylParamsGpu {
     _pad_f1: f32,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 struct PackedMethylProblemGpu {
     base_params: MethylParamsGpu,
     ro_floats: Vec<f32>,
     ro_ints: Vec<u32>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn pack_methyl_problem(prob: &MethylContactProblem) -> PackedMethylProblemGpu {
     let mut ro_floats = Vec::new();
     let mut ro_ints = Vec::new();
@@ -265,7 +267,7 @@ fn pack_methyl_problem(prob: &MethylContactProblem) -> PackedMethylProblemGpu {
         off_gem_pairs,
         off_gem_nbr_offs,
         off_gem_nbr_vals,
-        _pad_u1: 0,
+        move_mask: METHYL_MOVE_ALL,
         d_cutoff: prob.d_cutoff,
         sigma_d: prob.sigma_d,
         flat_bottom_d: prob.flat_bottom_d,
@@ -594,18 +596,40 @@ impl<'a> MethylGpuSolver<'a> {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    #[allow(clippy::too_many_arguments)]
-    fn run_replica_batches(
+    /// Non-busy-spinning asynchronous GPU buffer readback (`wasm32` + native) delegating to
+    /// `GpuEngine::read_buffer_vec_async`, which waits on OS GPU fences (`wgpu::PollType::Wait`)
+    /// on native rather than spinning a CPU core.
+    pub async fn read_buffer_vec_async<T: Pod>(
+        &self,
+        src: &wgpu::Buffer,
+        count: usize,
+    ) -> Result<Vec<T>, String> {
+        self.engine.read_buffer_vec_async(src, count).await
+    }
+
+    /// Asynchronously evaluate exact per-root normalized objective $E(\pi)$ on WebGPU across a
+    /// batch of assignments (`wasm32` and native compatible without busy-spinning).
+    pub async fn evaluate_objectives_async(
         &self,
         prob: &MethylContactProblem,
-        replicas: usize,
-        total_steps: u32,
-        t_start: f64,
-        t_end: f64,
-        seed: u64,
-        return_terminal_cur: bool,
-    ) -> Result<Vec<Vec<i32>>, String> {
+        positions: &[Vec<i32>],
+    ) -> Result<Vec<f64>, String> {
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        for p in positions {
+            if p.len() != prob.s_len {
+                return Err(format!(
+                    "methyl assignment vector length {} != problem s_len {}",
+                    p.len(),
+                    prob.s_len
+                ));
+            }
+        }
+        if prob.s_len == 0 || prob.m_len == 0 {
+            return Ok(vec![0.0; positions.len()]);
+        }
+
         let packed = pack_methyl_problem(prob);
         let max_bind = self.engine.max_storage_binding_bytes();
         let ro_f_bytes = (packed.ro_floats.len() * 4) as u64;
@@ -622,7 +646,7 @@ impl<'a> MethylGpuSolver<'a> {
             .engine
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("methyl-anneal-ro-floats"),
+                label: Some("methyl-eval-async-ro-floats"),
                 contents: bytemuck::cast_slice(&packed.ro_floats),
                 usage: wgpu::BufferUsages::STORAGE,
             });
@@ -630,14 +654,247 @@ impl<'a> MethylGpuSolver<'a> {
             .engine
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("methyl-anneal-ro-ints"),
+                label: Some("methyl-eval-async-ro-ints"),
+                contents: bytemuck::cast_slice(&packed.ro_ints),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let per_rep_bytes = ((prob.m_len.max(prob.s_len) * 4) as u64).max(16);
+        let max_wg = self
+            .engine
+            .device
+            .limits()
+            .max_compute_workgroups_per_dimension as usize;
+        let max_batch = ((max_bind / per_rep_bytes) as usize)
+            .min(max_wg.saturating_mul(64))
+            .max(1);
+
+        let mut out = Vec::with_capacity(positions.len());
+        let mut offset = 0usize;
+        while offset < positions.len() {
+            let batch_n = (positions.len() - offset).min(max_batch);
+            let mut p_val = packed.base_params;
+            p_val.replicas = batch_n as u32;
+
+            let mut pos_flat = Vec::with_capacity(batch_n * prob.s_len);
+            for p in &positions[offset..offset + batch_n] {
+                pos_flat.extend_from_slice(p);
+            }
+            if pos_flat.is_empty() {
+                pos_flat.push(-1);
+            }
+
+            let at_dummy = vec![-1i32; (batch_n * prob.m_len).max(1)];
+            let scores_init = vec![[0.0f32; 2]; batch_n.max(1)];
+            let rng_dummy = vec![[1u32; 4]; batch_n.max(1)];
+
+            let u_params =
+                self.engine
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("methyl-eval-async-params"),
+                        contents: bytemuck::bytes_of(&p_val),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+            let b_at = self
+                .engine
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("methyl-eval-async-at"),
+                    contents: bytemuck::cast_slice(&at_dummy),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let b_pos = self
+                .engine
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("methyl-eval-async-pos"),
+                    contents: bytemuck::cast_slice(&pos_flat),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let b_scores =
+                self.engine
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("methyl-eval-async-scores"),
+                        contents: bytemuck::cast_slice(&scores_init),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    });
+            let b_rng = self
+                .engine
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("methyl-eval-async-rng"),
+                    contents: bytemuck::cast_slice(&rng_dummy),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+            let bg = self
+                .engine
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("methyl-eval-async-bg"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: u_params.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: b_floats.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: b_ints.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: b_at.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: b_pos.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: b_scores.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: b_rng.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let mut enc =
+                self.engine
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("methyl-eval-async-enc"),
+                    });
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("methyl-eval-async-pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.eval_pipeline);
+                cpass.set_bind_group(0, &bg, &[]);
+                cpass.dispatch_workgroups((batch_n as u32).div_ceil(64), 1, 1);
+            }
+            self.engine.queue.submit(Some(enc.finish()));
+
+            let scores_gpu: Vec<[f32; 2]> = self.read_buffer_vec_async(&b_scores, batch_n).await?;
+            for sc in scores_gpu {
+                out.push(sc[0] as f64);
+            }
+            offset += batch_n;
+        }
+
+        Ok(out)
+    }
+
+    /// Asynchronously run WebGPU multi-replica simulated annealing (`wasm32` and native compatible,
+    /// using `wgpu::PollType::Wait` readback on native).
+    pub async fn assign_async(
+        &self,
+        prob: &MethylContactProblem,
+        cfg: &MethylAnnealConfig,
+    ) -> Result<MethylAssignResult, String> {
+        let replicas = cfg.replicas.max(1);
+        if prob.s_len == 0 || prob.m_len == 0 {
+            return Ok(MethylAssignResult {
+                position: vec![-1; prob.s_len],
+                confidence: vec![0.0; prob.s_len],
+                class_posteriors: prob.class_posteriors.clone(),
+                score: 0.0,
+                raw_score: 0.0,
+                run_scores: vec![0.0; replicas],
+            });
+        }
+
+        let min_floor = cfg.steps_per_root.saturating_mul(85);
+        let total_steps = cfg
+            .steps_per_root
+            .saturating_mul(prob.s_len)
+            .max(min_floor)
+            .clamp(1, u32::MAX as usize) as u32;
+
+        let traj = self
+            .run_replica_batches_async(
+                prob,
+                replicas,
+                total_steps,
+                cfg.t_start,
+                cfg.t_end,
+                cfg.seed,
+                METHYL_MOVE_ALL,
+                None,
+            )
+            .await?;
+        let all_raw_scores: Vec<f64> = traj
+            .best_positions
+            .iter()
+            .map(|p_vec| evaluate_methyl_raw_score(prob, p_vec))
+            .collect();
+
+        Ok(consensus_and_calibrate_methyl(
+            prob,
+            &traj.best_positions,
+            &all_raw_scores,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_replica_batches_async(
+        &self,
+        prob: &MethylContactProblem,
+        replicas: usize,
+        total_steps: u32,
+        t_start: f64,
+        t_end: f64,
+        seed: u64,
+        move_mask: u32,
+        chunk_steps_override: Option<u32>,
+    ) -> Result<MethylGpuRawTrajectory, String> {
+        let packed = pack_methyl_problem(prob);
+        let max_bind = self.engine.max_storage_binding_bytes();
+        let ro_f_bytes = (packed.ro_floats.len() * 4) as u64;
+        let ro_i_bytes = (packed.ro_ints.len() * 4) as u64;
+        if ro_f_bytes > max_bind || ro_i_bytes > max_bind {
+            return Err(format!(
+                "methyl problem read-only buffer ({} B) exceeds adapter limit ({} B)",
+                ro_f_bytes.max(ro_i_bytes),
+                max_bind
+            ));
+        }
+
+        let b_floats = self
+            .engine
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("methyl-anneal-async-ro-floats"),
+                contents: bytemuck::cast_slice(&packed.ro_floats),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let b_ints = self
+            .engine
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("methyl-anneal-async-ro-ints"),
                 contents: bytemuck::cast_slice(&packed.ro_ints),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
         let max_dim = prob.s_len.max(prob.m_len);
-        let chunk_steps = chunk_steps_for_dim(max_dim);
-        debug_assert!(chunk_steps <= MAX_CHUNK_STEPS);
+        let chunk_steps = match chunk_steps_override {
+            Some(cs) => cs.max(1),
+            None => {
+                let cs = chunk_steps_for_dim(max_dim);
+                debug_assert!(cs <= MAX_CHUNK_STEPS);
+                cs
+            }
+        };
 
         let (pipeline, wg_threads) = if max_dim <= 255 {
             (&self.anneal_256_pipeline, 8u32)
@@ -670,7 +927,9 @@ impl<'a> MethylGpuSolver<'a> {
             .min(max_wg.saturating_mul(wg_threads as usize))
             .max(1);
 
-        let mut all_positions: Vec<Vec<i32>> = Vec::with_capacity(replicas);
+        let mut cur_positions: Vec<Vec<i32>> = Vec::with_capacity(replicas);
+        let mut best_positions: Vec<Vec<i32>> = Vec::with_capacity(replicas);
+        let mut all_scores_state: Vec<[f32; 2]> = Vec::with_capacity(replicas);
         let mut rep_offset = 0usize;
         while rep_offset < replicas {
             let batch_reps = (replicas - rep_offset).min(max_batch_reps);
@@ -689,12 +948,22 @@ impl<'a> MethylGpuSolver<'a> {
                 pos_both_init.extend_from_slice(&st.1);
             }
 
+            // Pad `COPY_SRC` buffers to `COPY_BUFFER_ALIGNMENT` (`4 B` multiple is already exact for
+            // `i32`/`[f32; 2]`, keep >= 1 element for non-empty descriptor invariant).
+            if at_both_init.is_empty() {
+                at_both_init.push(-1);
+            }
+            if pos_both_init.is_empty() {
+                pos_both_init.push(-1);
+            }
+
             let rng_slice = &all_rng_seeds[rep_offset..rep_offset + batch_reps];
 
             let mut p_init = packed.base_params;
             p_init.replicas = batch_reps as u32;
             p_init.total_steps = total_steps;
             p_init.chunk_steps = chunk_steps;
+            p_init.move_mask = move_mask;
             p_init.t_start = t_start as f32;
             p_init.t_end = t_end as f32;
 
@@ -702,7 +971,7 @@ impl<'a> MethylGpuSolver<'a> {
                 self.engine
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("methyl-anneal-params"),
+                        label: Some("methyl-anneal-async-params"),
                         contents: bytemuck::bytes_of(&p_init),
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     });
@@ -710,7 +979,7 @@ impl<'a> MethylGpuSolver<'a> {
                 .engine
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("methyl-anneal-at-both"),
+                    label: Some("methyl-anneal-async-at-both"),
                     contents: bytemuck::cast_slice(&at_both_init),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 });
@@ -718,7 +987,7 @@ impl<'a> MethylGpuSolver<'a> {
                 .engine
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("methyl-anneal-pos-both"),
+                    label: Some("methyl-anneal-async-pos-both"),
                     contents: bytemuck::cast_slice(&pos_both_init),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 });
@@ -726,7 +995,7 @@ impl<'a> MethylGpuSolver<'a> {
                 self.engine
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("methyl-anneal-scores"),
+                        label: Some("methyl-anneal-async-scores"),
                         contents: bytemuck::cast_slice(&scores_init),
                         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     });
@@ -734,7 +1003,7 @@ impl<'a> MethylGpuSolver<'a> {
                 .engine
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("methyl-anneal-rng"),
+                    label: Some("methyl-anneal-async-rng"),
                     contents: bytemuck::cast_slice(rng_slice),
                     usage: wgpu::BufferUsages::STORAGE,
                 });
@@ -743,7 +1012,7 @@ impl<'a> MethylGpuSolver<'a> {
                 .engine
                 .device
                 .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("methyl-anneal-bg"),
+                    label: Some("methyl-anneal-async-bg"),
                     layout: &self.bgl,
                     entries: &[
                         wgpu::BindGroupEntry {
@@ -790,11 +1059,11 @@ impl<'a> MethylGpuSolver<'a> {
                     self.engine
                         .device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("methyl-anneal-chunk-enc"),
+                            label: Some("methyl-anneal-async-chunk-enc"),
                         });
                 {
                     let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("methyl-anneal-chunk-pass"),
+                        label: Some("methyl-anneal-async-chunk-pass"),
                         timestamp_writes: None,
                     });
                     cpass.set_pipeline(pipeline);
@@ -805,37 +1074,99 @@ impl<'a> MethylGpuSolver<'a> {
                 step_offset = step_offset.saturating_add(chunk_steps);
             }
 
-            let pos_bytes = (2 * batch_reps * prob.s_len * 4) as u64;
-            let pos_both_out: Vec<i32> = self.engine.read_buffer_vec(&b_pos, pos_bytes)?;
-            let slice_out = if return_terminal_cur {
-                &pos_both_out[0..batch_reps * prob.s_len]
-            } else {
-                &pos_both_out[batch_reps * prob.s_len..2 * batch_reps * prob.s_len]
-            };
+            let pos_count = 2 * batch_reps * prob.s_len;
+            let pos_both_out: Vec<i32> = self.read_buffer_vec_async(&b_pos, pos_count).await?;
+            let scores_out: Vec<[f32; 2]> =
+                self.read_buffer_vec_async(&b_scores, batch_reps).await?;
 
+            let cur_slice = &pos_both_out[0..batch_reps * prob.s_len];
+            let best_slice = &pos_both_out[batch_reps * prob.s_len..2 * batch_reps * prob.s_len];
             for r in 0..batch_reps {
-                all_positions.push(slice_out[r * prob.s_len..(r + 1) * prob.s_len].to_vec());
+                cur_positions.push(cur_slice[r * prob.s_len..(r + 1) * prob.s_len].to_vec());
+                best_positions.push(best_slice[r * prob.s_len..(r + 1) * prob.s_len].to_vec());
             }
+            all_scores_state.extend_from_slice(&scores_out);
 
             rep_offset += batch_reps;
         }
 
-        Ok(all_positions)
+        Ok(MethylGpuRawTrajectory {
+            cur_positions,
+            best_positions,
+            scores_state: all_scores_state,
+        })
     }
 
-    /// Run fixed-temperature WebGPU Metropolis–Hastings MCMC and return terminal chain states
-    /// `pos_cur` (for stationary Boltzmann detailed-balance verification).
-    pub fn sample_mcmc_terminal_states(
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_replica_batches_raw(
+        &self,
+        prob: &MethylContactProblem,
+        replicas: usize,
+        total_steps: u32,
+        t_start: f64,
+        t_end: f64,
+        seed: u64,
+        move_mask: u32,
+        chunk_steps_override: Option<u32>,
+    ) -> Result<MethylGpuRawTrajectory, String> {
+        pollster::block_on(self.run_replica_batches_async(
+            prob,
+            replicas,
+            total_steps,
+            t_start,
+            t_end,
+            seed,
+            move_mask,
+            chunk_steps_override,
+        ))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_replica_batches(
+        &self,
+        prob: &MethylContactProblem,
+        replicas: usize,
+        total_steps: u32,
+        t_start: f64,
+        t_end: f64,
+        seed: u64,
+        move_mask: u32,
+        return_terminal_cur: bool,
+    ) -> Result<Vec<Vec<i32>>, String> {
+        let traj = self.run_replica_batches_raw(
+            prob,
+            replicas,
+            total_steps,
+            t_start,
+            t_end,
+            seed,
+            move_mask,
+            None,
+        )?;
+        if return_terminal_cur {
+            Ok(traj.cur_positions)
+        } else {
+            Ok(traj.best_positions)
+        }
+    }
+
+    /// Run fixed-temperature WebGPU Metropolis–Hastings MCMC with caller-specified `move_mask`
+    /// (`METHYL_MOVE_SLOT`, `METHYL_MOVE_CONTACT`, `METHYL_MOVE_GEMINAL`, `METHYL_MOVE_BIRTH_DEATH`,
+    /// or `METHYL_MOVE_ALL`) and return terminal chain states `pos_cur`.
+    pub fn sample_mcmc_terminal_states_with_mask(
         &self,
         prob: &MethylContactProblem,
         temperature: f64,
         steps: u32,
         replicas: usize,
         seed: u64,
+        move_mask: u32,
     ) -> Result<Vec<Vec<i32>>, String> {
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (prob, temperature, steps, replicas, seed);
+            let _ = (prob, temperature, steps, replicas, seed, move_mask);
             Err(
                 "synchronous WebGPU methyl MCMC readback is unsupported on wasm32; use async readback or CPU solver"
                     .to_string(),
@@ -855,7 +1186,82 @@ impl<'a> MethylGpuSolver<'a> {
                 temperature,
                 temperature,
                 seed,
+                move_mask,
                 true,
+            )
+        }
+    }
+
+    /// Run fixed-temperature WebGPU Metropolis–Hastings MCMC across all 4 reversible move families
+    /// on $\Omega = \bigcup_{k=0}^{k_{\max}} \Omega_k$ and return terminal chain states `pos_cur`.
+    pub fn sample_mcmc_terminal_states(
+        &self,
+        prob: &MethylContactProblem,
+        temperature: f64,
+        steps: u32,
+        replicas: usize,
+        seed: u64,
+    ) -> Result<Vec<Vec<i32>>, String> {
+        self.sample_mcmc_terminal_states_with_mask(
+            prob,
+            temperature,
+            steps,
+            replicas,
+            seed,
+            METHYL_MOVE_ALL,
+        )
+    }
+
+    /// Run WebGPU multi-replica annealing for an explicit `total_steps` count and caller-specified
+    /// `chunk_steps` per command-buffer dispatch, returning raw replica trajectories and `f32`
+    /// `[cur, best_sc]` state vectors (for multi-chunk `> 4,096` TDR trajectory bit-equality tests).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_anneal_trajectory_with_chunk_steps(
+        &self,
+        prob: &MethylContactProblem,
+        replicas: usize,
+        total_steps: u32,
+        t_start: f64,
+        t_end: f64,
+        seed: u64,
+        chunk_steps: u32,
+    ) -> Result<MethylGpuRawTrajectory, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (
+                prob,
+                replicas,
+                total_steps,
+                t_start,
+                t_end,
+                seed,
+                chunk_steps,
+            );
+            Err(
+                "synchronous WebGPU methyl trajectory readback is unsupported on wasm32"
+                    .to_string(),
+            )
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let reps = replicas.max(1);
+            if prob.s_len == 0 || prob.m_len == 0 {
+                return Ok(MethylGpuRawTrajectory {
+                    cur_positions: vec![vec![-1; prob.s_len]; reps],
+                    best_positions: vec![vec![-1; prob.s_len]; reps],
+                    scores_state: vec![[0.0, 0.0]; reps],
+                });
+            }
+            self.run_replica_batches_raw(
+                prob,
+                reps,
+                total_steps.max(1),
+                t_start,
+                t_end,
+                seed,
+                METHYL_MOVE_ALL,
+                Some(chunk_steps.max(1)),
             )
         }
     }
@@ -904,6 +1310,7 @@ impl<'a> MethylGpuSolver<'a> {
                 cfg.t_start,
                 cfg.t_end,
                 cfg.seed,
+                METHYL_MOVE_ALL,
                 false,
             )?;
             let all_raw_scores: Vec<f64> = all_positions

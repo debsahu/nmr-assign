@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use nmr_core::aromatic::{
     assign_aromatic_rings, classify_his_state, classify_his_tautomer, cluster_aromatic_rings,
     estimate_unlabelled_yamazaki_cb_offset, evaluate_aromatic_assignment, hungarian_max_weight,
-    merge_aromatic_assignments_preserving_existing, pick_all_aromatic_spectra, pick_aromatic_2d,
+    merge_aromatic_assignments_preserving_existing, merge_aromatic_into_shifts,
+    merge_aromatic_into_shifts_with_options, pick_all_aromatic_spectra, pick_aromatic_2d,
     pick_aromatic_hcch_3d, simulate_aromatic_peaks, simulate_aromatic_spectra,
     synthesize_aromatic_reference, AromaticExperiment, AromaticMetrics, AromaticPickerConfig,
     AromaticRingKind, AromaticSimConfig, AromaticSolverConfig, HisStateClassification, HisTautomer,
@@ -1156,16 +1157,40 @@ fn test_p1_11_his_fast_exchange_and_zn_metal_coordinated_abstention() {
         res_zn.rings[0].his_tautomer.is_none(),
         "Zn(II)-coordinated His must NOT mis-commit to DoublyProtonated or static neutral tautomer"
     );
-    assert_eq!(
-        res_zn.rings[0].his_state.map(|x| x.0),
-        Some(HisStateClassification::MetalCoordinatedCandidate)
+    assert!(
+        matches!(
+            res_zn.rings[0].his_state.map(|x| x.0),
+            Some(
+                HisStateClassification::MetalCoordinatedCandidate
+                    | HisStateClassification::FastExchangeUncommitted
+            )
+        ),
+        "2KRU His52 (HE1 = 8.246) must abstain cleanly via MetalCoordinatedCandidate or FastExchangeUncommitted without ad-hoc 15N windows, got {:?}",
+        res_zn.rings[0].his_state
     );
     assert!(
-        res_zn.rings[0].his_state.unwrap().1 < 0.80,
-        "metal-coordinated commitment confidence must be < 0.80"
+        res_zn.rings[0].his_state.unwrap().1 < 0.60,
+        "2KRU His52 abstention confidence must be < 0.60"
     );
     assert!((res_zn.reference.shifts[&(0, "ND1".to_string())] - 200.878).abs() < 0.1);
     assert!((res_zn.reference.shifts[&(0, "NE2".to_string())] - 178.265).abs() < 0.1);
+
+    // Case B2: Genuine orthogonal Zn(II)-ligated His (`ND1 = 200.88`, `NE2 = 178.27`, neutral `HE1 = 7.58`, `CE1 = 138.6`)
+    // where unprotonated `=N-Zn` shifts upfield WITHOUT cationic `HE1`/`CE1` protonation shift (`d_orth^2 >= 10.5`)
+    let (cls_zn_orth, conf_zn_orth) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(200.88),
+        ne2_ppm: Some(178.27),
+        cd2_ppm: Some(118.4),
+        hd2_ppm: Some(6.95),
+        ce1_ppm: Some(138.6),
+        he1_ppm: Some(7.58),
+        ..Default::default()
+    });
+    assert_eq!(
+        cls_zn_orth,
+        HisStateClassification::MetalCoordinatedCandidate
+    );
+    assert!(conf_zn_orth < 0.60);
 
     // Case C: Upfield 175.5/172.8 ppm at basic pH 7.8 with neutral HE1 = 7.74 ppm (or explicit metal hint)
     let (cls_ph, conf_ph) = classify_his_state(&HisTautomerEvidence {
@@ -1997,10 +2022,18 @@ fn test_p0_2_non_circular_real_bmrb_aromatic_benchmark_cb_drift_dropout_and_nois
                             "BMRB 16649 Zn(II)-His52 must abstain (`his_tautomer == None`), got {:?}",
                             r.his_tautomer
                         );
-                        assert_eq!(
-                            r.his_state.map(|x| x.0),
-                            Some(HisStateClassification::MetalCoordinatedCandidate)
+                        assert!(
+                            matches!(
+                                r.his_state.map(|x| x.0),
+                                Some(
+                                    HisStateClassification::MetalCoordinatedCandidate
+                                        | HisStateClassification::FastExchangeUncommitted
+                                )
+                            ),
+                            "BMRB 16649 Zn(II)-His52 must abstain via MetalCoordinatedCandidate or FastExchangeUncommitted, got {:?}",
+                            r.his_state
                         );
+                        assert!(r.his_state.unwrap().1 < 0.60);
                         zn_his52_checked += 1;
                     }
                 }
@@ -2088,4 +2121,479 @@ fn test_p0_2_non_circular_real_bmrb_aromatic_benchmark_cb_drift_dropout_and_nois
         ece <= 0.12,
         "non-circular real-BMRB Expected Calibration Error {ece:.4} exceeded 0.12 gate"
     );
+}
+
+#[test]
+fn test_p1_5_pelton_ph_titration_curves_zero_metal_fps_and_mahalanobis_ood_guard() {
+    let vp_tau = HisTautomer::Ne2H.variant_priors();
+    let vp_pi = HisTautomer::Nd1H.variant_priors();
+    let vp_cat = HisTautomer::DoublyProtonated.variant_priors();
+
+    // 1. Full synthetic & Pelton experimental non-metal His pH titration curves:
+    //    pH in 4.0..=9.0, pKa in [5.5, 6.3, 7.1], p_tau in [0.1, 0.3, 0.5, 0.7, 0.9],
+    //    plus direct grid f_prot = 0.0..=1.0 (0.05 steps) with and without sample_ph!
+    let mut metal_fps = 0usize;
+    let mut total_titration_pts = 0usize;
+
+    for &pka in &[5.5_f64, 6.3, 7.1] {
+        for ph_step in 0..=20 {
+            let ph = 4.0 + (ph_step as f64) * 0.25;
+            let f_prot = 1.0 / (1.0 + 10.0_f64.powf(ph - pka));
+            for &p_tau in &[0.1_f64, 0.3, 0.5, 0.7, 0.9] {
+                let w_tau = (1.0 - f_prot) * p_tau;
+                let w_pi = (1.0 - f_prot) * (1.0 - p_tau);
+                let w_cat = f_prot;
+
+                let ev = HisTautomerEvidence {
+                    nd1_ppm: Some(w_tau * vp_tau.nd1.0 + w_pi * vp_pi.nd1.0 + w_cat * vp_cat.nd1.0),
+                    ne2_ppm: Some(w_tau * vp_tau.ne2.0 + w_pi * vp_pi.ne2.0 + w_cat * vp_cat.ne2.0),
+                    cd2_ppm: Some(w_tau * vp_tau.cd2.0 + w_pi * vp_pi.cd2.0 + w_cat * vp_cat.cd2.0),
+                    hd2_ppm: Some(w_tau * vp_tau.hd2.0 + w_pi * vp_pi.hd2.0 + w_cat * vp_cat.hd2.0),
+                    ce1_ppm: Some(w_tau * vp_tau.ce1.0 + w_pi * vp_pi.ce1.0 + w_cat * vp_cat.ce1.0),
+                    he1_ppm: Some(w_tau * vp_tau.he1.0 + w_pi * vp_pi.he1.0 + w_cat * vp_cat.he1.0),
+                    cb_ppm: Some(w_tau * vp_tau.cb.0 + w_pi * vp_pi.cb.0 + w_cat * vp_cat.cb.0),
+                    sample_ph: Some(ph),
+                    metal_coordinated_hint: false,
+                    cg_ppm: None,
+                };
+                for ev_case in [
+                    ev.clone(),
+                    HisTautomerEvidence {
+                        sample_ph: None,
+                        ..ev
+                    },
+                ] {
+                    total_titration_pts += 1;
+                    let (cls, conf) = classify_his_state(&ev_case);
+                    if cls == HisStateClassification::MetalCoordinatedCandidate {
+                        metal_fps += 1;
+                    }
+                    // Intermediate protonation exchange (0.22 <= f_prot <= 0.78) or neutral tautomer
+                    // exchange (f_prot <= 0.12 && 0.30 <= p_tau <= 0.70) MUST abstain at conf < 0.50!
+                    if (0.22..=0.78).contains(&f_prot)
+                        || (f_prot <= 0.12 && (0.30..=0.70).contains(&p_tau))
+                    {
+                        assert_eq!(
+                            cls,
+                            HisStateClassification::FastExchangeUncommitted,
+                            "expected FastExchangeUncommitted at f_prot={f_prot:.3}, p_tau={p_tau:.2}, ph={:?}, got {cls:?}",
+                            ev_case.sample_ph
+                        );
+                        assert!(
+                            conf < 0.50,
+                            "intermediate exchange conf must be < 0.50, got {conf:.3} at f_prot={f_prot:.3}, p_tau={p_tau:.2}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        metal_fps, 0,
+        "expected 0% MetalCoordinatedCandidate false positives across {total_titration_pts} non-metal Pelton pH titration points, got {metal_fps}"
+    );
+
+    // 2. Specific review reproducers:
+    //    (a) Fast-exchange tau <-> cation at f_prot = 0.30..0.60 (`ND1 228 -> 206 ppm`, `NE2 ~ 170 ppm`)
+    for &(nd1, ne2, cd2, ce1, he1, ph) in &[
+        (
+            227.8_f64, 170.0_f64, 118.4_f64, 137.3_f64, 8.03_f64, 6.6_f64,
+        ),
+        (
+            216.9_f64, 170.8_f64, 118.6_f64, 137.0_f64, 8.15_f64, 6.3_f64,
+        ),
+        (
+            208.0_f64, 170.5_f64, 118.7_f64, 136.7_f64, 8.26_f64, 6.0_f64,
+        ),
+        (
+            206.0_f64, 171.5_f64, 118.7_f64, 136.7_f64, 8.27_f64, 6.0_f64,
+        ),
+    ] {
+        let (cls, conf) = classify_his_state(&HisTautomerEvidence {
+            nd1_ppm: Some(nd1),
+            ne2_ppm: Some(ne2),
+            cd2_ppm: Some(cd2),
+            ce1_ppm: Some(ce1),
+            he1_ppm: Some(he1),
+            sample_ph: Some(ph),
+            ..Default::default()
+        });
+        assert_eq!(
+            cls,
+            HisStateClassification::FastExchangeUncommitted,
+            "tau<->cat fast exchange (ND1={nd1}, NE2={ne2}) must NOT false-positive as MetalCoordinatedCandidate, got {cls:?}"
+        );
+        assert!(conf < 0.50, "expected conf < 0.50, got {conf:.3}");
+    }
+
+    //    (b) Salt-bridged / elevated-pKa cationic His (`176.5 / 174.0, HE1 = 8.0, pH 7.5`) -> 0 Metal FP!
+    let (cls_cat_ph75, _conf_cat_ph75) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(176.5),
+        ne2_ppm: Some(174.0),
+        cd2_ppm: Some(119.0),
+        ce1_ppm: Some(136.0),
+        he1_ppm: Some(8.00),
+        sample_ph: Some(7.5),
+        ..Default::default()
+    });
+    assert_ne!(
+        cls_cat_ph75,
+        HisStateClassification::MetalCoordinatedCandidate,
+        "elevated-pKa cationic His (176.5/174.0, HE1=8.0, pH=7.5) must NOT be misclassified as MetalCoordinatedCandidate"
+    );
+
+    //    (c) Out-of-distribution (OOD) probes (`ND1 = 191..201 ppm`, 4-7 sigma from cationic prior,
+    //        and `p_tau = 0.70` neutral exchange) -> `FastExchangeUncommitted` with `conf < 0.50`!
+    for nd1_ood in [191.0_f64, 195.0, 201.0] {
+        // Single-channel OOD ND1
+        let (cls1, conf1) = classify_his_state(&HisTautomerEvidence {
+            nd1_ppm: Some(nd1_ood),
+            ..Default::default()
+        });
+        assert_eq!(cls1, HisStateClassification::FastExchangeUncommitted);
+        assert!(
+            conf1 < 0.50,
+            "OOD ND1={nd1_ood} single-channel conf={conf1:.3}"
+        );
+
+        // Multi-channel OOD ND1 paired with cationic NE2/HE1/CD2
+        let (cls2, conf2) = classify_his_state(&HisTautomerEvidence {
+            nd1_ppm: Some(nd1_ood),
+            ne2_ppm: Some(173.5),
+            cd2_ppm: Some(119.0),
+            ce1_ppm: Some(135.8),
+            he1_ppm: Some(8.58),
+            sample_ph: Some(5.2),
+            ..Default::default()
+        });
+        assert_eq!(
+            cls2,
+            HisStateClassification::FastExchangeUncommitted,
+            "OOD ND1={nd1_ood} (4-7 sigma from cationic 177.0+-3.2) must trigger Mahalanobis OOD guard"
+        );
+        assert!(
+            conf2 < 0.50,
+            "OOD ND1={nd1_ood} conf must be < 0.50, got {conf2:.3}"
+        );
+    }
+
+    let (cls_ptau70, conf_ptau70) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(0.70 * vp_tau.nd1.0 + 0.30 * vp_pi.nd1.0),
+        ne2_ppm: Some(0.70 * vp_tau.ne2.0 + 0.30 * vp_pi.ne2.0),
+        cd2_ppm: Some(0.70 * vp_tau.cd2.0 + 0.30 * vp_pi.cd2.0),
+        he1_ppm: Some(7.81),
+        sample_ph: Some(7.8),
+        ..Default::default()
+    });
+    assert_eq!(cls_ptau70, HisStateClassification::FastExchangeUncommitted);
+    assert!(
+        conf_ptau70 < 0.50,
+        "p_tau=0.70 neutral exchange conf={conf_ptau70:.3}"
+    );
+
+    // 3. Genuine metal-ligated probes off the manifold (`MetalCoordinatedCandidate`):
+    //    - Pelton neutral envelope exceedance (`ND1 = 262.5 > 258.5 ppm`)
+    let (cls_env, conf_env) = classify_his_state(&HisTautomerEvidence {
+        nd1_ppm: Some(262.5),
+        ne2_ppm: Some(169.5),
+        cd2_ppm: Some(118.2),
+        he1_ppm: Some(7.80),
+        sample_ph: Some(7.2),
+        ..Default::default()
+    });
+    assert_eq!(cls_env, HisStateClassification::MetalCoordinatedCandidate);
+    assert!(conf_env < 0.60);
+}
+
+#[test]
+fn test_p1_10_non_destructive_ring_merge_partial_cd_rejection_and_curated_cluster_locks() {
+    let priors = SidechainPriors::empirical_bmrb();
+
+    // 1. Direct merge: `overwrite_existing = false` NEVER overwrites existing keys; `true` overwrites
+    let mut existing = Reference {
+        sequence: vec!["PHE".to_string()],
+        seq_ids: vec![10],
+        ..Default::default()
+    };
+    existing.shifts.insert((0, "CD1".to_string()), 131.10);
+    existing.shifts.insert((0, "HD1".to_string()), 7.12);
+    existing.ambiguity_codes.insert((0, "CD1".to_string()), 1);
+
+    let mut proposed = existing.clone();
+    proposed.shifts.insert((0, "CD1".to_string()), 131.38); // within tol, attempts to overwrite
+    proposed.shifts.insert((0, "CE1".to_string()), 129.25);
+    proposed.shifts.insert((0, "HE1".to_string()), 7.29);
+    proposed.ambiguity_codes.insert((0, "CD1".to_string()), 3);
+    proposed.ambiguity_codes.insert((0, "CE1".to_string()), 3);
+
+    let mut new_atoms = BTreeMap::new();
+    new_atoms.insert((0, "CD1".to_string()), 0.94);
+    new_atoms.insert((0, "CE1".to_string()), 0.94);
+    new_atoms.insert((0, "HE1".to_string()), 0.94);
+
+    let safe_merged = merge_aromatic_into_shifts(&existing, &proposed, &new_atoms);
+    assert_eq!(
+        safe_merged.shifts.get(&(0, "CD1".to_string())),
+        Some(&131.10),
+        "default merge_aromatic_into_shifts must NEVER overwrite pre-existing curated shift"
+    );
+    assert_eq!(
+        safe_merged.ambiguity_codes.get(&(0, "CD1".to_string())),
+        Some(&1)
+    );
+    assert_eq!(
+        safe_merged.shifts.get(&(0, "CE1".to_string())),
+        Some(&129.25),
+        "complete 2-position compatible ring may populate missing CE1"
+    );
+
+    let forced_merged =
+        merge_aromatic_into_shifts_with_options(&existing, &proposed, &new_atoms, true);
+    assert_eq!(
+        forced_merged.shifts.get(&(0, "CD1".to_string())),
+        Some(&131.38),
+        "overwrite_existing = true must overwrite when explicitly opted in"
+    );
+
+    // 2. Partial solver ring (`CD` only) MUST NEVER mix with user-curated `CE`/`CZ` shifts!
+    let mut curated_ce_cz = Reference {
+        sequence: vec!["PHE".to_string()],
+        seq_ids: vec![25],
+        ..Default::default()
+    };
+    curated_ce_cz.shifts.insert((0, "CB".to_string()), 39.40);
+    curated_ce_cz.shifts.insert((0, "CE1".to_string()), 129.60);
+    curated_ce_cz.shifts.insert((0, "CE2".to_string()), 129.60);
+    curated_ce_cz.shifts.insert((0, "HE1".to_string()), 7.32);
+    curated_ce_cz.shifts.insert((0, "HE2".to_string()), 7.32);
+    curated_ce_cz.shifts.insert((0, "CZ".to_string()), 127.95);
+    curated_ce_cz.shifts.insert((0, "HZ".to_string()), 7.18);
+
+    // Spectrum has ONLY CD/HD + Yamazaki HBCBCGCDHD (partial CD-only fragment, missing CE/CZ!)
+    let partial_cd_peaks = vec![
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.09,
+            n: 0.0,
+            c: Some(131.55),
+            sign: 1,
+            height: Some(190.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "HBCBCGCDHD".to_string(),
+            h: 7.09,
+            n: 0.0,
+            c: Some(39.40),
+            sign: 1,
+            height: Some(165.0),
+            volume: None,
+            h2: None,
+        },
+    ];
+    let res_partial = assign_aromatic_rings(
+        &curated_ce_cz,
+        None,
+        &partial_cd_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        !res_partial
+            .reference
+            .shifts
+            .contains_key(&(0, "CD1".to_string())),
+        "partial CD-only solver ring must NEVER be mixed onto curated CE/CZ residue"
+    );
+    assert!(res_partial.atom_confidence.is_empty());
+
+    // Standalone merge_aromatic_into_shifts must also block partial CD-only fragments
+    let mut manual_partial = curated_ce_cz.clone();
+    manual_partial.shifts.insert((0, "CD1".to_string()), 131.55);
+    manual_partial.shifts.insert((0, "HD1".to_string()), 7.09);
+    let mut manual_cd_atoms = BTreeMap::new();
+    manual_cd_atoms.insert((0, "CD1".to_string()), 0.90);
+    manual_cd_atoms.insert((0, "HD1".to_string()), 0.90);
+    let merged_partial =
+        merge_aromatic_into_shifts(&curated_ce_cz, &manual_partial, &manual_cd_atoms);
+    assert!(
+        !merged_partial.shifts.contains_key(&(0, "CD1".to_string())),
+        "standalone merge_aromatic_into_shifts must reject partial CD-only fragment on curated CE/CZ residue"
+    );
+
+    // 3. Curated ring lock: a ring cluster matching pre-curated PHE #0 must NEVER be assigned onto uncurated PHE #1!
+    let mut two_phe = Reference {
+        sequence: vec!["PHE".to_string(), "PHE".to_string()],
+        seq_ids: vec![10, 45],
+        ..Default::default()
+    };
+    // Similar CB values (or missing CB on #0) that would otherwise tempt a solver without curated locks!
+    two_phe.shifts.insert((0, "CB".to_string()), 38.50);
+    two_phe.shifts.insert((1, "CB".to_string()), 38.55);
+    // PHE #0 is already curated by the user:
+    for &(a, v) in &[
+        ("CD1", 131.45),
+        ("CD2", 131.45),
+        ("HD1", 7.16),
+        ("HD2", 7.16),
+        ("CE1", 129.50),
+        ("CE2", 129.50),
+        ("HE1", 7.28),
+        ("HE2", 7.28),
+        ("CZ", 127.85),
+        ("HZ", 7.11),
+    ] {
+        two_phe.shifts.insert((0, a.to_string()), v);
+    }
+
+    // Spectrum contains ONLY PHE #0's ring cluster (PHE #1 peaks broadened/absent)
+    let phe0_cluster_peaks = vec![
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.16,
+            n: 0.0,
+            c: Some(131.45),
+            sign: 1,
+            height: Some(210.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.28,
+            n: 0.0,
+            c: Some(129.50),
+            sign: 1,
+            height: Some(205.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "HBCBCGCDHD".to_string(),
+            h: 7.16,
+            n: 0.0,
+            c: Some(38.52),
+            sign: 1,
+            height: Some(175.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h: 7.16,
+            n: 0.0,
+            c: Some(131.45),
+            sign: 1,
+            height: Some(145.0),
+            volume: None,
+            h2: Some(7.28),
+        },
+        Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h: 7.28,
+            n: 0.0,
+            c: Some(129.50),
+            sign: 1,
+            height: Some(145.0),
+            volume: None,
+            h2: Some(7.16),
+        },
+    ];
+
+    let res_locked = assign_aromatic_rings(
+        &two_phe,
+        None,
+        &phe0_cluster_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        !res_locked.reference.shifts.contains_key(&(1, "CD1".to_string()))
+            && !res_locked.reference.shifts.contains_key(&(1, "CE1".to_string())),
+        "cluster matching curated PHE #0 must be locked to PHE #0 and NEVER assigned onto PHE #1! got PHE #1 shifts: {:?}",
+        res_locked
+            .reference
+            .shifts
+            .iter()
+            .filter(|((rk, _), _)| *rk == 1)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        res_locked.rings[1].cluster_idx.is_none(),
+        "uncurated PHE #1 must remain unassigned when the only observed cluster belongs to curated PHE #0"
+    );
+
+    // 4. Superset cluster completion (`CD`+`CE` curated on PHE #0, 6-slot `CD`+`CE`+`CZ` cluster observed)
+    //    AND 1-slot user-adjusted conflict quarantine (`HZ` nudged by +0.10 ppm on PHE #0):
+    let mut superset_peaks = phe0_cluster_peaks.clone();
+    superset_peaks.push(Peak {
+        exp: "AROM_C13HSQC".to_string(),
+        h: 7.11,
+        n: 0.0,
+        c: Some(127.85),
+        sign: 1,
+        height: Some(102.0),
+        volume: None,
+        h2: None,
+    });
+    superset_peaks.push(Peak {
+        exp: "AROM_HCCH_TOCSY".to_string(),
+        h: 7.28,
+        n: 0.0,
+        c: Some(129.50),
+        sign: 1,
+        height: Some(130.0),
+        volume: None,
+        h2: Some(7.11),
+    });
+    superset_peaks.push(Peak {
+        exp: "AROM_HCCH_TOCSY".to_string(),
+        h: 7.11,
+        n: 0.0,
+        c: Some(127.85),
+        sign: 1,
+        height: Some(130.0),
+        volume: None,
+        h2: Some(7.28),
+    });
+
+    let mut four_slot_phe = two_phe.clone();
+    four_slot_phe.shifts.remove(&(0, "CZ".to_string()));
+    four_slot_phe.shifts.remove(&(0, "HZ".to_string()));
+    let res_superset = assign_aromatic_rings(
+        &four_slot_phe,
+        None,
+        &superset_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        res_superset.rings[1].cluster_idx.is_none(),
+        "6-slot superset cluster of 4-slot curated PHE #0 must never duplicate onto PHE #1"
+    );
+    let merged_superset = merge_aromatic_into_shifts(
+        &four_slot_phe,
+        &res_superset.reference,
+        &res_superset.atom_confidence,
+    );
+    assert!((merged_superset.shifts[&(0, "CZ".to_string())] - 127.85).abs() < 1e-6);
+    assert!((merged_superset.shifts[&(0, "HZ".to_string())] - 7.11).abs() < 1e-6);
+
+    // User-nudged HZ (+0.10 ppm > 0.06 ppm tol) on PHE #0: must neither overwrite PHE #0 NOR leak onto PHE #1!
+    let mut nudged_phe = two_phe.clone();
+    nudged_phe.shifts.insert((0, "HZ".to_string()), 7.21);
+    let res_nudged = assign_aromatic_rings(
+        &nudged_phe,
+        None,
+        &superset_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        res_nudged.rings[0].cluster_idx.is_none() && res_nudged.rings[1].cluster_idx.is_none(),
+        "curated PHE #0 cluster with 1 user-adjusted slot outside tol must be quarantined from leaking onto PHE #1: {:?}",
+        res_nudged.rings
+    );
+    assert!((res_nudged.reference.shifts[&(0, "HZ".to_string())] - 7.21).abs() < 1e-9);
 }

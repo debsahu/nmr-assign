@@ -55,7 +55,7 @@ struct MethylParams {
     off_gem_pairs: u32,
     off_gem_nbr_offs: u32,
     off_gem_nbr_vals: u32,
-    _pad_u1: u32,
+    move_mask: u32,
 
     d_cutoff: f32,
     sigma_d: f32,
@@ -112,6 +112,37 @@ fn rand_f32(st: ptr<function, vec4<u32>>) -> f32 {
 
 fn rand_below(st: ptr<function, vec4<u32>>, upper: u32) -> u32 {
     return next_u32(st) % max(upper, 1u);
+}
+
+fn select_move_phase(st: ptr<function, vec4<u32>>, move_mask: u32) -> u32 {
+    let mask = move_mask & 15u;
+    if (mask == 0u || mask == 15u) {
+        return next_u32(st) & 15u;
+    }
+    let pop = countOneBits(mask);
+    let pick = rand_below(st, pop);
+    var seen: u32 = 0u;
+    for (var b: u32 = 0u; b < 4u; b = b + 1u) {
+        if ((mask & (1u << b)) != 0u) {
+            if (seen == pick) {
+                if (b == 0u) {
+                    return 0u;
+                }
+                if (b == 1u) {
+                    return 6u;
+                }
+                if (b == 2u) {
+                    if ((next_u32(st) & 1u) == 0u) {
+                        return 12u;
+                    }
+                    return 14u;
+                }
+                return 15u;
+            }
+            seen = seen + 1u;
+        }
+    }
+    return 15u;
 }
 
 fn in_u4(x: u32, n: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> bool {
@@ -950,9 +981,10 @@ fn run_anneal_wg(r: u32, wg_base: u32) {
     }
 
     var rng = rng_state[r];
-    var cur = eval_total_raw_wg(wg_base);
-    var best_sc = scores_state[r].y;
-    if (cur > best_sc + 1.0e-4) {
+    var cur: f32 = scores_state[r].x;
+    var best_sc: f32 = scores_state[r].y;
+    if (params.step_offset == 0u) {
+        cur = eval_total_raw_wg(wg_base);
         best_sc = cur;
         save_best_wg(wg_base, at_best_base, pos_best_base);
     }
@@ -960,17 +992,14 @@ fn run_anneal_wg(r: u32, wg_base: u32) {
     let denom = f32(max(select(0u, params.total_steps - 1u, params.total_steps > 0u), 1u));
     let log_ratio = log(params.t_end / params.t_start);
     let step_end = min(params.step_offset + params.chunk_steps, params.total_steps);
-    var temp = params.t_start * exp(log_ratio * (f32(params.step_offset) / denom));
-    let temp_step = exp(log_ratio / denom);
 
     for (var step: u32 = params.step_offset; step < step_end; step = step + 1u) {
-        let cur_temp = temp;
-        temp = temp * temp_step;
-        let phase = next_u32(&rng) & 15u;
+        let cur_temp = params.t_start * exp(log_ratio * (f32(step) / denom));
+        let phase = select_move_phase(&rng, params.move_mask);
         let save_ready = step * 3u >= params.total_steps;
 
-        if (phase < 7u) {
-            // Move 1 (`7/16`): slot-guided swap / move / reversible unassign-assign / displace-occupied
+        if (phase < 6u) {
+            // Move 1 (`6/16`): slot-guided swap / move / displace-occupied
             let s = rand_below(&rng, s_len);
             let sl0 = ro_ints[params.off_slots_offs + s];
             let sl1 = ro_ints[params.off_slots_offs + s + 1u];
@@ -1039,7 +1068,7 @@ fn run_anneal_wg(r: u32, wg_base: u32) {
                     wg_pos[wg_base + u32(oa0)] = i32(m);
                 }
             }
-        } else if (phase < 13u) {
+        } else if (phase < 12u) {
             // Move 2 (`6/16`): 3D contact-guided (`7/8`) + slot-ergodic (`1/8`) move/swap with exact Hastings correction
             let s = rand_below(&rng, s_len);
             let ms_i = wg_pos[wg_base + s];
@@ -1109,8 +1138,8 @@ fn run_anneal_wg(r: u32, wg_base: u32) {
                     save_best_wg(wg_base, at_best_base, pos_best_base);
                 }
             }
-        } else if (phase < 15u) {
-            // Move 3 (`2/16`): state-independent 4-body geminal residue involution
+        } else if (phase < 14u) {
+            // Move 3A (`2/16`): state-independent 4-body geminal residue involution
             let ng = params.n_gem_pairs;
             if (ng < 2u) {
                 continue;
@@ -1204,8 +1233,8 @@ fn run_anneal_wg(r: u32, wg_base: u32) {
                 if (sa3 >= 0) { wg_pos[wg_base + u32(sa3)] = i32(gm3); }
                 if (sa4 >= 0) { wg_pos[wg_base + u32(sa4)] = i32(gm4); }
             }
-        } else {
-            // Move 4 (`1/16`): state-independent intraresidue prochiral 2-flip involution
+        } else if (phase < 15u) {
+            // Move 3B (`1/16`): state-independent intraresidue prochiral 2-flip involution
             let ng = params.n_gem_pairs;
             if (ng == 0u) {
                 continue;
@@ -1252,13 +1281,68 @@ fn run_anneal_wg(r: u32, wg_base: u32) {
                     save_best_wg(wg_base, at_best_base, pos_best_base);
                 }
             }
+        } else {
+            // Move 4 (`1/16`): paired assign/unassign (birth/death) on variable-cardinality Omega = U_k Omega_k
+            let s = rand_below(&rng, s_len);
+            let sl0 = ro_ints[params.off_slots_offs + s];
+            let sl1 = ro_ints[params.off_slots_offs + s + 1u];
+            if (sl0 >= sl1) {
+                continue;
+            }
+            let sl_len = sl1 - sl0;
+            let ms_i = wg_pos[wg_base + s];
+            if (ms_i < 0) {
+                let m = ro_ints[params.off_slots_vals + sl0 + rand_below(&rng, sl_len)];
+                if (wg_at[wg_base + m] >= 0
+                    || ro_floats[params.off_u_mat + s * m_len + m] <= METHYL_FORBID_HALF)
+                {
+                    continue;
+                }
+                let before = eval_subset_wg(wg_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u);
+                wg_at[wg_base + m] = i32(s);
+                wg_pos[wg_base + s] = i32(m);
+                let delta = eval_subset_wg(wg_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u) - before;
+                let log_hastings = log(f32(sl_len));
+                if (mh_accept(&rng, delta, cur_temp, log_hastings)) {
+                    cur = cur + delta;
+                    if (save_ready && cur > best_sc + 0.15) {
+                        best_sc = cur;
+                        save_best_wg(wg_base, at_best_base, pos_best_base);
+                    }
+                } else {
+                    wg_at[wg_base + m] = -1;
+                    wg_pos[wg_base + s] = -1;
+                }
+            } else {
+                let m = u32(ms_i);
+                if (ro_floats[params.off_u_mat + s * m_len + m] <= METHYL_FORBID_HALF) {
+                    continue;
+                }
+                let before = eval_subset_wg(wg_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u);
+                wg_at[wg_base + m] = -1;
+                wg_pos[wg_base + s] = -1;
+                let delta = eval_subset_wg(wg_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u) - before;
+                let log_hastings = -log(f32(sl_len));
+                if (mh_accept(&rng, delta, cur_temp, log_hastings)) {
+                    cur = cur + delta;
+                    if (save_ready && cur > best_sc + 0.15) {
+                        best_sc = cur;
+                        save_best_wg(wg_base, at_best_base, pos_best_base);
+                    }
+                } else {
+                    wg_at[wg_base + m] = i32(s);
+                    wg_pos[wg_base + s] = i32(m);
+                }
+            }
         }
     }
 
-    cur = eval_total_raw_wg(wg_base);
-    if (cur > best_sc) {
-        best_sc = cur;
-        save_best_wg(wg_base, at_best_base, pos_best_base);
+    if (step_end >= params.total_steps) {
+        cur = eval_total_raw_wg(wg_base);
+        if (cur > best_sc) {
+            best_sc = cur;
+            save_best_wg(wg_base, at_best_base, pos_best_base);
+        }
     }
 
     for (var m: u32 = 0u; m < m_len; m = m + 1u) {
@@ -1317,9 +1401,10 @@ fn anneal_methyl_global(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pos_best_base = (reps + r) * s_len;
 
     var rng = rng_state[r];
-    var cur = eval_total_raw_global(at_cur_base, pos_cur_base);
-    var best_sc = scores_state[r].y;
-    if (cur > best_sc + 1.0e-4) {
+    var cur: f32 = scores_state[r].x;
+    var best_sc: f32 = scores_state[r].y;
+    if (params.step_offset == 0u) {
+        cur = eval_total_raw_global(at_cur_base, pos_cur_base);
         best_sc = cur;
         save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
     }
@@ -1327,16 +1412,13 @@ fn anneal_methyl_global(@builtin(global_invocation_id) gid: vec3<u32>) {
     let denom = f32(max(select(0u, params.total_steps - 1u, params.total_steps > 0u), 1u));
     let log_ratio = log(params.t_end / params.t_start);
     let step_end = min(params.step_offset + params.chunk_steps, params.total_steps);
-    var temp = params.t_start * exp(log_ratio * (f32(params.step_offset) / denom));
-    let temp_step = exp(log_ratio / denom);
 
     for (var step: u32 = params.step_offset; step < step_end; step = step + 1u) {
-        let cur_temp = temp;
-        temp = temp * temp_step;
-        let phase = next_u32(&rng) & 15u;
+        let cur_temp = params.t_start * exp(log_ratio * (f32(step) / denom));
+        let phase = select_move_phase(&rng, params.move_mask);
         let save_ready = step * 3u >= params.total_steps;
 
-        if (phase < 7u) {
+        if (phase < 6u) {
             let s = rand_below(&rng, s_len);
             let sl0 = ro_ints[params.off_slots_offs + s];
             let sl1 = ro_ints[params.off_slots_offs + s + 1u];
@@ -1405,7 +1487,7 @@ fn anneal_methyl_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                     pos_both[pos_cur_base + u32(oa0)] = i32(m);
                 }
             }
-        } else if (phase < 13u) {
+        } else if (phase < 12u) {
             let s = rand_below(&rng, s_len);
             let ms_i = pos_both[pos_cur_base + s];
             if (ms_i < 0) {
@@ -1474,7 +1556,7 @@ fn anneal_methyl_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                     save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
                 }
             }
-        } else if (phase < 15u) {
+        } else if (phase < 14u) {
             let ng = params.n_gem_pairs;
             if (ng < 2u) {
                 continue;
@@ -1569,7 +1651,7 @@ fn anneal_methyl_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (sa3 >= 0) { pos_both[pos_cur_base + u32(sa3)] = i32(gm3); }
                 if (sa4 >= 0) { pos_both[pos_cur_base + u32(sa4)] = i32(gm4); }
             }
-        } else {
+        } else if (phase < 15u) {
             let ng = params.n_gem_pairs;
             if (ng == 0u) {
                 continue;
@@ -1616,13 +1698,67 @@ fn anneal_methyl_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                     save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
                 }
             }
+        } else {
+            let s = rand_below(&rng, s_len);
+            let sl0 = ro_ints[params.off_slots_offs + s];
+            let sl1 = ro_ints[params.off_slots_offs + s + 1u];
+            if (sl0 >= sl1) {
+                continue;
+            }
+            let sl_len = sl1 - sl0;
+            let ms_i = pos_both[pos_cur_base + s];
+            if (ms_i < 0) {
+                let m = ro_ints[params.off_slots_vals + sl0 + rand_below(&rng, sl_len)];
+                if (at_both[at_cur_base + m] >= 0
+                    || ro_floats[params.off_u_mat + s * m_len + m] <= METHYL_FORBID_HALF)
+                {
+                    continue;
+                }
+                let before = eval_subset_global(at_cur_base, pos_cur_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u);
+                at_both[at_cur_base + m] = i32(s);
+                pos_both[pos_cur_base + s] = i32(m);
+                let delta = eval_subset_global(at_cur_base, pos_cur_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u) - before;
+                let log_hastings = log(f32(sl_len));
+                if (mh_accept(&rng, delta, cur_temp, log_hastings)) {
+                    cur = cur + delta;
+                    if (save_ready && cur > best_sc + 0.15) {
+                        best_sc = cur;
+                        save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
+                    }
+                } else {
+                    at_both[at_cur_base + m] = -1;
+                    pos_both[pos_cur_base + s] = -1;
+                }
+            } else {
+                let m = u32(ms_i);
+                if (ro_floats[params.off_u_mat + s * m_len + m] <= METHYL_FORBID_HALF) {
+                    continue;
+                }
+                let before = eval_subset_global(at_cur_base, pos_cur_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u);
+                at_both[at_cur_base + m] = -1;
+                pos_both[pos_cur_base + s] = -1;
+                let delta = eval_subset_global(at_cur_base, pos_cur_base, 1u, m, 0u, 0u, 0u, 1u, s, 0u, 0u, 0u) - before;
+                let log_hastings = -log(f32(sl_len));
+                if (mh_accept(&rng, delta, cur_temp, log_hastings)) {
+                    cur = cur + delta;
+                    if (save_ready && cur > best_sc + 0.15) {
+                        best_sc = cur;
+                        save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
+                    }
+                } else {
+                    at_both[at_cur_base + m] = i32(s);
+                    pos_both[pos_cur_base + s] = i32(m);
+                }
+            }
         }
     }
 
-    cur = eval_total_raw_global(at_cur_base, pos_cur_base);
-    if (cur > best_sc) {
-        best_sc = cur;
-        save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
+    if (step_end >= params.total_steps) {
+        cur = eval_total_raw_global(at_cur_base, pos_cur_base);
+        if (cur > best_sc) {
+            best_sc = cur;
+            save_best_global(at_cur_base, pos_cur_base, at_best_base, pos_best_base);
+        }
     }
     scores_state[r] = vec2<f32>(cur, best_sc);
     rng_state[r] = rng;

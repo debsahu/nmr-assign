@@ -216,13 +216,223 @@ fn gauss_logpdf(x: f64, mu: f64, sd: f64) -> f64 {
     -0.5 * z * z - (sd * TAU.sqrt()).ln()
 }
 
+fn hh_pka_zscore(f_prot: f64, sample_ph: f64) -> f64 {
+    // Weak Henderson-Hasselbalch prior around average protein His pKa = 6.3 +- 0.80
+    // (Pelton et al., Protein Sci. 1993; Edgcomb & Murphy, Proteins 2002: protein His pKa ~ 4.8..8.0).
+    // Evaluate over a +-0.015 protonation-fraction tolerance band so boundary states
+    // f_prot = 0 (high pH) and f_prot = 1 (low pH) incur zero artificial log-odds blowup.
+    const PKA_MEAN: f64 = 6.30;
+    const PKA_SD: f64 = 0.80;
+    const BAND: f64 = 0.015;
+
+    let f_lo = (f_prot - BAND).clamp(1.0e-4, 1.0 - 1.0e-4);
+    let f_hi = (f_prot + BAND).clamp(1.0e-4, 1.0 - 1.0e-4);
+    let pka_at = |f: f64| sample_ph - ((1.0 - f) / f).log10();
+
+    let pka_min = if f_prot <= BAND {
+        f64::NEG_INFINITY
+    } else {
+        pka_at(f_lo)
+    };
+    let pka_max = if f_prot >= 1.0 - BAND {
+        f64::INFINITY
+    } else {
+        pka_at(f_hi)
+    };
+
+    if PKA_MEAN < pka_min {
+        (pka_min - PKA_MEAN) / PKA_SD
+    } else if PKA_MEAN > pka_max {
+        (PKA_MEAN - pka_max) / PKA_SD
+    } else {
+        0.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeltonManifoldFit {
+    /// MAP protonated imidazolium fraction `f_prot in [0.0, 1.0]` including optional pH prior.
+    f_prot_map: f64,
+    /// MAP neutral tau (`Ne2H`) fraction `p_tau in [0.0, 1.0]` within the `(1 - f_prot)` neutral pool.
+    p_tau_map: f64,
+    /// Minimum orthogonal Mahalanobis residual `d_orth^2` off the pure shift manifold `(f_prot, p_tau) in [0, 1]^2`.
+    d_orth_sq_shift: f64,
+    /// Minimum joint `(shift + Henderson-Hasselbalch pH)` residual `d_orth_joint^2` off `[0, 1]^2`.
+    d_orth_sq_joint: f64,
+    ///Protonated fraction `f_prot_n` implied by `(ND1, NE2)` alone (`None` if neither `15N` is observed).
+    f_prot_n_only: Option<f64>,
+    /// Number of observed ring shift channels among `(ND1, NE2, CG, CD2, HD2, CE1, HE1)`.
+    n_ring_obs: usize,
+}
+
+/// Fit Pelton's two-site neutral (`tau <-> pi`) <-> cationic (`HisH+`) fast-exchange manifold:
+/// `mu(f_prot, p_tau) = (1 - f_prot) * (p_tau * mu_tau + (1 - p_tau) * mu_pi) + f_prot * mu_cat`
+/// across `(ND1, NE2, CG, CD2, HD2, CE1, HE1)` (plus weak `CB` tie-breaking in the MAP objective)
+/// and optional Henderson-Hasselbalch `sample_ph` prior (`pKa = 6.3 +- 0.8`).
+fn fit_pelton_titration_manifold(ev: &HisTautomerEvidence) -> PeltonManifoldFit {
+    let vp_tau = HIS_NE2H_PRIORS;
+    let vp_pi = HIS_ND1H_PRIORS;
+    let vp_cat = HIS_DOUBLY_PROTONATED_PRIORS;
+    let ph_opt = ev.sample_ph.filter(|v| v.is_finite());
+
+    type HisRingChannel = (Option<f64>, (f64, f64), (f64, f64), (f64, f64));
+    let ring_channels: [HisRingChannel; 7] = [
+        (ev.nd1_ppm, vp_tau.nd1, vp_pi.nd1, vp_cat.nd1),
+        (ev.ne2_ppm, vp_tau.ne2, vp_pi.ne2, vp_cat.ne2),
+        (ev.cg_ppm, vp_tau.cg, vp_pi.cg, vp_cat.cg),
+        (ev.cd2_ppm, vp_tau.cd2, vp_pi.cd2, vp_cat.cd2),
+        (ev.hd2_ppm, vp_tau.hd2, vp_pi.hd2, vp_cat.hd2),
+        (ev.ce1_ppm, vp_tau.ce1, vp_pi.ce1, vp_cat.ce1),
+        (ev.he1_ppm, vp_tau.he1, vp_pi.he1, vp_cat.he1),
+    ];
+    let n_ring_obs = ring_channels.iter().filter(|c| c.0.is_some()).count();
+
+    let eval_point = |f_prot: f64, p_tau: f64| -> (f64, f64, f64, f64) {
+        let w_tau = (1.0 - f_prot) * p_tau;
+        let w_pi = (1.0 - f_prot) * (1.0 - p_tau);
+        let w_cat = f_prot;
+
+        let mut d_sq_ring = 0.0;
+        let mut d_sq_n = 0.0;
+        for (idx, &(obs_opt, t_p, p_p, c_p)) in ring_channels.iter().enumerate() {
+            if let Some(obs) = obs_opt {
+                let mu = w_tau * t_p.0 + w_pi * p_p.0 + w_cat * c_p.0;
+                let var = w_tau * t_p.1 * t_p.1 + w_pi * p_p.1 * p_p.1 + w_cat * c_p.1 * c_p.1;
+                let z2 = (obs - mu) * (obs - mu) / var.max(1.0e-6);
+                d_sq_ring += z2;
+                if idx < 2 {
+                    d_sq_n += z2;
+                }
+            }
+        }
+
+        let cb_term = if let Some(cb) = ev.cb_ppm {
+            let mu_cb = w_tau * vp_tau.cb.0 + w_pi * vp_pi.cb.0 + w_cat * vp_cat.cb.0;
+            let var_cb = w_tau * vp_tau.cb.1 * vp_tau.cb.1
+                + w_pi * vp_pi.cb.1 * vp_pi.cb.1
+                + w_cat * vp_cat.cb.1 * vp_cat.cb.1;
+            0.25 * (cb - mu_cb) * (cb - mu_cb) / var_cb.max(1.0e-6)
+        } else {
+            0.0
+        };
+
+        // Weak neutral tau:pi ~ 0.64:0.36 preference from Pelton/BMRB when neutral tautomer is underdetermined
+        let z_tau_prior = (p_tau - 0.64) / 0.45;
+        let map_prior_pen = (1.0 - f_prot) * 0.12 * z_tau_prior * z_tau_prior;
+
+        let (ph_joint_pen, ph_map_pen) = if let Some(ph) = ph_opt {
+            let z_ph = hh_pka_zscore(f_prot, ph);
+            (0.65 * z_ph * z_ph, 0.45 * z_ph * z_ph)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let d_joint = d_sq_ring + ph_joint_pen;
+        let map_obj = d_sq_ring + cb_term + ph_map_pen + map_prior_pen;
+        (d_sq_ring, d_joint, map_obj, d_sq_n)
+    };
+
+    let mut d_orth_sq_shift = f64::INFINITY;
+    let mut d_orth_sq_joint = f64::INFINITY;
+    let mut best_map_obj = f64::INFINITY;
+    let mut f_prot_map = 0.0;
+    let mut p_tau_map = 0.64;
+
+    let has_n = ev.nd1_ppm.is_some() || ev.ne2_ppm.is_some();
+    let mut best_n_sq = f64::INFINITY;
+    let mut best_f_n = 0.0;
+
+    // Coarse 41 x 41 grid (`0.025` step) + local coordinate refinement (`0.005` step) on `[0, 1]^2`
+    const N_GRID: usize = 40;
+    for i in 0..=N_GRID {
+        let f = (i as f64) / (N_GRID as f64);
+        for j in 0..=N_GRID {
+            let p = (j as f64) / (N_GRID as f64);
+            let (d_shift, d_joint, map_obj, d_n) = eval_point(f, p);
+            if d_shift < d_orth_sq_shift {
+                d_orth_sq_shift = d_shift;
+            }
+            if d_joint < d_orth_sq_joint {
+                d_orth_sq_joint = d_joint;
+            }
+            if map_obj < best_map_obj {
+                best_map_obj = map_obj;
+                f_prot_map = f;
+                p_tau_map = p;
+            }
+            if has_n && d_n < best_n_sq {
+                best_n_sq = d_n;
+                best_f_n = f;
+            }
+        }
+    }
+
+    let (f_c, p_c) = (f_prot_map, p_tau_map);
+    for di in -5..=5_i32 {
+        let f = (f_c + (di as f64) * 0.005).clamp(0.0, 1.0);
+        for dj in -5..=5_i32 {
+            let p = (p_c + (dj as f64) * 0.005).clamp(0.0, 1.0);
+            let (d_shift, d_joint, map_obj, d_n) = eval_point(f, p);
+            d_orth_sq_shift = d_orth_sq_shift.min(d_shift);
+            d_orth_sq_joint = d_orth_sq_joint.min(d_joint);
+            if map_obj < best_map_obj {
+                best_map_obj = map_obj;
+                f_prot_map = f;
+                p_tau_map = p;
+            }
+            if has_n && d_n < best_n_sq {
+                best_n_sq = d_n;
+                best_f_n = f;
+            }
+        }
+    }
+
+    PeltonManifoldFit {
+        f_prot_map,
+        p_tau_map,
+        d_orth_sq_shift,
+        d_orth_sq_joint,
+        f_prot_n_only: has_n.then_some(best_f_n),
+        n_ring_obs,
+    }
+}
+
+/// Squared Mahalanobis distance `d_M^2`, maximum per-channel `|z|`, and observed channel count `m`
+/// to a single pure Pelton state (`Ne2H`, `Nd1H`, or `DoublyProtonated`).
+fn pure_his_state_mahalanobis(ev: &HisTautomerEvidence, state: HisTautomer) -> (f64, f64, usize) {
+    let vp = state.variant_priors();
+    let channels: [(Option<f64>, (f64, f64)); 7] = [
+        (ev.nd1_ppm, vp.nd1),
+        (ev.ne2_ppm, vp.ne2),
+        (ev.cg_ppm, vp.cg),
+        (ev.cd2_ppm, vp.cd2),
+        (ev.hd2_ppm, vp.hd2),
+        (ev.ce1_ppm, vp.ce1),
+        (ev.he1_ppm, vp.he1),
+    ];
+    let mut d_m_sq = 0.0;
+    let mut z_max = 0.0_f64;
+    let mut m = 0usize;
+    for &(obs_opt, (mu, sd)) in &channels {
+        if let Some(obs) = obs_opt {
+            let z = ((obs - mu) / sd).abs();
+            d_m_sq += z * z;
+            z_max = z_max.max(z);
+            m += 1;
+        }
+    }
+    (d_m_sq, z_max, m)
+}
+
 fn raw_pelton_three_state_posterior(ev: &HisTautomerEvidence) -> ([f64; 3], HisTautomer, f64) {
     let log_priors = if let Some(ph) = ev.sample_ph.filter(|v| v.is_finite()) {
-        // Mild Henderson-Hasselbalch modulation around average protein His pKa ~ 6.3,
-        // clamped conservatively because buried/salt-bridged His pKa values span ~4.5..8.5.
-        let p_prot = (1.0 / (1.0 + 10.0_f64.powf(ph - 6.3))).clamp(0.06, 0.90);
-        let p_neut = 1.0 - p_prot;
-        [(0.64 * p_neut).ln(), (0.36 * p_neut).ln(), p_prot.ln()]
+        // Weak Henderson-Hasselbalch prior around pKa = 6.3 +- 0.80 so basic/acidic pH informs
+        // neutral vs cationic odds without overriding genuine salt-bridged or buried pKa shifts.
+        let z_neut = hh_pka_zscore(0.0, ph);
+        let z_cat = hh_pka_zscore(1.0, ph);
+        let lp_neut = -0.225 * z_neut * z_neut;
+        let lp_cat = -0.225 * z_cat * z_cat;
+        [0.64_f64.ln() + lp_neut, 0.36_f64.ln() + lp_neut, lp_cat]
     } else {
         [0.45_f64.ln(), 0.25_f64.ln(), 0.30_f64.ln()]
     };
@@ -284,8 +494,14 @@ fn raw_pelton_three_state_posterior(ev: &HisTautomerEvidence) -> ([f64; 3], HisT
 
 /// Classify histidine imidazole state (`Resolved(HisTautomer)`, `FastExchangeUncommitted`, or
 /// `MetalCoordinatedCandidate`) and return the calibrated static-tautomer commitment confidence
-/// in `[0.0, 1.0]` (`< 0.80` whenever fast tautomer exchange or metal ligation makes static
-/// two-tautomer/imidazolium commitment physically invalid).
+/// in `[0.0, 1.0]` (`< 0.50` on fast exchange or out-of-distribution states, `< 0.60` on metal
+/// coordination, so callers and auto-apply widgets never over-commit non-static states).
+///
+/// Provenance:
+/// - Pelton, Torchia, Meadow & Roseman, *Protein Sci.* 2, 543–558 (1993): two-site fast-exchange
+///   titration surface `mu(f_prot, p_tau)` across `(ND1, NE2, CG, CD2, HD2, CE1, HE1)`.
+/// - Barraud, Schubert, Allain & Nietlispach, *J. Biomol. NMR* 53, 95–108 (2012): metal-ligated
+///   histidine `15N`/`1H`/`13C` orthogonal electronic departure off the protonation manifold.
 pub fn classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, f64) {
     let (_probs, best_taut, raw_post) = raw_pelton_three_state_posterior(ev);
 
@@ -297,67 +513,103 @@ pub fn classify_his_state(ev: &HisTautomerEvidence) -> (HisStateClassification, 
         );
     }
 
-    // 2. Fast neutral tautomer averaging (Ne2H <-> Nd1H):
-    //    - Both ND1 and NE2 lie in the 195..=225 ppm intermediate averaging zone, OR
-    //    - A single observed 15N lies in 198..=222 ppm with intermediate CD2 (~120..124 ppm) and neutral HE1 (< 8.25 ppm).
-    match (ev.nd1_ppm, ev.ne2_ppm) {
-        (Some(nd1), Some(ne2))
-            if (195.0..=225.0).contains(&nd1) && (195.0..=225.0).contains(&ne2) =>
-        {
-            let spread = (nd1 - ne2).abs();
-            // Closer to 209.5 ppm midpoint => closer to 50:50 uncommitted tautomer population
-            let conf = (0.38 + 0.14 * (spread / 30.0).min(1.0)).clamp(0.35, 0.52);
-            return (HisStateClassification::FastExchangeUncommitted, conf);
-        }
-        (Some(n_single), None) | (None, Some(n_single))
-            if (198.0..=222.0).contains(&n_single)
-                && ev.cd2_ppm.is_none_or(|c| (119.5..=124.2).contains(&c))
-                && ev.he1_ppm.is_none_or(|h| h < 8.25) =>
-        {
-            return (HisStateClassification::FastExchangeUncommitted, 0.48);
-        }
-        _ => {}
-    }
+    let fit = fit_pelton_titration_manifold(ev);
 
-    // 3. Zn(II) / Cu(I) / metal-coordinated histidine mimicry (Barraud et al., JBNMR 2012):
-    //    - Asymmetric pair: one protonated pyrrole-like >NH (160..=183.5 ppm) paired with a
-    //      metal-ligated =N-M shifted 20..48 ppm upfield from 249.5 into ~185..230 ppm (split 18..=68 ppm)
-    //      and non-cationic HE1 (< 8.30 ppm).
-    //    - Basic-pH contradiction: DoublyProtonated-like upfield 15N (< 192 ppm, neither >= 235 ppm)
-    //      conflicting with basic sample_ph >= 7.4 and neutral HE1 < 8.15 ppm.
-    if let (Some(nd1), Some(ne2)) = (ev.nd1_ppm, ev.ne2_ppm) {
-        let n_lo = nd1.min(ne2);
-        let n_hi = nd1.max(ne2);
-        let split = n_hi - n_lo;
-        let neutral_he1 = ev.he1_ppm.is_none_or(|h| h < 8.30);
-        let asymmetric_metal_pair = (160.0..=183.5).contains(&n_lo)
-            && (((202.0..=230.0).contains(&n_hi) && neutral_he1)
-                || ((185.0..=230.0).contains(&n_hi)
-                    && (18.0..=68.0).contains(&split)
-                    && neutral_he1));
-        if asymmetric_metal_pair {
-            return (
-                HisStateClassification::MetalCoordinatedCandidate,
-                raw_post.min(0.60),
-            );
-        }
-    }
-    let has_upfield_only_n = match (ev.nd1_ppm, ev.ne2_ppm) {
-        (Some(a), Some(b)) => a <= 192.0 && b <= 192.0,
-        (Some(a), None) | (None, Some(a)) => a <= 192.0,
-        (None, None) => false,
-    };
-    if has_upfield_only_n
-        && ev.sample_ph.is_some_and(|ph| ph >= 7.4)
-        && ev.he1_ppm.is_some_and(|h| h < 8.15)
-    {
+    // 2. Metal-coordination detection conditioned strictly on statistically significant orthogonal
+    //    Mahalanobis residual `d_orth^2` off the entire two-site neutral<->cation titration manifold
+    //    (zero ad-hoc 15N split windows):
+    //    (a) 15N shift outside Pelton's neutral<->cation simplex envelope (`> 258.5 ppm` downfield
+    //        beyond neutral `=N-` `249.5 +- 3.8`, `< 156.0 ppm`, or `ND1 + NE2 > 438.0 ppm` with `d_orth^2 >= 6.0`), OR
+    //    (b) Significant multi-channel orthogonal Mahalanobis residual off `[0, 1]^2` (`d_orth_joint^2 >= 12.0`
+    //        or `d_orth_shift^2 >= 8.0`) where `15N` shifts mimic
+    //        protonation/upfield coordination (`f_prot_n >= 0.35`) WITHOUT the accompanying cationic
+    //        protonation shift on `HE1`/`CE1` (electronic `=N-M` coordination signature; Barraud et al. 2012).
+    let n_envelope_exceeded = [ev.nd1_ppm, ev.ne2_ppm]
+        .into_iter()
+        .flatten()
+        .any(|n| !(156.0..=258.5).contains(&n))
+        || matches!((ev.nd1_ppm, ev.ne2_ppm), (Some(a), Some(b)) if a + b > 438.0 || a + b < 326.0);
+
+    if n_envelope_exceeded && fit.d_orth_sq_shift >= 5.5 {
         return (
             HisStateClassification::MetalCoordinatedCandidate,
-            raw_post.min(0.56),
+            raw_post.min(0.55),
         );
     }
 
-    (HisStateClassification::Resolved(best_taut), raw_post)
+    if let Some(f_n) = fit.f_prot_n_only {
+        let exp_he1_at_fn = (1.0 - f_n) * 7.815 + f_n * HIS_DOUBLY_PROTONATED_PRIORS.he1.0;
+        let exp_ce1_at_fn = (1.0 - f_n) * 137.92 + f_n * HIS_DOUBLY_PROTONATED_PRIORS.ce1.0;
+        let unprotonated_ch_contradiction = (f_n >= 0.35)
+            && (ev
+                .he1_ppm
+                .is_some_and(|h| (h - exp_he1_at_fn) / 0.28 <= -2.35)
+                || ev
+                    .ce1_ppm
+                    .is_some_and(|c| (c - exp_ce1_at_fn) / 1.60 >= 2.10));
+
+        if unprotonated_ch_contradiction
+            && (fit.d_orth_sq_joint >= 12.0 || fit.d_orth_sq_shift >= 8.0)
+        {
+            return (
+                HisStateClassification::MetalCoordinatedCandidate,
+                raw_post.min(0.56),
+            );
+        }
+    }
+
+    // 3. Intermediate fast-exchange abstention zone on Pelton's titration surface:
+    //    - Protonation exchange (`neutral <-> HisH+`): `0.18 < f_prot_map < 0.82`
+    //    - Neutral tautomer exchange (`Nd1H <-> Ne2H` when predominantly neutral): `f_prot_map <= 0.18 && 0.25 < p_tau_map < 0.75`
+    let in_prot_exchange = fit.f_prot_map > 0.18 && fit.f_prot_map < 0.82;
+    let in_tau_pi_exchange = fit.f_prot_map <= 0.18 && fit.p_tau_map > 0.25 && fit.p_tau_map < 0.75;
+    if in_prot_exchange || in_tau_pi_exchange {
+        let dist_edge = if in_prot_exchange {
+            ((fit.f_prot_map - 0.50).abs() / 0.32).clamp(0.0, 1.0)
+        } else {
+            ((fit.p_tau_map - 0.50).abs() / 0.25).clamp(0.0, 1.0)
+        };
+        let conf = (0.30 + 0.16 * dist_edge).clamp(0.25, 0.48);
+        return (HisStateClassification::FastExchangeUncommitted, conf);
+    }
+
+    // 4. Pure-state Mahalanobis out-of-distribution (OOD) misfit guard (`d_M^2` & `|z|_max` against
+    //    winning pure state `Ne2H`, `Nd1H`, or `DoublyProtonated`; ~99.9% chi-square gate + 3.5-sigma
+    //    channel guard so OOD states such as `ND1 = 191..201 ppm` never commit at high confidence).
+    let (d_m_sq, z_max, m_obs) = pure_his_state_mahalanobis(ev, best_taut);
+    let chi2_999 = match m_obs {
+        0 | 1 => 10.83,
+        2 => 13.82,
+        3 => 16.27,
+        4 => 18.47,
+        5 => 20.52,
+        6 => 22.46,
+        _ => 24.32,
+    };
+    if m_obs > 0 && (z_max > 3.50 || d_m_sq > chi2_999) {
+        let excess = (d_m_sq - chi2_999).max((z_max - 3.50) * 4.0).max(0.0);
+        let conf = (0.46 * (-0.08 * excess).exp()).clamp(0.18, 0.47);
+        return (HisStateClassification::FastExchangeUncommitted, conf);
+    }
+
+    // Mild Mahalanobis attenuation within the pure state's valid acceptance region
+    let chi2_95 = match m_obs {
+        0 | 1 => 3.84,
+        2 => 5.99,
+        3 => 7.81,
+        4 => 9.49,
+        5 => 11.07,
+        6 => 12.59,
+        _ => 14.07,
+    };
+    let ood_atten = if d_m_sq > chi2_95 {
+        (-0.045 * (d_m_sq - chi2_95)).exp()
+    } else {
+        1.0
+    };
+    let _ = fit.n_ring_obs;
+    let calibrated = (raw_post * ood_atten).clamp(0.0, 1.0);
+    (HisStateClassification::Resolved(best_taut), calibrated)
 }
 
 /// Classify histidine `HisTautomer` and compute its calibrated static-tautomer posterior in `[0.0, 1.0]`
@@ -4462,23 +4714,287 @@ pub struct AromaticAssignResult {
     pub clusters: Vec<AromaticRingCluster>,
 }
 
+fn is_aromatic_ring_atom(res_name: &str, atom: &str) -> bool {
+    match res_name {
+        "PHE" | "TYR" => matches!(
+            atom,
+            "CD1" | "CD2" | "HD1" | "HD2" | "CE1" | "CE2" | "HE1" | "HE2" | "CZ" | "HZ" | "CG"
+        ),
+        "TRP" => matches!(
+            atom,
+            "CD1"
+                | "HD1"
+                | "NE1"
+                | "HE1"
+                | "CE3"
+                | "HE3"
+                | "CZ3"
+                | "HZ3"
+                | "CH2"
+                | "HH2"
+                | "CZ2"
+                | "HZ2"
+                | "CG"
+                | "CD2"
+                | "CE2"
+        ),
+        "HIS" => matches!(
+            atom,
+            "CD2" | "HD2" | "CE1" | "HE1" | "ND1" | "NE2" | "CG" | "HD1" | "HE2"
+        ),
+        _ => false,
+    }
+}
+
+fn aromatic_ring_position_key(res_name: &str, atom: &str) -> Option<&'static str> {
+    match (res_name, atom) {
+        ("PHE" | "TYR", "CD1" | "CD2" | "HD1" | "HD2") => Some("CD"),
+        ("PHE" | "TYR", "CE1" | "CE2" | "HE1" | "HE2") => Some("CE"),
+        ("PHE", "CZ" | "HZ") => Some("CZ"),
+        ("TRP", "CD1" | "HD1") => Some("CD1"),
+        ("TRP", "NE1" | "HE1") => Some("NE1"),
+        ("TRP", "CE3" | "HE3") => Some("CE3"),
+        ("TRP", "CZ3" | "HZ3") => Some("CZ3"),
+        ("TRP", "CH2" | "HH2") => Some("CH2"),
+        ("TRP", "CZ2" | "HZ2") => Some("CZ2"),
+        ("HIS", "CD2" | "HD2") => Some("CD2"),
+        ("HIS", "CE1" | "HE1") => Some("CE1"),
+        ("HIS", "ND1") => Some("ND1"),
+        ("HIS", "NE2") => Some("NE2"),
+        _ => None,
+    }
+}
+
+#[inline]
+fn curated_aromatic_atom_tol(atom: &str) -> f64 {
+    if atom.starts_with('H') {
+        0.06
+    } else if atom.starts_with('C') {
+        0.55
+    } else {
+        0.85
+    }
+}
+
+fn residue_curated_ring_atoms(
+    existing_ref: &Reference,
+    k: usize,
+    res_name: &str,
+) -> Vec<(String, f64)> {
+    existing_ref
+        .shifts
+        .iter()
+        .filter(|&(&(rk, ref a), &v)| {
+            rk == k && is_aromatic_ring_atom(res_name, a) && v.is_finite()
+        })
+        .map(|((_, a), &v)| (a.clone(), v))
+        .collect()
+}
+
+fn cluster_atom_shifts_for_residue(
+    clu: &AromaticRingCluster,
+    res_name: &str,
+) -> Vec<(&'static str, f64)> {
+    let mut out = Vec::new();
+    for (&c_atom, slot) in &clu.ch_slots {
+        match (res_name, c_atom) {
+            ("PHE" | "TYR", "CD1") => {
+                out.extend_from_slice(&[
+                    ("CD1", slot.c_ppm),
+                    ("CD2", slot.c_ppm),
+                    ("HD1", slot.h_ppm),
+                    ("HD2", slot.h_ppm),
+                ]);
+            }
+            ("PHE" | "TYR", "CE1") => {
+                out.extend_from_slice(&[
+                    ("CE1", slot.c_ppm),
+                    ("CE2", slot.c_ppm),
+                    ("HE1", slot.h_ppm),
+                    ("HE2", slot.h_ppm),
+                ]);
+            }
+            ("PHE", "CZ") => {
+                out.extend_from_slice(&[("CZ", slot.c_ppm), ("HZ", slot.h_ppm)]);
+            }
+            ("TRP", "CD1") => out.extend_from_slice(&[("CD1", slot.c_ppm), ("HD1", slot.h_ppm)]),
+            ("TRP", "CE3") => out.extend_from_slice(&[("CE3", slot.c_ppm), ("HE3", slot.h_ppm)]),
+            ("TRP", "CZ3") => out.extend_from_slice(&[("CZ3", slot.c_ppm), ("HZ3", slot.h_ppm)]),
+            ("TRP", "CH2") => out.extend_from_slice(&[("CH2", slot.c_ppm), ("HH2", slot.h_ppm)]),
+            ("TRP", "CZ2") => out.extend_from_slice(&[("CZ2", slot.c_ppm), ("HZ2", slot.h_ppm)]),
+            ("HIS", "CD2") => out.extend_from_slice(&[("CD2", slot.c_ppm), ("HD2", slot.h_ppm)]),
+            ("HIS", "CE1") => out.extend_from_slice(&[("CE1", slot.c_ppm), ("HE1", slot.h_ppm)]),
+            _ => {}
+        }
+    }
+    if res_name == "TRP" {
+        if let Some((ne1, he1, _)) = clu.trp_indole {
+            out.extend_from_slice(&[("NE1", ne1), ("HE1", he1)]);
+        }
+    }
+    if res_name == "HIS" {
+        if let Some((nd1, _)) = clu.nd1_ppm {
+            out.push(("ND1", nd1));
+        }
+        if let Some((ne2, _)) = clu.ne2_ppm {
+            out.push(("NE2", ne2));
+        }
+    }
+    out
+}
+
+/// Merge newly assigned aromatic chemical shifts into `existing_ref` with explicit overwrite policy.
+///
+/// When `overwrite_existing == false` (the safe default):
+/// 1. Keys already present in `existing_ref.shifts` are **never** overwritten (`shifts` and `ambiguity_codes` preserved).
+/// 2. If residue `k` already carries curated aromatic ring shifts in `existing_ref`, any solver ring
+///    that conflicts on an overlapping ring atom OR is only a partial 1-position fragment (e.g. `CD`-only
+///    without `CE`, lacking intra-ring connectivity to curated `CE`/`CZ`) is rejected cleanly rather
+///    than producing a chimeric mixed ring.
+pub fn merge_aromatic_into_shifts_with_options(
+    existing_ref: &Reference,
+    newly_assigned: &Reference,
+    newly_assigned_atoms: &BTreeMap<(usize, String), f64>,
+    overwrite_existing: bool,
+) -> Reference {
+    let mut merged = existing_ref.clone();
+    if overwrite_existing {
+        for key in newly_assigned_atoms.keys() {
+            if let Some(&val) = newly_assigned.shifts.get(key) {
+                merged.shifts.insert(key.clone(), val);
+            }
+            if let Some(&code) = newly_assigned.ambiguity_codes.get(key) {
+                merged.ambiguity_codes.insert(key.clone(), code);
+            }
+        }
+        return merged;
+    }
+
+    let mut residues: BTreeSet<usize> = BTreeSet::new();
+    for &(k, _) in newly_assigned_atoms.keys() {
+        residues.insert(k);
+    }
+
+    for k in residues {
+        let res_name = existing_ref
+            .sequence
+            .get(k)
+            .or_else(|| newly_assigned.sequence.get(k))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let curated_ring = residue_curated_ring_atoms(existing_ref, k, res_name);
+        if !curated_ring.is_empty() {
+            // (a) Reject if any overlapping ring shift in newly_assigned conflicts with curated_ring
+            let has_conflict = curated_ring.iter().any(|(atom, cur_v)| {
+                newly_assigned
+                    .shifts
+                    .get(&(k, atom.clone()))
+                    .is_some_and(|&new_v| (new_v - *cur_v).abs() > curated_aromatic_atom_tol(atom))
+            });
+            if has_conflict {
+                continue;
+            }
+
+            // (b) Count distinct solver-proposed CH/NH ring positions on residue k; never graft a
+            //     1-position partial fragment (e.g. CD-only) onto curated CE/CZ shifts!
+            let mut solver_positions: BTreeSet<&'static str> = BTreeSet::new();
+            for (rk, atom) in newly_assigned_atoms.keys() {
+                if *rk == k {
+                    if let Some(pos) = aromatic_ring_position_key(res_name, atom) {
+                        solver_positions.insert(pos);
+                    }
+                }
+            }
+            if solver_positions.len() < 2 {
+                // Only allow a 1-position completion when existing_ref ALREADY holds >= 2 curated
+                // CH positions AND newly_assigned explicitly corroborated at least one of them.
+                let mut curated_positions: BTreeSet<&'static str> = BTreeSet::new();
+                let mut corroborated_curated_positions = 0usize;
+                for (atom, cur_v) in &curated_ring {
+                    if let Some(pos) = aromatic_ring_position_key(res_name, atom) {
+                        curated_positions.insert(pos);
+                        if !newly_assigned_atoms.contains_key(&(k, atom.clone()))
+                            && newly_assigned
+                                .shifts
+                                .get(&(k, atom.clone()))
+                                .is_some_and(|&nv| {
+                                    // Must be an actual solver-derived shift, not a bare clone of existing_ref
+                                    // when newly_assigned only populated 1 ring position overall
+                                    (nv - *cur_v).abs() <= curated_aromatic_atom_tol(atom)
+                                })
+                        {
+                            corroborated_curated_positions += 1;
+                        }
+                    }
+                }
+                let mut all_new_ref_positions: BTreeSet<&'static str> = BTreeSet::new();
+                for (rk, atom) in newly_assigned.shifts.keys() {
+                    if *rk == k {
+                        if let Some(pos) = aromatic_ring_position_key(res_name, atom) {
+                            all_new_ref_positions.insert(pos);
+                        }
+                    }
+                }
+                let complete_three_pos_completion = curated_positions.len() >= 2
+                    && corroborated_curated_positions >= 2
+                    && all_new_ref_positions.len() >= 3
+                    && !solver_positions.contains("CD")
+                    && !solver_positions.contains("CD1")
+                    && !solver_positions.contains("CD2");
+                if !complete_three_pos_completion {
+                    continue;
+                }
+            }
+        }
+
+        for key in newly_assigned_atoms.keys().filter(|(rk, _)| *rk == k) {
+            if merged.shifts.contains_key(key) {
+                continue;
+            }
+            if let Some(&val) = newly_assigned.shifts.get(key) {
+                merged.shifts.insert(key.clone(), val);
+            }
+            if !merged.ambiguity_codes.contains_key(key) {
+                if let Some(&code) = newly_assigned.ambiguity_codes.get(key) {
+                    merged.ambiguity_codes.insert(key.clone(), code);
+                }
+            }
+        }
+    }
+
+    merged
+}
+
+/// Merge newly assigned aromatic shifts into `existing_ref` without overwriting any pre-existing shifts
+/// (`overwrite_existing = false`) and without mixing partial solver rings onto curated residues.
+#[inline]
+pub fn merge_aromatic_into_shifts(
+    existing_ref: &Reference,
+    newly_assigned: &Reference,
+    newly_assigned_atoms: &BTreeMap<(usize, String), f64>,
+) -> Reference {
+    merge_aromatic_into_shifts_with_options(
+        existing_ref,
+        newly_assigned,
+        newly_assigned_atoms,
+        false,
+    )
+}
+
 /// Merge newly assigned aromatic chemical shifts into `existing_ref` while strictly preserving
-/// all pre-existing shifts and ambiguity codes on atoms NOT present in `newly_assigned_atoms`.
+/// all pre-existing shifts and ambiguity codes (`overwrite_existing = false`).
+#[inline]
 pub fn merge_aromatic_assignments_preserving_existing(
     existing_ref: &Reference,
     newly_assigned: &Reference,
     newly_assigned_atoms: &BTreeMap<(usize, String), f64>,
 ) -> Reference {
-    let mut merged = existing_ref.clone();
-    for key in newly_assigned_atoms.keys() {
-        if let Some(&val) = newly_assigned.shifts.get(key) {
-            merged.shifts.insert(key.clone(), val);
-        }
-        if let Some(&code) = newly_assigned.ambiguity_codes.get(key) {
-            merged.ambiguity_codes.insert(key.clone(), code);
-        }
-    }
-    merged
+    merge_aromatic_into_shifts_with_options(
+        existing_ref,
+        newly_assigned,
+        newly_assigned_atoms,
+        false,
+    )
 }
 
 /// Estimate an unlabelled systematic `13CB` referencing offset `δ` (`obs_cb - bb_cb`, in ppm)
@@ -5194,6 +5710,120 @@ pub fn assign_aromatic_rings(
         weights[ri][n_clu + ri] = null_score;
     }
 
+    // Pre-curated ring locks & conflict guards (P1-10):
+    // 1. Any cluster conflicting with curated ring shifts on residue `ri` is forbidden on `ri`.
+    // 2. Any cluster whose observed `(C, H)` / `(N, H)` shifts uniquely corroborate a pre-curated
+    //    residue `ri` (`>= 2` curated ring scalars matched within tolerance, zero conflicts, and
+    //    compatible `CB` when present) is locked exclusively to `ri` (`weights[rj][ci] = FORBID_SCORE`
+    //    for all `rj != ri`), preventing duplicate assignment of a curated ring onto a second residue!
+    let curated_per_ri: Vec<Vec<(String, f64)>> = arom_positions
+        .iter()
+        .map(|&k| residue_curated_ring_atoms(backbone_ref, k, &backbone_ref.sequence[k]))
+        .collect();
+
+    for (ci, clu) in clusters.iter().enumerate() {
+        let mut best_lock_ri: Option<(usize, usize, f64)> = None;
+        let mut quarantine_partial_curated = false;
+        for (ri, &k) in arom_positions.iter().enumerate() {
+            let res_name = backbone_ref.sequence[k].as_str();
+            if clu.kind.res_name() != res_name {
+                continue;
+            }
+            let cur_atoms = &curated_per_ri[ri];
+            if cur_atoms.is_empty() {
+                continue;
+            }
+            let clu_atoms = cluster_atom_shifts_for_residue(clu, res_name);
+            let mut n_matched_positions: BTreeSet<&'static str> = BTreeSet::new();
+            let mut n_conflict_positions: BTreeSet<&'static str> = BTreeSet::new();
+            let mut n_matched_scalars = 0usize;
+            let mut sum_norm_err = 0.0_f64;
+            let mut conflict = false;
+
+            for &(c_atom, c_val) in &clu_atoms {
+                if let Some(&(_, cur_val)) = cur_atoms.iter().find(|(a, _)| a == c_atom) {
+                    let tol = curated_aromatic_atom_tol(c_atom);
+                    let diff = (c_val - cur_val).abs();
+                    if diff > tol {
+                        conflict = true;
+                        if let Some(pos) = aromatic_ring_position_key(res_name, c_atom) {
+                            n_conflict_positions.insert(pos);
+                        }
+                    } else {
+                        n_matched_scalars += 1;
+                        sum_norm_err += diff / tol;
+                        if let Some(pos) = aromatic_ring_position_key(res_name, c_atom) {
+                            n_matched_positions.insert(pos);
+                        }
+                    }
+                }
+            }
+
+            // Also verify Yamazaki CB agreement if both backbone CB and cluster CB exist
+            let cb_conflict = if let (Some(&bb_cb), Some(clu_cb)) = (
+                backbone_ref.shifts.get(&(k, "CB".to_string())),
+                clu.cb_hd.or(clu.cb_he),
+            ) {
+                (clu_cb - bb_cb).abs() > 0.65
+            } else {
+                false
+            };
+
+            if conflict {
+                weights[ri][ci] = FORBID_SCORE;
+                // If >= 2 ring positions (e.g. CD + CE) and CB match curated residue `ri` while
+                // only 1 user-adjusted slot sits outside tolerance, quarantine `ci` so `ri`'s
+                // ring cluster cannot leak onto a second uncurated residue!
+                if !cb_conflict
+                    && n_matched_positions.len() >= 2
+                    && n_matched_positions.len() > n_conflict_positions.len()
+                {
+                    quarantine_partial_curated = true;
+                }
+                continue;
+            }
+
+            if !cb_conflict && (!n_matched_positions.is_empty() && n_matched_scalars >= 2) {
+                let mean_err = sum_norm_err / (n_matched_scalars as f64);
+                let better = match best_lock_ri {
+                    None => true,
+                    Some((_, prev_n, prev_err)) => {
+                        n_matched_scalars > prev_n
+                            || (n_matched_scalars == prev_n && mean_err < prev_err)
+                    }
+                };
+                if better {
+                    best_lock_ri = Some((ri, n_matched_scalars, mean_err));
+                }
+            } else if n_matched_positions.is_empty() {
+                // Cluster has zero overlap with curated atoms on `ri`: forbid partial 1-slot clusters
+                // (`CD`-only) from ever attaching to a residue that already has curated `CE`/`CZ` shifts!
+                let mut clu_positions: BTreeSet<&'static str> = BTreeSet::new();
+                for &(c_atom, _) in &clu_atoms {
+                    if let Some(pos) = aromatic_ring_position_key(res_name, c_atom) {
+                        clu_positions.insert(pos);
+                    }
+                }
+                if clu_positions.len() < 2 {
+                    weights[ri][ci] = FORBID_SCORE;
+                }
+            }
+        }
+
+        if let Some((lock_ri, _, _)) = best_lock_ri {
+            for (rj, row) in weights.iter_mut().enumerate() {
+                if rj != lock_ri {
+                    row[ci] = FORBID_SCORE;
+                }
+            }
+            weights[lock_ri][ci] = weights[lock_ri][ci].max(null_score + 12.0) + 25.0;
+        } else if quarantine_partial_curated {
+            for row in &mut weights {
+                row[ci] = FORBID_SCORE;
+            }
+        }
+    }
+
     let (win_cols, best_total) = hungarian_max_weight(&weights);
     let margins = hungarian_margins(&weights, &win_cols, best_total);
     let raw_bip_confs = compute_calibrated_ring_confidences(
@@ -5240,8 +5870,25 @@ pub fn assign_aromatic_rings(
         let bip_conf = (raw_bip_confs[ri] * a_conf).clamp(0.0, 1.0);
         let clu = &clusters[ci];
 
+        // Determine how many distinct aromatic ring positions this cluster actually observed
+        let clu_atoms_preview = cluster_atom_shifts_for_residue(clu, &res_name);
+        let mut clu_positions: BTreeSet<&'static str> = BTreeSet::new();
+        for &(ca, _) in &clu_atoms_preview {
+            if let Some(pos) = aromatic_ring_position_key(&res_name, ca) {
+                clu_positions.insert(pos);
+            }
+        }
+        let allow_ring_atom_writes = curated_per_ri[ri].is_empty() || clu_positions.len() >= 2;
+
         let mut record_new_atom = |atom_name: &str, val: f64, conf: f64| {
             let key = (k, atom_name.to_string());
+            // Never overwrite or claim confidence on shifts already curated in `backbone_ref`!
+            if backbone_ref.shifts.contains_key(&key) {
+                return;
+            }
+            if !allow_ring_atom_writes && is_aromatic_ring_atom(&res_name, atom_name) {
+                return;
+            }
             newly_assigned_ref.shifts.insert(key.clone(), val);
             newly_assigned_ref.ambiguity_codes.insert(
                 key.clone(),
