@@ -17,6 +17,8 @@ pub mod dihedrals;
 pub mod evaluate;
 pub mod evo_graph;
 pub mod fid;
+pub mod methyl_solver;
+pub mod methyl_trosy;
 pub mod nef;
 pub mod neural_picker;
 pub mod nmrstar;

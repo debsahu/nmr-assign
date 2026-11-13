@@ -9,6 +9,7 @@
 
 use std::sync::mpsc;
 
+pub mod methyl_gpu;
 pub mod neural_gpu;
 
 use bytemuck::{Pod, Zeroable};
