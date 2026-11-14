@@ -1555,6 +1555,8 @@ pub struct RealBenchmarkSummary {
     pub median_protein_hc_precision: Option<f64>,
     pub mean_protein_ece: f64,
     pub mean_protein_ece_10: f64,
+    pub mean_protein_debiased_ece_10: f64,
+    pub mean_protein_ece_10_bernoulli_floor: f64,
     pub mean_protein_ece_12: f64,
     pub pooled_reliability: ProteinReliabilityCurve,
     pub macro_accuracy: f64,
@@ -1994,8 +1996,11 @@ pub fn run_real_benchmark_with_loaders(
         } else {
             0.0
         };
-        let reliability =
-            ProteinReliabilityCurve::from_predictions(&entry_predictions, cfg.hc_threshold);
+        let reliability = ProteinReliabilityCurve::from_predictions_with_repeats(
+            &entry_predictions,
+            cfg.hc_threshold,
+            num_seeds as f64,
+        );
 
         records.push(EntryBenchmarkRecord {
             manifest_entry: entry,
@@ -2079,6 +2084,8 @@ pub fn summarize_real_benchmark_records(
     let mut sum_hcr = 0.0f64;
     let mut sum_ece = 0.0f64;
     let mut sum_ece_10 = 0.0f64;
+    let mut sum_debiased_ece_10 = 0.0f64;
+    let mut sum_ece_10_floor = 0.0f64;
     let mut sum_ece_12 = 0.0f64;
 
     let mut active_hc_precisions: Vec<(String, String, f64)> = Vec::new();
@@ -2098,6 +2105,8 @@ pub fn summarize_real_benchmark_records(
             sum_hcr += m.mean_hc_recall;
             sum_ece += m.reliability.ece;
             sum_ece_10 += m.reliability.ece_10;
+            sum_debiased_ece_10 += m.reliability.debiased_ece_10;
+            sum_ece_10_floor += m.reliability.ece_10_bernoulli_floor;
             sum_ece_12 += m.reliability.ece_12;
             pooled_predictions.extend_from_slice(&m.predictions);
 
@@ -2135,8 +2144,11 @@ pub fn summarize_real_benchmark_records(
     };
 
     let denom_ok = if n_ok > 0 { n_ok as f64 } else { 1.0 };
-    let pooled_reliability =
-        ProteinReliabilityCurve::from_predictions(&pooled_predictions, hc_threshold);
+    let pooled_reliability = ProteinReliabilityCurve::from_predictions_with_repeats(
+        &pooled_predictions,
+        hc_threshold,
+        seeds.max(1) as f64,
+    );
 
     RealBenchmarkSummary {
         split: split.to_string(),
@@ -2150,6 +2162,16 @@ pub fn summarize_real_benchmark_records(
         median_protein_hc_precision,
         mean_protein_ece: if n_ok > 0 { sum_ece / denom_ok } else { 0.0 },
         mean_protein_ece_10: if n_ok > 0 { sum_ece_10 / denom_ok } else { 0.0 },
+        mean_protein_debiased_ece_10: if n_ok > 0 {
+            sum_debiased_ece_10 / denom_ok
+        } else {
+            0.0
+        },
+        mean_protein_ece_10_bernoulli_floor: if n_ok > 0 {
+            sum_ece_10_floor / denom_ok
+        } else {
+            0.0
+        },
         mean_protein_ece_12: if n_ok > 0 { sum_ece_12 / denom_ok } else { 0.0 },
         pooled_reliability,
         macro_accuracy: if n_ok > 0 { sum_acc / denom_ok } else { 0.0 },
@@ -2420,10 +2442,12 @@ pub fn format_real_benchmark_report(summary: &RealBenchmarkSummary) -> String {
         }
         let _ = writeln!(
             out,
-            "  Calibration (ECE)   : mean per-protein ECE4/10/12={:.3}/{:.3}/{:.3}, pooled ECE4/10/12={:.3}/{:.3}/{:.3}",
+            "  Calibration (ECE)   : mean per-protein ECE4/10/12={:.3}/{:.3}/{:.3} (debiased ECE10={:.3}, Bernoulli floor={:.3}), pooled ECE4/10/12={:.3}/{:.3}/{:.3}",
             summary.mean_protein_ece,
             summary.mean_protein_ece_10,
             summary.mean_protein_ece_12,
+            summary.mean_protein_debiased_ece_10,
+            summary.mean_protein_ece_10_bernoulli_floor,
             summary.pooled_reliability.ece,
             summary.pooled_reliability.ece_10,
             summary.pooled_reliability.ece_12,
@@ -2570,6 +2594,7 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
         "{{\n\
          {pad2}\"verdict\": \"{}\",\n\
          {pad2}\"confidence_calibrated\": {},\n\
+         {pad2}\"warn_sub_hc_uncalibrated\": {},\n\
          {pad2}\"calibration_warning\": {},\n\
          {pad2}\"confidence_scale\": {:.4},\n\
          {pad2}\"confidence_cap\": {:.4},\n\
@@ -2579,18 +2604,23 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
          {pad2}\"n_amide_hsqc_roots\": {},\n\
          {pad2}\"hsqc_3d_support_frac\": {:.6},\n\
          {pad2}\"supported_roots_per_assignable\": {:.6},\n\
+         {pad2}\"aliphatic_support_frac\": {:.6},\n\
          {pad2}\"hsqc_3d_rms_dh_ppm\": {:.6},\n\
          {pad2}\"hsqc_3d_rms_dn_ppm\": {:.6},\n\
          {pad2}\"hsqc_multiplicity_ratio\": {:.6},\n\
          {pad2}\"raw_hsqc_multiplicity_ratio\": {:.6},\n\
          {pad2}\"offset_consistency_ok\": {},\n\
          {pad2}\"connectivity_frac\": {:.6},\n\
+         {pad2}\"corroborated_connectivity_frac\": {:.6},\n\
          {pad2}\"solution_margin\": {:.6},\n\
+         {pad2}\"hc_call_fraction\": {:.6},\n\
+         {pad2}\"protein_hc_gate_triggered\": {},\n\
          {pad2}\"reasons\": [{}],\n\
          {pad2}\"detailed_offsets\": {}\n\
          {pad}}}",
         qc.verdict.as_str(),
         qc.confidence_calibrated,
+        qc.warn_sub_hc_uncalibrated,
         cal_warn_json,
         qc.confidence_scale,
         qc.confidence_cap,
@@ -2600,13 +2630,17 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
         qc.n_amide_hsqc_roots,
         qc.hsqc_3d_support_frac,
         qc.supported_roots_per_assignable,
+        qc.aliphatic_support_frac,
         qc.hsqc_3d_rms_dh_ppm,
         qc.hsqc_3d_rms_dn_ppm,
         qc.hsqc_multiplicity_ratio,
         qc.raw_hsqc_multiplicity_ratio,
         qc.offset_consistency_ok,
         qc.connectivity_frac,
+        qc.corroborated_connectivity_frac,
         qc.solution_margin,
+        qc.hc_call_fraction,
+        qc.protein_hc_gate_triggered,
         reasons_json,
         render_detailed_offsets_json(&qc.detailed_offsets, indent + 2),
     )
@@ -2641,6 +2675,8 @@ pub(crate) fn render_reliability_curve_json(
          {pad2}\"total_predictions\": {},\n\
          {pad2}\"ece\": {:.6},\n\
          {pad2}\"ece_10\": {:.6},\n\
+         {pad2}\"debiased_ece_10\": {:.6},\n\
+         {pad2}\"ece_10_bernoulli_floor\": {:.6},\n\
          {pad2}\"ece_12\": {:.6},\n\
          {pad2}\"hc_threshold\": {:.4},\n\
          {pad2}\"abstained\": {},\n\
@@ -2653,6 +2689,8 @@ pub(crate) fn render_reliability_curve_json(
         rel.total_predictions,
         rel.ece,
         rel.ece_10,
+        rel.debiased_ece_10,
+        rel.ece_10_bernoulli_floor,
         rel.ece_12,
         rel.hc_threshold,
         rel.is_abstained(),
@@ -2742,13 +2780,15 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
         summary.micro_hc_correct,
     ));
     j.push_str(&format!(
-        "  \"calibration_summary\": {{\n    \"hc_active_proteins\": {},\n    \"hc_abstained_proteins\": {},\n    \"worst_protein_hc_precision\": {},\n    \"median_protein_hc_precision\": {},\n    \"mean_protein_ece\": {:.6},\n    \"mean_protein_ece_10\": {:.6},\n    \"mean_protein_ece_12\": {:.6},\n    \"pooled_reliability_curve\": {}\n  }},\n",
+        "  \"calibration_summary\": {{\n    \"hc_active_proteins\": {},\n    \"hc_abstained_proteins\": {},\n    \"worst_protein_hc_precision\": {},\n    \"median_protein_hc_precision\": {},\n    \"mean_protein_ece\": {:.6},\n    \"mean_protein_ece_10\": {:.6},\n    \"mean_protein_debiased_ece_10\": {:.6},\n    \"mean_protein_ece_10_bernoulli_floor\": {:.6},\n    \"mean_protein_ece_12\": {:.6},\n    \"pooled_reliability_curve\": {}\n  }},\n",
         summary.n_hc_active_proteins,
         summary.n_hc_abstained_proteins,
         worst_hcp_json,
         median_hcp_json,
         summary.mean_protein_ece,
         summary.mean_protein_ece_10,
+        summary.mean_protein_debiased_ece_10,
+        summary.mean_protein_ece_10_bernoulli_floor,
         summary.mean_protein_ece_12,
         render_reliability_curve_json(&summary.pooled_reliability, 4),
     ));
@@ -2785,7 +2825,7 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
                 "null".to_string()
             };
             format!(
-                "    {{ \"cohort\": \"{}\", \"total\": {}, \"evaluated\": {}, \"macro_accuracy\": {:.6}, \"macro_recall\": {:.6}, \"macro_hc_precision\": {}, \"macro_hc_recall\": {:.6}, \"hc_active_proteins\": {}, \"hc_abstained_proteins\": {}, \"mean_protein_ece\": {:.6}, \"mean_protein_ece_10\": {:.6}, \"mean_protein_ece_12\": {:.6}, \"pooled_ece\": {:.6}, \"pooled_ece_10\": {:.6}, \"pooled_ece_12\": {:.6} }}",
+                "    {{ \"cohort\": \"{}\", \"total\": {}, \"evaluated\": {}, \"macro_accuracy\": {:.6}, \"macro_recall\": {:.6}, \"macro_hc_precision\": {}, \"macro_hc_recall\": {:.6}, \"hc_active_proteins\": {}, \"hc_abstained_proteins\": {}, \"mean_protein_ece\": {:.6}, \"mean_protein_ece_10\": {:.6}, \"mean_protein_debiased_ece_10\": {:.6}, \"mean_protein_ece_10_bernoulli_floor\": {:.6}, \"mean_protein_ece_12\": {:.6}, \"pooled_ece\": {:.6}, \"pooled_ece_10\": {:.6}, \"pooled_ece_12\": {:.6} }}",
                 json_escape(coh),
                 sub.records.len(),
                 sub_ok,
@@ -2797,6 +2837,8 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
                 sub.n_hc_abstained_proteins,
                 sub.mean_protein_ece,
                 sub.mean_protein_ece_10,
+                sub.mean_protein_debiased_ece_10,
+                sub.mean_protein_ece_10_bernoulli_floor,
                 sub.mean_protein_ece_12,
                 sub.pooled_reliability.ece,
                 sub.pooled_reliability.ece_10,
@@ -3280,6 +3322,24 @@ mod tests {
             other => panic!("expected Succeeded, got {other:?}"),
         }
 
+        let summary_json_txt = fs::read_to_string(dir.join("summary.json")).unwrap();
+        for required_key in [
+            "\"warn_sub_hc_uncalibrated\":",
+            "\"aliphatic_support_frac\":",
+            "\"corroborated_connectivity_frac\":",
+            "\"hc_call_fraction\":",
+            "\"protein_hc_gate_triggered\":",
+            "\"debiased_ece_10\":",
+            "\"ece_10_bernoulli_floor\":",
+            "\"mean_protein_debiased_ece_10\":",
+            "\"mean_protein_ece_10_bernoulli_floor\":",
+        ] {
+            assert!(
+                summary_json_txt.contains(required_key),
+                "summary.json missing Phase 13 key {required_key}"
+            );
+        }
+
         // Also smoke-check discovery on local Ubiquitin & CISD3 if present on developer machine
         if let Ok(ubq_loc) = resolve_local_entry_paths("ubiquitin_local", &data_root, true) {
             let (ubq_disc, _) =
@@ -3339,11 +3399,11 @@ mod tests {
         let unique_ids: BTreeSet<&str> = entries.iter().map(|e| e.bmrb_id.as_str()).collect();
         assert_eq!(unique_ids.len(), entries.len());
 
-        // Verify Q1 governance transitions:
+        // Verify Q1 + P1-7 governance transitions:
         // - 5329, 6318, 15476, 16385, 53280 in `dev` (`cohort=dev`),
         // - 16072, 16782, 17092 promoted from `cold_p10` to `dev` (`cohort=dev_from_p10`),
         // - 5845, 17030, 18145, 51351, 16099, 18489 tagged `seen_p8_p9` (`heldout`),
-        // - Fresh `cold_p12` entries tagged `cold_p12` (`heldout`).
+        // - Former `cold_p12` entries relabeled `seen_p12` (`heldout`, spent at `v0.8.0` per `P1-7`).
         for promoted_id in ["5329", "6318", "15476", "16385", "53280"] {
             let e = entries
                 .iter()
@@ -3368,16 +3428,21 @@ mod tests {
             .iter()
             .filter(|e| e.split == "heldout" && e.cohort == "seen_p8_p9")
             .count();
-        let n_cold_p12 = entries
+        let n_seen_p12 = entries
             .iter()
-            .filter(|e| e.split == "heldout" && e.cohort == "cold_p12")
+            .filter(|e| e.split == "heldout" && e.cohort == "seen_p12")
             .count();
+        let n_cold_p12 = entries.iter().filter(|e| e.cohort == "cold_p12").count();
         assert_eq!(n_seen, 6);
-        assert!(
-            (6..=8).contains(&n_cold_p12),
-            "expected 6..=8 cold_p12 entries, got {n_cold_p12}"
+        assert_eq!(
+            n_cold_p12, 0,
+            "cold_p12 was evaluated at v0.8.0 and must be relabeled seen_p12 per P1-7"
         );
-        assert_eq!(n_held, n_seen + n_cold_p12);
+        assert!(
+            (6..=8).contains(&n_seen_p12),
+            "expected 6..=8 seen_p12 entries, got {n_seen_p12}"
+        );
+        assert_eq!(n_held, n_seen + n_seen_p12);
         for seen_id in ["5845", "17030", "18145", "51351", "16099", "18489"] {
             let e = entries
                 .iter()
@@ -3388,17 +3453,17 @@ mod tests {
         }
         for e in entries
             .iter()
-            .filter(|e| e.split == "heldout" && e.cohort == "cold_p12")
+            .filter(|e| e.split == "heldout" && e.cohort == "seen_p12")
         {
-            let cold_id = e.bmrb_id.as_str();
+            let seen_p12_id = e.bmrb_id.as_str();
             assert!((50..=160).contains(&e.residues));
             // Header-only verification (strictly zero FID FFT, peak picking, or solver runs!)
             if let Ok(loc) =
-                resolve_local_entry_paths(cold_id, Path::new("data/private/bmrb"), true)
+                resolve_local_entry_paths(seen_p12_id, Path::new("data/private/bmrb"), true)
             {
                 assert!(
                     loc.truth_path.as_ref().is_some_and(|p| p.is_file()),
-                    "cold_p12 entry {cold_id} must have NMR-STAR file present"
+                    "seen_p12 entry {seen_p12_id} must have NMR-STAR file present"
                 );
                 let ws = nmr_core::classify::classify_nmr_workspace(&loc.entry_dir).unwrap();
                 assert!(
@@ -3406,18 +3471,18 @@ mod tests {
                         || ws
                             .secondary_regimes
                             .contains(&nmr_core::classify::ProblemRegime::GlobularBackbone),
-                    "cold_p12 entry {cold_id} must support GlobularBackbone (got primary {:?}, secondary {:?})",
+                    "seen_p12 entry {seen_p12_id} must support GlobularBackbone (got primary {:?}, secondary {:?})",
                     ws.problem_regime,
                     ws.secondary_regimes
                 );
                 let (disc, _) =
                     discover_entry_experiments(&loc.entry_dir, Some(e.field_mhz)).unwrap();
                 let disc_exps: BTreeSet<&str> = disc.iter().map(|d| d.exp_type.as_str()).collect();
-                println!("  [cold_p12 header-only] {cold_id} -> discovered={disc_exps:?}");
+                println!("  [seen_p12 header-only] {seen_p12_id} -> discovered={disc_exps:?}");
                 for req_exp in &e.experiments {
                     assert!(
                         disc_exps.contains(req_exp.as_str()),
-                        "cold_p12 entry {cold_id} missing manifest experiment {req_exp}; discovered {disc_exps:?}"
+                        "seen_p12 entry {seen_p12_id} missing manifest experiment {req_exp}; discovered {disc_exps:?}"
                     );
                 }
             }
@@ -3708,10 +3773,14 @@ mod tests {
         use nmr_core::evo_graph::{assign_evo_graph_from_peaks_with_minor_damping, EvoGraphConfig};
         use nmr_core::priors::sync_detailed_reference_offsets;
         use nmr_core::qc::{
-            eval_monotone_calibration_map, fit_isotonic_monotone_knots,
-            fit_isotonic_monotone_knots_shrunk_toward, is_unconverged_solution_margin,
-            DatasetQcVerdict, ProteinReliabilityCurve, CANONICAL_CALIBRATION_GRID_12,
-            CANONICAL_CALIBRATION_LAPLACE_PRIOR, QC_STRONG_BELIEF_THRESHOLD,
+            evaluate_seed_predictions_with_gate, fit_isotonic_monotone_knots,
+            fit_isotonic_monotone_knots_beta, fit_isotonic_monotone_knots_shrunk_toward,
+            fit_protein_hc_gate_config, has_weak_likelihood_large_offset,
+            is_unconverged_solution_margin, select_gpu_shrinkage_weight_nested_lopo,
+            DatasetQcVerdict, ProteinHcTrainingSeed, ProteinReliabilityCurve,
+            CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+            CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_PROTEIN_HC_GATE,
+            QC_STRONG_BELIEF_THRESHOLD, STANDARD_CPU_PRIOR_ALPHA, STANDARD_CPU_PRIOR_BETA,
         };
         use nmr_core::solver::{assign_uncalibrated, prepare_scoring_priors, AnnealConfig};
         use nmr_gpu::GpuEngine;
@@ -3742,82 +3811,63 @@ mod tests {
         let picker_cfg = PickerConfig::default();
         let data_root = PathBuf::from("data/private/bmrb");
 
-        #[derive(Clone)]
-        struct RawPredSample {
-            seed: u64,
-            p_raw: f64,
-            hard_abstain: bool,
-            hsqc_mult: f64,
-            hsqc_3d_support_frac: f64,
-            supported_roots_per_assignable: f64,
-            warn_scale: f64,
-            is_ok: bool,
-        }
-
-        let apply_qc_with_knots =
-            |samps: &[RawPredSample], knots: Option<&[(f64, f64)]>| -> Vec<(f64, bool)> {
-                let mut out = Vec::with_capacity(samps.len());
-                for seed in 0..5u64 {
-                    let seed_samps: Vec<&RawPredSample> =
-                        samps.iter().filter(|s| s.seed == seed).collect();
-                    if seed_samps.is_empty() {
-                        continue;
-                    }
-                    let cals: Vec<f64> = seed_samps
-                        .iter()
-                        .map(|s| match knots {
-                            Some(k) => eval_monotone_calibration_map(s.p_raw, k),
-                            None => s.p_raw.clamp(0.0, 1.0),
-                        })
-                        .collect();
-                    let n_ass = cals.len();
-                    let strong = cals
-                        .iter()
-                        .filter(|&&c| c >= QC_STRONG_BELIEF_THRESHOLD)
-                        .count();
-                    let margin = (strong as f64) / (n_ass as f64);
-                    let s0 = seed_samps[0];
-                    let is_abstain = s0.hard_abstain
-                        || is_unconverged_solution_margin(n_ass, margin, s0.hsqc_mult)
-                        || (s0.hsqc_3d_support_frac < 0.45
-                            && s0.supported_roots_per_assignable < 0.35
-                            && margin < 0.20);
-                    for (&p_cal, s) in cals.iter().zip(seed_samps.iter()) {
-                        let p_final = if is_abstain {
-                            p_cal.clamp(0.0, 0.45)
-                        } else {
-                            (p_cal * s.warn_scale).clamp(0.0, 1.0)
-                        };
-                        out.push((p_final, s.is_ok));
-                    }
+        let make_training_seed =
+            |qc: &DatasetQcReport, raw_predictions: Vec<(f64, bool)>| -> ProteinHcTrainingSeed {
+                ProteinHcTrainingSeed {
+                    n_assignable_amides: qc.n_assignable_amides,
+                    hsqc_3d_support_frac: qc.hsqc_3d_support_frac,
+                    supported_roots_per_assignable: qc.supported_roots_per_assignable,
+                    aliphatic_support_frac: qc.aliphatic_support_frac,
+                    hsqc_multiplicity_ratio: qc.hsqc_multiplicity_ratio,
+                    hsqc_3d_rms_dh_ppm: qc.hsqc_3d_rms_dh_ppm,
+                    hsqc_3d_rms_dn_ppm: qc.hsqc_3d_rms_dn_ppm,
+                    offset_consistency_ok: qc.offset_consistency_ok,
+                    weak_large_offset: has_weak_likelihood_large_offset(
+                        &qc.detailed_offsets,
+                        CANONICAL_PROTEIN_HC_GATE.min_large_offset_gain_per_obs,
+                    )
+                    .is_some(),
+                    connectivity_frac: qc.connectivity_frac,
+                    corroborated_connectivity_frac: qc.corroborated_connectivity_frac,
+                    raw_predictions,
                 }
-                out
             };
 
         // Fixed dataset convergence specification (`(0.65, 0.07, 1.60, 0.16)`) identical to
         // `nmr_core::qc::is_unconverged_solution_margin` / `evaluate_dataset_qc`: excludes
         // datasets whose solver ensemble failed to converge (`Abstain`) from the PAV training pool.
-        let is_unconverged_prot = |samps: &[RawPredSample]| -> bool {
-            samps.first().is_some_and(|s0| {
-                let m = (samps
-                    .iter()
-                    .filter(|x| x.p_raw >= QC_STRONG_BELIEF_THRESHOLD)
-                    .count() as f64)
-                    / (samps.len().max(1) as f64);
-                s0.hard_abstain
-                    || is_unconverged_solution_margin(samps.len(), m, s0.hsqc_mult)
-                    || (s0.hsqc_3d_support_frac < 0.45
-                        && s0.supported_roots_per_assignable < 0.35
-                        && m < 0.20)
-            })
+        let is_trainable_prot = |seeds: &[ProteinHcTrainingSeed]| -> bool {
+            let tot_n: usize = seeds.iter().map(|s| s.raw_predictions.len()).sum();
+            if tot_n == 0 {
+                return false;
+            }
+            let s0 = &seeds[0];
+            let strong: usize = seeds
+                .iter()
+                .map(|s| {
+                    s.raw_predictions
+                        .iter()
+                        .filter(|&&(p, _)| p >= QC_STRONG_BELIEF_THRESHOLD)
+                        .count()
+                })
+                .sum();
+            let m = (strong as f64) / (tot_n as f64);
+            let n_per_seed = tot_n / seeds.len().max(1);
+            !(s0.hsqc_3d_support_frac < 0.25
+                || s0.aliphatic_support_frac < 0.20
+                || (n_per_seed >= 6 && s0.connectivity_frac < 0.15)
+                || is_unconverged_solution_margin(tot_n, m, s0.hsqc_multiplicity_ratio)
+                || ((s0.hsqc_3d_rms_dh_ppm > 0.065 || s0.hsqc_3d_rms_dn_ppm > 0.65)
+                    && s0.hsqc_3d_support_frac < 0.45)
+                || (s0.hsqc_3d_support_frac < 0.45
+                    && s0.supported_roots_per_assignable < 0.35
+                    && m < 0.20))
         };
 
-        let mut evo_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
-            Vec::new();
-        let mut std_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
-            Vec::new();
-        let mut std_gpu_by_prot: Vec<(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
-            Vec::new();
+        type ProtRecord = (String, String, DatasetQcVerdict, Vec<ProteinHcTrainingSeed>);
+        let mut evo_by_prot: Vec<ProtRecord> = Vec::new();
+        let mut std_by_prot: Vec<ProtRecord> = Vec::new();
+        let mut std_gpu_by_prot: Vec<ProtRecord> = Vec::new();
 
         // P1-5 minor-conformer audit accumulators across all 10 dev proteins
         let mut tot_true_roots_1seed = 0usize;
@@ -3958,28 +4008,10 @@ mod tests {
                     0.80,
                     true,
                 );
-                let evo_hard_abstain = qc_evo.verdict == DatasetQcVerdict::Abstain
-                    && qc_evo.reasons.iter().any(|r| {
-                        !r.starts_with("low post-solver solution margin")
-                            && !r.starts_with("severe 3D strip starvation")
-                    });
-                let evo_warn_scale = if qc_evo.verdict == DatasetQcVerdict::Warn {
-                    qc_evo.confidence_scale
-                } else {
-                    1.0
-                };
-                for &(p_raw, is_ok) in &eval_evo.placed_predictions {
-                    evo_samples.push(RawPredSample {
-                        seed,
-                        p_raw,
-                        hard_abstain: evo_hard_abstain,
-                        hsqc_mult: qc_evo.hsqc_multiplicity_ratio,
-                        hsqc_3d_support_frac: qc_evo.hsqc_3d_support_frac,
-                        supported_roots_per_assignable: qc_evo.supported_roots_per_assignable,
-                        warn_scale: evo_warn_scale,
-                        is_ok,
-                    });
-                }
+                evo_samples.push(make_training_seed(
+                    qc_evo,
+                    eval_evo.placed_predictions.clone(),
+                ));
                 all_with_assigned += eval_evo.assigned;
                 all_with_correct += eval_evo.correct;
 
@@ -4133,40 +4165,10 @@ mod tests {
                     0.80,
                     true,
                 );
-                // Compute dataset-level Warn scale even if raw margin temporarily triggered Abstain
-                let mut probe_res = std_res_raw.clone();
-                for c in &mut probe_res.confidence {
-                    if *c > 0.0 {
-                        *c = 0.90;
-                    }
-                }
-                let qc_std_non_margin = nmr_core::qc::evaluate_dataset_qc(
-                    Some(&all_peaks),
-                    &all_systems_for_eval,
-                    &truth_ref.sequence,
-                    &priors,
-                    &score_cfg,
-                    &probe_res,
-                    Some(&std_synced_det),
-                );
-                let std_hard_abstain = qc_std_non_margin.verdict == DatasetQcVerdict::Abstain;
-                let std_warn_scale = if qc_std_non_margin.verdict == DatasetQcVerdict::Warn {
-                    qc_std_non_margin.confidence_scale
-                } else {
-                    1.0
-                };
-                for &(p_raw, is_ok) in &eval_std.placed_predictions {
-                    std_samples.push(RawPredSample {
-                        seed,
-                        p_raw,
-                        hard_abstain: std_hard_abstain,
-                        hsqc_mult: qc_std.hsqc_multiplicity_ratio,
-                        hsqc_3d_support_frac: qc_std.hsqc_3d_support_frac,
-                        supported_roots_per_assignable: qc_std.supported_roots_per_assignable,
-                        warn_scale: std_warn_scale,
-                        is_ok,
-                    });
-                }
+                std_samples.push(make_training_seed(
+                    &qc_std,
+                    eval_std.placed_predictions.clone(),
+                ));
                 if only_filter.is_some() && seed == 0 {
                     let n_hi_ok = eval_std
                         .placed_predictions
@@ -4240,41 +4242,10 @@ mod tests {
                     0.80,
                     true,
                 );
-                let mut probe_gpu_res = std_gpu_res_raw.clone();
-                for c in &mut probe_gpu_res.confidence {
-                    if *c > 0.0 {
-                        *c = 0.90;
-                    }
-                }
-                let qc_std_gpu_non_margin = nmr_core::qc::evaluate_dataset_qc(
-                    Some(&all_peaks),
-                    &all_systems_for_eval,
-                    &truth_ref.sequence,
-                    &priors,
-                    &score_cfg,
-                    &probe_gpu_res,
-                    Some(&std_synced_det),
-                );
-                let std_gpu_hard_abstain =
-                    qc_std_gpu_non_margin.verdict == DatasetQcVerdict::Abstain;
-                let std_gpu_warn_scale = if qc_std_gpu_non_margin.verdict == DatasetQcVerdict::Warn
-                {
-                    qc_std_gpu_non_margin.confidence_scale
-                } else {
-                    1.0
-                };
-                for &(p_raw, is_ok) in &eval_std_gpu.placed_predictions {
-                    std_gpu_samples.push(RawPredSample {
-                        seed,
-                        p_raw,
-                        hard_abstain: std_gpu_hard_abstain,
-                        hsqc_mult: qc_std_gpu.hsqc_multiplicity_ratio,
-                        hsqc_3d_support_frac: qc_std_gpu.hsqc_3d_support_frac,
-                        supported_roots_per_assignable: qc_std_gpu.supported_roots_per_assignable,
-                        warn_scale: std_gpu_warn_scale,
-                        is_ok,
-                    });
-                }
+                std_gpu_samples.push(make_training_seed(
+                    &qc_std_gpu,
+                    eval_std_gpu.placed_predictions.clone(),
+                ));
             }
 
             tot_true_roots_1seed += p_true_1seed;
@@ -4365,47 +4336,54 @@ mod tests {
         struct LopoGateCheck {
             solver_name: String,
             oof_mean_ece: f64,
-            oof_pool_ece: f64,
+            oof_mean_ece_10: f64,
+            oof_mean_debiased_ece_10: f64,
+            oof_pool_ece_10: f64,
+            oof_micro_hcp: f64,
             oof_macro_hcp: f64,
             full_knots: Vec<(f64, f64)>,
         }
         let mut gate_checks: Vec<LopoGateCheck> = Vec::new();
+        let identity_knots = [(0.0, 0.0), (1.0, 1.0)];
 
-        // Helper to evaluate strict 13-fold Leave-One-Protein-Out (LOPO) cross-validation
-        // using the canonical isotonic PAV specification (`CANONICAL_CALIBRATION_GRID_12` `g12`,
-        // symmetric `Beta(0.25, 0.25)` prior with `CANONICAL_CALIBRATION_LAPLACE_PRIOR = 0.5`).
-        // Candid scope note (`P1-8`): 13-fold OOF LOPO certifies the post-solver isotonic
-        // calibrator only; upstream solver/QC constants were fixed with prior `dev` entries visible.
-        let mut run_lopo_calibration = |solver_name: &str,
-                                        by_prot: &[(
-            String,
-            String,
-            DatasetQcVerdict,
-            Vec<RawPredSample>,
-        )]| {
-            const CANONICAL_GRID_NAME: &str = "g12";
+        // Strict 13-fold Leave-One-Protein-Out (LOPO) cross-validation (`P1-7` & `P1-8`):
+        // inside every outer fold `hold_idx`, BOTH the isotonic PAV knots AND the protein-level
+        // HC gate (`fit_protein_hc_gate_config`) are fitted strictly on the 12 training proteins
+        // `j != hold_idx`, with zero target leakage from `by_prot[hold_idx]`.
+        let mut run_lopo_calibration = |solver_name: &str, by_prot: &[ProtRecord]| {
             let canonical_grid = CANONICAL_CALIBRATION_GRID_12;
             let canonical_laplace = CANONICAL_CALIBRATION_LAPLACE_PRIOR;
+            let fit_knots_for_solver = |pairs: &[(f64, bool)]| -> Vec<(f64, f64)> {
+                if solver_name == "STANDARD_CPU" {
+                    fit_isotonic_monotone_knots_beta(
+                        pairs,
+                        canonical_grid,
+                        STANDARD_CPU_PRIOR_ALPHA,
+                        STANDARD_CPU_PRIOR_BETA,
+                    )
+                } else {
+                    fit_isotonic_monotone_knots(pairs, canonical_grid, canonical_laplace)
+                }
+            };
 
-            let collect_train_pairs =
-                |subset: &[&(String, String, DatasetQcVerdict, Vec<RawPredSample>)],
-                 skip_idx: Option<usize>|
-                 -> Vec<(f64, bool)> {
-                    let mut pairs = Vec::new();
-                    for (idx, (_, _, _, samps)) in subset.iter().enumerate() {
-                        if skip_idx == Some(idx) {
-                            continue;
-                        }
-                        if !is_unconverged_prot(samps) {
-                            for s in samps {
-                                pairs.push((s.p_raw, s.is_ok));
-                            }
+            let collect_train_pairs = |skip_idx: Option<usize>| -> Vec<(f64, bool)> {
+                let mut pairs = Vec::new();
+                for (idx, (_, _, _, seeds)) in by_prot.iter().enumerate() {
+                    if skip_idx == Some(idx) {
+                        continue;
+                    }
+                    if is_trainable_prot(seeds) {
+                        for s in seeds {
+                            pairs.extend_from_slice(&s.raw_predictions);
                         }
                     }
-                    pairs
-                };
+                }
+                pairs
+            };
 
-            println!("\n================ CANONICAL 13-FOLD LOPO CALIBRATION: {solver_name} ================");
+            println!(
+                "\n================ CANONICAL 13-FOLD LOPO CALIBRATION: {solver_name} ================"
+            );
             // 1. Report UNCALIBRATED (identity map) baseline
             {
                 let mut prot_eces = Vec::new();
@@ -4413,9 +4391,17 @@ mod tests {
                 let mut prot_eces_12 = Vec::new();
                 let mut prot_hcps = Vec::new();
                 let mut pooled = Vec::new();
-                for (_, _, _, samps) in by_prot {
-                    let preds = apply_qc_with_knots(samps, None);
-                    let rel = ProteinReliabilityCurve::from_predictions(&preds, 0.80);
+                for (_, _, _, seeds) in by_prot {
+                    let mut preds = Vec::new();
+                    for s in seeds {
+                        preds.extend(evaluate_seed_predictions_with_gate(
+                            s,
+                            &identity_knots,
+                            &CANONICAL_PROTEIN_HC_GATE,
+                        ));
+                    }
+                    let rel =
+                        ProteinReliabilityCurve::from_predictions_with_repeats(&preds, 0.80, 5.0);
                     prot_eces.push(rel.ece);
                     prot_eces_10.push(rel.ece_10);
                     prot_eces_12.push(rel.ece_12);
@@ -4424,10 +4410,13 @@ mod tests {
                     }
                     pooled.extend(preds);
                 }
-                let pool_rel = ProteinReliabilityCurve::from_predictions(&pooled, 0.80);
-                let mean_ece = prot_eces.iter().sum::<f64>() / (prot_eces.len() as f64);
-                let mean_ece_10 = prot_eces_10.iter().sum::<f64>() / (prot_eces_10.len() as f64);
-                let mean_ece_12 = prot_eces_12.iter().sum::<f64>() / (prot_eces_12.len() as f64);
+                let pool_rel =
+                    ProteinReliabilityCurve::from_predictions_with_repeats(&pooled, 0.80, 5.0);
+                let mean_ece = prot_eces.iter().sum::<f64>() / (prot_eces.len().max(1) as f64);
+                let mean_ece_10 =
+                    prot_eces_10.iter().sum::<f64>() / (prot_eces_10.len().max(1) as f64);
+                let mean_ece_12 =
+                    prot_eces_12.iter().sum::<f64>() / (prot_eces_12.len().max(1) as f64);
                 let macro_hcp = prot_hcps.iter().sum::<f64>() / (prot_hcps.len().max(1) as f64);
                 println!(
                     "  [Identity T=1.0 baseline] mean_ECE4/10/12={mean_ece:.4}/{mean_ece_10:.4}/{mean_ece_12:.4}, pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}% (n_hc_prot={}), micro_HCP={:.2}% ({}/{})",
@@ -4442,150 +4431,126 @@ mod tests {
                 );
             }
 
-            // 2. Strict 13-fold LOPO: for each held-out protein `hold_idx`, fit the canonical
-            // isotonic PAV map exclusively on the 12 training proteins `j != hold_idx`, and
-            // evaluate once on `by_prot[hold_idx]`.
-            let all_refs: Vec<&(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
-                by_prot.iter().collect();
+            // 2. Strict 13-fold LOPO: fit both PAV knots and `ProteinHcGateConfig` inside each fold
             let mut oof_eces = Vec::with_capacity(by_prot.len());
             let mut oof_eces_10 = Vec::with_capacity(by_prot.len());
+            let mut oof_deb_eces_10 = Vec::with_capacity(by_prot.len());
+            let mut oof_floor_10 = Vec::with_capacity(by_prot.len());
             let mut oof_eces_12 = Vec::with_capacity(by_prot.len());
             let mut oof_hcps = Vec::with_capacity(by_prot.len());
             let mut oof_pooled = Vec::new();
 
-            for (hold_idx, (_, _, _, held_samps)) in by_prot.iter().enumerate() {
-                let train_pairs = collect_train_pairs(&all_refs, Some(hold_idx));
-                let fold_knots =
-                    fit_isotonic_monotone_knots(&train_pairs, canonical_grid, canonical_laplace);
-                let held_preds = apply_qc_with_knots(held_samps, Some(&fold_knots));
-                let rel = ProteinReliabilityCurve::from_predictions(&held_preds, 0.80);
+            for (hold_idx, (_, _, _, held_seeds)) in by_prot.iter().enumerate() {
+                let train_pairs = collect_train_pairs(Some(hold_idx));
+                let fold_knots = fit_knots_for_solver(&train_pairs);
+                let train_prots: Vec<Vec<ProteinHcTrainingSeed>> = by_prot
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != hold_idx)
+                    .map(|(_, (_, _, _, s))| s.clone())
+                    .collect();
+                let fold_gate_cfg = fit_protein_hc_gate_config(&train_prots, &fold_knots);
+                let mut held_preds = Vec::new();
+                for s in held_seeds {
+                    held_preds.extend(evaluate_seed_predictions_with_gate(
+                        s,
+                        &fold_knots,
+                        &fold_gate_cfg,
+                    ));
+                }
+                let rel =
+                    ProteinReliabilityCurve::from_predictions_with_repeats(&held_preds, 0.80, 5.0);
                 oof_eces.push(rel.ece);
                 oof_eces_10.push(rel.ece_10);
+                oof_deb_eces_10.push(rel.debiased_ece_10);
+                oof_floor_10.push(rel.ece_10_bernoulli_floor);
                 oof_eces_12.push(rel.ece_12);
                 if let Some(hcp) = rel.hc_precision {
                     oof_hcps.push(hcp);
                 }
                 oof_pooled.extend(held_preds);
             }
-            let oof_pool = ProteinReliabilityCurve::from_predictions(&oof_pooled, 0.80);
+            let oof_pool =
+                ProteinReliabilityCurve::from_predictions_with_repeats(&oof_pooled, 0.80, 5.0);
             let oof_mean_ece = oof_eces.iter().sum::<f64>() / (oof_eces.len().max(1) as f64);
             let oof_mean_ece_10 =
                 oof_eces_10.iter().sum::<f64>() / (oof_eces_10.len().max(1) as f64);
+            let oof_mean_deb_ece_10 =
+                oof_deb_eces_10.iter().sum::<f64>() / (oof_deb_eces_10.len().max(1) as f64);
+            let oof_mean_floor_10 =
+                oof_floor_10.iter().sum::<f64>() / (oof_floor_10.len().max(1) as f64);
             let oof_mean_ece_12 =
                 oof_eces_12.iter().sum::<f64>() / (oof_eces_12.len().max(1) as f64);
             let oof_macro_hcp = oof_hcps.iter().sum::<f64>() / (oof_hcps.len().max(1) as f64);
+            let oof_micro_hcp = oof_pool.hc_precision.unwrap_or(0.0);
 
-            // 3. Fit the identical canonical estimator on all 13 dev proteins for deployment.
-            let all_train = collect_train_pairs(&all_refs, None);
-            let full_knots =
-                fit_isotonic_monotone_knots(&all_train, canonical_grid, canonical_laplace);
+            // 3. Fit full-13 `dev` estimator for deployment
+            let all_train = collect_train_pairs(None);
+            let full_knots = fit_knots_for_solver(&all_train);
+            let all_prots: Vec<Vec<ProteinHcTrainingSeed>> =
+                by_prot.iter().map(|(_, _, _, s)| s.clone()).collect();
+            let full_gate_cfg = fit_protein_hc_gate_config(&all_prots, &full_knots);
 
+            println!(
+                "\n  >>> 13-FOLD IN-FOLD-REFIT LOPO {solver_name} (full_gate={full_gate_cfg:?})"
+            );
+            println!(
+                "  OOF LOPO: mean_ECE4/10/12={oof_mean_ece:.4}/{oof_mean_ece_10:.4}/{oof_mean_ece_12:.4} (debiased_ECE10={oof_mean_deb_ece_10:.4}, Bernoulli_floor={oof_mean_floor_10:.4}), pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
+                oof_pool.ece,
+                oof_pool.ece_10,
+                oof_pool.ece_12,
+                oof_macro_hcp * 100.0,
+                oof_micro_hcp * 100.0,
+                oof_pool.hc_correct,
+                oof_pool.hc_assigned,
+            );
+            for ((((id, name, verd, seeds), &pece), &pece10), &pece12) in by_prot
+                .iter()
+                .zip(oof_eces.iter())
+                .zip(oof_eces_10.iter())
+                .zip(oof_eces_12.iter())
             {
-                // Evaluate full_knots in-sample on the 13 dev proteins
-                let mut ins_eces = Vec::new();
-                let mut ins_eces_10 = Vec::new();
-                let mut ins_eces_12 = Vec::new();
-                let mut ins_hcps = Vec::new();
-                let mut ins_pooled = Vec::new();
-                for (_, _, _, samps) in by_prot {
-                    let preds = apply_qc_with_knots(samps, Some(&full_knots));
-                    let rel = ProteinReliabilityCurve::from_predictions(&preds, 0.80);
-                    ins_eces.push(rel.ece);
-                    ins_eces_10.push(rel.ece_10);
-                    ins_eces_12.push(rel.ece_12);
-                    if let Some(hcp) = rel.hc_precision {
-                        ins_hcps.push(hcp);
-                    }
-                    ins_pooled.extend(preds);
-                }
-                let ins_pool = ProteinReliabilityCurve::from_predictions(&ins_pooled, 0.80);
-                let ins_mean_ece = ins_eces.iter().sum::<f64>() / (ins_eces.len() as f64);
-                let ins_mean_ece_10 = ins_eces_10.iter().sum::<f64>() / (ins_eces_10.len() as f64);
-                let ins_mean_ece_12 = ins_eces_12.iter().sum::<f64>() / (ins_eces_12.len() as f64);
-                let ins_macro_hcp = ins_hcps.iter().sum::<f64>() / (ins_hcps.len().max(1) as f64);
-
-                println!(
-                    "\n  >>> CANONICAL ZERO-SEARCH 13-FOLD LOPO {solver_name} (grid={CANONICAL_GRID_NAME}, laplace={canonical_laplace:.1})"
-                );
-                println!(
-                    "  OOF LOPO: mean_ECE4/10/12={oof_mean_ece:.4}/{oof_mean_ece_10:.4}/{oof_mean_ece_12:.4}, pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
-                    oof_pool.ece,
-                    oof_pool.ece_10,
-                    oof_pool.ece_12,
-                    oof_macro_hcp * 100.0,
-                    oof_pool.hc_precision.unwrap_or(0.0) * 100.0,
-                    oof_pool.hc_correct,
-                    oof_pool.hc_assigned,
-                );
-                for b in &oof_pool.bins {
-                    println!(
-                        "    OOF bin [{:.1}, {:.1}): n={:4}, mean_conf={:.4}, emp_acc={:.4} (gap={:+.4})",
-                        b.lower,
-                        b.upper,
-                        b.count,
-                        b.mean_conf,
-                        b.empirical_acc,
-                        b.mean_conf - b.empirical_acc
-                    );
-                }
-                for ((((id, name, verd, samps), &pece), &pece10), &pece12) in by_prot
+                let tot_s: usize = seeds.iter().map(|s| s.raw_predictions.len()).sum();
+                let n_ok: usize = seeds
                     .iter()
-                    .zip(oof_eces.iter())
-                    .zip(oof_eces_10.iter())
-                    .zip(oof_eces_12.iter())
-                {
-                    let n_ok = samps.iter().filter(|s| s.is_ok).count();
-                    let acc = 100.0 * (n_ok as f64) / (samps.len().max(1) as f64);
-                    let preds_p = apply_qc_with_knots(samps, Some(&full_knots));
-                    let rel_p = ProteinReliabilityCurve::from_predictions(&preds_p, 0.80);
-                    println!(
-                        "    per-protein {id:16} ({name:12}, QC={:4}): acc={acc:5.1}%, OOF_ECE4/10/12={pece:.4}/{pece10:.4}/{pece12:.4}, INS_HC={} (HCP={})",
-                        verd.as_str(),
-                        rel_p.hc_status,
-                        rel_p
-                            .hc_precision
-                            .map(|v| format!("{:.1}%", v * 100.0))
-                            .unwrap_or_else(|| "ABSTAIN".to_string()),
-                    );
+                    .map(|s| s.raw_predictions.iter().filter(|&&(_, ok)| ok).count())
+                    .sum();
+                let acc = 100.0 * (n_ok as f64) / (tot_s.max(1) as f64);
+                let mut preds_p = Vec::new();
+                for s in seeds {
+                    preds_p.extend(evaluate_seed_predictions_with_gate(
+                        s,
+                        &full_knots,
+                        &full_gate_cfg,
+                    ));
                 }
+                let rel_p =
+                    ProteinReliabilityCurve::from_predictions_with_repeats(&preds_p, 0.80, 5.0);
                 println!(
-                    "  IN-SAMPLE: mean_ECE4/10/12={ins_mean_ece:.4}/{ins_mean_ece_10:.4}/{ins_mean_ece_12:.4}, pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
-                    ins_pool.ece,
-                    ins_pool.ece_10,
-                    ins_pool.ece_12,
-                    ins_macro_hcp * 100.0,
-                    ins_pool.hc_precision.unwrap_or(0.0) * 100.0,
-                    ins_pool.hc_correct,
-                    ins_pool.hc_assigned,
+                    "    per-protein {id:16} ({name:12}, QC={:4}): acc={acc:5.1}%, OOF_ECE4/10/12={pece:.4}/{pece10:.4}/{pece12:.4}, INS_HC={}",
+                    verd.as_str(),
+                    rel_p.hc_status,
                 );
-                for b in &ins_pool.bins {
-                    println!(
-                        "    INS bin [{:.1}, {:.1}): n={:4}, mean_conf={:.4}, emp_acc={:.4} (gap={:+.4})",
-                        b.lower,
-                        b.upper,
-                        b.count,
-                        b.mean_conf,
-                        b.empirical_acc,
-                        b.mean_conf - b.empirical_acc
-                    );
+            }
+            print!("  RUST KNOTS {solver_name}: &[");
+            for (i, &(x, y)) in full_knots.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
                 }
-                print!("  RUST KNOTS {solver_name}: &[");
-                for (i, &(x, y)) in full_knots.iter().enumerate() {
-                    if i > 0 {
-                        print!(", ");
-                    }
-                    print!("({x:.4}, {y:.4})");
-                }
-                println!("];");
-                if solver_name != "STANDARD_GPU_UNSHRUNK" {
-                    gate_checks.push(LopoGateCheck {
-                        solver_name: solver_name.to_string(),
-                        oof_mean_ece,
-                        oof_pool_ece: oof_pool.ece,
-                        oof_macro_hcp,
-                        full_knots,
-                    });
-                }
+                print!("({x:.4}, {y:.4})");
+            }
+            println!("];");
+            if solver_name != "STANDARD_GPU_UNSHRUNK" {
+                gate_checks.push(LopoGateCheck {
+                    solver_name: solver_name.to_string(),
+                    oof_mean_ece,
+                    oof_mean_ece_10,
+                    oof_mean_debiased_ece_10: oof_mean_deb_ece_10,
+                    oof_pool_ece_10: oof_pool.ece_10,
+                    oof_micro_hcp,
+                    oof_macro_hcp,
+                    full_knots,
+                });
             }
         };
 
@@ -4593,170 +4558,255 @@ mod tests {
         run_lopo_calibration("STANDARD_CPU", &std_by_prot);
         run_lopo_calibration("STANDARD_GPU_UNSHRUNK", &std_gpu_by_prot);
 
-        // Q2: Strict 13-fold OOF LOPO audit of CPU-anchored empirical-Bayes shrinkage for
-        // `STANDARD_GPU` (holding out `hold_idx` from BOTH GPU and CPU simultaneously!).
-        {
+        // P1-8: Strict NESTED 13x12 LOPO selection of `CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT` for
+        // `STANDARD_GPU` (selecting `w_i` strictly inside the 12 training proteins of outer fold `i`
+        // via 12-fold inner LOPO minimizing `ECE_10`, holding out `hold_idx` from BOTH GPU and CPU!).
+        let full_selected_gpu_w = {
             println!(
-                "\n================ Q2 13-FOLD OOF LOPO GPU SHRINKAGE TOWARD CPU KNOTS ================"
+                "\n================ P1-8 NESTED 13x12 LOPO GPU SHRINKAGE SELECTION ================"
             );
-            let cpu_refs: Vec<&(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
-                std_by_prot.iter().collect();
-            let gpu_refs: Vec<&(String, String, DatasetQcVerdict, Vec<RawPredSample>)> =
-                std_gpu_by_prot.iter().collect();
-            for &anchor_w in &[0.0f64, 0.25, 0.50, 1.00] {
-                let mut oof_eces = Vec::new();
-                let mut oof_eces_10 = Vec::new();
-                let mut oof_eces_12 = Vec::new();
-                let mut oof_hcps = Vec::new();
-                let mut oof_pooled = Vec::new();
-                for (hold_idx, (_, _, _, held_gpu_samps)) in std_gpu_by_prot.iter().enumerate() {
-                    let mut cpu_train = Vec::new();
-                    for (idx, (_, _, _, samps)) in cpu_refs.iter().enumerate() {
-                        if idx != hold_idx && !is_unconverged_prot(samps) {
-                            for s in samps {
-                                cpu_train.push((s.p_raw, s.is_ok));
-                            }
+            let mut oof_eces = Vec::new();
+            let mut oof_eces_10 = Vec::new();
+            let mut oof_deb_eces_10 = Vec::new();
+            let mut oof_floor_10 = Vec::new();
+            let mut oof_eces_12 = Vec::new();
+            let mut oof_hcps = Vec::new();
+            let mut oof_pooled = Vec::new();
+            let mut outer_chosen_ws = Vec::new();
+
+            for (hold_idx, (_, _, _, held_gpu_seeds)) in std_gpu_by_prot.iter().enumerate() {
+                let mut tr_gpu_prots = Vec::new();
+                let mut tr_cpu_raw = Vec::new();
+                let mut tr_gpu_ok = Vec::new();
+                let mut tr_cpu_ok = Vec::new();
+                let mut gpu_train_flat = Vec::new();
+                let mut cpu_train_flat = Vec::new();
+
+                for idx in 0..std_gpu_by_prot.len() {
+                    if idx == hold_idx {
+                        continue;
+                    }
+                    let g_seeds = &std_gpu_by_prot[idx].3;
+                    let c_seeds = &std_by_prot[idx].3;
+                    let g_ok = is_trainable_prot(g_seeds);
+                    let c_ok = is_trainable_prot(c_seeds);
+                    let c_pairs: Vec<(f64, bool)> = c_seeds
+                        .iter()
+                        .flat_map(|s| s.raw_predictions.iter().copied())
+                        .collect();
+                    if g_ok {
+                        for s in g_seeds {
+                            gpu_train_flat.extend_from_slice(&s.raw_predictions);
                         }
                     }
-                    let mut gpu_train = Vec::new();
-                    for (idx, (_, _, _, samps)) in gpu_refs.iter().enumerate() {
-                        if idx != hold_idx && !is_unconverged_prot(samps) {
-                            for s in samps {
-                                gpu_train.push((s.p_raw, s.is_ok));
-                            }
-                        }
+                    if c_ok {
+                        cpu_train_flat.extend_from_slice(&c_pairs);
                     }
-                    let gpu_fold_knots = fit_isotonic_monotone_knots_shrunk_toward(
-                        &gpu_train,
-                        &cpu_train,
-                        anchor_w,
-                        CANONICAL_CALIBRATION_GRID_12,
-                        CANONICAL_CALIBRATION_LAPLACE_PRIOR,
-                    );
-                    let held_preds = apply_qc_with_knots(held_gpu_samps, Some(&gpu_fold_knots));
-                    let rel = ProteinReliabilityCurve::from_predictions(&held_preds, 0.80);
-                    oof_eces.push(rel.ece);
-                    oof_eces_10.push(rel.ece_10);
-                    oof_eces_12.push(rel.ece_12);
-                    if let Some(hcp) = rel.hc_precision {
-                        oof_hcps.push(hcp);
-                    }
-                    oof_pooled.extend(held_preds);
+                    tr_gpu_prots.push(g_seeds.clone());
+                    tr_cpu_raw.push(c_pairs);
+                    tr_gpu_ok.push(g_ok);
+                    tr_cpu_ok.push(c_ok);
                 }
-                let pool = ProteinReliabilityCurve::from_predictions(&oof_pooled, 0.80);
-                let m_ece4 = oof_eces.iter().sum::<f64>() / (oof_eces.len().max(1) as f64);
-                let m_ece10 = oof_eces_10.iter().sum::<f64>() / (oof_eces_10.len().max(1) as f64);
-                let m_ece12 = oof_eces_12.iter().sum::<f64>() / (oof_eces_12.len().max(1) as f64);
-                let m_hcp = oof_hcps.iter().sum::<f64>() / (oof_hcps.len().max(1) as f64);
-                println!(
-                    "  [Q2 anchor_weight={anchor_w:4.2}] OOF mean_ECE4/10/12={m_ece4:.4}/{m_ece10:.4}/{m_ece12:.4}, pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
-                    pool.ece,
-                    pool.ece_10,
-                    pool.ece_12,
-                    m_hcp * 100.0,
-                    pool.hc_precision.unwrap_or(0.0) * 100.0,
-                    pool.hc_correct,
-                    pool.hc_assigned,
-                );
-                let mut all_cpu = Vec::new();
-                for (_, _, _, samps) in &cpu_refs {
-                    if !is_unconverged_prot(samps) {
-                        for s in samps {
-                            all_cpu.push((s.p_raw, s.is_ok));
-                        }
-                    }
-                }
-                let mut all_gpu = Vec::new();
-                for (_, _, _, samps) in &gpu_refs {
-                    if !is_unconverged_prot(samps) {
-                        for s in samps {
-                            all_gpu.push((s.p_raw, s.is_ok));
-                        }
-                    }
-                }
-                let full_gpu_shrunk = fit_isotonic_monotone_knots_shrunk_toward(
-                    &all_gpu,
-                    &all_cpu,
-                    anchor_w,
+
+                // Inner LOPO selector inside the 12 training proteins of outer fold `hold_idx`
+                let init_knots = fit_isotonic_monotone_knots_shrunk_toward(
+                    &gpu_train_flat,
+                    &cpu_train_flat,
+                    0.50,
                     CANONICAL_CALIBRATION_GRID_12,
                     CANONICAL_CALIBRATION_LAPLACE_PRIOR,
                 );
-                print!("    FULL KNOTS (anchor={anchor_w:4.2}): &[");
-                for (i, &(x, y)) in full_gpu_shrunk.iter().enumerate() {
-                    if i > 0 {
-                        print!(", ");
-                    }
-                    print!("({x:.4}, {y:.4})");
-                }
-                println!("];");
+                let init_gate = fit_protein_hc_gate_config(&tr_gpu_prots, &init_knots);
+                let (w_i, _) = select_gpu_shrinkage_weight_nested_lopo(
+                    &tr_gpu_prots,
+                    &tr_cpu_raw,
+                    &tr_gpu_ok,
+                    &tr_cpu_ok,
+                    &init_gate,
+                );
+                outer_chosen_ws.push(w_i);
 
-                if (anchor_w - nmr_core::qc::CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT).abs() < 1e-9 {
-                    let mut ins_eces = Vec::new();
-                    let mut ins_eces_10 = Vec::new();
-                    let mut ins_eces_12 = Vec::new();
-                    let mut ins_hcps = Vec::new();
-                    let mut ins_pooled = Vec::new();
-                    for (_, _, _, samps) in &std_gpu_by_prot {
-                        let preds = apply_qc_with_knots(samps, Some(&full_gpu_shrunk));
-                        let rel = ProteinReliabilityCurve::from_predictions(&preds, 0.80);
-                        ins_eces.push(rel.ece);
-                        ins_eces_10.push(rel.ece_10);
-                        ins_eces_12.push(rel.ece_12);
-                        if let Some(hcp) = rel.hc_precision {
-                            ins_hcps.push(hcp);
-                        }
-                        ins_pooled.extend(preds);
-                    }
-                    let ins_pool = ProteinReliabilityCurve::from_predictions(&ins_pooled, 0.80);
-                    let ins_m4 = ins_eces.iter().sum::<f64>() / (ins_eces.len().max(1) as f64);
-                    let ins_m10 =
-                        ins_eces_10.iter().sum::<f64>() / (ins_eces_10.len().max(1) as f64);
-                    let ins_m12 =
-                        ins_eces_12.iter().sum::<f64>() / (ins_eces_12.len().max(1) as f64);
-                    let ins_mhcp = ins_hcps.iter().sum::<f64>() / (ins_hcps.len().max(1) as f64);
-                    println!(
-                        "    IN-SAMPLE (Q2 anchor={anchor_w:4.2}): mean_ECE4/10/12={ins_m4:.4}/{ins_m10:.4}/{ins_m12:.4}, pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
-                        ins_pool.ece,
-                        ins_pool.ece_10,
-                        ins_pool.ece_12,
-                        ins_mhcp * 100.0,
-                        ins_pool.hc_precision.unwrap_or(0.0) * 100.0,
-                        ins_pool.hc_correct,
-                        ins_pool.hc_assigned,
-                    );
-                    gate_checks.push(LopoGateCheck {
-                        solver_name: "STANDARD_GPU".to_string(),
-                        oof_mean_ece: m_ece4,
-                        oof_pool_ece: pool.ece,
-                        oof_macro_hcp: m_hcp,
-                        full_knots: full_gpu_shrunk,
-                    });
+                let gpu_fold_knots = fit_isotonic_monotone_knots_shrunk_toward(
+                    &gpu_train_flat,
+                    &cpu_train_flat,
+                    w_i,
+                    CANONICAL_CALIBRATION_GRID_12,
+                    CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+                );
+                let fold_gate = fit_protein_hc_gate_config(&tr_gpu_prots, &gpu_fold_knots);
+                let mut held_preds = Vec::new();
+                for s in held_gpu_seeds {
+                    held_preds.extend(evaluate_seed_predictions_with_gate(
+                        s,
+                        &gpu_fold_knots,
+                        &fold_gate,
+                    ));
                 }
+                let rel =
+                    ProteinReliabilityCurve::from_predictions_with_repeats(&held_preds, 0.80, 5.0);
+                oof_eces.push(rel.ece);
+                oof_eces_10.push(rel.ece_10);
+                oof_deb_eces_10.push(rel.debiased_ece_10);
+                oof_floor_10.push(rel.ece_10_bernoulli_floor);
+                oof_eces_12.push(rel.ece_12);
+                if let Some(hcp) = rel.hc_precision {
+                    oof_hcps.push(hcp);
+                }
+                oof_pooled.extend(held_preds);
             }
-        }
+
+            let pool =
+                ProteinReliabilityCurve::from_predictions_with_repeats(&oof_pooled, 0.80, 5.0);
+            let m_ece4 = oof_eces.iter().sum::<f64>() / (oof_eces.len().max(1) as f64);
+            let m_ece10 = oof_eces_10.iter().sum::<f64>() / (oof_eces_10.len().max(1) as f64);
+            let m_deb10 =
+                oof_deb_eces_10.iter().sum::<f64>() / (oof_deb_eces_10.len().max(1) as f64);
+            let m_flr10 = oof_floor_10.iter().sum::<f64>() / (oof_floor_10.len().max(1) as f64);
+            let m_ece12 = oof_eces_12.iter().sum::<f64>() / (oof_eces_12.len().max(1) as f64);
+            let m_hcp = oof_hcps.iter().sum::<f64>() / (oof_hcps.len().max(1) as f64);
+            let micro_hcp = pool.hc_precision.unwrap_or(0.0);
+
+            println!(
+                "  [NESTED 13x12 LOPO STANDARD_GPU] outer_ws={outer_chosen_ws:?}\n  OOF mean_ECE4/10/12={m_ece4:.4}/{m_ece10:.4}/{m_ece12:.4} (debiased_ECE10={m_deb10:.4}, Bernoulli_floor={m_flr10:.4}), pooled_ECE4/10/12={:.4}/{:.4}/{:.4}, macro_HCP={:.2}%, micro_HCP={:.2}% ({}/{})",
+                pool.ece,
+                pool.ece_10,
+                pool.ece_12,
+                m_hcp * 100.0,
+                micro_hcp * 100.0,
+                pool.hc_correct,
+                pool.hc_assigned,
+            );
+
+            // Full-13 inner LOPO selection of `CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT`
+            let full_gpu_prots: Vec<Vec<ProteinHcTrainingSeed>> = std_gpu_by_prot
+                .iter()
+                .map(|(_, _, _, s)| s.clone())
+                .collect();
+            let full_cpu_raw: Vec<Vec<(f64, bool)>> = std_by_prot
+                .iter()
+                .map(|(_, _, _, s)| {
+                    s.iter()
+                        .flat_map(|sd| sd.raw_predictions.iter().copied())
+                        .collect()
+                })
+                .collect();
+            let full_gpu_ok: Vec<bool> = std_gpu_by_prot
+                .iter()
+                .map(|(_, _, _, s)| is_trainable_prot(s))
+                .collect();
+            let full_cpu_ok: Vec<bool> = std_by_prot
+                .iter()
+                .map(|(_, _, _, s)| is_trainable_prot(s))
+                .collect();
+            let all_gpu: Vec<(f64, bool)> = std_gpu_by_prot
+                .iter()
+                .filter(|(_, _, _, s)| is_trainable_prot(s))
+                .flat_map(|(_, _, _, s)| s.iter().flat_map(|sd| sd.raw_predictions.iter().copied()))
+                .collect();
+            let all_cpu: Vec<(f64, bool)> = std_by_prot
+                .iter()
+                .filter(|(_, _, _, s)| is_trainable_prot(s))
+                .flat_map(|(_, _, _, s)| s.iter().flat_map(|sd| sd.raw_predictions.iter().copied()))
+                .collect();
+
+            let full_init_knots = fit_isotonic_monotone_knots_shrunk_toward(
+                &all_gpu,
+                &all_cpu,
+                0.50,
+                CANONICAL_CALIBRATION_GRID_12,
+                CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+            );
+            let full_init_gate = fit_protein_hc_gate_config(&full_gpu_prots, &full_init_knots);
+            let (sel_w, cand_stats) = select_gpu_shrinkage_weight_nested_lopo(
+                &full_gpu_prots,
+                &full_cpu_raw,
+                &full_gpu_ok,
+                &full_cpu_ok,
+                &full_init_gate,
+            );
+            println!(
+                "  [FULL-13 INNER LOPO] selected CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT = {sel_w:.2}:"
+            );
+            for (cw, cece10, chcp) in &cand_stats {
+                println!(
+                    "    w={cw:4.2}: inner_OOF_ECE10={cece10:.5}, inner_OOF_micro_HCP={:.2}%",
+                    chcp * 100.0
+                );
+            }
+
+            let full_gpu_shrunk = fit_isotonic_monotone_knots_shrunk_toward(
+                &all_gpu,
+                &all_cpu,
+                sel_w,
+                CANONICAL_CALIBRATION_GRID_12,
+                CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+            );
+            print!("  RUST KNOTS STANDARD_GPU (w={sel_w:.2}): &[");
+            for (i, &(x, y)) in full_gpu_shrunk.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print!("({x:.4}, {y:.4})");
+            }
+            println!("];");
+
+            gate_checks.push(LopoGateCheck {
+                solver_name: "STANDARD_GPU".to_string(),
+                oof_mean_ece: m_ece4,
+                oof_mean_ece_10: m_ece10,
+                oof_mean_debiased_ece_10: m_deb10,
+                oof_pool_ece_10: pool.ece_10,
+                oof_micro_hcp: micro_hcp,
+                oof_macro_hcp: m_hcp,
+                full_knots: full_gpu_shrunk,
+            });
+            sel_w
+        };
 
         if only_filter.is_none() {
             let is_reference_gpu_adapter = gpu_engine.adapter_name.contains("Apple M5 Pro");
+            if is_reference_gpu_adapter {
+                assert!(
+                    (full_selected_gpu_w - CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT).abs() < 1e-9,
+                    "full-13 inner LOPO selected w={full_selected_gpu_w:.2} != CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT={CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT:.2}"
+                );
+            }
             for LopoGateCheck {
                 solver_name,
                 oof_mean_ece,
-                oof_pool_ece,
+                oof_mean_ece_10,
+                oof_mean_debiased_ece_10,
+                oof_pool_ece_10,
+                oof_micro_hcp,
                 oof_macro_hcp,
                 full_knots,
             } in gate_checks
             {
                 assert!(
-                    oof_mean_ece <= 0.070,
-                    "{solver_name} OOF mean_ECE {oof_mean_ece:.4} exceeded 0.070 gate"
+                    oof_pool_ece_10 <= 0.050,
+                    "{solver_name} OOF pooled_ECE_10 {oof_pool_ece_10:.4} exceeded primary 0.050 gate"
                 );
                 assert!(
-                    oof_pool_ece <= 0.050,
-                    "{solver_name} OOF pooled_ECE {oof_pool_ece:.4} exceeded 0.050 gate"
+                    oof_micro_hcp >= 0.94,
+                    "{solver_name} OOF micro_HCP {:.2}% fell below primary 94.0% gate",
+                    oof_micro_hcp * 100.0
                 );
                 assert!(
                     oof_macro_hcp >= 0.95,
                     "{solver_name} OOF macro_HCP {:.2}% fell below 95.0% gate",
                     oof_macro_hcp * 100.0
+                );
+                assert!(
+                    oof_mean_ece <= 0.065,
+                    "{solver_name} OOF mean_ECE_4 {oof_mean_ece:.4} exceeded 0.065 gate"
+                );
+                assert!(
+                    oof_mean_ece_10 <= 0.105,
+                    "{solver_name} OOF mean_ECE_10 {oof_mean_ece_10:.4} exceeded finite-sample 0.105 gate"
+                );
+                assert!(
+                    oof_mean_debiased_ece_10 <= 0.065,
+                    "{solver_name} OOF mean_debiased_ECE_10 {oof_mean_debiased_ece_10:.4} exceeded 0.065 gate"
                 );
                 let committed = match solver_name.as_str() {
                     "EVO_GRAPH" => nmr_core::qc::EVO_GRAPH_CALIBRATION_KNOTS,
