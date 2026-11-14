@@ -18,17 +18,23 @@
 //! No external source code or external parameter tables were consulted.
 
 use bytemuck::{Pod, Zeroable};
+#[cfg(not(target_arch = "wasm32"))]
 use nmr_core::bayes_sa::{
-    build_bayes_move_tables, build_initial_bayes_replicas, condition_peaks_preserving_hsqc_roots,
-    evaluate_state_energy, finalize_bayes_sa_from_replicas, pack_bayes_scoring_inputs,
-    BayesMoveTables, BayesPackedScoringInputs, BayesSaConfig, BayesSaMatrices, BayesSaReport,
-    BayesScheduleDriver, FORBID_ENERGY,
+    build_bayes_move_tables, build_initial_bayes_replicas, evaluate_state_energy,
+    finalize_bayes_sa_from_replicas, pack_bayes_scoring_inputs, BayesScheduleDriver,
+};
+use nmr_core::bayes_sa::{
+    condition_peaks_preserving_hsqc_roots, BayesMoveTables, BayesPackedScoringInputs,
+    BayesSaConfig, BayesSaMatrices, BayesSaReport, FORBID_ENERGY,
 };
 use nmr_core::peaks::Peak;
 use nmr_core::priors::Priors;
 use nmr_core::rng::Rng;
-use nmr_core::solver::{AssignResult, Matrix2D};
+use nmr_core::solver::AssignResult;
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_core::solver::Matrix2D;
 use nmr_core::spinsystems::{build_spin_systems, SpinSystem};
+#[cfg(not(target_arch = "wasm32"))]
 use wgpu::util::DeviceExt;
 
 use crate::GpuEngine;
@@ -47,10 +53,37 @@ pub const fn bayes_gpu_chunk_steps_for_dim(max_dim: usize) -> u32 {
     }
 }
 
+/// Compute pipeline tier selected by [`BayesSaGpuSolver`] for multi-replica MCMC stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BayesGpuKernelTier {
+    /// `@workgroup_size(8, 1, 1)` `i16`-paired `16 KiB` workgroup SRAM (`max(S, K) <= 512`).
+    Sram512,
+    /// `@workgroup_size(4, 1, 1)` `i16`-paired `16 KiB` workgroup SRAM (`513 <= max(S, K) <= 1024`).
+    Sram1024,
+    /// `@workgroup_size(32, 1, 1)` global storage-buffer kernel (`max(S, K) > 1024` or forced).
+    GlobalStorage,
+}
+
+/// Select the WebGPU MCMC kernel tier and workgroup size `(tier, wg_threads)` for `(max_dim, force_global)`.
+#[inline]
+pub const fn select_bayes_gpu_kernel_tier(
+    max_dim: usize,
+    force_global: bool,
+) -> (BayesGpuKernelTier, u32) {
+    if force_global || max_dim > 1024 {
+        (BayesGpuKernelTier::GlobalStorage, 32)
+    } else if max_dim <= 512 {
+        (BayesGpuKernelTier::Sram512, 8)
+    } else {
+        (BayesGpuKernelTier::Sram1024, 4)
+    }
+}
+
 /// Raw output of a single WebGPU annealing stage (used to test bit-for-bit TDR multi-chunk
-/// equivalence and global-buffer fallback execution).
+/// equivalence, `513..=1024` SRAM tier dispatch, and `>1024` global-buffer execution).
 #[derive(Clone, Debug, PartialEq)]
 pub struct BayesGpuStageTrajectory {
+    pub kernel_tier: BayesGpuKernelTier,
     pub cur_ats: Vec<Vec<i32>>,
     pub best_ats: Vec<Vec<i32>>,
     pub cur_positions: Vec<Vec<i32>>,
@@ -152,8 +185,9 @@ fn check_storage_buffer_limits(
     Ok(())
 }
 
-/// Validate that all scoring and multi-replica state storage buffers for `(s_len, k_len, replicas)`
-/// fit inside `device.limits().max_buffer_size` and `max_storage_buffer_binding_size`.
+/// Validate that all scoring, `Q27.36` state-evaluation, move-table, and multi-replica state
+/// storage buffers for `(s_len, k_len, replicas)` fit inside `device.limits().max_buffer_size`
+/// and `max_storage_buffer_binding_size`.
 pub fn validate_bayes_gpu_buffer_budget(
     device: &wgpu::Device,
     s_len: usize,
@@ -172,6 +206,39 @@ pub fn validate_bayes_gpu_buffer_budget(
         .ok_or_else(|| "matrix element count overflow".to_string())?;
     let mat_bytes = (mat_ab_elems as u64).saturating_mul(4).max(16);
     check_storage_buffer_limits(device, "energy-matrices", mat_bytes)?;
+
+    let q36_elems = sk
+        .checked_add(ss)
+        .ok_or_else(|| "q36 matrix element count overflow".to_string())?
+        .max(2);
+    let q36_bytes = (q36_elems as u64).saturating_mul(8).max(16);
+    check_storage_buffer_limits(device, "eval-matrices-q36", q36_bytes)?;
+
+    let score_ro_f_elems = k_len
+        .checked_mul(45)
+        .and_then(|v| s_len.checked_mul(145).and_then(|u| v.checked_add(u)))
+        .and_then(|v| v.checked_add(949))
+        .ok_or_else(|| "score-ro-floats element count overflow".to_string())?
+        .max(4);
+    let score_ro_f_bytes = (score_ro_f_elems as u64).saturating_mul(4).max(16);
+    check_storage_buffer_limits(device, "score-ro-floats", score_ro_f_bytes)?;
+
+    let score_ro_i_elems = k_len
+        .checked_mul(2)
+        .and_then(|v| s_len.checked_mul(29).and_then(|u| v.checked_add(u)))
+        .and_then(|v| v.checked_add(120))
+        .ok_or_else(|| "score-ro-ints element count overflow".to_string())?
+        .max(4);
+    let score_ro_i_bytes = (score_ro_i_elems as u64).saturating_mul(4).max(16);
+    check_storage_buffer_limits(device, "score-ro-ints", score_ro_i_bytes)?;
+
+    let move_tbl_elems = k_len
+        .checked_mul(35)
+        .and_then(|v| s_len.checked_mul(25).and_then(|u| v.checked_add(u)))
+        .ok_or_else(|| "anneal-move-tables element count overflow".to_string())?
+        .max(4);
+    let move_tbl_bytes = (move_tbl_elems as u64).saturating_mul(4).max(16);
+    check_storage_buffer_limits(device, "anneal-move-tables", move_tbl_bytes)?;
 
     let at_elems = r
         .checked_mul(k_len)
@@ -198,14 +265,8 @@ pub fn validate_bayes_gpu_buffer_budget(
         ));
     }
     let max_dim = s_len.max(k_len);
-    let wg_threads = if max_dim <= 512 {
-        8usize
-    } else if max_dim <= 1024 {
-        4usize
-    } else {
-        32usize
-    };
-    let anneal_wgs = r.div_ceil(wg_threads);
+    let (_, wg_threads_u32) = select_bayes_gpu_kernel_tier(max_dim, false);
+    let anneal_wgs = r.div_ceil(wg_threads_u32 as usize);
     if anneal_wgs > max_wg {
         return Err(format!(
             "bayes_sa_gpu replica workgroups ({anneal_wgs}) exceed max_compute_workgroups_per_dimension ({max_wg})"
@@ -214,6 +275,7 @@ pub fn validate_bayes_gpu_buffer_budget(
     Ok(())
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn seed_xoshiro128(seed: u64) -> [u32; 4] {
     let mut rng = Rng::new(seed ^ 0xA076_1D64_78BD_642F);
     let a = rng.next_u64();
@@ -225,6 +287,7 @@ fn seed_xoshiro128(seed: u64) -> [u32; 4] {
     st
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn pack_scoring_buffers(inp: &BayesPackedScoringInputs) -> (BayesGpuParams, Vec<f32>, Vec<i32>) {
     let mut ro_f = Vec::new();
     let mut ro_i = Vec::new();
@@ -346,6 +409,7 @@ fn pack_scoring_buffers(inp: &BayesPackedScoringInputs) -> (BayesGpuParams, Vec<
     (params, ro_f, ro_i)
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn pack_move_tables_buffer(tables: &BayesMoveTables) -> ([u32; 8], Vec<i32>) {
     let mut buf = Vec::new();
     let off_free_k = buf.len() as u32;
@@ -405,6 +469,7 @@ fn pack_move_tables_buffer(tables: &BayesMoveTables) -> ([u32; 8], Vec<i32>) {
     )
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn pack_matrices_f32(matrices: &BayesSaMatrices) -> Vec<f32> {
     let sk = matrices.e_unary.data.len();
     let ss = matrices.e_link.data.len();
@@ -417,8 +482,10 @@ fn pack_matrices_f32(matrices: &BayesSaMatrices) -> Vec<f32> {
     out
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const Q36_SCALE: f64 = 68_719_476_736.0; // 2^36 (~1.45e-11 nats resolution)
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn pack_matrices_q36(matrices: &BayesSaMatrices) -> Vec<i32> {
     let total = (matrices.e_unary.data.len() + matrices.e_link.data.len()).max(2);
     let mut out = Vec::with_capacity(2 * total);
@@ -444,10 +511,43 @@ fn pack_matrices_q36(matrices: &BayesSaMatrices) -> Vec<i32> {
     out
 }
 
+fn infer_software_adapter_from_name(adapter_name: &str) -> bool {
+    let lower = adapter_name.to_ascii_lowercase();
+    lower.contains("llvmpipe")
+        || lower.contains("lavapipe")
+        || lower.contains("swiftshader")
+        || lower.contains("microsoft basic render")
+        || lower.contains("software")
+}
+
+fn probe_headless_device_type(adapter_name: &str) -> wgpu::DeviceType {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        if let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                ..Default::default()
+            }))
+        {
+            return adapter.get_info().device_type;
+        }
+    }
+    if infer_software_adapter_from_name(adapter_name) {
+        wgpu::DeviceType::Cpu
+    } else {
+        wgpu::DeviceType::Other
+    }
+}
+
 /// WebGPU compute pipelines and context for Bayesian pseudo-energy evaluation and specific-heat
 /// $C_v(T)$ adaptive simulated annealing.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct BayesSaGpuSolver {
     pub engine: GpuEngine,
+    pub device_type: wgpu::DeviceType,
     bgl: wgpu::BindGroupLayout,
     ln_z_bg_pipeline: wgpu::ComputePipeline,
     e_type_pipeline: wgpu::ComputePipeline,
@@ -461,19 +561,31 @@ pub struct BayesSaGpuSolver {
 impl BayesSaGpuSolver {
     /// Initialize standalone headless WebGPU Bayesian SA solver with hardware buffer limits.
     pub fn new_headless() -> Result<Self, String> {
-        Ok(Self::new(GpuEngine::new_headless()?))
+        let engine = GpuEngine::new_headless()?;
+        let device_type = probe_headless_device_type(&engine.adapter_name);
+        Ok(Self::with_device_type(engine, device_type))
     }
 
     /// Initialize headless WebGPU Bayesian SA solver with caller-supplied `wgpu::Limits`
     /// (for portable browser-cap and buffer-limit rejection tests).
     pub fn new_headless_with_limits(required_limits: wgpu::Limits) -> Result<Self, String> {
-        Ok(Self::new(GpuEngine::new_headless_with_limits(
-            required_limits,
-        )?))
+        let engine = GpuEngine::new_headless_with_limits(required_limits)?;
+        let device_type = probe_headless_device_type(&engine.adapter_name);
+        Ok(Self::with_device_type(engine, device_type))
     }
 
     /// Build `BayesSaGpuSolver` pipelines atop an existing `GpuEngine`.
     pub fn new(engine: GpuEngine) -> Self {
+        let device_type = if infer_software_adapter_from_name(&engine.adapter_name) {
+            wgpu::DeviceType::Cpu
+        } else {
+            wgpu::DeviceType::Other
+        };
+        Self::with_device_type(engine, device_type)
+    }
+
+    /// Build `BayesSaGpuSolver` pipelines atop an existing `GpuEngine` with explicit `wgpu::DeviceType`.
+    pub fn with_device_type(engine: GpuEngine, device_type: wgpu::DeviceType) -> Self {
         let shader = engine
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -562,8 +674,75 @@ impl BayesSaGpuSolver {
                 "anneal_bayes_global",
             ),
             engine,
+            device_type,
             bgl,
         }
+    }
+
+    /// Returns `true` when backed by a software CPU emulator (e.g. Mesa `llvmpipe` / `lavapipe` /
+    /// SwiftShader with `wgpu::DeviceType::Cpu`) rather than discrete or integrated GPU silicon.
+    pub fn is_software_cpu_adapter(&self) -> bool {
+        self.device_type == wgpu::DeviceType::Cpu
+            || infer_software_adapter_from_name(&self.engine.adapter_name)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn map_and_read_staging_bytes(
+        &self,
+        staging: &wgpu::Buffer,
+        byte_len: u64,
+        label: &str,
+    ) -> Result<Vec<u8>, String> {
+        let slice = staging.slice(0..byte_len);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.engine
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("GPU device poll failed during {label}: {e}"))?;
+        let map_res = rx
+            .recv()
+            .map_err(|e| format!("GPU staging map channel closed during {label}: {e}"))?;
+        map_res.map_err(|e| format!("GPU staging map_async failed during {label}: {e}"))?;
+        let out = {
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|e| format!("GPU staging mapped range failed during {label}: {e}"))?;
+            mapped.to_vec()
+        };
+        staging.unmap();
+        Ok(out)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_gpu_vec_checked<T: Pod>(
+        &self,
+        buffer: &wgpu::Buffer,
+        byte_size: u64,
+        label: &str,
+    ) -> Result<Vec<T>, String> {
+        let aligned = byte_size
+            .max(wgpu::COPY_BUFFER_ALIGNMENT)
+            .div_ceil(wgpu::COPY_BUFFER_ALIGNMENT)
+            * wgpu::COPY_BUFFER_ALIGNMENT;
+        let staging = self.engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bayes-checked-read-staging"),
+            size: aligned,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bayes-checked-read-copy-enc"),
+            });
+        enc.copy_buffer_to_buffer(buffer, 0, &staging, 0, byte_size);
+        self.engine.queue.submit(Some(enc.finish()));
+        let bytes = self.map_and_read_staging_bytes(&staging, byte_size, label)?;
+        Ok(bytemuck::cast_slice(&bytes).to_vec())
     }
 
     fn compute_energy_matrices_with_gpu_buf(
@@ -573,14 +752,217 @@ impl BayesSaGpuSolver {
         priors: &Priors,
         cfg: &BayesSaConfig,
     ) -> Result<(BayesSaMatrices, Option<wgpu::Buffer>), String> {
-        let inp = pack_bayes_scoring_inputs(systems, sequence, priors, cfg);
-        let s_len = inp.s_len;
-        let k_len = inp.k_len;
-        if s_len == 0 || k_len == 0 {
-            let empty = BayesSaMatrices {
-                e_type: Matrix2D::filled(s_len, k_len, FORBID_ENERGY),
-                e_unary: Matrix2D::filled(s_len, k_len, FORBID_ENERGY),
-                e_link: Matrix2D::filled(s_len, s_len, 0.0),
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (systems, sequence, priors, cfg);
+            Err(
+                "synchronous WebGPU Bayesian matrix readback is unsupported on wasm32; use async pipeline or CPU solver"
+                    .to_string(),
+            )
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let inp = pack_bayes_scoring_inputs(systems, sequence, priors, cfg);
+            let s_len = inp.s_len;
+            let k_len = inp.k_len;
+            if s_len == 0 || k_len == 0 {
+                let empty = BayesSaMatrices {
+                    e_type: Matrix2D::filled(s_len, k_len, FORBID_ENERGY),
+                    e_unary: Matrix2D::filled(s_len, k_len, FORBID_ENERGY),
+                    e_link: Matrix2D::filled(s_len, s_len, 0.0),
+                    weak_penalties: inp.weak_penalties,
+                    mu_null: inp.mu_null,
+                    applied_offsets: inp.applied_offsets,
+                    detailed_offsets: inp.detailed_offsets,
+                    effective_priors: inp.effective_priors,
+                    resolved_locks: inp.resolved_locks,
+                    active_slots: inp.active_slots,
+                };
+                return Ok((empty, None));
+            }
+
+            validate_bayes_gpu_buffer_budget(&self.engine.device, s_len, k_len, 1)?;
+            let (params, ro_f, ro_i) = pack_scoring_buffers(&inp);
+            check_storage_buffer_limits(
+                &self.engine.device,
+                "score-ro-floats",
+                (ro_f.len() * 4) as u64,
+            )?;
+            check_storage_buffer_limits(
+                &self.engine.device,
+                "score-ro-ints",
+                (ro_i.len() * 4) as u64,
+            )?;
+
+            let mat_a_len = (s_len + s_len * k_len).max(4);
+            let mat_b_len = (s_len * k_len + s_len * s_len).max(4);
+            let mat_a_bytes = (mat_a_len * 4) as u64;
+            let mat_b_bytes = (mat_b_len * 4) as u64;
+            check_storage_buffer_limits(&self.engine.device, "score-rw-mat-a", mat_a_bytes)?;
+            check_storage_buffer_limits(&self.engine.device, "score-rw-mat-b", mat_b_bytes)?;
+
+            let dev = &self.engine.device;
+            let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-ro-f"),
+                contents: bytemuck::cast_slice(&ro_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-ro-i"),
+                contents: bytemuck::cast_slice(&ro_i),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_mat_a = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bayes-score-mat-a"),
+                size: mat_a_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let b_mat_b = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bayes-score-mat-b"),
+                size: mat_b_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+
+            let dummy_i32 = [0i32; 4];
+            let dummy_f4 = [[0.0f32; 4]; 1];
+            let dummy_u4 = [[0u32; 4]; 2];
+            let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-dummy-at"),
+                contents: bytemuck::cast_slice(&dummy_i32),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-dummy-pos"),
+                contents: bytemuck::cast_slice(&dummy_i32),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-dummy-sf"),
+                contents: bytemuck::cast_slice(&dummy_f4),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-score-dummy-su"),
+                contents: bytemuck::cast_slice(&dummy_u4),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bayes-score-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: u_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_ro_f.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b_ro_i.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: b_mat_a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: b_mat_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: b_at.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: b_pos.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: b_sf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: b_su.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bayes-score-enc"),
+            });
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("bayes-score-pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, &bg, &[]);
+
+                cpass.set_pipeline(&self.ln_z_bg_pipeline);
+                cpass.dispatch_workgroups((s_len as u32).div_ceil(64), 1, 1);
+
+                cpass.set_pipeline(&self.e_type_pipeline);
+                cpass.dispatch_workgroups(
+                    (s_len as u32).div_ceil(16),
+                    (k_len as u32).div_ceil(16),
+                    1,
+                );
+
+                cpass.set_pipeline(&self.e_link_pipeline);
+                cpass.dispatch_workgroups(
+                    (s_len as u32).div_ceil(16),
+                    (s_len as u32).div_ceil(16),
+                    1,
+                );
+            }
+            self.engine.queue.submit(Some(enc.finish()));
+
+            let raw_a: Vec<f32> =
+                self.read_gpu_vec_checked(&b_mat_a, mat_a_bytes, "score-mat-a readback")?;
+            let raw_b: Vec<f32> =
+                self.read_gpu_vec_checked(&b_mat_b, mat_b_bytes, "score-mat-b readback")?;
+
+            let sk = s_len * k_len;
+            let ss = s_len * s_len;
+            let e_type_f64: Vec<f64> = raw_a[s_len..s_len + sk]
+                .iter()
+                .map(|&v| if v >= 5.0e8 { FORBID_ENERGY } else { v as f64 })
+                .collect();
+            let e_unary_f64: Vec<f64> = raw_b[0..sk]
+                .iter()
+                .map(|&v| if v >= 5.0e8 { FORBID_ENERGY } else { v as f64 })
+                .collect();
+            let e_link_f64: Vec<f64> = raw_b[sk..sk + ss]
+                .iter()
+                .map(|&v| if v >= 5.0e8 { FORBID_ENERGY } else { v as f64 })
+                .collect();
+
+            let matrices = BayesSaMatrices {
+                e_type: Matrix2D {
+                    rows: s_len,
+                    cols: k_len,
+                    data: e_type_f64,
+                },
+                e_unary: Matrix2D {
+                    rows: s_len,
+                    cols: k_len,
+                    data: e_unary_f64,
+                },
+                e_link: Matrix2D {
+                    rows: s_len,
+                    cols: s_len,
+                    data: e_link_f64,
+                },
                 weak_penalties: inp.weak_penalties,
                 mu_null: inp.mu_null,
                 applied_offsets: inp.applied_offsets,
@@ -589,190 +971,9 @@ impl BayesSaGpuSolver {
                 resolved_locks: inp.resolved_locks,
                 active_slots: inp.active_slots,
             };
-            return Ok((empty, None));
+
+            Ok((matrices, Some(b_mat_b)))
         }
-
-        validate_bayes_gpu_buffer_budget(&self.engine.device, s_len, k_len, 1)?;
-        let (params, ro_f, ro_i) = pack_scoring_buffers(&inp);
-        check_storage_buffer_limits(
-            &self.engine.device,
-            "score-ro-floats",
-            (ro_f.len() * 4) as u64,
-        )?;
-        check_storage_buffer_limits(
-            &self.engine.device,
-            "score-ro-ints",
-            (ro_i.len() * 4) as u64,
-        )?;
-
-        let mat_a_len = (s_len + s_len * k_len).max(4);
-        let mat_b_len = (s_len * k_len + s_len * s_len).max(4);
-        let mat_a_bytes = (mat_a_len * 4) as u64;
-        let mat_b_bytes = (mat_b_len * 4) as u64;
-        check_storage_buffer_limits(&self.engine.device, "score-rw-mat-a", mat_a_bytes)?;
-        check_storage_buffer_limits(&self.engine.device, "score-rw-mat-b", mat_b_bytes)?;
-
-        let dev = &self.engine.device;
-        let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-ro-f"),
-            contents: bytemuck::cast_slice(&ro_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-ro-i"),
-            contents: bytemuck::cast_slice(&ro_i),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_mat_a = dev.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bayes-score-mat-a"),
-            size: mat_a_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let b_mat_b = dev.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bayes-score-mat-b"),
-            size: mat_b_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let dummy_i32 = [0i32; 4];
-        let dummy_f4 = [[0.0f32; 4]; 1];
-        let dummy_u4 = [[0u32; 4]; 2];
-        let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-dummy-at"),
-            contents: bytemuck::cast_slice(&dummy_i32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-dummy-pos"),
-            contents: bytemuck::cast_slice(&dummy_i32),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-dummy-sf"),
-            contents: bytemuck::cast_slice(&dummy_f4),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-score-dummy-su"),
-            contents: bytemuck::cast_slice(&dummy_u4),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bayes-score-bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_ro_f.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_ro_i.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: b_mat_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: b_mat_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: b_at.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: b_pos.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: b_sf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: b_su.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bayes-score-enc"),
-        });
-        {
-            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("bayes-score-pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, &bg, &[]);
-
-            cpass.set_pipeline(&self.ln_z_bg_pipeline);
-            cpass.dispatch_workgroups((s_len as u32).div_ceil(64), 1, 1);
-
-            cpass.set_pipeline(&self.e_type_pipeline);
-            cpass.dispatch_workgroups((s_len as u32).div_ceil(16), (k_len as u32).div_ceil(16), 1);
-
-            cpass.set_pipeline(&self.e_link_pipeline);
-            cpass.dispatch_workgroups((s_len as u32).div_ceil(16), (s_len as u32).div_ceil(16), 1);
-        }
-        self.engine.queue.submit(Some(enc.finish()));
-
-        let raw_a: Vec<f32> = self.engine.read_buffer_vec(&b_mat_a, mat_a_bytes)?;
-        let raw_b: Vec<f32> = self.engine.read_buffer_vec(&b_mat_b, mat_b_bytes)?;
-
-        let sk = s_len * k_len;
-        let ss = s_len * s_len;
-        let e_type_f64: Vec<f64> = raw_a[s_len..s_len + sk]
-            .iter()
-            .map(|&v| if v >= 5.0e8 { FORBID_ENERGY } else { v as f64 })
-            .collect();
-        let e_unary_f64: Vec<f64> = raw_b[0..sk]
-            .iter()
-            .map(|&v| if v >= 5.0e8 { FORBID_ENERGY } else { v as f64 })
-            .collect();
-        let e_link_f64: Vec<f64> = raw_b[sk..sk + ss]
-            .iter()
-            .map(|&v| if v >= 5.0e8 { FORBID_ENERGY } else { v as f64 })
-            .collect();
-
-        let matrices = BayesSaMatrices {
-            e_type: Matrix2D {
-                rows: s_len,
-                cols: k_len,
-                data: e_type_f64,
-            },
-            e_unary: Matrix2D {
-                rows: s_len,
-                cols: k_len,
-                data: e_unary_f64,
-            },
-            e_link: Matrix2D {
-                rows: s_len,
-                cols: s_len,
-                data: e_link_f64,
-            },
-            weak_penalties: inp.weak_penalties,
-            mu_null: inp.mu_null,
-            applied_offsets: inp.applied_offsets,
-            detailed_offsets: inp.detailed_offsets,
-            effective_priors: inp.effective_priors,
-            resolved_locks: inp.resolved_locks,
-            active_slots: inp.active_slots,
-        };
-
-        Ok((matrices, Some(b_mat_b)))
     }
 
     /// Compute `E_type`, `E_unary`, and `E_link` on WebGPU (`< 1e-4` parity vs CPU `f64`).
@@ -796,200 +997,223 @@ impl BayesSaGpuSolver {
         matrices: &BayesSaMatrices,
         state_ats: &[Vec<i32>],
     ) -> Result<Vec<f64>, String> {
-        if state_ats.is_empty() {
-            return Ok(Vec::new());
-        }
-        let s_len = matrices.e_unary.rows;
-        let k_len = matrices.e_unary.cols;
-        let n_states = state_ats.len();
-
-        // Validate state structural invariants identically to CPU evaluate_state_energy
-        for (idx, at) in state_ats.iter().enumerate() {
-            if at.len() != k_len {
-                return Err(format!("state[{idx}] len {} != k_len {k_len}", at.len()));
-            }
-            let mut seen = vec![false; s_len];
-            for (k, &s_raw) in at.iter().enumerate() {
-                if s_raw >= 0 {
-                    let s = s_raw as usize;
-                    if s >= s_len {
-                        return Err(format!(
-                            "state[{idx}] invalid spin {s} >= {s_len} at slot {k}"
-                        ));
-                    }
-                    if seen[s] {
-                        return Err(format!("state[{idx}] duplicate spin {s}"));
-                    }
-                    seen[s] = true;
-                    if matrices.e_unary.get(s, k) >= FORBID_ENERGY * 0.5 {
-                        return Err(format!("state[{idx}] forbidden placement (s={s}, k={k})"));
-                    }
-                }
-            }
-        }
-        if s_len == 0 || k_len == 0 {
-            return Ok(vec![0.0; n_states]);
-        }
-
-        let q36_ints = pack_matrices_q36(matrices);
-        check_storage_buffer_limits(
-            &self.engine.device,
-            "eval-matrices-q36",
-            (q36_ints.len() * 4) as u64,
-        )?;
-        let at_bytes = ((n_states * k_len).max(4) * 4) as u64;
-        check_storage_buffer_limits(&self.engine.device, "eval-states-at", at_bytes)?;
-        let out_bytes = ((2 * n_states).max(4) * 4) as u64;
-        check_storage_buffer_limits(&self.engine.device, "eval-states-out", out_bytes)?;
-        let max_wg = self
-            .engine
-            .device
-            .limits()
-            .max_compute_workgroups_per_dimension as usize;
-        let eval_wgs = n_states.div_ceil(64);
-        if eval_wgs > max_wg {
-            return Err(format!(
-                "bayes_sa_gpu eval_states workgroups ({eval_wgs}) exceed max_compute_workgroups_per_dimension ({max_wg})"
-            ));
-        }
-
-        let mut at_flat = Vec::with_capacity((n_states * k_len).max(4));
-        for at in state_ats {
-            at_flat.extend_from_slice(at);
-        }
-        while at_flat.len() < 4 {
-            at_flat.push(-1);
-        }
-
-        let mut params = BayesGpuParams::zeroed();
-        params.s_len = s_len as u32;
-        params.k_len = k_len as u32;
-        params.replicas = n_states as u32;
-        params.off_f0 = 0;
-        params.off_f1 = (s_len * k_len) as u32;
-
-        let dev = &self.engine.device;
-        let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let dummy_f = [0.0f32; 4];
-        let dummy_i = [0i32; 4];
-        let dummy_f4 = [[0.0f32; 4]; 1];
-        let dummy_u4 = [[0u32; 4]; 2];
-        let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-dummy-ro-f"),
-            contents: bytemuck::cast_slice(&dummy_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-matrices-q36"),
-            contents: bytemuck::cast_slice(&q36_ints),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_out = dev.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bayes-eval-out"),
-            size: out_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-dummy-mat-b"),
-            contents: bytemuck::cast_slice(&dummy_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-at"),
-            contents: bytemuck::cast_slice(&at_flat),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-dummy-pos"),
-            contents: bytemuck::cast_slice(&dummy_i),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-dummy-sf"),
-            contents: bytemuck::cast_slice(&dummy_f4),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-eval-dummy-su"),
-            contents: bytemuck::cast_slice(&dummy_u4),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bayes-eval-bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_ro_f.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_ro_i.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: b_out.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: b_mat_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: b_at.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: b_pos.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: b_sf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: b_su.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bayes-eval-enc"),
-        });
+        #[cfg(target_arch = "wasm32")]
         {
-            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("bayes-eval-pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.eval_states_pipeline);
-            cpass.set_bind_group(0, &bg, &[]);
-            cpass.dispatch_workgroups((n_states as u32).div_ceil(64), 1, 1);
+            let _ = (matrices, state_ats);
+            Err(
+                "synchronous WebGPU state-energy readback is unsupported on wasm32; use async pipeline or CPU solver"
+                    .to_string(),
+            )
         }
-        self.engine.queue.submit(Some(enc.finish()));
 
-        let raw_out: Vec<u32> = self.engine.read_buffer_vec(&b_out, out_bytes)?;
-        Ok((0..n_states)
-            .map(|i| {
-                let lo = raw_out[2 * i];
-                let hi = raw_out[2 * i + 1];
-                if hi == 0x7FFF_FFFF && lo == 0xFFFF_FFFF {
-                    FORBID_ENERGY
-                } else {
-                    let q = (((hi as u64) << 32) | (lo as u64)) as i64;
-                    (q as f64) * (1.0 / Q36_SCALE)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if state_ats.is_empty() {
+                return Ok(Vec::new());
+            }
+            let s_len = matrices.e_unary.rows;
+            let k_len = matrices.e_unary.cols;
+            let n_states = state_ats.len();
+
+            // Validate state structural invariants identically to CPU evaluate_state_energy
+            for (idx, at) in state_ats.iter().enumerate() {
+                if at.len() != k_len {
+                    return Err(format!("state[{idx}] len {} != k_len {k_len}", at.len()));
                 }
-            })
-            .collect())
+                let mut seen = vec![false; s_len];
+                for (k, &s_raw) in at.iter().enumerate() {
+                    if s_raw >= 0 {
+                        let s = s_raw as usize;
+                        if s >= s_len {
+                            return Err(format!(
+                                "state[{idx}] invalid spin {s} >= {s_len} at slot {k}"
+                            ));
+                        }
+                        if seen[s] {
+                            return Err(format!("state[{idx}] duplicate spin {s}"));
+                        }
+                        seen[s] = true;
+                        if matrices.e_unary.get(s, k) >= FORBID_ENERGY * 0.5 {
+                            return Err(format!("state[{idx}] forbidden placement (s={s}, k={k})"));
+                        }
+                    }
+                }
+            }
+            if s_len == 0 || k_len == 0 {
+                return Ok(vec![0.0; n_states]);
+            }
+
+            let q36_cells = matrices
+                .e_unary
+                .data
+                .len()
+                .checked_add(matrices.e_link.data.len())
+                .ok_or_else(|| "q36 matrix cell count overflow".to_string())?
+                .max(2);
+            let q36_bytes = (q36_cells as u64).saturating_mul(8).max(16);
+            check_storage_buffer_limits(&self.engine.device, "eval-matrices-q36", q36_bytes)?;
+
+            let at_elems = n_states
+                .checked_mul(k_len)
+                .ok_or_else(|| "eval-states-at element count overflow".to_string())?
+                .max(4);
+            let at_bytes = (at_elems as u64).saturating_mul(4);
+            check_storage_buffer_limits(&self.engine.device, "eval-states-at", at_bytes)?;
+            let out_bytes = ((2 * n_states).max(4) * 4) as u64;
+            check_storage_buffer_limits(&self.engine.device, "eval-states-out", out_bytes)?;
+            let max_wg = self
+                .engine
+                .device
+                .limits()
+                .max_compute_workgroups_per_dimension as usize;
+            let eval_wgs = n_states.div_ceil(64);
+            if eval_wgs > max_wg {
+                return Err(format!(
+                    "bayes_sa_gpu eval_states workgroups ({eval_wgs}) exceed max_compute_workgroups_per_dimension ({max_wg})"
+                ));
+            }
+
+            let q36_ints = pack_matrices_q36(matrices);
+
+            let mut at_flat = Vec::with_capacity(at_elems);
+            for at in state_ats {
+                at_flat.extend_from_slice(at);
+            }
+            while at_flat.len() < 4 {
+                at_flat.push(-1);
+            }
+
+            let mut params = BayesGpuParams::zeroed();
+            params.s_len = s_len as u32;
+            params.k_len = k_len as u32;
+            params.replicas = n_states as u32;
+            params.off_f0 = 0;
+            params.off_f1 = (s_len * k_len) as u32;
+
+            let dev = &self.engine.device;
+            let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let dummy_f = [0.0f32; 4];
+            let dummy_i = [0i32; 4];
+            let dummy_f4 = [[0.0f32; 4]; 1];
+            let dummy_u4 = [[0u32; 4]; 2];
+            let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-dummy-ro-f"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-matrices-q36"),
+                contents: bytemuck::cast_slice(&q36_ints),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_out = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bayes-eval-out"),
+                size: out_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-dummy-mat-b"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-at"),
+                contents: bytemuck::cast_slice(&at_flat),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-dummy-pos"),
+                contents: bytemuck::cast_slice(&dummy_i),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-dummy-sf"),
+                contents: bytemuck::cast_slice(&dummy_f4),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-eval-dummy-su"),
+                contents: bytemuck::cast_slice(&dummy_u4),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bayes-eval-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: u_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_ro_f.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b_ro_i.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: b_out.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: b_mat_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: b_at.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: b_pos.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: b_sf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: b_su.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bayes-eval-enc"),
+            });
+            {
+                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("bayes-eval-pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.eval_states_pipeline);
+                cpass.set_bind_group(0, &bg, &[]);
+                cpass.dispatch_workgroups((n_states as u32).div_ceil(64), 1, 1);
+            }
+            self.engine.queue.submit(Some(enc.finish()));
+
+            let raw_out: Vec<u32> =
+                self.read_gpu_vec_checked(&b_out, out_bytes, "eval-states readback")?;
+            Ok((0..n_states)
+                .map(|i| {
+                    let lo = raw_out[2 * i];
+                    let hi = raw_out[2 * i + 1];
+                    if hi == 0x7FFF_FFFF && lo == 0xFFFF_FFFF {
+                        FORBID_ENERGY
+                    } else {
+                        let q = (((hi as u64) << 32) | (lo as u64)) as i64;
+                        (q as f64) * (1.0 / Q36_SCALE)
+                    }
+                })
+                .collect())
+        }
     }
 
     /// Execute a single stage of WebGPU MCMC with caller-specified `max_chunk_steps` (`<= 4,096`)
@@ -1010,246 +1234,279 @@ impl BayesSaGpuSolver {
         max_chunk_steps: u32,
         force_global_kernel: bool,
     ) -> Result<BayesGpuStageTrajectory, String> {
-        let r_cnt = cur_ats.len();
-        if r_cnt == 0 {
-            return Err("replicas must be >= 1".to_string());
-        }
-        let s_len = matrices.e_unary.rows;
-        let k_len = matrices.e_unary.cols;
-        validate_bayes_gpu_buffer_budget(&self.engine.device, s_len, k_len, r_cnt)?;
-
-        let ro_f = pack_matrices_f32(matrices);
-        let (tbl_offs, ro_i) = pack_move_tables_buffer(tables);
-        check_storage_buffer_limits(&self.engine.device, "stage-ro-f", (ro_f.len() * 4) as u64)?;
-        check_storage_buffer_limits(&self.engine.device, "stage-ro-i", (ro_i.len() * 4) as u64)?;
-
-        let mut at_flat = Vec::with_capacity(2 * r_cnt * k_len);
-        for at in cur_ats {
-            at_flat.extend_from_slice(at);
-        }
-        for at in cur_ats {
-            at_flat.extend_from_slice(at);
-        }
-        let mut pos_flat = Vec::with_capacity(r_cnt * s_len);
-        for p in cur_poss {
-            pos_flat.extend_from_slice(p);
-        }
-        while at_flat.len() < 4 {
-            at_flat.push(-1);
-        }
-        while pos_flat.len() < 4 {
-            pos_flat.push(-1);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (
+                matrices,
+                tables,
+                cur_ats,
+                cur_poss,
+                cur_energies,
+                sub_seeds,
+                temp,
+                stage_steps,
+                max_fragment_len,
+                max_chunk_steps,
+                force_global_kernel,
+            );
+            Err(
+                "synchronous WebGPU stage trajectory readback is unsupported on wasm32; use async pipeline or CPU solver"
+                    .to_string(),
+            )
         }
 
-        let stats_f_init: Vec<[f32; 4]> = (0..r_cnt)
-            .map(|r| {
-                let e = cur_energies[r] as f32;
-                [e, e, 0.0, 0.0]
-            })
-            .collect();
-        let mut state_u_init = vec![[0u32; 4]; 2 * r_cnt];
-        for r in 0..r_cnt {
-            state_u_init[r_cnt + r] = seed_xoshiro128(sub_seeds[r]);
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let r_cnt = cur_ats.len();
+            if r_cnt == 0 {
+                return Err("replicas must be >= 1".to_string());
+            }
+            let s_len = matrices.e_unary.rows;
+            let k_len = matrices.e_unary.cols;
+            validate_bayes_gpu_buffer_budget(&self.engine.device, s_len, k_len, r_cnt)?;
 
-        let n_fk = tables.free_k.len();
-        let n_fs = tables.free_s.len();
-        let has_cands = tables.cand_m > 0;
-        let r_glob = if n_fs > 0 {
-            (if has_cands { 0.22 } else { 0.62 }) / (n_fs as f32)
-        } else {
-            0.0
-        };
-        let r_cand = if has_cands {
-            0.40 / (tables.cand_m as f32)
-        } else {
-            0.0
-        };
-        let r_ext = 0.19_f32 / 8.0;
+            let ro_f = pack_matrices_f32(matrices);
+            let (tbl_offs, ro_i) = pack_move_tables_buffer(tables);
+            check_storage_buffer_limits(
+                &self.engine.device,
+                "stage-ro-f",
+                (ro_f.len() * 4) as u64,
+            )?;
+            check_storage_buffer_limits(
+                &self.engine.device,
+                "stage-ro-i",
+                (ro_i.len() * 4) as u64,
+            )?;
 
-        let mut base_params = BayesGpuParams::zeroed();
-        base_params.s_len = s_len as u32;
-        base_params.k_len = k_len as u32;
-        base_params.replicas = r_cnt as u32;
-        base_params.n_fk = n_fk as u32;
-        base_params.n_fs = n_fs as u32;
-        base_params.cand_m = tables.cand_m as u32;
-        base_params.max_w = max_fragment_len.clamp(2, 32) as u32;
-        base_params.stage_steps = stage_steps as u32;
-        base_params.burn_in = (stage_steps / 2) as u32;
-        base_params.inv_temp = (1.0 / temp.max(1e-6)) as f32;
-        base_params.r_glob = r_glob;
-        base_params.r_cand = r_cand;
-        base_params.r_ext = r_ext;
-        base_params.off_f0 = 0;
-        base_params.off_f1 = (s_len * k_len) as u32;
-        base_params.off_i0 = tbl_offs[0];
-        base_params.off_i1 = tbl_offs[1];
-        base_params.off_i2 = tbl_offs[2];
-        base_params.off_i3 = tbl_offs[3];
-        base_params.off_i4 = tbl_offs[4];
-        base_params.off_i5 = tbl_offs[5];
-        base_params.off_i6 = tbl_offs[6];
-        base_params.off_i7 = tbl_offs[7];
+            let mut at_flat = Vec::with_capacity(2 * r_cnt * k_len);
+            for at in cur_ats {
+                at_flat.extend_from_slice(at);
+            }
+            for at in cur_ats {
+                at_flat.extend_from_slice(at);
+            }
+            let mut pos_flat = Vec::with_capacity(r_cnt * s_len);
+            for p in cur_poss {
+                pos_flat.extend_from_slice(p);
+            }
+            while at_flat.len() < 4 {
+                at_flat.push(-1);
+            }
+            while pos_flat.len() < 4 {
+                pos_flat.push(-1);
+            }
 
-        let dev = &self.engine.device;
-        let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-params"),
-            contents: bytemuck::bytes_of(&base_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-ro-f"),
-            contents: bytemuck::cast_slice(&ro_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-ro-i"),
-            contents: bytemuck::cast_slice(&ro_i),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let dummy_f = [0.0f32; 4];
-        let b_mat_a = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-dummy-a"),
-            contents: bytemuck::cast_slice(&dummy_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-dummy-b"),
-            contents: bytemuck::cast_slice(&dummy_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-at"),
-            contents: bytemuck::cast_slice(&at_flat),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-pos"),
-            contents: bytemuck::cast_slice(&pos_flat),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-sf"),
-            contents: bytemuck::cast_slice(&stats_f_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-raw-su"),
-            contents: bytemuck::cast_slice(&state_u_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+            let stats_f_init: Vec<[f32; 4]> = (0..r_cnt)
+                .map(|r| {
+                    let e = cur_energies[r] as f32;
+                    [e, e, 0.0, 0.0]
+                })
+                .collect();
+            let mut state_u_init = vec![[0u32; 4]; 2 * r_cnt];
+            for r in 0..r_cnt {
+                state_u_init[r_cnt + r] = seed_xoshiro128(sub_seeds[r]);
+            }
 
-        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bayes-raw-bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_ro_f.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_ro_i.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: b_mat_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: b_mat_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: b_at.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: b_pos.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: b_sf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: b_su.as_entire_binding(),
-                },
-            ],
-        });
+            let n_fk = tables.free_k.len();
+            let n_fs = tables.free_s.len();
+            let has_cands = tables.cand_m > 0;
+            let r_glob = if n_fs > 0 {
+                (if has_cands { 0.22 } else { 0.62 }) / (n_fs as f32)
+            } else {
+                0.0
+            };
+            let r_cand = if has_cands {
+                0.40 / (tables.cand_m as f32)
+            } else {
+                0.0
+            };
+            let r_ext = 0.19_f32 / 8.0;
 
-        let max_dim = s_len.max(k_len);
-        let (pipe, wg_size) = if force_global_kernel || max_dim > 1024 {
-            (&self.anneal_global_pipeline, 32u32)
-        } else if max_dim <= 512 {
-            (&self.anneal_256_pipeline, 8u32)
-        } else {
-            (&self.anneal_1024_pipeline, 4u32)
-        };
-        let n_wg = (r_cnt as u32).div_ceil(wg_size);
-        let chunk_cap = max_chunk_steps.clamp(1, MAX_BAYES_GPU_CHUNK_STEPS) as usize;
+            let mut base_params = BayesGpuParams::zeroed();
+            base_params.s_len = s_len as u32;
+            base_params.k_len = k_len as u32;
+            base_params.replicas = r_cnt as u32;
+            base_params.n_fk = n_fk as u32;
+            base_params.n_fs = n_fs as u32;
+            base_params.cand_m = tables.cand_m as u32;
+            base_params.max_w = max_fragment_len.clamp(2, 32) as u32;
+            base_params.stage_steps = stage_steps as u32;
+            base_params.burn_in = (stage_steps / 2) as u32;
+            base_params.inv_temp = (1.0 / temp.max(1e-6)) as f32;
+            base_params.r_glob = r_glob;
+            base_params.r_cand = r_cand;
+            base_params.r_ext = r_ext;
+            base_params.off_f0 = 0;
+            base_params.off_f1 = (s_len * k_len) as u32;
+            base_params.off_i0 = tbl_offs[0];
+            base_params.off_i1 = tbl_offs[1];
+            base_params.off_i2 = tbl_offs[2];
+            base_params.off_i3 = tbl_offs[3];
+            base_params.off_i4 = tbl_offs[4];
+            base_params.off_i5 = tbl_offs[5];
+            base_params.off_i6 = tbl_offs[6];
+            base_params.off_i7 = tbl_offs[7];
 
-        let mut step_offset = 0usize;
-        loop {
-            let chunk = (stage_steps - step_offset).min(chunk_cap);
-            base_params.step_offset = step_offset as u32;
-            base_params.chunk_steps = chunk as u32;
-            self.engine
-                .queue
-                .write_buffer(&u_params, 0, bytemuck::bytes_of(&base_params));
-
-            let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("bayes-raw-chunk-enc"),
+            let dev = &self.engine.device;
+            let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-params"),
+                contents: bytemuck::bytes_of(&base_params),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-            {
-                let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("bayes-raw-chunk-pass"),
-                    timestamp_writes: None,
+            let b_ro_f = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-ro-f"),
+                contents: bytemuck::cast_slice(&ro_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-ro-i"),
+                contents: bytemuck::cast_slice(&ro_i),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let dummy_f = [0.0f32; 4];
+            let b_mat_a = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-dummy-a"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-dummy-b"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-at"),
+                contents: bytemuck::cast_slice(&at_flat),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-pos"),
+                contents: bytemuck::cast_slice(&pos_flat),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-sf"),
+                contents: bytemuck::cast_slice(&stats_f_init),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-raw-su"),
+                contents: bytemuck::cast_slice(&state_u_init),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bayes-raw-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: u_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_ro_f.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b_ro_i.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: b_mat_a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: b_mat_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: b_at.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: b_pos.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: b_sf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: b_su.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let max_dim = s_len.max(k_len);
+            let (kernel_tier, wg_size) = select_bayes_gpu_kernel_tier(max_dim, force_global_kernel);
+            let pipe = match kernel_tier {
+                BayesGpuKernelTier::Sram512 => &self.anneal_256_pipeline,
+                BayesGpuKernelTier::Sram1024 => &self.anneal_1024_pipeline,
+                BayesGpuKernelTier::GlobalStorage => &self.anneal_global_pipeline,
+            };
+            let n_wg = (r_cnt as u32).div_ceil(wg_size);
+            let chunk_cap = max_chunk_steps.clamp(1, MAX_BAYES_GPU_CHUNK_STEPS) as usize;
+
+            let mut step_offset = 0usize;
+            loop {
+                let chunk = (stage_steps - step_offset).min(chunk_cap);
+                base_params.step_offset = step_offset as u32;
+                base_params.chunk_steps = chunk as u32;
+                self.engine
+                    .queue
+                    .write_buffer(&u_params, 0, bytemuck::bytes_of(&base_params));
+
+                let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bayes-raw-chunk-enc"),
                 });
-                cpass.set_pipeline(pipe);
-                cpass.set_bind_group(0, &bg, &[]);
-                cpass.dispatch_workgroups(n_wg, 1, 1);
+                {
+                    let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("bayes-raw-chunk-pass"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(pipe);
+                    cpass.set_bind_group(0, &bg, &[]);
+                    cpass.dispatch_workgroups(n_wg, 1, 1);
+                }
+                self.engine.queue.submit(Some(enc.finish()));
+
+                step_offset += chunk;
+                if step_offset >= stage_steps {
+                    break;
+                }
             }
-            self.engine.queue.submit(Some(enc.finish()));
 
-            step_offset += chunk;
-            if step_offset >= stage_steps {
-                break;
+            let at_out: Vec<i32> =
+                self.read_gpu_vec_checked(&b_at, (at_flat.len() * 4) as u64, "stage-at readback")?;
+            let pos_out: Vec<i32> = self.read_gpu_vec_checked(
+                &b_pos,
+                (pos_flat.len() * 4) as u64,
+                "stage-pos readback",
+            )?;
+            let sf_out: Vec<[f32; 4]> =
+                self.read_gpu_vec_checked(&b_sf, (r_cnt * 16) as u64, "stage-sf readback")?;
+            let su_all: Vec<[u32; 4]> =
+                self.read_gpu_vec_checked(&b_su, (2 * r_cnt * 16) as u64, "stage-su readback")?;
+
+            let mut out_cur_ats = Vec::with_capacity(r_cnt);
+            let mut out_best_ats = Vec::with_capacity(r_cnt);
+            let mut out_cur_poss = Vec::with_capacity(r_cnt);
+            for r in 0..r_cnt {
+                out_cur_ats.push(at_out[r * k_len..(r + 1) * k_len].to_vec());
+                out_best_ats.push(at_out[(r_cnt + r) * k_len..(r_cnt + r + 1) * k_len].to_vec());
+                out_cur_poss.push(pos_out[r * s_len..(r + 1) * s_len].to_vec());
             }
+
+            Ok(BayesGpuStageTrajectory {
+                kernel_tier,
+                cur_ats: out_cur_ats,
+                best_ats: out_best_ats,
+                cur_positions: out_cur_poss,
+                stats_float: sf_out,
+                stats_uint: su_all[..r_cnt].to_vec(),
+            })
         }
-
-        let at_out: Vec<i32> = self
-            .engine
-            .read_buffer_vec(&b_at, (at_flat.len() * 4) as u64)?;
-        let pos_out: Vec<i32> = self
-            .engine
-            .read_buffer_vec(&b_pos, (pos_flat.len() * 4) as u64)?;
-        let sf_out: Vec<[f32; 4]> = self.engine.read_buffer_vec(&b_sf, (r_cnt * 16) as u64)?;
-        let su_all: Vec<[u32; 4]> = self
-            .engine
-            .read_buffer_vec(&b_su, (2 * r_cnt * 16) as u64)?;
-
-        let mut out_cur_ats = Vec::with_capacity(r_cnt);
-        let mut out_best_ats = Vec::with_capacity(r_cnt);
-        let mut out_cur_poss = Vec::with_capacity(r_cnt);
-        for r in 0..r_cnt {
-            out_cur_ats.push(at_out[r * k_len..(r + 1) * k_len].to_vec());
-            out_best_ats.push(at_out[(r_cnt + r) * k_len..(r_cnt + r + 1) * k_len].to_vec());
-            out_cur_poss.push(pos_out[r * s_len..(r + 1) * s_len].to_vec());
-        }
-
-        Ok(BayesGpuStageTrajectory {
-            cur_ats: out_cur_ats,
-            best_ats: out_best_ats,
-            cur_positions: out_cur_poss,
-            stats_float: sf_out,
-            stats_uint: su_all[..r_cnt].to_vec(),
-        })
     }
 
     /// Run full multi-replica specific-heat ($C_v(T)$) adaptive simulated annealing on WebGPU,
@@ -1262,357 +1519,345 @@ impl BayesSaGpuSolver {
         priors: &Priors,
         cfg: &BayesSaConfig,
     ) -> Result<(AssignResult, BayesSaReport), String> {
-        let (matrices, gpu_mat_b_opt) =
-            self.compute_energy_matrices_with_gpu_buf(systems, sequence, priors, cfg)?;
-        if systems.is_empty() || sequence.is_empty() {
-            return Ok(finalize_bayes_sa_from_replicas(
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (peaks, systems, sequence, priors, cfg);
+            Err(
+                "synchronous WebGPU Bayesian SA readback is unsupported on wasm32; use async pipeline or CPU solver"
+                    .to_string(),
+            )
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (matrices, gpu_mat_b_opt) =
+                self.compute_energy_matrices_with_gpu_buf(systems, sequence, priors, cfg)?;
+            if systems.is_empty() || sequence.is_empty() {
+                return Ok(finalize_bayes_sa_from_replicas(
+                    peaks,
+                    systems,
+                    sequence,
+                    priors,
+                    cfg,
+                    &matrices,
+                    &[],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+
+            let s_len = matrices.e_unary.rows;
+            let k_len = matrices.e_unary.cols;
+            let r_cnt = cfg.replicas.max(1);
+            validate_bayes_gpu_buffer_budget(&self.engine.device, s_len, k_len, r_cnt)?;
+
+            let tables = build_bayes_move_tables(&matrices, cfg);
+            let (tbl_offs, ro_i) = pack_move_tables_buffer(&tables);
+            check_storage_buffer_limits(
+                &self.engine.device,
+                "anneal-move-tables",
+                (ro_i.len() * 4) as u64,
+            )?;
+
+            let mut master_rng = Rng::new(cfg.seed);
+            let (init_ats, init_poss, init_es, sub_seeds) =
+                build_initial_bayes_replicas(&matrices, &tables, r_cnt, &mut master_rng);
+
+            let mut at_flat = Vec::with_capacity(2 * r_cnt * k_len);
+            for at in &init_ats {
+                at_flat.extend_from_slice(at);
+            }
+            for at in &init_ats {
+                at_flat.extend_from_slice(at);
+            }
+            let mut pos_flat = Vec::with_capacity(r_cnt * s_len);
+            for p in &init_poss {
+                pos_flat.extend_from_slice(p);
+            }
+            while at_flat.len() < 4 {
+                at_flat.push(-1);
+            }
+            while pos_flat.len() < 4 {
+                pos_flat.push(-1);
+            }
+
+            let stats_f_init: Vec<[f32; 4]> = (0..r_cnt)
+                .map(|r| {
+                    let e = init_es[r] as f32;
+                    [e, e, 0.0, 0.0]
+                })
+                .collect();
+            let mut state_u_init = vec![[0u32; 4]; 2 * r_cnt];
+            for r in 0..r_cnt {
+                state_u_init[r_cnt + r] = seed_xoshiro128(sub_seeds[r]);
+            }
+
+            let n_fk = tables.free_k.len();
+            let n_fs = tables.free_s.len();
+            let has_cands = tables.cand_m > 0;
+            let r_glob = if n_fs > 0 {
+                (if has_cands { 0.22 } else { 0.62 }) / (n_fs as f32)
+            } else {
+                0.0
+            };
+            let r_cand = if has_cands {
+                0.40 / (tables.cand_m as f32)
+            } else {
+                0.0
+            };
+            let r_ext = 0.19_f32 / 8.0;
+
+            let mut base_params = BayesGpuParams::zeroed();
+            base_params.s_len = s_len as u32;
+            base_params.k_len = k_len as u32;
+            base_params.replicas = r_cnt as u32;
+            base_params.n_fk = n_fk as u32;
+            base_params.n_fs = n_fs as u32;
+            base_params.cand_m = tables.cand_m as u32;
+            base_params.max_w = cfg.max_fragment_len.clamp(2, 32) as u32;
+            base_params.r_glob = r_glob;
+            base_params.r_cand = r_cand;
+            base_params.r_ext = r_ext;
+            base_params.off_f0 = 0;
+            base_params.off_f1 = (s_len * k_len) as u32;
+            base_params.off_i0 = tbl_offs[0];
+            base_params.off_i1 = tbl_offs[1];
+            base_params.off_i2 = tbl_offs[2];
+            base_params.off_i3 = tbl_offs[3];
+            base_params.off_i4 = tbl_offs[4];
+            base_params.off_i5 = tbl_offs[5];
+            base_params.off_i6 = tbl_offs[6];
+            base_params.off_i7 = tbl_offs[7];
+
+            let dev = &self.engine.device;
+            let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-params"),
+                contents: bytemuck::bytes_of(&base_params),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let b_ro_f = match gpu_mat_b_opt {
+                Some(buf) => buf,
+                None => {
+                    let ro_f = pack_matrices_f32(&matrices);
+                    dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("bayes-anneal-ro-f"),
+                        contents: bytemuck::cast_slice(&ro_f),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+                }
+            };
+            let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-ro-i"),
+                contents: bytemuck::cast_slice(&ro_i),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let dummy_f = [0.0f32; 4];
+            let b_mat_a = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-dummy-a"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-dummy-b"),
+                contents: bytemuck::cast_slice(&dummy_f),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-at"),
+                contents: bytemuck::cast_slice(&at_flat),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-pos"),
+                contents: bytemuck::cast_slice(&pos_flat),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-sf"),
+                contents: bytemuck::cast_slice(&stats_f_init),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bayes-anneal-su"),
+                contents: bytemuck::cast_slice(&state_u_init),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bayes-anneal-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: u_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: b_ro_f.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b_ro_i.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: b_mat_a.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: b_mat_b.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: b_at.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: b_pos.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: b_sf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: b_su.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let max_dim = s_len.max(k_len);
+            let (kernel_tier, wg_size) = select_bayes_gpu_kernel_tier(max_dim, false);
+            let pipe = match kernel_tier {
+                BayesGpuKernelTier::Sram512 => &self.anneal_256_pipeline,
+                BayesGpuKernelTier::Sram1024 => &self.anneal_1024_pipeline,
+                BayesGpuKernelTier::GlobalStorage => &self.anneal_global_pipeline,
+            };
+            let n_wg = (r_cnt as u32).div_ceil(wg_size);
+            let chunk_cap = bayes_gpu_chunk_steps_for_dim(max_dim) as usize;
+
+            let sf_bytes = (r_cnt * 16) as u64;
+            let su_head_bytes = (r_cnt * 16) as u64;
+            let telem_bytes = sf_bytes + su_head_bytes;
+            let b_telem_staging = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bayes-anneal-telem-staging"),
+                size: telem_bytes.max(wgpu::COPY_BUFFER_ALIGNMENT),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut telem_u32 = vec![0u32; r_cnt * 8];
+            let mut driver = BayesScheduleDriver::new(cfg, matrices.active_slots, r_cnt);
+
+            while !driver.done {
+                let stage_steps = driver.stage_steps.max(1);
+                base_params.stage_steps = stage_steps as u32;
+                base_params.burn_in = (if driver.stage == 0 {
+                    (3 * stage_steps) / 4
+                } else {
+                    stage_steps / 2
+                }) as u32;
+                base_params.inv_temp = (1.0 / driver.temp.max(1e-6)) as f32;
+
+                let mut step_offset = 0usize;
+                while step_offset < stage_steps {
+                    let chunk = (stage_steps - step_offset).min(chunk_cap);
+                    let is_last_chunk = step_offset + chunk >= stage_steps;
+                    base_params.step_offset = step_offset as u32;
+                    base_params.chunk_steps = chunk as u32;
+                    self.engine
+                        .queue
+                        .write_buffer(&u_params, 0, bytemuck::bytes_of(&base_params));
+
+                    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("bayes-anneal-chunk-enc"),
+                    });
+                    {
+                        let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("bayes-anneal-chunk-pass"),
+                            timestamp_writes: None,
+                        });
+                        cpass.set_pipeline(pipe);
+                        cpass.set_bind_group(0, &bg, &[]);
+                        cpass.dispatch_workgroups(n_wg, 1, 1);
+                    }
+                    if is_last_chunk {
+                        enc.copy_buffer_to_buffer(&b_sf, 0, &b_telem_staging, 0, sf_bytes);
+                        enc.copy_buffer_to_buffer(
+                            &b_su,
+                            0,
+                            &b_telem_staging,
+                            sf_bytes,
+                            su_head_bytes,
+                        );
+                    }
+                    self.engine.queue.submit(Some(enc.finish()));
+                    step_offset += chunk;
+                }
+
+                let telem_raw = self.map_and_read_staging_bytes(
+                    &b_telem_staging,
+                    telem_bytes,
+                    "anneal-telemetry readback",
+                )?;
+                let words: &[u32] = bytemuck::cast_slice(&telem_raw[..(telem_u32.len() * 4)]);
+                telem_u32.copy_from_slice(words);
+                let sf_u32_len = r_cnt * 4;
+
+                for r in 0..r_cnt {
+                    let sf_base = r * 4;
+                    let su_base = sf_u32_len + r * 4;
+                    let best_r = f32::from_bits(telem_u32[sf_base + 1]);
+                    let mean_r = f32::from_bits(telem_u32[sf_base + 2]);
+                    let m2_r = f32::from_bits(telem_u32[sf_base + 3]);
+                    driver.rep_stats[r] = (
+                        mean_r as f64,
+                        (m2_r as f64).max(0.0),
+                        telem_u32[su_base] as usize,
+                        telem_u32[su_base + 1] as usize,
+                        telem_u32[su_base + 2] as usize,
+                        best_r as f64,
+                    );
+                }
+                driver.advance_after_stage(cfg);
+            }
+
+            let at_out: Vec<i32> = self.read_gpu_vec_checked(
+                &b_at,
+                (at_flat.len() * 4) as u64,
+                "anneal-final-at readback",
+            )?;
+            let sf_final: Vec<[f32; 4]> =
+                self.read_gpu_vec_checked(&b_sf, sf_bytes, "anneal-final-sf readback")?;
+
+            let mut best_ats = Vec::with_capacity(r_cnt);
+            let mut best_es = Vec::with_capacity(r_cnt);
+            let mut final_es = Vec::with_capacity(r_cnt);
+            for r in 0..r_cnt {
+                let cur_at = &at_out[r * k_len..(r + 1) * k_len];
+                let best_at = at_out[(r_cnt + r) * k_len..(r_cnt + r + 1) * k_len].to_vec();
+                let exact_fin =
+                    evaluate_state_energy(cur_at, &matrices).unwrap_or(sf_final[r][0] as f64);
+                best_ats.push(best_at);
+                best_es.push(sf_final[r][1] as f64);
+                final_es.push(exact_fin);
+            }
+
+            Ok(finalize_bayes_sa_from_replicas(
                 peaks,
                 systems,
                 sequence,
                 priors,
                 cfg,
                 &matrices,
-                &[],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                false,
-            ));
+                &best_ats,
+                best_es,
+                final_es,
+                driver.trajectory,
+                driver.converged_early,
+            ))
         }
-
-        let s_len = matrices.e_unary.rows;
-        let k_len = matrices.e_unary.cols;
-        let r_cnt = cfg.replicas.max(1);
-        validate_bayes_gpu_buffer_budget(&self.engine.device, s_len, k_len, r_cnt)?;
-
-        let tables = build_bayes_move_tables(&matrices, cfg);
-        let (tbl_offs, ro_i) = pack_move_tables_buffer(&tables);
-        check_storage_buffer_limits(
-            &self.engine.device,
-            "anneal-move-tables",
-            (ro_i.len() * 4) as u64,
-        )?;
-
-        let mut master_rng = Rng::new(cfg.seed);
-        let (init_ats, init_poss, init_es, sub_seeds) =
-            build_initial_bayes_replicas(&matrices, &tables, r_cnt, &mut master_rng);
-
-        let mut at_flat = Vec::with_capacity(2 * r_cnt * k_len);
-        for at in &init_ats {
-            at_flat.extend_from_slice(at);
-        }
-        for at in &init_ats {
-            at_flat.extend_from_slice(at);
-        }
-        let mut pos_flat = Vec::with_capacity(r_cnt * s_len);
-        for p in &init_poss {
-            pos_flat.extend_from_slice(p);
-        }
-        while at_flat.len() < 4 {
-            at_flat.push(-1);
-        }
-        while pos_flat.len() < 4 {
-            pos_flat.push(-1);
-        }
-
-        let stats_f_init: Vec<[f32; 4]> = (0..r_cnt)
-            .map(|r| {
-                let e = init_es[r] as f32;
-                [e, e, 0.0, 0.0]
-            })
-            .collect();
-        let mut state_u_init = vec![[0u32; 4]; 2 * r_cnt];
-        for r in 0..r_cnt {
-            state_u_init[r_cnt + r] = seed_xoshiro128(sub_seeds[r]);
-        }
-
-        let n_fk = tables.free_k.len();
-        let n_fs = tables.free_s.len();
-        let has_cands = tables.cand_m > 0;
-        let r_glob = if n_fs > 0 {
-            (if has_cands { 0.22 } else { 0.62 }) / (n_fs as f32)
-        } else {
-            0.0
-        };
-        let r_cand = if has_cands {
-            0.40 / (tables.cand_m as f32)
-        } else {
-            0.0
-        };
-        let r_ext = 0.19_f32 / 8.0;
-
-        let mut base_params = BayesGpuParams::zeroed();
-        base_params.s_len = s_len as u32;
-        base_params.k_len = k_len as u32;
-        base_params.replicas = r_cnt as u32;
-        base_params.n_fk = n_fk as u32;
-        base_params.n_fs = n_fs as u32;
-        base_params.cand_m = tables.cand_m as u32;
-        base_params.max_w = cfg.max_fragment_len.clamp(2, 32) as u32;
-        base_params.r_glob = r_glob;
-        base_params.r_cand = r_cand;
-        base_params.r_ext = r_ext;
-        base_params.off_f0 = 0;
-        base_params.off_f1 = (s_len * k_len) as u32;
-        base_params.off_i0 = tbl_offs[0];
-        base_params.off_i1 = tbl_offs[1];
-        base_params.off_i2 = tbl_offs[2];
-        base_params.off_i3 = tbl_offs[3];
-        base_params.off_i4 = tbl_offs[4];
-        base_params.off_i5 = tbl_offs[5];
-        base_params.off_i6 = tbl_offs[6];
-        base_params.off_i7 = tbl_offs[7];
-
-        let dev = &self.engine.device;
-        let u_params = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-params"),
-            contents: bytemuck::bytes_of(&base_params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let b_ro_f = match gpu_mat_b_opt {
-            Some(buf) => buf,
-            None => {
-                let ro_f = pack_matrices_f32(&matrices);
-                dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("bayes-anneal-ro-f"),
-                    contents: bytemuck::cast_slice(&ro_f),
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
-            }
-        };
-        let b_ro_i = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-ro-i"),
-            contents: bytemuck::cast_slice(&ro_i),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let dummy_f = [0.0f32; 4];
-        let b_mat_a = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-dummy-a"),
-            contents: bytemuck::cast_slice(&dummy_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_mat_b = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-dummy-b"),
-            contents: bytemuck::cast_slice(&dummy_f),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let b_at = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-at"),
-            contents: bytemuck::cast_slice(&at_flat),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let b_pos = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-pos"),
-            contents: bytemuck::cast_slice(&pos_flat),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let b_sf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-sf"),
-            contents: bytemuck::cast_slice(&stats_f_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let b_su = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bayes-anneal-su"),
-            contents: bytemuck::cast_slice(&state_u_init),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-
-        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bayes-anneal-bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: u_params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_ro_f.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: b_ro_i.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: b_mat_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: b_mat_b.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: b_at.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: b_pos.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: b_sf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: b_su.as_entire_binding(),
-                },
-            ],
-        });
-
-        let max_dim = s_len.max(k_len);
-        let (pipe, wg_size) = if max_dim <= 512 {
-            (&self.anneal_256_pipeline, 8u32)
-        } else if max_dim <= 1024 {
-            (&self.anneal_1024_pipeline, 4u32)
-        } else {
-            (&self.anneal_global_pipeline, 32u32)
-        };
-        let n_wg = (r_cnt as u32).div_ceil(wg_size);
-        let chunk_cap = bayes_gpu_chunk_steps_for_dim(max_dim) as usize;
-
-        let sf_bytes = (r_cnt * 16) as u64;
-        let su_head_bytes = (r_cnt * 16) as u64;
-        let telem_bytes = sf_bytes + su_head_bytes;
-        let b_telem_staging = dev.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("bayes-anneal-telem-staging"),
-            size: telem_bytes.max(wgpu::COPY_BUFFER_ALIGNMENT),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut telem_u32 = vec![0u32; r_cnt * 8];
-        let mut driver = BayesScheduleDriver::new(cfg, matrices.active_slots, r_cnt);
-
-        while !driver.done {
-            let stage_steps = driver.stage_steps.max(1);
-            base_params.stage_steps = stage_steps as u32;
-            base_params.burn_in = (if driver.stage == 0 {
-                (3 * stage_steps) / 4
-            } else {
-                stage_steps / 2
-            }) as u32;
-            base_params.inv_temp = (1.0 / driver.temp.max(1e-6)) as f32;
-
-            let mut step_offset = 0usize;
-            let mut last_sub_idx: Option<wgpu::SubmissionIndex> = None;
-            while step_offset < stage_steps {
-                let chunk = (stage_steps - step_offset).min(chunk_cap);
-                let is_last_chunk = step_offset + chunk >= stage_steps;
-                base_params.step_offset = step_offset as u32;
-                base_params.chunk_steps = chunk as u32;
-                self.engine
-                    .queue
-                    .write_buffer(&u_params, 0, bytemuck::bytes_of(&base_params));
-
-                let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("bayes-anneal-chunk-enc"),
-                });
-                {
-                    let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("bayes-anneal-chunk-pass"),
-                        timestamp_writes: None,
-                    });
-                    cpass.set_pipeline(pipe);
-                    cpass.set_bind_group(0, &bg, &[]);
-                    cpass.dispatch_workgroups(n_wg, 1, 1);
-                }
-                if is_last_chunk {
-                    enc.copy_buffer_to_buffer(&b_sf, 0, &b_telem_staging, 0, sf_bytes);
-                    enc.copy_buffer_to_buffer(&b_su, 0, &b_telem_staging, sf_bytes, su_head_bytes);
-                }
-                let sub = self.engine.queue.submit(Some(enc.finish()));
-                if is_last_chunk {
-                    last_sub_idx = Some(sub);
-                }
-                step_offset += chunk;
-            }
-
-            {
-                let slice = b_telem_staging.slice(0..telem_bytes);
-                let res_cell = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let cb_cell = std::sync::Arc::clone(&res_cell);
-                slice.map_async(wgpu::MapMode::Read, move |res| {
-                    if let Ok(mut g) = cb_cell.lock() {
-                        *g = Some(res);
-                    }
-                });
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let _ = dev.poll(wgpu::PollType::Wait {
-                        submission_index: last_sub_idx,
-                        timeout: None,
-                    });
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = last_sub_idx;
-                }
-                let map_res = res_cell
-                    .lock()
-                    .map_err(|_| "telem staging map mutex poisoned".to_string())?
-                    .take()
-                    .ok_or_else(|| "telem staging map_async did not complete".to_string())?;
-                map_res.map_err(|e| format!("telem staging map_async failed: {e}"))?;
-                {
-                    let mapped = slice
-                        .get_mapped_range()
-                        .map_err(|e| format!("telem staging mapped range failed: {e}"))?;
-                    let words: &[u32] = bytemuck::cast_slice(&mapped[..(telem_u32.len() * 4)]);
-                    telem_u32.copy_from_slice(words);
-                }
-                b_telem_staging.unmap();
-            }
-            let sf_u32_len = r_cnt * 4;
-
-            for r in 0..r_cnt {
-                let sf_base = r * 4;
-                let su_base = sf_u32_len + r * 4;
-                let best_r = f32::from_bits(telem_u32[sf_base + 1]);
-                let mean_r = f32::from_bits(telem_u32[sf_base + 2]);
-                let m2_r = f32::from_bits(telem_u32[sf_base + 3]);
-                driver.rep_stats[r] = (
-                    mean_r as f64,
-                    (m2_r as f64).max(0.0),
-                    telem_u32[su_base] as usize,
-                    telem_u32[su_base + 1] as usize,
-                    telem_u32[su_base + 2] as usize,
-                    best_r as f64,
-                );
-            }
-            driver.advance_after_stage(cfg);
-        }
-
-        let at_out: Vec<i32> = self
-            .engine
-            .read_buffer_vec(&b_at, (at_flat.len() * 4) as u64)?;
-        let sf_final: Vec<[f32; 4]> = self.engine.read_buffer_vec(&b_sf, sf_bytes)?;
-
-        let mut best_ats = Vec::with_capacity(r_cnt);
-        let mut best_es = Vec::with_capacity(r_cnt);
-        let mut final_es = Vec::with_capacity(r_cnt);
-        for r in 0..r_cnt {
-            let cur_at = &at_out[r * k_len..(r + 1) * k_len];
-            let best_at = at_out[(r_cnt + r) * k_len..(r_cnt + r + 1) * k_len].to_vec();
-            let exact_fin =
-                evaluate_state_energy(cur_at, &matrices).unwrap_or(sf_final[r][0] as f64);
-            best_ats.push(best_at);
-            best_es.push(sf_final[r][1] as f64);
-            final_es.push(exact_fin);
-        }
-
-        Ok(finalize_bayes_sa_from_replicas(
-            peaks,
-            systems,
-            sequence,
-            priors,
-            cfg,
-            &matrices,
-            &best_ats,
-            best_es,
-            final_es,
-            driver.trajectory,
-            driver.converged_early,
-        ))
     }
 
     /// Run WebGPU Bayesian SA on assembled `SpinSystem`s.

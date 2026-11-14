@@ -245,14 +245,15 @@ impl Default for BayesSaConfig {
 
 impl BayesSaConfig {
     /// Default configuration tuned for massively parallel WebGPU execution (`R = 128` replicas,
-    /// single-submit `<= 2,560` TDR-safe SRAM stage step budget, and 16-entry candidate tables).
+    /// multi-chunk TDR-safe `<= 4,096` steps/submit stage execution, and 16-entry candidate tables).
     pub fn default_gpu() -> Self {
         Self {
             replicas: BAYES_SA_GPU_DEFAULT_REPLICAS,
-            delta_beta_0: 0.170,
-            steps_per_stage_per_active: 14,
-            min_stages: 22,
-            max_stages: 64,
+            t_start: 9.0,
+            delta_beta_0: 0.180,
+            steps_per_stage_per_active: 7,
+            min_stages: 24,
+            max_stages: 44,
             max_fragment_len: 16,
             candidate_list_size: 16,
             ..Self::default()
@@ -2025,7 +2026,16 @@ pub fn next_stage_temperature(
                     (1.56 * geom_step).max(1e-4)
                 }
             } else {
-                cfg.delta_beta_0.max(1e-4)
+                let rem_stages = planned_stages.saturating_sub(stage + 1);
+                if rem_stages == 0 {
+                    return cfg.t_min;
+                }
+                if rem_stages <= 6 {
+                    let rem_log = (current_temp / cfg.t_min.max(1e-6)).max(1.0).ln();
+                    (rem_log / (rem_stages as f64) * denom).max(cfg.delta_beta_0.max(1e-4))
+                } else {
+                    cfg.delta_beta_0.max(1e-4)
+                }
             };
 
             let d_beta = base_beta / denom;
@@ -2040,14 +2050,15 @@ pub fn next_stage_temperature(
     }
 }
 
-/// Determine per-stage step count per replica (`<= 2,560` single-chunk TDR-safe budget for `R >= 64`
-/// GPU ensembles; `<= 12,288` for `R < 64`, honoring `fixed_total_steps` when set).
+/// Determine per-stage step count per replica, scaling linearly with `active_slots` for both
+/// `R >= 64` WebGPU ensembles (`[1_024, 8_192]`, dispatched via `<= 4,096` TDR-safe chunks) and
+/// `R < 64` CPU ensembles (`[512, 12_288]`), honoring `fixed_total_steps` when set.
 #[inline]
 pub fn default_steps_per_stage(cfg: &BayesSaConfig, active_slots: usize) -> usize {
     if let Some(fixed_tot) = cfg.fixed_total_steps {
         (fixed_tot / cfg.max_stages.max(1)).max(64)
     } else if cfg.replicas >= 64 {
-        (cfg.steps_per_stage_per_active.max(1) * active_slots.max(16)).clamp(1_024, 2_560)
+        (cfg.steps_per_stage_per_active.max(1) * active_slots.max(16)).clamp(1_024, 8_192)
     } else {
         (cfg.steps_per_stage_per_active.max(1) * active_slots.max(16)).clamp(512, 12_288)
     }
@@ -3153,7 +3164,13 @@ pub fn finalize_bayes_sa_from_replicas(
             let linked_right = k + 1 < k_len
                 && winner_at[k + 1] >= 0
                 && matrices.e_link.get(s, winner_at[k + 1] as usize) <= -2.0;
-            if (!linked_left && !linked_right) || (confidence[s] < 0.22 && c_rep[s] < 0.20) {
+            let strong_link = (linked_left && linked_right)
+                || (linked_left && matrices.e_link.get(winner_at[k - 1] as usize, s) <= -4.5)
+                || (linked_right && matrices.e_link.get(s, winner_at[k + 1] as usize) <= -4.5);
+            if (!linked_left && !linked_right)
+                || (!strong_link && confidence[s] < 0.22 && c_rep[s] < 0.20)
+                || confidence[s] < 0.08
+            {
                 winner_pos[s] = -1;
                 if winner_at[k] == s as i32 {
                     winner_at[k] = -1;
@@ -3318,7 +3335,12 @@ fn synthesize_and_polish_mbr_consensus(
             let f_u = cnt / n_rep;
             let f_b = w_acc / (w_sum + 2.0);
             let p_ens = 0.50 * f_u + 0.50 * f_b;
-            (p_ens >= 0.14).then_some((s, k, p_ens - 0.002 * e_u.get(s, k)))
+            let min_vote = if matrices.active_slots >= 180 {
+                0.05
+            } else {
+                0.14
+            };
+            (p_ens >= min_vote).then_some((s, k, p_ens - 0.004 * e_u.get(s, k)))
         })
         .collect();
     ranked_pairs.sort_by(|a, b| b.2.total_cmp(&a.2));
@@ -3587,8 +3609,11 @@ fn compute_bayes_marginal_confidence(
     let e_u = &matrices.e_unary;
     let e_l = &matrices.e_link;
 
-    // Identify connected sequential stretches (`E_link(at[k], at[k+1]) <= -1.5`)
+    // Identify connected sequential stretches (`E_link(at[k], at[k+1]) <= -1.5`) and cooperative
+    // multi-residue island support for large multi-domain sequences where independent replicas
+    // nucleate complementary subsets of sequential islands before MBR synthesis.
     let mut chain_len = vec![1usize; s_len];
+    let mut eff_rep_base = c_rep.clone();
     {
         let mut k = 1usize;
         while k < k_len {
@@ -3597,16 +3622,44 @@ fn compute_bayes_marginal_confidence(
                 continue;
             }
             let start = k;
+            let mut neg_link_sum = 0.0_f64;
             while k + 1 < k_len && at[k + 1] >= 0 {
-                if e_l.get(at[k] as usize, at[k + 1] as usize) <= -1.5 {
+                let el = e_l.get(at[k] as usize, at[k + 1] as usize);
+                if el <= -1.5 {
+                    neg_link_sum += -el;
                     k += 1;
                 } else {
                     break;
                 }
             }
             let clen = k - start + 1;
+            let mut sum_r = 0.0_f64;
+            let mut max_r = 0.0_f64;
             for &sp in &at[start..=k] {
-                chain_len[sp as usize] = clen;
+                let su = sp as usize;
+                chain_len[su] = clen;
+                sum_r += c_rep[su];
+                max_r = max_r.max(c_rep[su]);
+            }
+            if clen >= 4 && max_r >= 0.06 {
+                let mean_r = sum_r / (clen as f64);
+                let mean_neg_link = neg_link_sum / ((clen - 1) as f64);
+                let stretch_e = interval_energy(at, e_u, e_l, start, clen);
+                if stretch_e < -(1.5 * (clen as f64)) && mean_neg_link >= 3.5 {
+                    let mut island_floor = 0.75 * mean_r;
+                    if matrices.active_slots >= 180 && mean_r >= 0.06 && mean_neg_link >= 4.0 {
+                        let coop = if mean_r >= 0.14 {
+                            (0.56 + 0.06 * ((clen - 4).min(5) as f64)).min(0.86)
+                        } else {
+                            (0.38 + 0.06 * ((clen - 4).min(5) as f64)).min(0.72)
+                        };
+                        island_floor = island_floor.max(coop);
+                    }
+                    for &sp in &at[start..=k] {
+                        let su = sp as usize;
+                        eff_rep_base[su] = eff_rep_base[su].max(island_floor);
+                    }
+                }
             }
             k += 1;
         }
@@ -3617,7 +3670,7 @@ fn compute_bayes_marginal_confidence(
         .collect();
 
     let clamp_w = |spin_idx: usize| -> f64 {
-        let r = (c_rep[spin_idx] / 0.85).clamp(0.0, 1.0);
+        let r = (eff_rep_base[spin_idx] / 0.85).clamp(0.0, 1.0);
         r * r
     };
 
@@ -3636,7 +3689,7 @@ fn compute_bayes_marginal_confidence(
 
     for s in 0..s_len {
         let k_raw = pos[s];
-        if k_raw < 0 || c_rep[s] <= 0.0 {
+        if k_raw < 0 || eff_rep_base[s] <= 0.0 {
             continue;
         }
         let k = k_raw as usize;
@@ -3724,11 +3777,12 @@ fn compute_bayes_marginal_confidence(
         }
 
         let p_local = 1.0 / (1.0 + alt_part);
-        let eff_c_rep = if chain_len[s] >= 3 && c_rep[s] >= 0.42 && p_local >= 0.92 {
+        let base_r = eff_rep_base[s];
+        let eff_c_rep = if chain_len[s] >= 3 && base_r >= 0.42 && p_local >= 0.92 {
             let boost = 0.06 * ((chain_len[s] - 2).min(4) as f64);
-            (c_rep[s] + boost).clamp(0.0, 0.995)
+            (base_r + boost).clamp(0.0, 0.995)
         } else {
-            c_rep[s]
+            base_r
         };
         let p_joint = (eff_c_rep * p_local).clamp(0.0, 1.0);
         let p_min = eff_c_rep.min(p_local);

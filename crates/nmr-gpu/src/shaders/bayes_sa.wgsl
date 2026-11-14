@@ -637,8 +637,7 @@ fn eval_full_wg(base_k: u32) -> f32 {
     return sum;
 }
 
-fn site_e_wg(base_k: u32, k: u32) -> f32 {
-    let s = wg_get_at(base_k, k);
+fn site_e_cand_wg(base_k: u32, k: u32, s: i32) -> f32 {
     if (s < 0) {
         return 0.0;
     }
@@ -659,11 +658,11 @@ fn site_e_wg(base_k: u32, k: u32) -> f32 {
     return e;
 }
 
-fn two_site_e_wg(base_k: u32, ka: u32, kb: u32) -> f32 {
-    let lo = min(ka, kb);
-    let hi = max(ka, kb);
-    let slo = wg_get_at(base_k, lo);
-    let shi = wg_get_at(base_k, hi);
+fn two_site_e_cand_wg(base_k: u32, ka: u32, sa: i32, kb: u32, sb: i32) -> f32 {
+    let lo = select(kb, ka, ka < kb);
+    let hi = select(ka, kb, ka < kb);
+    let slo = select(sb, sa, ka < kb);
+    let shi = select(sa, sb, ka < kb);
     var e: f32 = 0.0;
     if (slo >= 0) {
         let su = u32(slo);
@@ -672,7 +671,7 @@ fn two_site_e_wg(base_k: u32, ka: u32, kb: u32) -> f32 {
             let sl = wg_get_at(base_k, lo - 1u);
             if (sl >= 0) { e = e + get_el(u32(sl), su); }
         }
-        let sr = wg_get_at(base_k, lo + 1u);
+        let sr = select(wg_get_at(base_k, lo + 1u), shi, hi == lo + 1u);
         if (sr >= 0) { e = e + get_el(su, u32(sr)); }
     }
     if (shi >= 0) {
@@ -788,6 +787,15 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
     let inv_t = params.inv_temp;
     let max_w = clamp(params.max_w, 2u, 32u);
     let has_cands = params.cand_m > 0u;
+    let w_pair_min = max(params.r_glob, 1.0e-12);
+    let w_pair_max = params.r_glob + params.r_cand + 2.0 * params.r_ext;
+    let max_log_pair = log(w_pair_max / w_pair_min) + 1.0e-4;
+    let max_log_restore_evict = max_log_pair
+        + log(1.0 / max(P_RESTORE_EVICT * (0.50 / max(n_fk_f, 1.0)), 1.0e-12))
+        + 1.0e-4;
+    let max_log_evict = max_log_pair
+        + log((P_RESTORE_EVICT * ((0.50 / max(n_fk_f, 1.0)) + 0.0625)) / P_EVICT_WHEN_SWAP_OK)
+        + 1.0e-4;
 
     for (var step_local: u32 = 0u; step_local < params.chunk_steps; step_local = step_local + 1u) {
         let global_step = params.step_offset + step_local;
@@ -816,19 +824,16 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                 if (s1 != s2
                     && (s1 < 0 || get_eu(u32(s1), k2) < FORBID_HALF)
                     && (s2 < 0 || get_eu(u32(s2), k1) < FORBID_HALF)) {
-                    let before = two_site_e_wg(base, k1, k2);
-                    wg_set_at(base, k1, s2);
-                    wg_set_at(base, k2, s1);
-                    let after = two_site_e_wg(base, k1, k2);
+                    let before = two_site_e_cand_wg(base, k1, s1, k2, s2);
+                    let after = two_site_e_cand_wg(base, k1, s2, k2, s1);
                     let de = after - before;
                     if (de <= 0.0 || rand_f32(&rng) < exp(-de * inv_t)) {
+                        wg_set_at(base, k1, s2);
+                        wg_set_at(base, k2, s1);
                         if (s1 >= 0) { wg_set_pos(base, u32(s1), i32(k2)); }
                         if (s2 >= 0) { wg_set_pos(base, u32(s2), i32(k1)); }
                         cur_e = cur_e + de;
                         n_accepted = n_accepted + 1u;
-                    } else {
-                        wg_set_at(base, k1, s1);
-                        wg_set_at(base, k2, s2);
                     }
                 }
             }
@@ -865,28 +870,21 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                 let ks = wg_get_pos(base, s);
 
                 if (t == s_i32) {
-                    let before = site_e_wg(base, k);
-                    wg_set_at(base, k, -1);
-                    let de = -before;
+                    let de = -site_e_cand_wg(base, k, s_i32);
                     if (de <= 0.0 || rand_f32(&rng) < exp(-de * inv_t)) {
+                        wg_set_at(base, k, -1);
                         wg_set_pos(base, s, -1);
                         cur_e = cur_e + de;
                         n_accepted = n_accepted + 1u;
-                    } else {
-                        wg_set_at(base, k, s_i32);
                     }
                 } else if (t == -1 && ks == -1) {
                     if (get_eu(s, k) < FORBID_HALF) {
-                        let before = site_e_wg(base, k);
-                        wg_set_at(base, k, s_i32);
-                        let after = site_e_wg(base, k);
-                        let de = after - before;
+                        let de = site_e_cand_wg(base, k, s_i32);
                         if (de <= 0.0 || rand_f32(&rng) < exp(-de * inv_t)) {
+                            wg_set_at(base, k, s_i32);
                             wg_set_pos(base, s, i32(k));
                             cur_e = cur_e + de;
                             n_accepted = n_accepted + 1u;
-                        } else {
-                            wg_set_at(base, k, -1);
                         }
                     }
                 } else if (t >= 0 && ks == -1) {
@@ -905,64 +903,72 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                                     && ro_ints[params.off_i3 + m] != 0
                                     && wg_get_at(base, m) < 0
                                     && get_eu(t_u, m) < FORBID_HALF) {
-                                    let w_fwd = pair_prop_w_wg(base, k, s_i32)
-                                        * P_RESTORE_EVICT
-                                        * evict_slot_weight(t, m, n_fk_f);
-                                    let before = two_site_e_wg(base, k, m);
-                                    wg_set_at(base, k, s_i32);
-                                    wg_set_at(base, m, t);
-                                    let after = two_site_e_wg(base, k, m);
-                                    let p_ev_rev = select(1.0, P_EVICT_WHEN_SWAP_OK, get_eu(s, m) < FORBID_HALF);
-                                    let w_rev = pair_prop_w_wg(base, k, t) * p_ev_rev;
+                                    let before = two_site_e_cand_wg(base, k, t, m, -1);
+                                    let after = two_site_e_cand_wg(base, k, s_i32, m, t);
                                     let de = after - before;
-                                    let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                                    if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                        wg_set_pos(base, s, i32(k));
-                                        wg_set_pos(base, t_u, i32(m));
-                                        cur_e = cur_e + de;
-                                        n_accepted = n_accepted + 1u;
-                                    } else {
-                                        wg_set_at(base, k, t);
-                                        wg_set_at(base, m, -1);
+                                    let u_acc = rand_f32(&rng);
+                                    let u_bound = -de * inv_t + max_log_restore_evict;
+                                    if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                        let w_fwd = pair_prop_w_wg(base, k, s_i32)
+                                            * P_RESTORE_EVICT
+                                            * evict_slot_weight(t, m, n_fk_f);
+                                        wg_set_at(base, k, s_i32);
+                                        wg_set_at(base, m, t);
+                                        let p_ev_rev = select(1.0, P_EVICT_WHEN_SWAP_OK, get_eu(s, m) < FORBID_HALF);
+                                        let w_rev = pair_prop_w_wg(base, k, t) * p_ev_rev;
+                                        let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                        if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                            wg_set_pos(base, s, i32(k));
+                                            wg_set_pos(base, t_u, i32(m));
+                                            cur_e = cur_e + de;
+                                            n_accepted = n_accepted + 1u;
+                                        } else {
+                                            wg_set_at(base, k, t);
+                                            wg_set_at(base, m, -1);
+                                        }
                                     }
                                 }
                             }
                         } else {
-                            let w_fwd = pair_prop_w_wg(base, k, s_i32);
-                            let w_rev = pair_prop_w_wg(base, k, t);
-                            let before = site_e_wg(base, k);
-                            wg_set_at(base, k, s_i32);
-                            let after = site_e_wg(base, k);
-                            let de = after - before;
-                            let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                            if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                wg_set_pos(base, t_u, -1);
-                                wg_set_pos(base, s, i32(k));
-                                cur_e = cur_e + de;
-                                n_accepted = n_accepted + 1u;
-                            } else {
-                                wg_set_at(base, k, t);
+                            let de = site_e_cand_wg(base, k, s_i32) - site_e_cand_wg(base, k, t);
+                            let u_acc = rand_f32(&rng);
+                            let u_bound = -de * inv_t + max_log_pair;
+                            if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                let w_fwd = pair_prop_w_wg(base, k, s_i32);
+                                let w_rev = pair_prop_w_wg(base, k, t);
+                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                    wg_set_at(base, k, s_i32);
+                                    wg_set_pos(base, t_u, -1);
+                                    wg_set_pos(base, s, i32(k));
+                                    cur_e = cur_e + de;
+                                    n_accepted = n_accepted + 1u;
+                                }
                             }
                         }
                     }
                 } else if (t == -1 && ks >= 0) {
                     let ks_u = u32(ks);
                     if (ro_ints[params.off_i3 + ks_u] != 0 && get_eu(s, k) < FORBID_HALF) {
-                        let w_fwd = pair_prop_w_wg(base, k, s_i32);
-                        let before = two_site_e_wg(base, k, ks_u);
-                        wg_set_at(base, ks_u, -1);
-                        wg_set_at(base, k, s_i32);
-                        let after = two_site_e_wg(base, k, ks_u);
-                        let w_rev = pair_prop_w_wg(base, ks_u, s_i32);
+                        let before = two_site_e_cand_wg(base, k, -1, ks_u, s_i32);
+                        let after = two_site_e_cand_wg(base, k, s_i32, ks_u, -1);
                         let de = after - before;
-                        let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                        if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                            wg_set_pos(base, s, i32(k));
-                            cur_e = cur_e + de;
-                            n_accepted = n_accepted + 1u;
-                        } else {
-                            wg_set_at(base, ks_u, s_i32);
-                            wg_set_at(base, k, -1);
+                        let u_acc = rand_f32(&rng);
+                        let u_bound = -de * inv_t + max_log_pair;
+                        if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                            let w_fwd = pair_prop_w_wg(base, k, s_i32);
+                            wg_set_at(base, ks_u, -1);
+                            wg_set_at(base, k, s_i32);
+                            let w_rev = pair_prop_w_wg(base, ks_u, s_i32);
+                            let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                            if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                wg_set_pos(base, s, i32(k));
+                                cur_e = cur_e + de;
+                                n_accepted = n_accepted + 1u;
+                            } else {
+                                wg_set_at(base, ks_u, s_i32);
+                                wg_set_at(base, k, -1);
+                            }
                         }
                     }
                 } else if (t >= 0 && ks >= 0) {
@@ -973,44 +979,52 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                         let do_evict = (!swap_ok) || (n_fk >= 2u && rand_f32(&rng) < P_EVICT_WHEN_SWAP_OK);
                         if (do_evict) {
                             if (n_fk >= 2u) {
-                                let p_ev = select(1.0, P_EVICT_WHEN_SWAP_OK, swap_ok);
-                                let w_fwd = pair_prop_w_wg(base, k, s_i32) * p_ev;
-                                let before = two_site_e_wg(base, k, ks_u);
-                                wg_set_at(base, ks_u, -1);
-                                wg_set_at(base, k, s_i32);
-                                let after = two_site_e_wg(base, k, ks_u);
-                                let w_rev = pair_prop_w_wg(base, k, t)
-                                    * P_RESTORE_EVICT
-                                    * evict_slot_weight(s_i32, ks_u, n_fk_f);
+                                let before = two_site_e_cand_wg(base, k, t, ks_u, s_i32);
+                                let after = two_site_e_cand_wg(base, k, s_i32, ks_u, -1);
                                 let de = after - before;
-                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                                if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                    wg_set_pos(base, s, i32(k));
-                                    wg_set_pos(base, t_u, -1);
-                                    cur_e = cur_e + de;
-                                    n_accepted = n_accepted + 1u;
-                                } else {
-                                    wg_set_at(base, ks_u, s_i32);
-                                    wg_set_at(base, k, t);
+                                let u_acc = rand_f32(&rng);
+                                let u_bound = -de * inv_t + max_log_evict;
+                                if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                    let p_ev = select(1.0, P_EVICT_WHEN_SWAP_OK, swap_ok);
+                                    let w_fwd = pair_prop_w_wg(base, k, s_i32) * p_ev;
+                                    wg_set_at(base, ks_u, -1);
+                                    wg_set_at(base, k, s_i32);
+                                    let w_rev = pair_prop_w_wg(base, k, t)
+                                        * P_RESTORE_EVICT
+                                        * evict_slot_weight(s_i32, ks_u, n_fk_f);
+                                    let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                    if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                        wg_set_pos(base, s, i32(k));
+                                        wg_set_pos(base, t_u, -1);
+                                        cur_e = cur_e + de;
+                                        n_accepted = n_accepted + 1u;
+                                    } else {
+                                        wg_set_at(base, ks_u, s_i32);
+                                        wg_set_at(base, k, t);
+                                    }
                                 }
                             }
                         } else {
-                            let w_fwd = pair_prop_w_wg(base, k, s_i32) + pair_prop_w_wg(base, ks_u, t);
-                            let before = two_site_e_wg(base, k, ks_u);
-                            wg_set_at(base, k, s_i32);
-                            wg_set_at(base, ks_u, t);
-                            let after = two_site_e_wg(base, k, ks_u);
-                            let w_rev = pair_prop_w_wg(base, k, t) + pair_prop_w_wg(base, ks_u, s_i32);
+                            let before = two_site_e_cand_wg(base, k, t, ks_u, s_i32);
+                            let after = two_site_e_cand_wg(base, k, s_i32, ks_u, t);
                             let de = after - before;
-                            let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                            if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                wg_set_pos(base, s, i32(k));
-                                wg_set_pos(base, t_u, ks);
-                                cur_e = cur_e + de;
-                                n_accepted = n_accepted + 1u;
-                            } else {
-                                wg_set_at(base, k, t);
-                                wg_set_at(base, ks_u, s_i32);
+                            let u_acc = rand_f32(&rng);
+                            let u_bound = -de * inv_t + max_log_pair;
+                            if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                let w_fwd = pair_prop_w_wg(base, k, s_i32) + pair_prop_w_wg(base, ks_u, t);
+                                wg_set_at(base, k, s_i32);
+                                wg_set_at(base, ks_u, t);
+                                let w_rev = pair_prop_w_wg(base, k, t) + pair_prop_w_wg(base, ks_u, s_i32);
+                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                    wg_set_pos(base, s, i32(k));
+                                    wg_set_pos(base, t_u, ks);
+                                    cur_e = cur_e + de;
+                                    n_accepted = n_accepted + 1u;
+                                } else {
+                                    wg_set_at(base, k, t);
+                                    wg_set_at(base, ks_u, s_i32);
+                                }
                             }
                         }
                     }
@@ -1217,7 +1231,6 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                                 let a_span = ka_end - ka0 + 1u;
                                 let b_span = kb_end - kb0 + 1u;
 
-                                let w_fwd = block_swap_prop_w_wg(base, ia, ib, l, m_start_f);
                                 let before = two_spans_e_wg(base, ka0, a_span, kb0, b_span);
                                 for (var off: u32 = 0u; off < l; off = off + 1u) {
                                     let ka = u32(ro_ints[params.off_i0 + ia + off]);
@@ -1228,21 +1241,10 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                                     wg_set_at(base, kb, sa_tmp);
                                 }
                                 let after = two_spans_e_wg(base, ka0, a_span, kb0, b_span);
-                                let w_rev = block_swap_prop_w_wg(base, ia, ib, l, m_start_f);
                                 let de = after - before;
-                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                                if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                    for (var off: u32 = 0u; off < l; off = off + 1u) {
-                                        let ka = u32(ro_ints[params.off_i0 + ia + off]);
-                                        let kb = u32(ro_ints[params.off_i0 + ib + off]);
-                                        let sa_n = wg_get_at(base, ka);
-                                        let sb_n = wg_get_at(base, kb);
-                                        if (sa_n >= 0) { wg_set_pos(base, u32(sa_n), i32(ka)); }
-                                        if (sb_n >= 0) { wg_set_pos(base, u32(sb_n), i32(kb)); }
-                                    }
-                                    cur_e = cur_e + de;
-                                    n_accepted = n_accepted + 1u;
-                                } else {
+                                let u_acc = rand_f32(&rng);
+                                let u_bound = -de * inv_t + log(1.0 + 0.1875 * m_start_f) + 1.0e-4;
+                                if (u_bound < 0.0 && u_acc >= exp(u_bound)) {
                                     for (var off: u32 = 0u; off < l; off = off + 1u) {
                                         let ka = u32(ro_ints[params.off_i0 + ia + off]);
                                         let kb = u32(ro_ints[params.off_i0 + ib + off]);
@@ -1250,6 +1252,32 @@ fn run_anneal_wg_impl(r: u32, base: u32) {
                                         let sb_tmp = wg_get_at(base, kb);
                                         wg_set_at(base, ka, sb_tmp);
                                         wg_set_at(base, kb, sa_tmp);
+                                    }
+                                } else {
+                                    let w_rev = block_swap_prop_w_wg(base, ia, ib, l, m_start_f);
+                                    for (var off: u32 = 0u; off < l; off = off + 1u) {
+                                        let ka = u32(ro_ints[params.off_i0 + ia + off]);
+                                        let kb = u32(ro_ints[params.off_i0 + ib + off]);
+                                        let sa_tmp = wg_get_at(base, ka);
+                                        let sb_tmp = wg_get_at(base, kb);
+                                        wg_set_at(base, ka, sb_tmp);
+                                        wg_set_at(base, kb, sa_tmp);
+                                    }
+                                    let w_fwd = block_swap_prop_w_wg(base, ia, ib, l, m_start_f);
+                                    let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                    if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                        for (var off: u32 = 0u; off < l; off = off + 1u) {
+                                            let ka = u32(ro_ints[params.off_i0 + ia + off]);
+                                            let kb = u32(ro_ints[params.off_i0 + ib + off]);
+                                            let sa_orig = wg_get_at(base, ka);
+                                            let sb_orig = wg_get_at(base, kb);
+                                            wg_set_at(base, ka, sb_orig);
+                                            wg_set_at(base, kb, sa_orig);
+                                            if (sb_orig >= 0) { wg_set_pos(base, u32(sb_orig), i32(ka)); }
+                                            if (sa_orig >= 0) { wg_set_pos(base, u32(sa_orig), i32(kb)); }
+                                        }
+                                        cur_e = cur_e + de;
+                                        n_accepted = n_accepted + 1u;
                                     }
                                 }
                             }
@@ -1328,8 +1356,7 @@ fn eval_full_gl(cur_base: u32) -> f32 {
     return sum;
 }
 
-fn site_e_gl(cur_base: u32, k: u32) -> f32 {
-    let s = at_buf[cur_base + k];
+fn site_e_cand_gl(cur_base: u32, k: u32, s: i32) -> f32 {
     if (s < 0) { return 0.0; }
     let su = u32(s);
     var e = get_eu(su, k);
@@ -1344,11 +1371,11 @@ fn site_e_gl(cur_base: u32, k: u32) -> f32 {
     return e;
 }
 
-fn two_site_e_gl(cur_base: u32, ka: u32, kb: u32) -> f32 {
-    let lo = min(ka, kb);
-    let hi = max(ka, kb);
-    let slo = at_buf[cur_base + lo];
-    let shi = at_buf[cur_base + hi];
+fn two_site_e_cand_gl(cur_base: u32, ka: u32, sa: i32, kb: u32, sb: i32) -> f32 {
+    let lo = select(kb, ka, ka < kb);
+    let hi = select(ka, kb, ka < kb);
+    let slo = select(sb, sa, ka < kb);
+    let shi = select(sa, sb, ka < kb);
     var e: f32 = 0.0;
     if (slo >= 0) {
         let su = u32(slo);
@@ -1357,7 +1384,7 @@ fn two_site_e_gl(cur_base: u32, ka: u32, kb: u32) -> f32 {
             let sl = at_buf[cur_base + lo - 1u];
             if (sl >= 0) { e = e + get_el(u32(sl), su); }
         }
-        let sr = at_buf[cur_base + lo + 1u];
+        let sr = select(at_buf[cur_base + lo + 1u], shi, hi == lo + 1u);
         if (sr >= 0) { e = e + get_el(su, u32(sr)); }
     }
     if (shi >= 0) {
@@ -1524,6 +1551,15 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let inv_t = params.inv_temp;
     let has_cands = params.cand_m > 0u;
+    let w_pair_min = max(params.r_glob, 1.0e-12);
+    let w_pair_max = params.r_glob + params.r_cand + 2.0 * params.r_ext;
+    let max_log_pair = log(w_pair_max / w_pair_min) + 1.0e-4;
+    let max_log_restore_evict = max_log_pair
+        + log(1.0 / max(P_RESTORE_EVICT * (0.50 / max(n_fk_f, 1.0)), 1.0e-12))
+        + 1.0e-4;
+    let max_log_evict = max_log_pair
+        + log((P_RESTORE_EVICT * ((0.50 / max(n_fk_f, 1.0)) + 0.0625)) / P_EVICT_WHEN_SWAP_OK)
+        + 1.0e-4;
 
     for (var step_local: u32 = 0u; step_local < params.chunk_steps; step_local = step_local + 1u) {
         let global_step = params.step_offset + step_local;
@@ -1550,19 +1586,16 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (s1 != s2
                     && (s1 < 0 || get_eu(u32(s1), k2) < FORBID_HALF)
                     && (s2 < 0 || get_eu(u32(s2), k1) < FORBID_HALF)) {
-                    let before = two_site_e_gl(cur_base, k1, k2);
-                    at_buf[cur_base + k1] = s2;
-                    at_buf[cur_base + k2] = s1;
-                    let after = two_site_e_gl(cur_base, k1, k2);
+                    let before = two_site_e_cand_gl(cur_base, k1, s1, k2, s2);
+                    let after = two_site_e_cand_gl(cur_base, k1, s2, k2, s1);
                     let de = after - before;
                     if (de <= 0.0 || rand_f32(&rng) < exp(-de * inv_t)) {
+                        at_buf[cur_base + k1] = s2;
+                        at_buf[cur_base + k2] = s1;
                         if (s1 >= 0) { pos_buf[pos_base + u32(s1)] = i32(k2); }
                         if (s2 >= 0) { pos_buf[pos_base + u32(s2)] = i32(k1); }
                         cur_e = cur_e + de;
                         n_accepted = n_accepted + 1u;
-                    } else {
-                        at_buf[cur_base + k1] = s1;
-                        at_buf[cur_base + k2] = s2;
                     }
                 }
             }
@@ -1594,27 +1627,20 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let t = at_buf[cur_base + k];
                 let ks = pos_buf[pos_base + s];
                 if (t == s_i32) {
-                    let before = site_e_gl(cur_base, k);
-                    at_buf[cur_base + k] = -1;
-                    let de = -before;
+                    let de = -site_e_cand_gl(cur_base, k, s_i32);
                     if (de <= 0.0 || rand_f32(&rng) < exp(-de * inv_t)) {
+                        at_buf[cur_base + k] = -1;
                         pos_buf[pos_base + s] = -1;
                         cur_e = cur_e + de;
                         n_accepted = n_accepted + 1u;
-                    } else {
-                        at_buf[cur_base + k] = s_i32;
                     }
                 } else if (t == -1 && ks == -1 && get_eu(s, k) < FORBID_HALF) {
-                    let before = site_e_gl(cur_base, k);
-                    at_buf[cur_base + k] = s_i32;
-                    let after = site_e_gl(cur_base, k);
-                    let de = after - before;
+                    let de = site_e_cand_gl(cur_base, k, s_i32);
                     if (de <= 0.0 || rand_f32(&rng) < exp(-de * inv_t)) {
+                        at_buf[cur_base + k] = s_i32;
                         pos_buf[pos_base + s] = i32(k);
                         cur_e = cur_e + de;
                         n_accepted = n_accepted + 1u;
-                    } else {
-                        at_buf[cur_base + k] = -1;
                     }
                 } else if (t >= 0 && ks == -1 && get_eu(s, k) < FORBID_HALF) {
                     let t_u = u32(t);
@@ -1628,61 +1654,69 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                         if (m_i32 >= 0) {
                             let m = u32(m_i32);
                             if (m != k && ro_ints[params.off_i3 + m] != 0 && at_buf[cur_base + m] < 0 && get_eu(t_u, m) < FORBID_HALF) {
-                                let w_fwd = pair_prop_w_gl(cur_base, k, s_i32) * P_RESTORE_EVICT * evict_slot_weight(t, m, n_fk_f);
-                                let before = two_site_e_gl(cur_base, k, m);
-                                at_buf[cur_base + k] = s_i32;
-                                at_buf[cur_base + m] = t;
-                                let after = two_site_e_gl(cur_base, k, m);
-                                let p_ev_rev = select(1.0, P_EVICT_WHEN_SWAP_OK, get_eu(s, m) < FORBID_HALF);
-                                let w_rev = pair_prop_w_gl(cur_base, k, t) * p_ev_rev;
+                                let before = two_site_e_cand_gl(cur_base, k, t, m, -1);
+                                let after = two_site_e_cand_gl(cur_base, k, s_i32, m, t);
                                 let de = after - before;
-                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                                if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                    pos_buf[pos_base + s] = i32(k);
-                                    pos_buf[pos_base + t_u] = i32(m);
-                                    cur_e = cur_e + de;
-                                    n_accepted = n_accepted + 1u;
-                                } else {
-                                    at_buf[cur_base + k] = t;
-                                    at_buf[cur_base + m] = -1;
+                                let u_acc = rand_f32(&rng);
+                                let u_bound = -de * inv_t + max_log_restore_evict;
+                                if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                    let w_fwd = pair_prop_w_gl(cur_base, k, s_i32) * P_RESTORE_EVICT * evict_slot_weight(t, m, n_fk_f);
+                                    at_buf[cur_base + k] = s_i32;
+                                    at_buf[cur_base + m] = t;
+                                    let p_ev_rev = select(1.0, P_EVICT_WHEN_SWAP_OK, get_eu(s, m) < FORBID_HALF);
+                                    let w_rev = pair_prop_w_gl(cur_base, k, t) * p_ev_rev;
+                                    let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                    if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                        pos_buf[pos_base + s] = i32(k);
+                                        pos_buf[pos_base + t_u] = i32(m);
+                                        cur_e = cur_e + de;
+                                        n_accepted = n_accepted + 1u;
+                                    } else {
+                                        at_buf[cur_base + k] = t;
+                                        at_buf[cur_base + m] = -1;
+                                    }
                                 }
                             }
                         }
                     } else {
-                        let w_fwd = pair_prop_w_gl(cur_base, k, s_i32);
-                        let w_rev = pair_prop_w_gl(cur_base, k, t);
-                        let before = site_e_gl(cur_base, k);
-                        at_buf[cur_base + k] = s_i32;
-                        let after = site_e_gl(cur_base, k);
-                        let de = after - before;
-                        let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                        if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                            pos_buf[pos_base + t_u] = -1;
-                            pos_buf[pos_base + s] = i32(k);
-                            cur_e = cur_e + de;
-                            n_accepted = n_accepted + 1u;
-                        } else {
-                            at_buf[cur_base + k] = t;
+                        let de = site_e_cand_gl(cur_base, k, s_i32) - site_e_cand_gl(cur_base, k, t);
+                        let u_acc = rand_f32(&rng);
+                        let u_bound = -de * inv_t + max_log_pair;
+                        if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                            let w_fwd = pair_prop_w_gl(cur_base, k, s_i32);
+                            let w_rev = pair_prop_w_gl(cur_base, k, t);
+                            let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                            if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                at_buf[cur_base + k] = s_i32;
+                                pos_buf[pos_base + t_u] = -1;
+                                pos_buf[pos_base + s] = i32(k);
+                                cur_e = cur_e + de;
+                                n_accepted = n_accepted + 1u;
+                            }
                         }
                     }
                 } else if (t == -1 && ks >= 0) {
                     let ks_u = u32(ks);
                     if (ro_ints[params.off_i3 + ks_u] != 0 && get_eu(s, k) < FORBID_HALF) {
-                        let w_fwd = pair_prop_w_gl(cur_base, k, s_i32);
-                        let before = two_site_e_gl(cur_base, k, ks_u);
-                        at_buf[cur_base + ks_u] = -1;
-                        at_buf[cur_base + k] = s_i32;
-                        let after = two_site_e_gl(cur_base, k, ks_u);
-                        let w_rev = pair_prop_w_gl(cur_base, ks_u, s_i32);
+                        let before = two_site_e_cand_gl(cur_base, k, -1, ks_u, s_i32);
+                        let after = two_site_e_cand_gl(cur_base, k, s_i32, ks_u, -1);
                         let de = after - before;
-                        let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                        if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                            pos_buf[pos_base + s] = i32(k);
-                            cur_e = cur_e + de;
-                            n_accepted = n_accepted + 1u;
-                        } else {
-                            at_buf[cur_base + ks_u] = s_i32;
-                            at_buf[cur_base + k] = -1;
+                        let u_acc = rand_f32(&rng);
+                        let u_bound = -de * inv_t + max_log_pair;
+                        if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                            let w_fwd = pair_prop_w_gl(cur_base, k, s_i32);
+                            at_buf[cur_base + ks_u] = -1;
+                            at_buf[cur_base + k] = s_i32;
+                            let w_rev = pair_prop_w_gl(cur_base, ks_u, s_i32);
+                            let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                            if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                pos_buf[pos_base + s] = i32(k);
+                                cur_e = cur_e + de;
+                                n_accepted = n_accepted + 1u;
+                            } else {
+                                at_buf[cur_base + ks_u] = s_i32;
+                                at_buf[cur_base + k] = -1;
+                            }
                         }
                     }
                 } else if (t >= 0 && ks >= 0) {
@@ -1693,42 +1727,50 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let do_evict = (!swap_ok) || (n_fk >= 2u && rand_f32(&rng) < P_EVICT_WHEN_SWAP_OK);
                         if (do_evict) {
                             if (n_fk >= 2u) {
-                                let p_ev = select(1.0, P_EVICT_WHEN_SWAP_OK, swap_ok);
-                                let w_fwd = pair_prop_w_gl(cur_base, k, s_i32) * p_ev;
-                                let before = two_site_e_gl(cur_base, k, ks_u);
-                                at_buf[cur_base + ks_u] = -1;
-                                at_buf[cur_base + k] = s_i32;
-                                let after = two_site_e_gl(cur_base, k, ks_u);
-                                let w_rev = pair_prop_w_gl(cur_base, k, t) * P_RESTORE_EVICT * evict_slot_weight(s_i32, ks_u, n_fk_f);
+                                let before = two_site_e_cand_gl(cur_base, k, t, ks_u, s_i32);
+                                let after = two_site_e_cand_gl(cur_base, k, s_i32, ks_u, -1);
                                 let de = after - before;
-                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                                if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                    pos_buf[pos_base + s] = i32(k);
-                                    pos_buf[pos_base + t_u] = -1;
-                                    cur_e = cur_e + de;
-                                    n_accepted = n_accepted + 1u;
-                                } else {
-                                    at_buf[cur_base + ks_u] = s_i32;
-                                    at_buf[cur_base + k] = t;
+                                let u_acc = rand_f32(&rng);
+                                let u_bound = -de * inv_t + max_log_evict;
+                                if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                    let p_ev = select(1.0, P_EVICT_WHEN_SWAP_OK, swap_ok);
+                                    let w_fwd = pair_prop_w_gl(cur_base, k, s_i32) * p_ev;
+                                    at_buf[cur_base + ks_u] = -1;
+                                    at_buf[cur_base + k] = s_i32;
+                                    let w_rev = pair_prop_w_gl(cur_base, k, t) * P_RESTORE_EVICT * evict_slot_weight(s_i32, ks_u, n_fk_f);
+                                    let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                    if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                        pos_buf[pos_base + s] = i32(k);
+                                        pos_buf[pos_base + t_u] = -1;
+                                        cur_e = cur_e + de;
+                                        n_accepted = n_accepted + 1u;
+                                    } else {
+                                        at_buf[cur_base + ks_u] = s_i32;
+                                        at_buf[cur_base + k] = t;
+                                    }
                                 }
                             }
                         } else {
-                            let w_fwd = pair_prop_w_gl(cur_base, k, s_i32) + pair_prop_w_gl(cur_base, ks_u, t);
-                            let before = two_site_e_gl(cur_base, k, ks_u);
-                            at_buf[cur_base + k] = s_i32;
-                            at_buf[cur_base + ks_u] = t;
-                            let after = two_site_e_gl(cur_base, k, ks_u);
-                            let w_rev = pair_prop_w_gl(cur_base, k, t) + pair_prop_w_gl(cur_base, ks_u, s_i32);
+                            let before = two_site_e_cand_gl(cur_base, k, t, ks_u, s_i32);
+                            let after = two_site_e_cand_gl(cur_base, k, s_i32, ks_u, t);
                             let de = after - before;
-                            let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                            if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                pos_buf[pos_base + s] = i32(k);
-                                pos_buf[pos_base + t_u] = ks;
-                                cur_e = cur_e + de;
-                                n_accepted = n_accepted + 1u;
-                            } else {
-                                at_buf[cur_base + k] = t;
-                                at_buf[cur_base + ks_u] = s_i32;
+                            let u_acc = rand_f32(&rng);
+                            let u_bound = -de * inv_t + max_log_pair;
+                            if (u_bound >= 0.0 || u_acc < exp(u_bound)) {
+                                let w_fwd = pair_prop_w_gl(cur_base, k, s_i32) + pair_prop_w_gl(cur_base, ks_u, t);
+                                at_buf[cur_base + k] = s_i32;
+                                at_buf[cur_base + ks_u] = t;
+                                let w_rev = pair_prop_w_gl(cur_base, k, t) + pair_prop_w_gl(cur_base, ks_u, s_i32);
+                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                    pos_buf[pos_base + s] = i32(k);
+                                    pos_buf[pos_base + t_u] = ks;
+                                    cur_e = cur_e + de;
+                                    n_accepted = n_accepted + 1u;
+                                } else {
+                                    at_buf[cur_base + k] = t;
+                                    at_buf[cur_base + ks_u] = s_i32;
+                                }
                             }
                         }
                     }
@@ -1935,7 +1977,6 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 let a_span = ka_end - ka0 + 1u;
                                 let b_span = kb_end - kb0 + 1u;
 
-                                let w_fwd = block_swap_prop_w_gl(cur_base, ia, ib, l, m_start_f);
                                 let before = two_spans_e_gl(cur_base, ka0, a_span, kb0, b_span);
                                 for (var off: u32 = 0u; off < l; off = off + 1u) {
                                     let ka = u32(ro_ints[params.off_i0 + ia + off]);
@@ -1945,27 +1986,41 @@ fn anneal_bayes_global(@builtin(global_invocation_id) gid: vec3<u32>) {
                                     at_buf[cur_base + kb] = tmp;
                                 }
                                 let after = two_spans_e_gl(cur_base, ka0, a_span, kb0, b_span);
-                                let w_rev = block_swap_prop_w_gl(cur_base, ia, ib, l, m_start_f);
                                 let de = after - before;
-                                let log_acc = -de * inv_t + log(w_rev / w_fwd);
-                                if (log_acc >= 0.0 || rand_f32(&rng) < exp(log_acc)) {
-                                    for (var off: u32 = 0u; off < l; off = off + 1u) {
-                                        let ka = u32(ro_ints[params.off_i0 + ia + off]);
-                                        let kb = u32(ro_ints[params.off_i0 + ib + off]);
-                                        let sa_n = at_buf[cur_base + ka];
-                                        let sb_n = at_buf[cur_base + kb];
-                                        if (sa_n >= 0) { pos_buf[pos_base + u32(sa_n)] = i32(ka); }
-                                        if (sb_n >= 0) { pos_buf[pos_base + u32(sb_n)] = i32(kb); }
-                                    }
-                                    cur_e = cur_e + de;
-                                    n_accepted = n_accepted + 1u;
-                                } else {
+                                let u_acc = rand_f32(&rng);
+                                let u_bound = -de * inv_t + log(1.0 + 0.1875 * m_start_f) + 1.0e-4;
+                                if (u_bound < 0.0 && u_acc >= exp(u_bound)) {
                                     for (var off: u32 = 0u; off < l; off = off + 1u) {
                                         let ka = u32(ro_ints[params.off_i0 + ia + off]);
                                         let kb = u32(ro_ints[params.off_i0 + ib + off]);
                                         let tmp = at_buf[cur_base + ka];
                                         at_buf[cur_base + ka] = at_buf[cur_base + kb];
                                         at_buf[cur_base + kb] = tmp;
+                                    }
+                                } else {
+                                    let w_rev = block_swap_prop_w_gl(cur_base, ia, ib, l, m_start_f);
+                                    for (var off: u32 = 0u; off < l; off = off + 1u) {
+                                        let ka = u32(ro_ints[params.off_i0 + ia + off]);
+                                        let kb = u32(ro_ints[params.off_i0 + ib + off]);
+                                        let tmp = at_buf[cur_base + ka];
+                                        at_buf[cur_base + ka] = at_buf[cur_base + kb];
+                                        at_buf[cur_base + kb] = tmp;
+                                    }
+                                    let w_fwd = block_swap_prop_w_gl(cur_base, ia, ib, l, m_start_f);
+                                    let log_acc = -de * inv_t + log(w_rev / w_fwd);
+                                    if (log_acc >= 0.0 || u_acc < exp(log_acc)) {
+                                        for (var off: u32 = 0u; off < l; off = off + 1u) {
+                                            let ka = u32(ro_ints[params.off_i0 + ia + off]);
+                                            let kb = u32(ro_ints[params.off_i0 + ib + off]);
+                                            let sa_orig = at_buf[cur_base + ka];
+                                            let sb_orig = at_buf[cur_base + kb];
+                                            at_buf[cur_base + ka] = sb_orig;
+                                            at_buf[cur_base + kb] = sa_orig;
+                                            if (sb_orig >= 0) { pos_buf[pos_base + u32(sb_orig)] = i32(ka); }
+                                            if (sa_orig >= 0) { pos_buf[pos_base + u32(sa_orig)] = i32(kb); }
+                                        }
+                                        cur_e = cur_e + de;
+                                        n_accepted = n_accepted + 1u;
                                     }
                                 }
                             }

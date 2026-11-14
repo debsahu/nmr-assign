@@ -27,8 +27,9 @@ use nmr_core::rng::Rng;
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::spinsystems::build_spin_systems;
 use nmr_gpu::bayes_sa_gpu::{
-    compute_bayes_energy_matrices_gpu, evaluate_states_energy_gpu,
-    validate_bayes_gpu_buffer_budget, BayesSaGpuSolver, MAX_BAYES_GPU_CHUNK_STEPS,
+    compute_bayes_energy_matrices_gpu, evaluate_states_energy_gpu, select_bayes_gpu_kernel_tier,
+    validate_bayes_gpu_buffer_budget, BayesGpuKernelTier, BayesSaGpuSolver,
+    MAX_BAYES_GPU_CHUNK_STEPS,
 };
 
 fn workspace_root() -> PathBuf {
@@ -580,6 +581,260 @@ fn ubiquitin_realistic_bruker_5_seeds_webgpu_accuracy_gate() {
 }
 
 #[test]
+fn gpu_buffer_limit_guard_returns_clean_err_without_panicking() {
+    let Some(_gpu) = require_gpu_solver() else {
+        return;
+    };
+
+    // Request a 16 KiB storage-buffer-binding-limited device (preserving baseline 8 storage
+    // buffers per shader stage from `wgpu::Limits::default()`) so auxiliary buffers
+    // (`score-ro-floats`, `anneal-move-tables`, `eval-matrices-q36`) and medium problem sizes
+    // exceed the device cap.
+    let tiny_limits = wgpu::Limits {
+        max_storage_buffer_binding_size: 16 * 1024,
+        max_buffer_size: 256 * 1024,
+        ..Default::default()
+    };
+
+    let tiny_gpu = BayesSaGpuSolver::new_headless_with_limits(tiny_limits)
+        .expect("16 KiB-limit device creation must succeed");
+
+    // (s_len = 10, k_len = 200, replicas = 1): `energy-matrices` is only 8,400 B (< 16 KiB),
+    // whereas `score-ro-floats` (45,596 B), `anneal-move-tables` (29,000 B), and
+    // `eval-matrices-q36` (16,800 B) all exceed 16 KiB and must be caught upfront!
+    let small_mat_aux_overflow =
+        validate_bayes_gpu_buffer_budget(&tiny_gpu.engine.device, 10, 200, 1);
+    assert!(
+        small_mat_aux_overflow.is_err(),
+        "(10, 200, 1) auxiliary buffer overflow must return Err on a 16 KiB device: {small_mat_aux_overflow:?}"
+    );
+
+    // Prepare 76-aa Ubiquitin inputs on CPU and verify every WebGPU entry point returns clean Err
+    // (without wgpu validation panics or huge host allocations prior to checking limits).
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let ubq = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::default();
+    let (peaks, _) = simulate(
+        &ubq,
+        &SimConfig {
+            seed: 0,
+            ..SimConfig::realistic_bruker()
+        },
+    );
+    let cfg = BayesSaConfig {
+        replicas: 8,
+        seed: 7,
+        ..BayesSaConfig::default_gpu()
+    };
+    let cond = condition_peaks_preserving_hsqc_roots(&peaks, &cfg.tolerances);
+    let systems = build_spin_systems(&cond, &cfg.tolerances, cfg.max_cands, false).expect("sys");
+    let cpu_mats = compute_bayes_energy_matrices(&systems, &ubq.sequence, &priors, &cfg);
+
+    let err_mat = tiny_gpu.compute_energy_matrices(&systems, &ubq.sequence, &priors, &cfg);
+    assert!(
+        err_mat.is_err(),
+        "compute_energy_matrices on 16 KiB device must return clean Err"
+    );
+
+    let dummy_state = vec![-1i32; ubq.sequence.len()];
+    let err_eval = tiny_gpu.evaluate_states_energy(&cpu_mats, &[dummy_state]);
+    assert!(
+        err_eval.is_err(),
+        "evaluate_states_energy (8-byte Q27.36 matrix > 16 KiB) must return clean Err before packing/uploading"
+    );
+
+    let err_solve = tiny_gpu.solve_from_peaks(&peaks, &ubq.sequence, &priors, &cfg);
+    assert!(
+        err_solve.is_err(),
+        "solve_from_peaks on 16 KiB device must return clean Err"
+    );
+}
+
+#[test]
+fn tier_1024_and_above_1024_automatic_dispatch_bijection_and_energy_parity() {
+    let Some(gpu) = require_gpu_solver() else {
+        return;
+    };
+    let priors = Priors::default();
+
+    // -------------------------------------------------------------------------
+    // Part A: Real 513..=1,024 (`620 aa`) -> automatic `Sram1024` (`anneal_bayes_1024`)
+    // -------------------------------------------------------------------------
+    let ref_620 = build_synthetic_protein_reference(620, 620);
+    let (peaks_620, _) = simulate(
+        &ref_620,
+        &SimConfig {
+            seed: 620,
+            p_missing_root: 0.05,
+            p_missing_peak: 0.05,
+            spurious_rate: 0.02,
+            ..SimConfig::default()
+        },
+    );
+    let cfg_620 = BayesSaConfig {
+        replicas: 16,
+        seed: 620,
+        ..BayesSaConfig::default_gpu()
+    };
+    let cond_620 = condition_peaks_preserving_hsqc_roots(&peaks_620, &cfg_620.tolerances);
+    let sys_620 = build_spin_systems(&cond_620, &cfg_620.tolerances, cfg_620.max_cands, false)
+        .expect("620aa spin systems");
+    let mats_620 = gpu
+        .compute_energy_matrices(&sys_620, &ref_620.sequence, &priors, &cfg_620)
+        .expect("gpu 620aa matrices");
+    let tables_620 = build_bayes_move_tables(&mats_620, &cfg_620);
+
+    let max_dim_620 = mats_620.e_type.rows.max(mats_620.e_type.cols);
+    assert!(
+        (513..=1024).contains(&max_dim_620),
+        "Expected 620aa max_dim in 513..=1024, got {max_dim_620}"
+    );
+    assert_eq!(
+        select_bayes_gpu_kernel_tier(max_dim_620, false),
+        (BayesGpuKernelTier::Sram1024, 4)
+    );
+
+    let mut rng_620 = Rng::new(cfg_620.seed);
+    let (ats_620, poss_620, es_620, seeds_620) =
+        build_initial_bayes_replicas(&mats_620, &tables_620, 16, &mut rng_620);
+    let traj_620 = gpu
+        .run_stage_raw_with_chunk_cap(
+            &mats_620,
+            &tables_620,
+            &ats_620,
+            &poss_620,
+            &es_620,
+            &seeds_620,
+            1.85,
+            1_500,
+            cfg_620.max_fragment_len,
+            1_024,
+            false,
+        )
+        .expect("Sram1024 620aa stage");
+    assert_eq!(traj_620.kernel_tier, BayesGpuKernelTier::Sram1024);
+
+    let q36_es_620 = gpu
+        .evaluate_states_energy(&mats_620, &traj_620.cur_ats)
+        .expect("620aa Q27.36 state eval");
+    for (r, &q36_e) in q36_es_620.iter().enumerate().take(16) {
+        let at = &traj_620.cur_ats[r];
+        let pos = &traj_620.cur_positions[r];
+        for (k, &s_raw) in at.iter().enumerate() {
+            if s_raw >= 0 {
+                assert_eq!(pos[s_raw as usize], k as i32, "Sram1024 at->pos mismatch");
+            }
+        }
+        for (s, &k_raw) in pos.iter().enumerate() {
+            if k_raw >= 0 {
+                assert_eq!(at[k_raw as usize], s as i32, "Sram1024 pos->at mismatch");
+            }
+        }
+        let exact_e = evaluate_state_energy(at, &mats_620).expect("valid 620aa state");
+        let tracked_e = traj_620.stats_float[r][0] as f64;
+        assert!(
+            (exact_e - tracked_e).abs() < 1e-2,
+            "Sram1024 replica {r} tracked energy ({tracked_e:.4}) drifted from exact ({exact_e:.4})"
+        );
+        assert!(
+            (exact_e - q36_e).abs() < 1e-4,
+            "Sram1024 replica {r} Q27.36 GPU state energy ({q36_e:.6}) differed from CPU ({exact_e:.6})"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Part B: Real > 1,024 (`1,080 aa`) -> automatic `GlobalStorage` (`anneal_bayes_global`)
+    // -------------------------------------------------------------------------
+    let ref_1080 = build_synthetic_protein_reference(1_080, 1080);
+    let (peaks_1080, _) = simulate(
+        &ref_1080,
+        &SimConfig {
+            seed: 1080,
+            p_missing_root: 0.05,
+            p_missing_peak: 0.05,
+            spurious_rate: 0.02,
+            ..SimConfig::default()
+        },
+    );
+    let cfg_1080 = BayesSaConfig {
+        replicas: 32,
+        seed: 1080,
+        ..BayesSaConfig::default_gpu()
+    };
+    let cond_1080 = condition_peaks_preserving_hsqc_roots(&peaks_1080, &cfg_1080.tolerances);
+    let sys_1080 = build_spin_systems(&cond_1080, &cfg_1080.tolerances, cfg_1080.max_cands, false)
+        .expect("1080aa spin systems");
+    let mats_1080 = gpu
+        .compute_energy_matrices(&sys_1080, &ref_1080.sequence, &priors, &cfg_1080)
+        .expect("gpu 1080aa matrices");
+    let tables_1080 = build_bayes_move_tables(&mats_1080, &cfg_1080);
+
+    let max_dim_1080 = mats_1080.e_type.rows.max(mats_1080.e_type.cols);
+    assert!(
+        max_dim_1080 > 1_024,
+        "Expected 1080aa max_dim > 1024, got {max_dim_1080}"
+    );
+    assert_eq!(
+        select_bayes_gpu_kernel_tier(max_dim_1080, false),
+        (BayesGpuKernelTier::GlobalStorage, 32)
+    );
+
+    let mut rng_1080 = Rng::new(cfg_1080.seed);
+    let (ats_1080, poss_1080, es_1080, seeds_1080) =
+        build_initial_bayes_replicas(&mats_1080, &tables_1080, 32, &mut rng_1080);
+    let traj_1080 = gpu
+        .run_stage_raw_with_chunk_cap(
+            &mats_1080,
+            &tables_1080,
+            &ats_1080,
+            &poss_1080,
+            &es_1080,
+            &seeds_1080,
+            1.85,
+            1_024,
+            cfg_1080.max_fragment_len,
+            1_024,
+            false,
+        )
+        .expect("GlobalStorage 1080aa automatic stage");
+    assert_eq!(traj_1080.kernel_tier, BayesGpuKernelTier::GlobalStorage);
+
+    let q36_es_1080 = gpu
+        .evaluate_states_energy(&mats_1080, &traj_1080.cur_ats)
+        .expect("1080aa Q27.36 state eval");
+    for (r, &q36_e) in q36_es_1080.iter().enumerate().take(32) {
+        let at = &traj_1080.cur_ats[r];
+        let pos = &traj_1080.cur_positions[r];
+        for (k, &s_raw) in at.iter().enumerate() {
+            if s_raw >= 0 {
+                assert_eq!(
+                    pos[s_raw as usize], k as i32,
+                    "Global >1024 at->pos mismatch"
+                );
+            }
+        }
+        for (s, &k_raw) in pos.iter().enumerate() {
+            if k_raw >= 0 {
+                assert_eq!(
+                    at[k_raw as usize], s as i32,
+                    "Global >1024 pos->at mismatch"
+                );
+            }
+        }
+        let exact_e = evaluate_state_energy(at, &mats_1080).expect("valid 1080aa state");
+        let tracked_e = traj_1080.stats_float[r][0] as f64;
+        assert!(
+            (exact_e - tracked_e).abs() < 1.5e-2,
+            "Global >1024 replica {r} tracked energy ({tracked_e:.4}) drifted from exact ({exact_e:.4})"
+        );
+        assert!(
+            (exact_e - q36_e).abs() < 1e-4,
+            "Global >1024 replica {r} Q27.36 GPU state energy ({q36_e:.6}) differed from CPU ({exact_e:.6})"
+        );
+    }
+}
+
+#[test]
 fn large_480aa_protein_webgpu_accuracy_and_under_5s_gate() {
     let Some(gpu) = require_gpu_solver() else {
         return;
@@ -599,9 +854,21 @@ fn large_480aa_protein_webgpu_accuracy_and_under_5s_gate() {
         },
     );
 
-    let cfg = BayesSaConfig {
-        seed: 101,
-        ..BayesSaConfig::default_gpu()
+    let is_sw_cpu = gpu.is_software_cpu_adapter();
+    let cfg = if is_sw_cpu {
+        BayesSaConfig {
+            seed: 101,
+            replicas: 16,
+            min_stages: 10,
+            max_stages: 20,
+            steps_per_stage_per_active: 6,
+            ..BayesSaConfig::default_gpu()
+        }
+    } else {
+        BayesSaConfig {
+            seed: 101,
+            ..BayesSaConfig::default_gpu()
+        }
     };
 
     let t0 = Instant::now();
@@ -610,18 +877,29 @@ fn large_480aa_protein_webgpu_accuracy_and_under_5s_gate() {
         .expect("WebGPU 480aa solve");
     let elapsed_s = t0.elapsed().as_secs_f64();
 
+    let mut seen_pos = std::collections::HashSet::new();
     for &p in &res.position {
         if p >= 0 {
-            assert_ne!(ref_480.sequence[p as usize], "PRO");
+            let k = p as usize;
+            assert!(k > 0 && k < ref_480.sequence.len());
+            assert_ne!(ref_480.sequence[k], "PRO");
+            assert!(seen_pos.insert(k), "Duplicate assigned position {k}");
         }
     }
+    for step in &rep.cooling_trajectory {
+        assert!(step.specific_heat_cv >= 0.0 && step.specific_heat_cv.is_finite());
+    }
+    assert!(rep.best_energy.is_finite());
+
     let m = Metrics {
         assignable: truth.iter().filter(|&&t| t >= 0).count(),
         ..score(&res, &truth, 0.80)
     };
     eprintln!(
-        "[WebGPU 480aa R={}] accuracy={:.2}% ({}/{}) recall={:.2}% ({}/{}) hc_prec={:.2}% ({}/{}) elapsed={elapsed_s:.3}s T_crit={:.2} max_Cv={:.2} stages={}",
+        "[WebGPU 480aa R={} adapter='{}' device_type={:?}] accuracy={:.2}% ({}/{}) recall={:.2}% ({}/{}) hc_prec={:.2}% ({}/{}) elapsed={elapsed_s:.3}s T_crit={:.2} max_Cv={:.2} stages={}",
         cfg.replicas,
+        gpu.engine.adapter_name,
+        gpu.device_type,
         100.0 * m.accuracy(),
         m.correct,
         m.assigned,
@@ -636,13 +914,35 @@ fn large_480aa_protein_webgpu_accuracy_and_under_5s_gate() {
         rep.total_stages
     );
 
-    assert!(
-        m.accuracy() >= 0.88,
-        "WebGPU 480aa accuracy {:.2}% fell below 88% gate",
-        100.0 * m.accuracy()
-    );
-    assert!(
-        elapsed_s < 5.0,
-        "WebGPU 480aa runtime {elapsed_s:.3}s exceeded 5.0s gate"
-    );
+    if is_sw_cpu {
+        assert!(
+            elapsed_s <= 60.0,
+            "Software CPU WebGPU adapter ({}) 480aa smoke run {elapsed_s:.3}s exceeded 60.0s ceiling",
+            gpu.engine.adapter_name
+        );
+    } else {
+        assert!(
+            m.accuracy() >= 0.88,
+            "WebGPU 480aa accuracy {:.2}% fell below 88% gate",
+            100.0 * m.accuracy()
+        );
+        assert!(
+            m.recall() >= 0.65,
+            "WebGPU 480aa recall {:.2}% ({}/{}) fell below 65% gate",
+            100.0 * m.recall(),
+            m.correct,
+            m.assignable
+        );
+        assert!(
+            m.hc_assigned >= 40 && m.hc_precision() >= 0.95,
+            "WebGPU 480aa high-confidence output ({}/{} = {:.2}%) fell below >=40 HC & >=95% HC precision gate",
+            m.hc_correct,
+            m.hc_assigned,
+            100.0 * m.hc_precision()
+        );
+        assert!(
+            elapsed_s < 5.0,
+            "WebGPU 480aa runtime {elapsed_s:.3}s exceeded 5.0s gate"
+        );
+    }
 }

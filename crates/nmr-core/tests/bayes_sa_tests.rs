@@ -821,4 +821,18 @@ fn large_480aa_protein_cpu_accuracy_gate() {
         "480aa CPU accuracy {:.2}% fell below 88% gate",
         100.0 * m.accuracy()
     );
+    assert!(
+        m.recall() >= 0.65,
+        "480aa CPU recall {:.2}% ({}/{}) fell below 65% gate",
+        100.0 * m.recall(),
+        m.correct,
+        m.assignable
+    );
+    assert!(
+        m.hc_assigned >= 40 && m.hc_precision() >= 0.95,
+        "480aa CPU high-confidence output ({}/{} = {:.2}%) fell below >=40 HC & >=95% HC precision gate",
+        m.hc_correct,
+        m.hc_assigned,
+        100.0 * m.hc_precision()
+    );
 }
