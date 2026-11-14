@@ -930,8 +930,8 @@ where
                 }
                 "include" => {
                     let raw_target = parse_include_target(rest)?;
-                    // Always validate include path safety even in inactive branches so path-traversal
-                    // payloads (`..` or `/abs`) can never hide behind conditionals!
+                    // Always validate include path safety and local symlink containment even in inactive
+                    // conditional branches so path-traversal or escaping-symlink payloads fail closed!
                     let safe_rel = validate_local_include_path(&raw_target)?;
                     if parent_active {
                         if include_chain.len() >= MAX_INCLUDE_DEPTH {
@@ -967,6 +967,8 @@ where
                                 out.unresolved_standard_includes.push(safe_rel);
                             }
                         }
+                    } else {
+                        let _ = resolve_local(&safe_rel)?;
                     }
                 }
                 _ => {
@@ -1418,6 +1420,7 @@ struct RawLoopSpan {
 struct SymbolicDimLoopInfo {
     synthesized_quad: Option<DecodedQuadMode>,
     quad_reg_sign: Option<(usize, i32)>,
+    paired_post_evo_echo_quad: bool,
     comment_reverse_override: Option<bool>,
     has_tppi_toggle: bool,
     has_igrad_ea: bool,
@@ -1426,8 +1429,10 @@ struct SymbolicDimLoopInfo {
     ea_grad_idx: Option<usize>,
     dec_grad_idx: Option<usize>,
     constant_time: bool,
+    evo_decremented: bool,
     sct_inc_before_dec: Option<bool>,
     loop_nesting_rank: Option<usize>,
+    per_scan_fq_sfo_mhz: Option<(String, f64)>,
 }
 
 /// Inputs for in-memory Bruker experiment physics interpretation.
@@ -1668,7 +1673,10 @@ pub fn interpret_bruker_dir(dir: impl AsRef<Path>) -> Result<PulprogInterpretati
     let nuslist_text = read_opt_list(&["nuslist"])?;
     let vdlist_text = read_opt_list(&["vdlist"])?;
     let vclist_text = read_opt_list(&["vclist"])?;
-    let fqlist_text = read_opt_list(&["fqlist", "fq1list", "fq2list"])?;
+    let fqlist_text = read_opt_list(&[
+        "fqlist", "fq1list", "fq2list", "fq3list", "fq4list", "fq5list", "fq6list", "fq7list",
+        "fq8list",
+    ])?;
     let difflist_text = read_opt_list(&["difflist"])?;
 
     let inputs = BrukerExperimentInputs {
@@ -2009,7 +2017,13 @@ fn interpret_bruker_experiment_inner(
                     {
                         let is_runtime_in_override = (d_idx == 0 && rhs_low.contains("in0"))
                             || (d_idx == 10 && rhs_low.contains("in10"));
-                        if d_idx < 64 && (delays_s[d_idx] <= 0.0 || is_runtime_in_override) {
+                        let is_multi_half_dwell =
+                            rhs_low.contains("cnst") && rhs_low.contains("*2+1)*in");
+                        if d_idx < 64
+                            && (delays_s[d_idx] <= 0.0
+                                || is_multi_half_dwell
+                                || is_runtime_in_override)
+                        {
                             if let Some(sec) = eval_simple_delay_expr(
                                 rhs_t,
                                 &delays_s,
@@ -2205,37 +2219,62 @@ fn interpret_bruker_experiment_inner(
     let loops = nest_loop_spans(raw_loops.clone());
 
     // Resolve `AQSEQ` (`321` vs `312`):
-    // 1. Explicit `##$AQSEQ= 1` -> `Aqseq312`.
-    // 2. Manual `lo to` loops (`mc_lines.is_empty()`) execute hard-coded hardware loop order
-    //    regardless of template default `##$AQSEQ= 0` in `acqus`: when `id0` (F1) is nested
-    //    inside `id10` (F2), resolve `Aqseq312` even if `##$AQSEQ= 0`!
+    // 1. Manual `lo to` loops (`mc_lines.is_empty()`) execute hard-coded hardware loop order
+    //    regardless of template `##$AQSEQ` (`0` or `1`) in `acqus` (e.g., XWIN-NMR 2.x `hncof.s`
+    //    with `##$AQSEQ= 1` while `l4` (`d10`, F2) runs inner to `l6` (`d0`, F1) = `Aqseq321`,
+    //    or `d0` (F1) inner to `d10` (F2) under `##$AQSEQ= 0` = `Aqseq312`).
+    // 2. Otherwise explicit `##$AQSEQ= 1` -> `Aqseq312`, `##$AQSEQ= 0` -> `Aqseq321`.
     // 3. When `##$AQSEQ` is omitted, fall back to `aqseq 312`/`aqseq 321` directive or loop order.
     let header_aqseq = a1.get("AQSEQ").and_then(|s| s.parse::<i32>().ok());
     let symbolic_loop_aqseq = detect_symbolic_loop_aqseq(&raw_loops);
     let aqseq = match dimensionality {
         1 => AcquisitionOrder::Dim1D,
         2 => AcquisitionOrder::Dim2D,
-        3 => match header_aqseq {
-            Some(1) => AcquisitionOrder::Aqseq312,
-            Some(0) => {
-                if mc_lines.is_empty() && symbolic_loop_aqseq == Some(AcquisitionOrder::Aqseq312) {
-                    warnings.push(
-                        "manual `lo to` loops advance `d0` (F1) inner to `d10` (F2) while acqus has default ##$AQSEQ=0; honoring loop order `Aqseq312`".to_string(),
-                    );
-                    AcquisitionOrder::Aqseq312
-                } else {
-                    if pp_aqseq_override == Some(AcquisitionOrder::Aqseq312) {
-                        warnings.push(
-                            "pulseprogram specifies `aqseq 312` while acqus ##$AQSEQ=0".to_string(),
-                        );
+        3 => {
+            if mc_lines.is_empty() {
+                if let Some(loop_order) = symbolic_loop_aqseq {
+                    if (header_aqseq == Some(0) && loop_order == AcquisitionOrder::Aqseq312)
+                        || (header_aqseq == Some(1) && loop_order == AcquisitionOrder::Aqseq321)
+                    {
+                        warnings.push(format!(
+                            "manual `lo to` loop nesting specifies `{loop_order:?}` while acqus has ##$AQSEQ={}; honoring executed hardware loop order",
+                            header_aqseq.unwrap_or(-1)
+                        ));
                     }
-                    AcquisitionOrder::Aqseq321
+                    loop_order
+                } else {
+                    match header_aqseq {
+                        Some(1) => AcquisitionOrder::Aqseq312,
+                        Some(0) => {
+                            if pp_aqseq_override == Some(AcquisitionOrder::Aqseq312) {
+                                warnings.push(
+                                    "pulseprogram specifies `aqseq 312` while acqus ##$AQSEQ=0"
+                                        .to_string(),
+                                );
+                            }
+                            AcquisitionOrder::Aqseq321
+                        }
+                        _ => pp_aqseq_override.unwrap_or(AcquisitionOrder::Aqseq321),
+                    }
+                }
+            } else {
+                match header_aqseq {
+                    Some(1) => AcquisitionOrder::Aqseq312,
+                    Some(0) => {
+                        if pp_aqseq_override == Some(AcquisitionOrder::Aqseq312) {
+                            warnings.push(
+                                "pulseprogram specifies `aqseq 312` while acqus ##$AQSEQ=0"
+                                    .to_string(),
+                            );
+                        }
+                        AcquisitionOrder::Aqseq321
+                    }
+                    _ => pp_aqseq_override
+                        .or(symbolic_loop_aqseq)
+                        .unwrap_or(AcquisitionOrder::Aqseq321),
                 }
             }
-            _ => pp_aqseq_override
-                .or(symbolic_loop_aqseq)
-                .unwrap_or(AcquisitionOrder::Aqseq321),
-        },
+        }
         _ => AcquisitionOrder::Dim4D,
     };
 
@@ -2260,6 +2299,30 @@ fn interpret_bruker_experiment_inner(
         &ch_nuclei,
     );
     dim_sym_f2.comment_reverse_override = comment_rev_overrides[2];
+
+    let mut fq_extra_jumps_ppm: Vec<(String, f64)> = Vec::new();
+    let (fq_sfo_f1, mut fq_jumps_f1) = resolve_bruker_per_scan_fq_sfo(
+        1,
+        &exec_lines,
+        &raw_loops,
+        &a1,
+        &ch_nuclei,
+        inp.fqlist_text,
+        exp_dir,
+    )?;
+    dim_sym_f1.per_scan_fq_sfo_mhz = fq_sfo_f1;
+    fq_extra_jumps_ppm.append(&mut fq_jumps_f1);
+    let (fq_sfo_f2, mut fq_jumps_f2) = resolve_bruker_per_scan_fq_sfo(
+        2,
+        &exec_lines,
+        &raw_loops,
+        &a1,
+        &ch_nuclei,
+        inp.fqlist_text,
+        exp_dir,
+    )?;
+    dim_sym_f2.per_scan_fq_sfo_mhz = fq_sfo_f2;
+    fq_extra_jumps_ppm.append(&mut fq_jumps_f2);
 
     // Build `IndirectDimPhysics` in acquisition parameter file order:
     // - 2D: `[acqu2s (F1)]`
@@ -2292,9 +2355,9 @@ fn interpret_bruker_experiment_inner(
                 || inp.vclist_text.is_some_and(|s| !s.trim().is_empty())
                 || inp.fqlist_text.is_some_and(|s| !s.trim().is_empty())
                 || inp.difflist_text.is_some_and(|s| !s.trim().is_empty());
-            let has_d10_evo = exec_lines
-                .iter()
-                .any(|(_, s)| contains_word(s, "d10") || contains_word(s, "id10"));
+            let has_d10_evo = exec_lines.iter().any(|(_, s)| {
+                contains_word(s, "d10") || contains_word(s, "id10") || contains_word(s, "dd10")
+            });
             let fn2 = a2
                 .as_ref()
                 .and_then(|m| m.get("FnMODE"))
@@ -2466,6 +2529,7 @@ fn interpret_bruker_experiment_inner(
         &direct_nucleus,
         &ch_nuclei,
         &ch_carrier_ppm,
+        &fq_extra_jumps_ppm,
         &cnst,
         &delays_s,
         &named_delays_s,
@@ -2539,8 +2603,42 @@ fn eval_simple_delay_expr(
             }
         }
     }
-    let clean = low.trim_start_matches('(').trim_end_matches(')');
-    // Half-dwell runtime expression `"d0=(in0/2-p1-(p21*2/3.14159))"` or `"in0/2-..."`
+    let mut outer_div = 1.0_f64;
+    let mut expr_body = low.as_str();
+    if expr_body.starts_with('(') {
+        if let Some(pos) = expr_body.rfind(")/") {
+            if let Ok(dv) = expr_body[pos + 2..].parse::<f64>() {
+                if dv > 0.0 {
+                    outer_div = dv;
+                    expr_body = &expr_body[1..pos];
+                }
+            }
+        }
+    }
+    let clean = expr_body.trim_start_matches('(').trim_end_matches(')');
+    // Pre-compensated multi-half-dwell runtime expression `"d0=((cnst0*2+1)*in0-...)/2"`
+    if let Some(rest_cnst) = clean.strip_prefix("cnst") {
+        let k_len = rest_cnst.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if k_len > 0 {
+            if let Ok(c_idx) = rest_cnst[..k_len].parse::<usize>() {
+                let after_k = &rest_cnst[k_len..];
+                if let Some(after_mul) = after_k.strip_prefix("*2+1)*") {
+                    for (in_tok, in_idx) in [("in10", 10usize), ("in0", 0usize)] {
+                        if after_mul.starts_with(in_tok) {
+                            if let (Some(&c_val), Some(&inc_s)) =
+                                (cnst.get(c_idx), increments_s.get(in_idx))
+                            {
+                                if (0.0..=4.0).contains(&c_val) && inc_s > 0.0 {
+                                    return Some(((2.0 * c_val + 1.0) * inc_s) / outer_div);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Half-dwell runtime expression `"d0=(in0/2-p1-(p21*2/3.14159))"` or `"(in0-...)/2"`
     for (in_tok, in_idx) in [("in10", 10usize), ("in0", 0usize)] {
         if let Some(after_in) = clean.strip_prefix(in_tok) {
             if let Some(&inc_s) = increments_s.get(in_idx) {
@@ -2553,12 +2651,12 @@ fn eval_simple_delay_expr(
                         if d_len > 0 {
                             if let Ok(dv) = after_div[..d_len].parse::<f64>() {
                                 if dv > 0.0 {
-                                    return Some(inc_s / dv);
+                                    return Some(inc_s / (dv * outer_div));
                                 }
                             }
                         }
                     }
-                    return Some(inc_s);
+                    return Some(inc_s / outer_div);
                 }
             }
         }
@@ -2622,6 +2720,28 @@ fn detect_symbolic_loop_aqseq(raw_loops: &[RawLoopSpan]) -> Option<AcquisitionOr
     }
 }
 
+/// Extract a canonical lowercase 180° refocusing pulse token (e.g. `"p14:sp3"`, `"cab_180"`,
+/// `"c13_180"`, `"p14"`, `"p22"`, `"p2"`) from an executable Bruker statement inside a spin echo.
+fn extract_180_pulse_token(stmt: &str) -> Option<String> {
+    let low = stmt.to_ascii_lowercase();
+    for raw_tok in low.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',')) {
+        let tok = raw_tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if tok.contains("180") {
+            return Some(tok.split(':').next().unwrap_or(tok).to_string());
+        }
+        if tok.starts_with("p14:sp") || tok.starts_with("p22:sp") || tok.starts_with("p2:sp") {
+            return Some(tok.to_string());
+        }
+        if matches!(tok, "p14" | "p22" | "p2" | "p8" | "p4") {
+            return Some(tok.to_string());
+        }
+    }
+    None
+}
+
 fn analyze_bruker_symbolic_dim(
     f_dim: usize,
     exec_lines: &[(usize, String)],
@@ -2637,11 +2757,12 @@ fn analyze_bruker_symbolic_dim(
         ..SymbolicDimLoopInfo::default()
     };
 
-    let (inc_d, dec_d, ph_macro, ea_macro, evo_tok, dec_tok) = if f_dim == 1 {
-        ("id0", "dd20", "F1PH", "F1EA", "d0", "d20")
-    } else {
-        ("id10", "dd30", "F2PH", "F2EA", "d10", "d30")
-    };
+    let (inc_d, dec_d, alt_dec_evo, alt_inc_comp, ph_macro, ea_macro, evo_tok, dec_tok) =
+        if f_dim == 1 {
+            ("id0", "dd20", "dd0", "id20", "F1PH", "F1EA", "d0", "d20")
+        } else {
+            ("id10", "dd30", "dd10", "id30", "F2PH", "F2EA", "d10", "d30")
+        };
 
     // 1. Check `mc` macro lines (`F1PH`, `F2PH`, `F1EA`, `F2EA`)
     let joined_mc = mc_lines.join(" ");
@@ -2662,6 +2783,10 @@ fn analyze_bruker_symbolic_dim(
         if contains_word(stmt, dec_d) && contains_word(stmt, inc_d) {
             info.constant_time = true;
         }
+        if contains_word(stmt, alt_dec_evo) && contains_word(stmt, alt_inc_comp) {
+            info.constant_time = true;
+            info.evo_decremented = true;
+        }
         if stmt.contains(precomp_tok) && info.quad_reg_sign.is_none() {
             for (_, follow) in exec_lines.iter().skip(idx + 1).take(6) {
                 if let Some(found) = follow
@@ -2680,13 +2805,19 @@ fn analyze_bruker_symbolic_dim(
         let touches_dim = lp
             .delay_ops
             .iter()
-            .any(|op| op == inc_d || (f_dim == 1 && op == "dd0") || (f_dim == 2 && op == "dd10"));
+            .any(|op| op == inc_d || op == alt_dec_evo);
         if !touches_dim {
             continue;
         }
         info.loop_nesting_rank = Some(lp_idx);
         if lp.delay_ops.iter().any(|op| op == dec_d) {
             info.constant_time = true;
+        }
+        if lp.delay_ops.iter().any(|op| op == alt_dec_evo) {
+            info.evo_decremented = true;
+            if lp.delay_ops.iter().any(|op| op == alt_inc_comp) {
+                info.constant_time = true;
+            }
         }
         let outer_has_tppi = lp
             .phase_ops
@@ -2700,17 +2831,70 @@ fn analyze_bruker_symbolic_dim(
             let is_two_step = prev.resolved_count == Some(2) || prev.count_expr.trim() == "2";
             if is_two_step && prev.end_line < lp.end_line {
                 let prev_igrad = !prev.grad_ops.is_empty();
-                let prev_90 = prev.phase_ops.iter().find_map(|op| parse_90deg_ip_dp(op));
+                let prev_90_all: Vec<(usize, i32)> = prev
+                    .phase_ops
+                    .iter()
+                    .filter_map(|op| parse_90deg_ip_dp(op))
+                    .collect();
                 if prev_igrad {
                     info.has_igrad_ea = true;
                     info.synthesized_quad = Some(DecodedQuadMode::EchoAntiecho);
-                } else if let Some((reg, sign)) = prev_90 {
+                } else if let Some(&(reg, sign)) = prev_90_all.first() {
                     info.quad_reg_sign = Some((reg, sign));
-                    info.synthesized_quad = Some(if outer_has_tppi {
+                    let (_, rec_qturns) = phase_ops_quarter_turns(&lp.phase_ops, 31);
+                    let rec_toggles_180 = rec_qturns.rem_euclid(4) == 2;
+                    let (rf_reset, rf_qturns) = phase_ops_quarter_turns(&lp.phase_ops, reg);
+                    // Executing `ip<reg>`/`dp<reg>` twice in `prev` advances `ph<reg>` by 180° per `t1`
+                    // step unless `lp` cancels it (`rp<reg>` or `ip<reg>*2`/`dp<reg>*2`). When `ph<reg>`
+                    // IS uncancelled AND `ph31` ALSO toggles by 180° (`2 * ip31`), `(-1)_RF * (-1)_rec = +1`
+                    // = pure `States` (`States-TPPI` requires `rec_toggles_180 && rf_cancelled_in_outer`).
+                    let rf_cancelled_in_outer = rf_reset || rf_qturns.rem_euclid(4) == 2;
+                    info.synthesized_quad = Some(if rec_toggles_180 && rf_cancelled_in_outer {
                         DecodedQuadMode::StatesTppi
                     } else {
                         DecodedQuadMode::States
                     });
+
+                    // Paired post-evolution readout echo `(90_{phA}) - tau - (180_{+x}) - tau - (90_{phB})`
+                    // (e.g. Abildgaard `hncacbf.s` / `hncocacbf.s` `ip16` + `ip17`, vs TopSpin `hncacbgp3d`
+                    // which places an additional `(p14:sp3 ph1):f2` 180° refocusing pulse between the last
+                    // `d0` and `ph9`!): count parity `(1 + pre_refocus_cnt) % 2 == 1` of the echo's own
+                    // 180° refocusing pulse token between the last `evo_tok` (`d0`/`d10`) and `phA`.
+                    if prev_90_all.len() >= 2 && prev_90_all[0].0 != prev_90_all[1].0 {
+                        let r_a = format!("ph{}", prev_90_all[0].0);
+                        let r_b = format!("ph{}", prev_90_all[1].0);
+                        let last_evo_l = exec_lines.iter().rposition(|(_, s)| {
+                            !s.contains("MCWRK")
+                                && !s.contains("caldel")
+                                && !s.trim_start().starts_with('"')
+                                && !s.starts_with("define ")
+                                && contains_word(s, evo_tok)
+                        });
+                        let a_l = exec_lines.iter().position(|(_, s)| {
+                            !s.trim_start().starts_with('"') && contains_word(s, &r_a)
+                        });
+                        let b_l = exec_lines.iter().position(|(_, s)| {
+                            !s.trim_start().starts_with('"') && contains_word(s, &r_b)
+                        });
+                        if let (Some(el), Some(al), Some(bl)) = (last_evo_l, a_l, b_l) {
+                            if al > el && bl > al {
+                                let echo_180_tok = exec_lines[al + 1..bl]
+                                    .iter()
+                                    .find_map(|(_, s)| extract_180_pulse_token(s));
+                                if let Some(ref tok180) = echo_180_tok {
+                                    let pre_refocus_cnt = exec_lines[el + 1..al]
+                                        .iter()
+                                        .filter(|(_, s)| {
+                                            s.to_ascii_lowercase().contains(tok180.as_str())
+                                        })
+                                        .count();
+                                    if (1 + pre_refocus_cnt) % 2 == 1 {
+                                        info.paired_post_evo_echo_quad = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -2912,6 +3096,200 @@ fn parse_90deg_ip_dp(tok: &str) -> Option<(usize, i32)> {
     None
 }
 
+fn phase_ops_quarter_turns(ops: &[String], target_reg: usize) -> (bool, i32) {
+    let mut has_reset = false;
+    let mut qturns = 0_i32;
+    for op in ops {
+        let low = op.to_ascii_lowercase();
+        if let Some(rest) = low.strip_prefix("rp") {
+            if rest.parse::<usize>().ok() == Some(target_reg) {
+                has_reset = true;
+                qturns = 0;
+            }
+        } else if let Some((sign, rest)) = low
+            .strip_prefix("ip")
+            .map(|r| (1_i32, r))
+            .or_else(|| low.strip_prefix("dp").map(|r| (-1_i32, r)))
+        {
+            let (reg_s, mult_s) = rest
+                .split_once('*')
+                .map(|(a, b)| (a, Some(b)))
+                .unwrap_or((rest, None));
+            if reg_s.parse::<usize>().ok() == Some(target_reg) {
+                let m = mult_s.and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+                qturns += sign * m;
+            }
+        }
+    }
+    (has_reset, qturns)
+}
+
+#[allow(clippy::type_complexity)]
+fn resolve_bruker_per_scan_fq_sfo(
+    f_dim: usize,
+    exec_lines: &[(usize, String)],
+    raw_loops: &[RawLoopSpan],
+    acqus: &HashMap<String, String>,
+    ch_nuclei: &[String; 5],
+    fallback_fqlist_text: Option<&str>,
+    exp_dir: Option<&Path>,
+) -> Result<(Option<(String, f64)>, Vec<(String, f64)>), PulprogError> {
+    if raw_loops
+        .iter()
+        .any(|l| l.list_ops.iter().any(|o| o.starts_with("ifq")))
+    {
+        return Ok((None, Vec::new()));
+    }
+    let evo_tok = if f_dim == 1 { "d0" } else { "d10" };
+    let Some(evo_idx) = exec_lines.iter().position(|(_, s)| {
+        !s.contains("MCWRK")
+            && !s.contains("caldel")
+            && !s.trim_start().starts_with('"')
+            && !s.starts_with("define ")
+            && contains_word(s, evo_tok)
+    }) else {
+        return Ok((None, Vec::new()));
+    };
+
+    // Scan `exec_lines` for intra-scan `fq<k>:f<ch>` switches (`1 <= k <= 8`, `1 <= ch <= 4`)
+    for k in 1..=8usize {
+        for (ch, nuc) in ch_nuclei.iter().enumerate().take(5).skip(1) {
+            if nuc.is_empty() {
+                continue;
+            }
+            let pat = format!("fq{k}:f{ch}");
+            let mut before_evo = 0usize;
+            let mut total_calls = 0usize;
+            for (idx, (_, stmt)) in exec_lines.iter().enumerate() {
+                if stmt.trim_start().starts_with('"') {
+                    continue;
+                }
+                let low = stmt.to_ascii_lowercase();
+                let n_hits = low
+                    .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';'))
+                    .filter(|t| *t == pat)
+                    .count();
+                if n_hits > 0 {
+                    total_calls += n_hits;
+                    if idx < evo_idx {
+                        before_evo += n_hits;
+                    }
+                }
+            }
+            if before_evo == 0 || total_calls < 2 {
+                continue;
+            }
+            // Locate the corresponding `fq*list` file (`fq<k>list`, XWIN-NMR 0-indexed `fq<k-1>list`, or `fqlist`)
+            let fq_txt_owned: Option<String> = if let Some(dir) = exp_dir {
+                let canon_root = canonicalize_exp_dir(dir)?;
+                let mut candidates = vec![format!("fq{k}list")];
+                if k >= 1 {
+                    candidates.push(format!("fq{}list", k - 1));
+                }
+                candidates.push("fqlist".to_string());
+                let mut loaded = None;
+                for cand in &candidates {
+                    if let Some(p) = find_relative_child_ci(dir, cand) {
+                        let s = read_sandboxed_text_lossy(&canon_root, &p, cand)?;
+                        if !s.trim().is_empty() {
+                            loaded = Some(s);
+                            break;
+                        }
+                    }
+                }
+                loaded.or_else(|| fallback_fqlist_text.map(String::from))
+            } else {
+                fallback_fqlist_text.map(String::from)
+            };
+
+            let Some(txt) = fq_txt_owned else {
+                continue;
+            };
+            let ch_bf = acqus
+                .get(&format!("BF{ch}"))
+                .or_else(|| acqus.get(&format!("SFO{ch}")))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(150.9);
+            let Some(entries_mhz) = parse_bruker_fqlist_mhz(&txt, ch_bf) else {
+                continue;
+            };
+            if entries_mhz.len() != total_calls {
+                continue;
+            }
+            let active_sfo = entries_mhz[(before_evo - 1) % entries_mhz.len()];
+            let mut extra_jumps = Vec::new();
+            if entries_mhz.len() >= 3 && ch_bf > 1.0 {
+                for &mhz in &entries_mhz {
+                    let ppm = (mhz - ch_bf) * 1e6 / ch_bf;
+                    extra_jumps.push((nuc.clone(), ppm));
+                }
+            }
+            return Ok((Some((nuc.clone(), active_sfo)), extra_jumps));
+        }
+    }
+    Ok((None, Vec::new()))
+}
+
+fn parse_bruker_fqlist_mhz(text: &str, default_bf_mhz: f64) -> Option<Vec<f64>> {
+    #[derive(Clone, Copy)]
+    enum FqUnit {
+        DefaultBfHz(f64),
+        HzOffset(f64),
+        PpmOffset(f64),
+        AbsHz,
+    }
+    let mut unit = FqUnit::DefaultBfHz(default_bf_mhz);
+    let mut entries = Vec::new();
+    for raw in text.lines() {
+        let t = raw.split(['#', ';']).next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut parts = t.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        if first.eq_ignore_ascii_case("O") || first.eq_ignore_ascii_case("B") {
+            if let Some(base) = parts.next().and_then(|s| s.parse::<f64>().ok()) {
+                if base > 1.0 {
+                    unit = FqUnit::HzOffset(base);
+                }
+            }
+            continue;
+        }
+        if first.eq_ignore_ascii_case("P") {
+            if let Some(base) = parts.next().and_then(|s| s.parse::<f64>().ok()) {
+                if base > 1.0 {
+                    unit = FqUnit::PpmOffset(base);
+                }
+            }
+            continue;
+        }
+        if first.eq_ignore_ascii_case("SFO") {
+            if let Some(kind) = parts.next() {
+                if kind.eq_ignore_ascii_case("hz") {
+                    unit = FqUnit::AbsHz;
+                }
+            }
+            continue;
+        }
+        if let Ok(val) = first.parse::<f64>() {
+            let mhz = match unit {
+                FqUnit::HzOffset(base) => base + val * 1e-6,
+                FqUnit::PpmOffset(base) => base * (1.0 + val * 1e-6),
+                FqUnit::AbsHz => val * 1e-6,
+                FqUnit::DefaultBfHz(bf) => {
+                    if val > 1.0e7 {
+                        val * 1e-6
+                    } else {
+                        bf + val * 1e-6
+                    }
+                }
+            };
+            entries.push(mhz);
+        }
+    }
+    (!entries.is_empty()).then_some(entries)
+}
+
 fn extract_calph_macro_90(text: &str, macro_prefix: &str) -> Option<(usize, i32)> {
     let idx = text.find(macro_prefix)?;
     let tail = &text[idx + macro_prefix.len()..];
@@ -3019,6 +3397,11 @@ fn build_bruker_indirect_dim_physics(
                     active_sfo = cs;
                 }
             }
+        }
+    }
+    if let Some((ref fq_nuc, fq_sfo)) = sym.per_scan_fq_sfo_mhz {
+        if *fq_nuc == nucleus && fq_sfo > 1.0 {
+            active_sfo = fq_sfo;
         }
     }
     let carrier_ppm = (active_sfo - obs_mhz) * 1e6 / obs_mhz;
@@ -3140,8 +3523,16 @@ fn build_bruker_indirect_dim_physics(
         0.0
     };
     let half_dwell_sampling = !sym.constant_time && (0.34..=0.68).contains(&frac_dwell);
+    let multi_half_dwell = !sym.constant_time
+        && (1.34..=4.68).contains(&frac_dwell)
+        && ((frac_dwell - 0.5) - (frac_dwell - 0.5).round()).abs() <= 0.18;
     let (predicted_phc0_deg, predicted_phc1_deg) = if half_dwell_sampling {
         (-90.0, 180.0)
+    } else if multi_half_dwell {
+        let dwell_mult = (frac_dwell - 0.5).round() + 0.5;
+        let raw_p0 = -180.0 * dwell_mult;
+        let wrapped_p0 = (raw_p0 + 180.0).rem_euclid(360.0) - 180.0;
+        (wrapped_p0, 360.0 * dwell_mult)
     } else {
         (0.0, 0.0)
     };
@@ -3241,6 +3632,12 @@ fn infer_symbolic_reverse(
                 if has_dec_before_evo {
                     net_sign = -net_sign;
                 }
+            }
+            if sym.evo_decremented {
+                net_sign = -net_sign;
+            }
+            if sym.paired_post_evo_echo_quad {
+                net_sign = -net_sign;
             }
             return net_sign < 0;
         }
@@ -3352,6 +3749,16 @@ fn detect_bruker_pseudo3d_order(
                 list_kind_from_inputs.or_else(|| Some("qf_planes".to_string())),
             );
         }
+        // If BOTH indirect dimensions are phase-sensitive hypercomplex (`!inner_qf && !outer_qf`)
+        // AND the pulse sequence evolves two chemical-shift axes (`d0` and `d10`/`id10`/`dd10`)
+        // with no `ivd`/`ivc`/`ifq` list-increment loop, any `fq*list` on disk is an intra-scan
+        // carrier-switching list (e.g., XWIN-NMR 2.x `hncocacbf.s` / `hncof.s`), NOT pseudo-3D!
+        let has_d10_shift_evo = exec_lines.iter().any(|(_, s)| {
+            contains_word(s, "d10") || contains_word(s, "id10") || contains_word(s, "dd10")
+        });
+        if !inner_qf && !outer_qf && has_d10_shift_evo {
+            return (Pseudo3DStorageOrder::NotPseudo3D, None);
+        }
     }
 
     if let Some(kind) = list_kind_from_inputs {
@@ -3378,6 +3785,7 @@ fn build_bruker_transfer_graph(
     direct_nucleus: &str,
     ch_nuclei: &[String; 5],
     ch_carrier_ppm: &[Option<f64>; 5],
+    extra_carrier_jumps_ppm: &[(String, f64)],
     cnst: &[f64],
     delays_s: &[f64],
     named_delays_s: &HashMap<String, f64>,
@@ -3488,14 +3896,29 @@ fn build_bruker_transfer_graph(
             }
         }
     }
-    if let Some(c_ppm) = ch_carrier_ppm[2] {
-        if ch_nuclei[2] == "13C" {
-            if (165.0..=190.0).contains(&c_ppm) {
-                visited_co = true;
-            } else if (49.0..=66.0).contains(&c_ppm) {
-                visited_ca = true;
-            } else if (35.0..=48.9).contains(&c_ppm) {
-                visited_cacb = true;
+    for &(ref nuc, ppm) in extra_carrier_jumps_ppm {
+        carrier_jumps_ppm.push((nuc.clone(), ppm));
+        if (165.0..=190.0).contains(&ppm) {
+            visited_co = true;
+        } else if (49.0..=66.0).contains(&ppm) {
+            visited_ca = true;
+        } else if (35.0..=48.9).contains(&ppm) {
+            visited_cacb = true;
+        }
+    }
+    for ch in 1..=4 {
+        if let Some(c_ppm) = ch_carrier_ppm[ch] {
+            if ch_nuclei[ch] == "13C" {
+                let evolves_co = indirect_dims
+                    .iter()
+                    .any(|d| d.nucleus == "13C" && d.carrier_ppm > 145.0);
+                if (165.0..=190.0).contains(&c_ppm) {
+                    visited_co = true;
+                } else if (49.0..=66.0).contains(&c_ppm) && !evolves_co {
+                    visited_ca = true;
+                } else if (35.0..=48.9).contains(&c_ppm) && !evolves_co {
+                    visited_cacb = true;
+                }
             }
         }
     }

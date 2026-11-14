@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 
 use nmr_core::fid::{
     bruker_dsp_group_delay, find_child_ci, read_bruker_fid_1d, read_bruker_fid_2d,
-    read_bruker_fid_3d, read_fid_2d, read_fid_3d, read_fid_auto, Complex64, FidVendor, QuadMode,
-    RawFid,
+    read_bruker_fid_3d, read_fid_2d, read_fid_2d_opts, read_fid_3d, read_fid_3d_opts,
+    read_fid_auto, Complex64, FidVendor, QuadMode, RawFid,
+};
+use nmr_core::process::{
+    process_fid_dir_2d, process_fid_dir_2d_opts, process_fid_dir_3d, process_fid_dir_3d_opts,
 };
 use nmr_core::spectrum::{read_bruker_pdata_2d, read_bruker_pdata_3d};
 
@@ -1717,4 +1720,334 @@ f2coef 2 2 32 0 0 2 1 1 1 17
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f1_xwinnmr_missing_fnmode_pulprog_and_mc2_fallbacks_and_template_sf_guard() {
+    let dir = temp_test_dir("f1_xwinnmr_mc2_sf_guard");
+    let acqus = "\
+##TITLE= Parameter file, XWIN-NMR 2.6
+##JCAMPDX= 5.0
+##$BYTORDA= 1
+##$DTYPA= 0
+##$AQ_mod= 3
+##$TD= 32
+##$SW_h= 8389.26
+##$SFO1= 600.1328206
+##$BF1= 600.1300000
+##$O1= 2820.61
+##$NUC1= <1H>
+##$NUC3= <15N>
+##$BF3= 60.8106630
+##$SFO3= 60.8179603
+##$O3= 7297.29
+##$DECIM= 1
+##$DSPFVS= 0
+##$PULPROG= <fhsqc.s>
+##END=
+";
+    // Legacy XWIN-NMR 2.x `acqu2s` omits `##$FnMODE` entirely!
+    let acqu2s_no_fnmode = "\
+##TITLE= Parameter file, XWIN-NMR 2.6
+##JCAMPDX= 5.0
+##$TD= 8
+##$SW= 29.85
+##$SFO1= 60.8179603
+##$BF1= 60.8106630
+##$NUC1= <15N>
+##END=
+";
+    fs::write(dir.join("acqus"), acqus).unwrap();
+    fs::write(dir.join("acqu2s"), acqu2s_no_fnmode).unwrap();
+
+    // 8 traces of 256 big-endian i32 words (1024-byte blocks)
+    let mut ser_bytes = Vec::with_capacity(8 * 1024);
+    for t in 0..8i32 {
+        for w in 0..256i32 {
+            let v = if w < 32 { (t + 1) * 100 + w } else { 0 };
+            ser_bytes.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+    fs::write(dir.join("ser"), &ser_bytes).unwrap();
+
+    // Priority 3: neither `pulseprogram` nor `proc2s` `MC2` -> fail closed!
+    let err_none = read_fid_2d(&dir).expect_err("missing FnMODE without pulprog or MC2 must fail");
+    assert!(
+        err_none.contains("FnMODE") && err_none.contains("MC2"),
+        "unexpected error: {err_none}"
+    );
+
+    // Priority 2: `proc2s` `MC2` deterministic mapping (`0=>Qf`, `3=>States`, `4=>StatesTppi`, `5=>EchoAntiecho`)
+    // AND template `SF = 600.13` (`1H` template on `15N` `BF1 = 60.810663`!) + `OFFSET = -898657.9` guard!
+    let pdata1 = dir.join("pdata").join("1");
+    fs::create_dir_all(&pdata1).unwrap();
+    fs::write(
+        pdata1.join("procs"),
+        "##$FT_mod= 6\n##$PH_mod= 1\n##$PHC0= 0\n##$PHC1= 0\n##$SF= 600.13\n##$OFFSET= 11.68\n##$SI= 32\n##END=\n",
+    )
+    .unwrap();
+    for (mc2_code, expected_qm) in [
+        (0, QuadMode::Qf),
+        (3, QuadMode::States),
+        (4, QuadMode::StatesTppi),
+        (5, QuadMode::EchoAntiecho),
+    ] {
+        fs::write(
+            pdata1.join("proc2s"),
+            format!(
+                "##$MC2= {mc2_code}\n##$FT_mod= 4\n##$PH_mod= 1\n##$PHC0= 0\n##$PHC1= 0\n##$SF= 600.1300000\n##$OFFSET= -898657.9\n##$SI= 16\n##$REVERSE= no\n##END=\n"
+            ),
+        )
+        .unwrap();
+        let fid2 = read_fid_2d(&dir).expect("MC2 fallback should succeed");
+        assert_eq!(fid2.axis_y.quad_mode, expected_qm);
+        assert!(
+            (fid2.axis_y.obs_mhz - 60.8106630).abs() < 1e-4,
+            "proc2s template 1H SF=600.13 must be rejected on 15N axis (BF1=60.810663), got {}",
+            fid2.axis_y.obs_mhz
+        );
+        assert!(
+            fid2.axis_y.first_ppm > 100.0 && fid2.axis_y.first_ppm < 160.0,
+            "proc2s template OFFSET=-898657.9 must be rejected, got first_ppm={}",
+            fid2.axis_y.first_ppm
+        );
+    }
+
+    // Unsupported `MC2` codes (`1 = QSEQ`, `2 = TPPI`, `99 = unknown`) must fail closed!
+    for bad_mc2 in [1, 2, 99] {
+        fs::write(
+            pdata1.join("proc2s"),
+            format!("##$MC2= {bad_mc2}\n##$SF= 60.8106630\n##$OFFSET= 134.9\n##END=\n"),
+        )
+        .unwrap();
+        let err = read_fid_2d(&dir).expect_err("unsupported MC2 must fail closed");
+        assert!(
+            err.contains("MC2"),
+            "expected MC2 error for {bad_mc2}, got: {err}"
+        );
+    }
+
+    // Priority 1: `pulseprogram` `SynthesizedManualLoop` (`StatesTppi`) takes priority over `proc2s` `MC2 = 3` (`States`)!
+    fs::write(
+        pdata1.join("proc2s"),
+        "##$MC2= 3\n##$SF= 60.8106630\n##$OFFSET= 134.9\n##END=\n",
+    )
+    .unwrap();
+    let pp_manual_states_tppi = "\
+1 ze
+2 d1 do:f3
+3 (p1 ph1)
+  (p21 ph3):f3
+  d0
+  (p2 ph2)
+  d0
+  (p21 ph4):f3
+  go=3 ph31 cpd3:f3
+  d1 do:f3 wr #0 if #0 zd ip3
+  lo to 3 times 2
+  d1 id0 ip3*2 ip31*2
+  lo to 2 times 4
+exit
+ph1=0
+ph2=0
+ph3=0 2
+ph4=0
+ph31=0 2
+";
+    fs::write(dir.join("pulseprogram"), pp_manual_states_tppi).unwrap();
+    let fid_pp = read_fid_2d(&dir).expect("pulseprogram manual loop priority 1");
+    assert_eq!(
+        fid_pp.axis_y.quad_mode,
+        QuadMode::StatesTppi,
+        "Priority 1 pulseprogram SynthesizedManualLoop must take precedence over proc2s MC2"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f2_truncated_fid_opt_in_zero_fill_bruker_and_varian() {
+    // 1. Truncated Bruker 3D `ser` (`48 / 64` traces = 75.0% acquired)
+    let bdir = temp_test_dir("f2_trunc_bruker_3d");
+    let acqus = "\
+##TITLE= Parameter file, TopSpin 3.2
+##JCAMPDX= 5.0
+##$BYTORDA= 0
+##$DTYPA= 0
+##$AQ_mod= 3
+##$TD= 32
+##$SW_h= 8000.0
+##$SFO1= 600.1328
+##$BF1= 600.1300
+##$NUC1= <1H>
+##$DECIM= 1
+##$DSPFVS= 0
+##$AQSEQ= 0
+##$PULPROG= <hncogp3d>
+##END=
+";
+    let acqu2s = "\
+##$FnMODE= 4
+##$TD= 8
+##$SW= 32.0
+##$SFO1= 60.8180
+##$BF1= 60.8106
+##$NUC1= <15N>
+##END=
+";
+    let acqu3s = "\
+##$FnMODE= 4
+##$TD= 8
+##$SW= 14.0
+##$SFO1= 150.9293
+##$BF1= 150.9028
+##$NUC1= <13C>
+##END=
+";
+    fs::write(bdir.join("acqus"), acqus).unwrap();
+    fs::write(bdir.join("acqu2s"), acqu2s).unwrap();
+    fs::write(bdir.join("acqu3s"), acqu3s).unwrap();
+
+    // Write only 48 of the expected 64 1024-byte traces (+ 128 trailing partial bytes from mid-scan halt!)
+    let mut ser_trunc = Vec::with_capacity(48 * 1024 + 128);
+    for t in 0..48i32 {
+        for w in 0..256i32 {
+            let val = if w < 32 { (t + 1) * 10 + w } else { 0 };
+            ser_trunc.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+    ser_trunc.extend_from_slice(&[0xAB; 128]);
+    fs::write(bdir.join("ser"), &ser_trunc).unwrap();
+
+    assert!(
+        read_fid_3d(&bdir).is_err(),
+        "default read_fid_3d must reject truncated Bruker ser"
+    );
+    assert!(
+        process_fid_dir_3d(&bdir, "HNCO", false, false).is_err(),
+        "default process_fid_dir_3d must reject truncated Bruker ser"
+    );
+
+    let bfid = read_fid_3d_opts(&bdir, true).expect("opt-in truncated Bruker 3D");
+    assert_eq!(bfid.truncated_traces, Some((48, 64)));
+    assert_eq!(bfid.trace(0, 0, 0, 0)[0], [10.0, 11.0]);
+    // k2 = 3 (traces 48..63) must be zero-filled!
+    assert_eq!(bfid.trace(3, 0, 0, 0), vec![[0.0, 0.0]; 16].as_slice());
+
+    let (_bspec, brec) =
+        process_fid_dir_3d_opts(&bdir, "HNCO", false, false, true).expect("process truncated 3D");
+    assert!(brec.allow_truncated_fid);
+    assert!(brec.truncated_fid_zero_filled);
+    let bwarn = brec
+        .truncated_fid_warning
+        .as_deref()
+        .expect("truncated_fid_warning recorded");
+    assert!(bwarn.contains("48/64") && bwarn.contains("75.0%"));
+
+    // Empty `ser` (`0` complete traces) must STILL fail closed even with `allow_truncated_fid = true`!
+    fs::write(bdir.join("ser"), [0u8; 64]).unwrap();
+    assert!(read_fid_3d_opts(&bdir, true).is_err());
+    let _ = fs::remove_dir_all(&bdir);
+
+    // 2. Truncated Varian 2D & 3D `fid` (including mid-hypercomplex-point halt `10 / 16` traces!)
+    let vdir = temp_test_dir("f2_trunc_varian_3d");
+    let procpar_3d = "\
+sfrq 1 1 1000 0 0 2 1 1 1 1
+1 599.812
+0
+dfrq 1 1 1000 0 0 2 1 1 1 2
+1 150.822
+0
+dfrq2 1 1 1000 0 0 2 1 1 1 3
+1 60.785
+0
+sw 1 1 100000 0 0 2 1 1 1 4
+1 8000.0
+0
+sw1 1 1 100000 0 0 2 1 1 1 5
+1 9000.0
+0
+sw2 1 1 100000 0 0 2 1 1 1 6
+1 1800.0
+0
+np 1 1 65536 2 2 2 1 1 1 7
+1 32
+0
+ni 1 1 4096 0 1 2 1 1 1 8
+1 2
+0
+ni2 1 1 4096 0 1 2 1 1 1 9
+1 2
+0
+tn 2 2 8 0 0 2 1 1 1 10
+1 \"H1\"
+0
+dn 2 2 8 0 0 2 1 1 1 11
+1 \"C13\"
+0
+dn2 2 2 8 0 0 2 1 1 1 12
+1 \"N15\"
+0
+phase 1 1 4 1 1 2 1 1 1 13
+2 1 2
+0
+phase2 1 1 4 1 1 2 1 1 1 14
+2 1 2
+0
+array 2 2 32 0 0 2 1 1 1 15
+1 \"phase,phase2\"
+0
+f1coef 2 2 32 0 0 2 1 1 1 16
+1 \"1 0 0 0 0 0 -1 0\"
+0
+f2coef 2 2 32 0 0 2 1 1 1 17
+1 \"1 0 -1 0 0 -1 0 -1\"
+0
+";
+    fs::write(vdir.join("procpar"), procpar_3d).unwrap();
+    // Expects 2 * 2 * 2 * 2 = 16 traces of 16 complex points; write only 10 blocks (+ truncated 11th block bytes)!
+    let mut vtraces: Vec<Vec<[f32; 2]>> = (0..11).map(|_| vec![[0.0, 0.0]; 16]).collect();
+    for (ti, tr) in vtraces.iter_mut().enumerate() {
+        tr[0] = [(ti as f32) + 5.0, 1.0];
+    }
+    let mut vbytes = build_varian_f32_fid(&vtraces);
+    // Chop off the last 40 bytes so block 11 is incomplete on disk (leaving 10 complete traces out of 16)!
+    vbytes.truncate(vbytes.len() - 40);
+    fs::write(vdir.join("fid"), &vbytes).unwrap();
+
+    assert!(
+        read_fid_3d(&vdir).is_err(),
+        "default read_fid_3d must reject truncated Varian fid"
+    );
+    assert!(
+        process_fid_dir_3d(&vdir, "CBCACONH", false, false).is_err(),
+        "default process_fid_dir_3d must reject truncated Varian fid"
+    );
+
+    let vfid = read_fid_3d_opts(&vdir, true).expect("opt-in truncated Varian 3D");
+    assert_eq!(vfid.truncated_traces, Some((10, 16)));
+    let (_vspec, vrec) = process_fid_dir_3d_opts(&vdir, "CBCACONH", false, false, true)
+        .expect("process truncated Varian 3D");
+    assert!(vrec.allow_truncated_fid);
+    assert!(vrec.truncated_fid_zero_filled);
+    let vwarn = vrec
+        .truncated_fid_warning
+        .as_deref()
+        .expect("Varian truncated_fid_warning");
+    assert!(vwarn.contains("10/16") && vwarn.contains("62.5%"));
+
+    // Also check Varian 2D (`ni2 = 0`) default reject vs opt-in zero-fill
+    let procpar_2d = procpar_3d.replace("ni2 1 1 4096 0 1 2 1 1 1 9\n1 2\n0\n", "");
+    fs::write(vdir.join("procpar"), procpar_2d).unwrap();
+    let v2_traces: Vec<Vec<[f32; 2]>> = (0..3).map(|_| vec![[2.0, 0.5]; 16]).collect();
+    fs::write(vdir.join("fid"), build_varian_f32_fid(&v2_traces)).unwrap();
+    assert!(read_fid_2d(&vdir).is_err());
+    assert!(process_fid_dir_2d(&vdir, true, false).is_err());
+    let vfid2 = read_fid_2d_opts(&vdir, true).expect("opt-in truncated Varian 2D");
+    assert_eq!(vfid2.truncated_traces, Some((3, 4)));
+    let (_vspec2, vrec2) =
+        process_fid_dir_2d_opts(&vdir, true, false, true).expect("process truncated Varian 2D");
+    assert!(vrec2.truncated_fid_zero_filled);
+
+    let _ = fs::remove_dir_all(&vdir);
 }

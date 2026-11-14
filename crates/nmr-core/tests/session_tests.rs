@@ -93,6 +93,9 @@ fn sample_processing_recipe(
         }),
         enable_axis_rescue: true,
         axis_rescue_audit: None,
+        allow_truncated_fid: false,
+        truncated_fid_zero_filled: false,
+        truncated_fid_warning: None,
     }
 }
 
