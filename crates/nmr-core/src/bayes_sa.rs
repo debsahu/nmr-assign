@@ -36,7 +36,11 @@ use crate::priors::{
     sync_detailed_reference_offsets, DetailedReferenceOffsets, Priors, ShiftOffsets,
     COVALENT_COIL_WEIGHT, STANDARD_RESIDUES,
 };
-use crate::qc::{apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport};
+use crate::qc::{
+    apply_bayes_sa_calibration_map, apply_bayes_sa_gpu_calibration_map,
+    apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport,
+    BAYES_SA_CPU_CALIBRATED_RUNS, BAYES_SA_GPU_CALIBRATED_RUNS,
+};
 use crate::rng::Rng;
 use crate::solver::{resolve_locked_assignments, AssignResult, Matrix2D, ScoreConfig};
 use crate::spinsystems::{build_spin_systems, SpinSystem, Tolerances};
@@ -3021,8 +3025,8 @@ pub fn check_post_peak_convergence(
     stage + 1 >= cfg.min_stages && passed_peak && low_fluct_streak >= 3 && next_temp <= 0.45
 }
 
-/// Convert multi-replica best assignments + energies into a calibrated `(AssignResult, BayesSaReport)`.
-/// Shared by both `nmr-core::bayes_sa` (CPU) and `nmr-gpu::bayes_sa_gpu` (WebGPU).
+/// Convert multi-replica best assignments + energies into a calibrated `(AssignResult, BayesSaReport)`
+/// for CPU (`is_gpu_engine = false`).
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_bayes_sa_from_replicas(
     peaks: Option<&[Peak]>,
@@ -3036,6 +3040,40 @@ pub fn finalize_bayes_sa_from_replicas(
     final_energies: Vec<f64>,
     cooling_trajectory: Vec<BayesSaTempStep>,
     converged_early: bool,
+) -> (AssignResult, BayesSaReport) {
+    finalize_bayes_sa_from_replicas_for_engine(
+        peaks,
+        systems,
+        sequence,
+        priors,
+        cfg,
+        matrices,
+        best_ats,
+        best_energies,
+        final_energies,
+        cooling_trajectory,
+        converged_early,
+        false,
+    )
+}
+
+/// Convert multi-replica best assignments + energies into a calibrated `(AssignResult, BayesSaReport)`.
+/// Shared by both `nmr-core::bayes_sa` (`is_gpu_engine = false`) and
+/// `nmr-gpu::bayes_sa_gpu` (`is_gpu_engine = true`).
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_bayes_sa_from_replicas_for_engine(
+    peaks: Option<&[Peak]>,
+    systems: &[SpinSystem],
+    sequence: &[String],
+    priors: &Priors,
+    cfg: &BayesSaConfig,
+    matrices: &BayesSaMatrices,
+    best_ats: &[Vec<i32>],
+    best_energies: Vec<f64>,
+    final_energies: Vec<f64>,
+    cooling_trajectory: Vec<BayesSaTempStep>,
+    converged_early: bool,
+    is_gpu_engine: bool,
 ) -> (AssignResult, BayesSaReport) {
     let s_len = systems.len();
     let k_len = matrices.e_unary.cols;
@@ -3193,6 +3231,20 @@ pub fn finalize_bayes_sa_from_replicas(
         run_scores,
     };
 
+    if cfg.apply_qc_calibration {
+        for s in 0..s_len {
+            if result.position[s] >= 0 {
+                result.confidence[s] = if is_gpu_engine {
+                    apply_bayes_sa_gpu_calibration_map(result.confidence[s])
+                } else {
+                    apply_bayes_sa_calibration_map(result.confidence[s])
+                };
+            } else {
+                result.confidence[s] = 0.0;
+            }
+        }
+    }
+
     // Enforce hard locked assignments prior to and following QC evaluation
     for &(s_lock, k_lock) in &matrices.resolved_locks {
         if s_lock < s_len && k_lock < k_len {
@@ -3211,6 +3263,19 @@ pub fn finalize_bayes_sa_from_replicas(
         Some(&matrices.detailed_offsets),
     );
     if cfg.apply_qc_calibration {
+        let fit_runs = if is_gpu_engine {
+            BAYES_SA_GPU_CALIBRATED_RUNS
+        } else {
+            BAYES_SA_CPU_CALIBRATED_RUNS
+        };
+        if best_ats.len() != fit_runs {
+            let engine_lbl = if is_gpu_engine {
+                "WebGPU (bayes-sa)"
+            } else {
+                "CPU (f64, bayes-sa)"
+            };
+            qc_report.mark_uncalibrated_runs(engine_lbl, best_ats.len(), fit_runs);
+        }
         apply_dataset_qc_to_assignments(&mut result, &qc_report);
         qc_report.already_applied = true;
         for &(s_lock, k_lock) in &matrices.resolved_locks {

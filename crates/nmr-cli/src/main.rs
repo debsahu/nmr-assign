@@ -28,7 +28,7 @@ use nmr_core::dihedrals::{
 };
 use nmr_core::evaluate::{compare_shifts, score, to_reference, Metrics};
 use nmr_core::evo_graph::{assign_evo_graph_from_peaks, EvoGraphConfig};
-use nmr_core::fid::{read_fid_2d, read_fid_3d, read_fid_auto, Fid2D, Fid3D, RawFid};
+use nmr_core::fid::{read_fid_2d_opts, read_fid_3d_opts, read_fid_auto_opts, Fid2D, Fid3D, RawFid};
 use nmr_core::idp_propensity::{
     compute_idp_propensity, format_propensity_json, format_propensity_tsv, PropensityConfig,
 };
@@ -82,8 +82,9 @@ use nmr_core::process::{
     AxisRescueAuditRecord, ProcessingRecipe,
 };
 use nmr_core::qc::{
-    apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport, DatasetQcVerdict,
-    ProteinReliabilityCurve, EVO_GRAPH_CALIBRATED_RUNS, STANDARD_CPU_CALIBRATED_RUNS,
+    apply_dataset_qc_to_assignments, apply_truncated_fid_qc_warning, evaluate_dataset_qc,
+    DatasetQcReport, DatasetQcVerdict, ProteinReliabilityCurve, BAYES_SA_CPU_CALIBRATED_RUNS,
+    BAYES_SA_GPU_CALIBRATED_RUNS, EVO_GRAPH_CALIBRATED_RUNS, STANDARD_CPU_CALIBRATED_RUNS,
     STANDARD_GPU_CALIBRATED_RUNS,
 };
 use nmr_core::rdc::{
@@ -720,7 +721,7 @@ pub(crate) fn execute_assignment_workflow_with_options(
             })
         }
         SolverKind::BayesSa => {
-            let (systems, result, rep, engine_label) = match engine {
+            let (systems, mut result, mut rep, engine_label, used_gpu) = match engine {
                 EngineKind::Cpu => {
                     let bayes_cfg = build_bayes_sa_config_cli(
                         false,
@@ -733,7 +734,7 @@ pub(crate) fn execute_assignment_workflow_with_options(
                     );
                     let (sys, res, rep) =
                         solve_bayes_sa_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
-                    (sys, res, rep, "CPU (f64, bayes-sa)".to_string())
+                    (sys, res, rep, "CPU (f64, bayes-sa)".to_string(), false)
                 }
                 EngineKind::Gpu => {
                     if let Some(bgpu) = shared_bayes_gpu {
@@ -752,7 +753,7 @@ pub(crate) fn execute_assignment_workflow_with_options(
                         );
                         let (sys, res, rep) =
                             bgpu.solve_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
-                        (sys, res, rep, lbl)
+                        (sys, res, rep, lbl, true)
                     } else {
                         match BayesSaGpuSolver::new_headless() {
                             Ok(bgpu) => {
@@ -771,7 +772,7 @@ pub(crate) fn execute_assignment_workflow_with_options(
                                 );
                                 let (sys, res, rep) =
                                     bgpu.solve_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
-                                (sys, res, rep, lbl)
+                                (sys, res, rep, lbl, true)
                             }
                             Err(err) if engine_opt.is_none() => {
                                 eprintln!(
@@ -793,6 +794,7 @@ pub(crate) fn execute_assignment_workflow_with_options(
                                     res,
                                     rep,
                                     "CPU (f64, bayes-sa, auto-fallback)".to_string(),
+                                    false,
                                 )
                             }
                             Err(err) => return Err(err),
@@ -800,6 +802,23 @@ pub(crate) fn execute_assignment_workflow_with_options(
                     }
                 }
             };
+            let fit_runs = if used_gpu {
+                BAYES_SA_GPU_CALIBRATED_RUNS
+            } else {
+                BAYES_SA_CPU_CALIBRATED_RUNS
+            };
+            let requested_runs = runs_opt.unwrap_or_else(|| rep.replica_best_energies.len().max(1));
+            if requested_runs != fit_runs {
+                rep.qc_report
+                    .mark_uncalibrated_runs(&engine_label, requested_runs, fit_runs);
+                apply_dataset_qc_to_assignments(&mut result, &rep.qc_report);
+                for &(s_lock, k_lock) in &score_cfg.locked_assignments {
+                    if s_lock < result.confidence.len() && result.position[s_lock] == k_lock as i32
+                    {
+                        result.confidence[s_lock] = 1.0;
+                    }
+                }
+            }
             if let Some(ref w) = rep.qc_report.calibration_warning {
                 eprintln!("Warning: [{engine_label}] confidence_calibrated=false — {w}");
             }
@@ -3361,6 +3380,7 @@ struct FidCliOpts {
     hilbert: bool,
     nus_fista: Option<bool>,
     no_axis_rescue: bool,
+    allow_truncated_fid: bool,
 }
 
 fn parse_crop_h_arg(raw: &str) -> Result<[f64; 2], String> {
@@ -3445,6 +3465,9 @@ fn build_recipe_for_fid_2d(fid: &Fid2D, opts: &FidCliOpts) -> Result<ProcessingR
     if opts.no_axis_rescue {
         recipe.set_axis_rescue(false);
     }
+    if opts.allow_truncated_fid {
+        recipe.set_allow_truncated_fid(true);
+    }
     Ok(recipe)
 }
 
@@ -3489,6 +3512,9 @@ fn build_recipe_for_fid_3d(fid: &Fid3D, opts: &FidCliOpts) -> Result<ProcessingR
     if opts.no_axis_rescue {
         recipe.set_axis_rescue(false);
     }
+    if opts.allow_truncated_fid {
+        recipe.set_allow_truncated_fid(true);
+    }
     Ok(recipe)
 }
 
@@ -3496,9 +3522,12 @@ fn process_fid_2d_with_opts(
     dir: &Path,
     opts: &FidCliOpts,
 ) -> Result<(Spectrum2D, ProcessingRecipe), String> {
-    let fid = read_fid_2d(dir)?;
+    let fid = read_fid_2d_opts(dir, opts.allow_truncated_fid)?;
     let mut recipe = build_recipe_for_fid_2d(&fid, opts)?;
     let spec = process_fid_2d_mut(&fid, &mut recipe)?;
+    if let Some(ref w) = recipe.truncated_fid_warning {
+        eprintln!("Warning: {w}");
+    }
     Ok((spec, recipe))
 }
 
@@ -3507,9 +3536,12 @@ fn process_fid_3d_with_opts(
     exp: &str,
     opts: &FidCliOpts,
 ) -> Result<(Spectrum3D, ProcessingRecipe), String> {
-    let fid = read_fid_3d(dir)?;
+    let fid = read_fid_3d_opts(dir, opts.allow_truncated_fid)?;
     let mut recipe = build_recipe_for_fid_3d(&fid, opts)?;
     let spec = process_fid_3d_mut(&fid, exp, &mut recipe)?;
+    if let Some(ref w) = recipe.truncated_fid_warning {
+        eprintln!("Warning: {w}");
+    }
     Ok((spec, recipe))
 }
 
@@ -3570,6 +3602,7 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
             "--lp" => opts.lp = true,
             "--auto-phase" => opts.auto_phase = true,
             "--no-axis-rescue" => opts.no_axis_rescue = true,
+            "--allow-truncated-fid" => opts.allow_truncated_fid = true,
             "--phase-x" => {
                 i += 1;
                 opts.phase_x = Some(parse_phase_pair_arg(
@@ -3612,10 +3645,13 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
         .to_ascii_lowercase();
 
     let t0 = Instant::now();
-    match read_fid_auto(&in_p)? {
+    match read_fid_auto_opts(&in_p, opts.allow_truncated_fid)? {
         RawFid::Dim2(fid2) => {
             let mut recipe = build_recipe_for_fid_2d(&fid2, &opts)?;
             let spec = process_fid_2d_mut(&fid2, &mut recipe)?;
+            if let Some(ref w) = recipe.truncated_fid_warning {
+                eprintln!("Warning: {w}");
+            }
             let dt = t0.elapsed().as_secs_f64();
             let recipe_out = match ext_low.as_str() {
                 "ft2" | "pipe" => {
@@ -3667,8 +3703,11 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
                 .unwrap_or_else(|| "HNCA".to_string());
             let mut recipe = build_recipe_for_fid_3d(&fid3, &opts)?;
             let mut spec = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
+            if let Some(ref w) = recipe.truncated_fid_warning {
+                eprintln!("Warning: {w}");
+            }
             if let Some(ref hp) = hsqc_ref_path {
-                let hsqc_2d = match read_fid_auto(hp) {
+                let hsqc_2d = match read_fid_auto_opts(hp, opts.allow_truncated_fid) {
                     Ok(RawFid::Dim2(f2)) => {
                         let mut r2 = build_recipe_for_fid_2d(&f2, &opts)?;
                         process_fid_2d_mut(&f2, &mut r2)?
@@ -3855,6 +3894,7 @@ type ProcessedFidBundleWithAudit = (
     String,
     String,
     Vec<AxisRescueAuditRecord>,
+    Vec<String>,
 );
 
 fn pick_spectra_bundle_with_audit(
@@ -3958,12 +3998,22 @@ fn process_and_pick_fid_bundle(
         s
     };
     let collected_audits: Vec<AxisRescueAuditRecord> = raw_audits.into_iter().flatten().collect();
+    let mut trunc_warnings: Vec<String> = Vec::new();
+    if let Some(ref w) = hsqc_recipe.truncated_fid_warning {
+        trunc_warnings.push(format!("HSQC: {w}"));
+    }
+    for (exp, r3) in &triple_recipes {
+        if let Some(ref w) = r3.truncated_fid_warning {
+            trunc_warnings.push(format!("{exp}: {w}"));
+        }
+    }
     Ok((
         roots,
         all_peaks,
         label,
         bundle_recipe_json,
         collected_audits,
+        trunc_warnings,
     ))
 }
 
@@ -4065,6 +4115,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
             "--lp" => fid_opts.lp = true,
             "--auto-phase" => fid_opts.auto_phase = true,
             "--no-axis-rescue" => fid_opts.no_axis_rescue = true,
+            "--allow-truncated-fid" => fid_opts.allow_truncated_fid = true,
             "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
@@ -4114,7 +4165,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
     let out_p = out_path.ok_or("pick requires --out <peaks.tsv> (or -o <peaks.tsv>)")?;
 
     let (roots, all_peaks, method_label) = if let Some(fh) = &fid_hsqc_path {
-        let (r, all, lbl, _, _) = process_and_pick_fid_bundle(
+        let (r, all, lbl, _, _, _) = process_and_pick_fid_bundle(
             fh,
             &fid_triples,
             &triples,
@@ -4126,7 +4177,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
         )?;
         (r, all, lbl)
     } else if let Some(fp) = &fid_path {
-        match read_fid_auto(fp) {
+        match read_fid_auto_opts(fp, fid_opts.allow_truncated_fid) {
             Ok(RawFid::Dim2(fid2)) => {
                 let mut recipe = build_recipe_for_fid_2d(&fid2, &fid_opts)?;
                 let spec2 = process_fid_2d_mut(&fid2, &mut recipe)?;
@@ -4197,7 +4248,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 if fp.is_dir() {
                     match discover_fid_bundle_dirs(fp) {
                         Ok((disc_hsqc, disc_triples)) => {
-                            let (r, all, lbl, _, _) = process_and_pick_fid_bundle(
+                            let (r, all, lbl, _, _, _) = process_and_pick_fid_bundle(
                                 &disc_hsqc,
                                 &disc_triples,
                                 &triples,
@@ -6415,6 +6466,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--lp" => fid_opts.lp = true,
             "--auto-phase" => fid_opts.auto_phase = true,
             "--no-axis-rescue" => fid_opts.no_axis_rescue = true,
+            "--allow-truncated-fid" => fid_opts.allow_truncated_fid = true,
             "--peaks" => {
                 i += 1;
                 peaks_path = args.get(i).map(PathBuf::from);
@@ -6816,11 +6868,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
 
     let t_total = Instant::now();
     let mut pipeline_axis_audits: Vec<AxisRescueAuditRecord> = Vec::new();
+    let mut pipeline_trunc_warnings: Vec<String> = Vec::new();
     let (base_ref, peaks, project_name) = if let Some(np) = &nef_path {
         let doc = read_nef_file(np)?;
         let r = doc.to_reference()?;
         let pks = if let Some((ref fhsqc, ref ftriples)) = resolved_fid {
-            let (_, all_pks, _, recipe_json, audits) = process_and_pick_fid_bundle(
+            let (_, all_pks, _, recipe_json, audits, trunc_w) = process_and_pick_fid_bundle(
                 fhsqc,
                 ftriples,
                 &triples,
@@ -6831,6 +6884,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 prob,
             )?;
             pipeline_axis_audits = audits;
+            pipeline_trunc_warnings = trunc_w;
             fs::write(
                 dir.join("processing_recipe.json"),
                 format!("{recipe_json}\n"),
@@ -6891,7 +6945,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .to_string(),
             );
         };
-        let (roots, pks, method_label, recipe_json, audits) = process_and_pick_fid_bundle(
+        let (roots, pks, method_label, recipe_json, audits, trunc_w) = process_and_pick_fid_bundle(
             fhsqc,
             ftriples,
             &triples,
@@ -6902,6 +6956,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             prob,
         )?;
         pipeline_axis_audits = audits;
+        pipeline_trunc_warnings = trunc_w;
         fs::write(
             dir.join("processing_recipe.json"),
             format!("{recipe_json}\n"),
@@ -7081,7 +7136,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         let rlbl = elbl.clone();
         (pr, cf, sys, res, elbl, rlbl, dt, Some(hdr), None)
     } else {
-        let wf = execute_assignment_workflow_with_options(
+        let mut wf = execute_assignment_workflow_with_options(
             solver,
             engine_opt,
             &peaks,
@@ -7096,6 +7151,23 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             None,
             None,
         )?;
+        if !pipeline_trunc_warnings.is_empty() {
+            apply_truncated_fid_qc_warning(
+                &mut wf.result,
+                &mut wf.qc_report,
+                &pipeline_trunc_warnings,
+            );
+            for &(s_lock, k_lock) in &scfg.locked_assignments {
+                if s_lock < wf.result.confidence.len()
+                    && wf.result.position[s_lock] == k_lock as i32
+                {
+                    wf.result.confidence[s_lock] = 1.0;
+                }
+            }
+            if let Some(ref mut brep) = wf.bayes_report {
+                brep.qc_report = wf.qc_report.clone();
+            }
+        }
         let dt = t_solve.elapsed().as_secs_f64();
         log_workflow_diagnostics(
             &wf.engine_label,

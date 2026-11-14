@@ -21,7 +21,7 @@ use bytemuck::{Pod, Zeroable};
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::bayes_sa::{
     build_bayes_move_tables, build_initial_bayes_replicas, evaluate_state_energy,
-    finalize_bayes_sa_from_replicas, pack_bayes_scoring_inputs, BayesScheduleDriver,
+    finalize_bayes_sa_from_replicas_for_engine, pack_bayes_scoring_inputs, BayesScheduleDriver,
 };
 use nmr_core::bayes_sa::{
     condition_peaks_preserving_hsqc_roots, BayesMoveTables, BayesPackedScoringInputs,
@@ -1533,7 +1533,7 @@ impl BayesSaGpuSolver {
             let (matrices, gpu_mat_b_opt) =
                 self.compute_energy_matrices_with_gpu_buf(systems, sequence, priors, cfg)?;
             if systems.is_empty() || sequence.is_empty() {
-                return Ok(finalize_bayes_sa_from_replicas(
+                return Ok(finalize_bayes_sa_from_replicas_for_engine(
                     peaks,
                     systems,
                     sequence,
@@ -1545,6 +1545,7 @@ impl BayesSaGpuSolver {
                     Vec::new(),
                     Vec::new(),
                     false,
+                    true,
                 ));
             }
 
@@ -1844,7 +1845,7 @@ impl BayesSaGpuSolver {
                 final_es.push(exact_fin);
             }
 
-            Ok(finalize_bayes_sa_from_replicas(
+            Ok(finalize_bayes_sa_from_replicas_for_engine(
                 peaks,
                 systems,
                 sequence,
@@ -1856,6 +1857,7 @@ impl BayesSaGpuSolver {
                 final_es,
                 driver.trajectory,
                 driver.converged_early,
+                true,
             ))
         }
     }

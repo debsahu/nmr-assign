@@ -25,8 +25,13 @@ use nmr_core::picker::{
     corroborated_re_pick_3d, pick_hsqc_2d, CorroboratedRepickConfig, PickerConfig, StripBank3D,
 };
 use nmr_core::priors::{DetailedReferenceOffsets, NucleusOffsetFit, OffsetFitStatus, ShiftOffsets};
-use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d, AxisRescueAuditRecord};
-use nmr_core::qc::{DatasetQcReport, ProteinReliabilityCurve, STANDARD_CPU_CALIBRATED_RUNS};
+#[cfg(test)]
+use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
+use nmr_core::process::{process_fid_dir_2d_opts, process_fid_dir_3d_opts, AxisRescueAuditRecord};
+use nmr_core::qc::{
+    apply_truncated_fid_qc_warning, DatasetQcReport, ProteinReliabilityCurve,
+    BAYES_SA_CPU_CALIBRATED_RUNS, BAYES_SA_GPU_CALIBRATED_RUNS, STANDARD_CPU_CALIBRATED_RUNS,
+};
 use nmr_core::solver::ScoreConfig;
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, Tolerances};
@@ -1597,6 +1602,7 @@ pub struct RealBenchmarkConfig {
     pub no_crop: bool,
     pub lp: bool,
     pub no_axis_rescue: bool,
+    pub allow_truncated_fid: bool,
     pub json_out: Option<PathBuf>,
     pub verbose: bool,
 }
@@ -1607,6 +1613,28 @@ pub fn run_real_benchmark_with_loaders(
     cfg: &RealBenchmarkConfig,
     load_fid_2d: &dyn Fn(&Path) -> Result<Spectrum2D, String>,
     load_fid_3d: &dyn Fn(&Path, &str) -> Result<Spectrum3D, String>,
+) -> Result<RealBenchmarkSummary, String> {
+    run_real_benchmark_with_loaders_and_warnings(
+        cfg,
+        &|dir| load_fid_2d(dir).map(|s| (s, None)),
+        &|dir, exp| load_fid_3d(dir, exp).map(|s| (s, None)),
+    )
+}
+
+/// 2D raw-FID loader callback returning `(Spectrum2D, optional_truncated_fid_warning)`.
+pub type Fid2DWarningLoader<'a> =
+    dyn Fn(&Path) -> Result<(Spectrum2D, Option<String>), String> + 'a;
+
+/// 3D raw-FID loader callback returning `(Spectrum3D, optional_truncated_fid_warning)`.
+pub type Fid3DWarningLoader<'a> =
+    dyn Fn(&Path, &str) -> Result<(Spectrum3D, Option<String>), String> + 'a;
+
+/// Variant of [`run_real_benchmark_with_loaders`] whose 2D/3D loaders also return optional
+/// truncated-FID zero-filling warnings (`F2`) so they propagate into stderr and `DatasetQcReport`.
+pub fn run_real_benchmark_with_loaders_and_warnings(
+    cfg: &RealBenchmarkConfig,
+    load_fid_2d: &Fid2DWarningLoader<'_>,
+    load_fid_3d: &Fid3DWarningLoader<'_>,
 ) -> Result<RealBenchmarkSummary, String> {
     let resolved_engine = resolve_solver_engine(cfg.solver, cfg.engine_opt)?;
     let manifest_txt = fs::read_to_string(&cfg.manifest_path)
@@ -1839,8 +1867,15 @@ pub fn run_real_benchmark_with_loaders(
         }
 
         // 3. Process 2D HSQC raw FID & pick roots
+        let mut entry_trunc_warnings: Vec<String> = Vec::new();
         let hsqc_spec = match load_fid_2d(&hsqc_exp.dir) {
-            Ok(s) => s,
+            Ok((s, maybe_w)) => {
+                if let Some(w) = maybe_w {
+                    eprintln!("Warning: [{}] HSQC — {w}", entry.bmrb_id);
+                    entry_trunc_warnings.push(format!("HSQC: {w}"));
+                }
+                s
+            }
             Err(reason) => {
                 records.push(EntryBenchmarkRecord {
                     outcome: EntryBenchmarkOutcome::Failed(EntryFailureDiagnostic {
@@ -1870,7 +1905,11 @@ pub fn run_real_benchmark_with_loaders(
             let is_required =
                 required_set.is_empty() || required_set.contains(texp.exp_type.as_str());
             match load_fid_3d(&texp.dir, &texp.exp_type) {
-                Ok(mut spec3d) => {
+                Ok((mut spec3d, maybe_w)) => {
+                    if let Some(w) = maybe_w {
+                        eprintln!("Warning: [{}] {} — {w}", entry.bmrb_id, texp.exp_type);
+                        entry_trunc_warnings.push(format!("{}: {w}", texp.exp_type));
+                    }
                     // Align 3D HN plane to HSQC via two-stage rigid (dH, dN) registration + audited `{sign, fold}` check (`13.3:P1-1`)
                     let (dh, dn, audit_opt) = register_3d_hn_to_hsqc_adaptive_with_audit(
                         &mut spec3d,
@@ -2007,103 +2046,115 @@ pub fn run_real_benchmark_with_loaders(
 
         for s_idx in 0..num_seeds {
             let cur_seed = cfg.base_seed + (s_idx as u64);
-            let (systems_for_seed, res_for_seed, eff_priors, det_off, qcr, elbl) = if let Some((
-                ref bsys,
-                use_gpu,
-            )) =
-                bayes_prebuilt
-            {
-                let bcfg = build_bayes_sa_config_cli(
-                    use_gpu,
-                    &truth_ref.sequence,
-                    &score_cfg,
-                    ToleranceOverrides::default(),
-                    cfg.runs_opt,
-                    cfg.steps_opt,
-                    cur_seed,
-                );
-                let (res, rep, lbl) = if let Some(ref bgpu) = shared_bayes_gpu {
-                    let lbl = format!(
-                        "WebGPU ({}, {}, bayes-sa)",
-                        bgpu.engine.adapter_name, bgpu.engine.backend_name
+            let (systems_for_seed, mut res_for_seed, eff_priors, det_off, mut qcr, elbl) =
+                if let Some((ref bsys, use_gpu)) = bayes_prebuilt {
+                    let bcfg = build_bayes_sa_config_cli(
+                        use_gpu,
+                        &truth_ref.sequence,
+                        &score_cfg,
+                        ToleranceOverrides::default(),
+                        cfg.runs_opt,
+                        cfg.steps_opt,
+                        cur_seed,
                     );
-                    match bgpu.solve_with_peaks(
-                        Some(&all_peaks),
-                        bsys,
+                    let (mut res, mut rep, lbl) = if let Some(ref bgpu) = shared_bayes_gpu {
+                        let lbl = format!(
+                            "WebGPU ({}, {}, bayes-sa)",
+                            bgpu.engine.adapter_name, bgpu.engine.backend_name
+                        );
+                        match bgpu.solve_with_peaks(
+                            Some(&all_peaks),
+                            bsys,
+                            &truth_ref.sequence,
+                            &priors,
+                            &bcfg,
+                        ) {
+                            Ok((res, rep)) => (res, rep, lbl),
+                            Err(e) => {
+                                assign_err = Some(e);
+                                break;
+                            }
+                        }
+                    } else {
+                        let lbl = if resolved_engine == EngineKind::Gpu {
+                            "CPU (f64, bayes-sa, auto-fallback)".to_string()
+                        } else {
+                            "CPU (f64, bayes-sa)".to_string()
+                        };
+                        let (res, rep) = solve_bayes_sa_with_peaks(
+                            Some(&all_peaks),
+                            bsys,
+                            &truth_ref.sequence,
+                            &priors,
+                            &bcfg,
+                        );
+                        (res, rep, lbl)
+                    };
+                    let fit_runs = if use_gpu {
+                        BAYES_SA_GPU_CALIBRATED_RUNS
+                    } else {
+                        BAYES_SA_CPU_CALIBRATED_RUNS
+                    };
+                    let req_runs = cfg
+                        .runs_opt
+                        .unwrap_or_else(|| rep.replica_best_energies.len().max(1));
+                    if req_runs != fit_runs {
+                        rep.qc_report
+                            .mark_uncalibrated_runs(&lbl, req_runs, fit_runs);
+                        nmr_core::qc::apply_dataset_qc_to_assignments(&mut res, &rep.qc_report);
+                    }
+                    if s_idx == 0 && cfg.verbose {
+                        eprintln!(
+                            "[bayes-sa] {}: T_crit={:.4}, max_Cv={:.4}, mu_null={:+.4}, best_energy={:+.3}",
+                            entry.bmrb_id, rep.t_crit, rep.max_cv, rep.mu_null, rep.best_energy
+                        );
+                    }
+                    let eff = priors.with_offsets(&rep.applied_offsets);
+                    let det = rep.detailed_offsets;
+                    let qc = rep.qc_report;
+                    (bsys.clone(), res, eff, det, qc, lbl)
+                } else {
+                    let eff_engine_opt = if cfg.solver == SolverKind::Standard
+                        && resolved_engine == EngineKind::Gpu
+                        && shared_gpu.is_none()
+                    {
+                        Some(EngineKind::Cpu)
+                    } else {
+                        cfg.engine_opt
+                    };
+                    let wf = match execute_assignment_workflow_with_options(
+                        cfg.solver,
+                        eff_engine_opt,
+                        &all_peaks,
                         &truth_ref.sequence,
                         &priors,
-                        &bcfg,
+                        &score_cfg,
+                        ToleranceOverrides::default(),
+                        cfg.runs_opt,
+                        cfg.steps_opt,
+                        STANDARD_CPU_CALIBRATED_RUNS,
+                        cur_seed,
+                        shared_gpu.as_ref(),
+                        shared_bayes_gpu.as_ref(),
                     ) {
-                        Ok((res, rep)) => (res, rep, lbl),
+                        Ok(w) => w,
                         Err(e) => {
                             assign_err = Some(e);
                             break;
                         }
-                    }
-                } else {
-                    let lbl = if resolved_engine == EngineKind::Gpu {
-                        "CPU (f64, bayes-sa, auto-fallback)".to_string()
-                    } else {
-                        "CPU (f64, bayes-sa)".to_string()
                     };
-                    let (res, rep) = solve_bayes_sa_with_peaks(
-                        Some(&all_peaks),
-                        bsys,
-                        &truth_ref.sequence,
-                        &priors,
-                        &bcfg,
-                    );
-                    (res, rep, lbl)
+                    (
+                        wf.systems,
+                        wf.result,
+                        wf.effective_priors,
+                        wf.detailed_offsets,
+                        wf.qc_report,
+                        wf.engine_label,
+                    )
                 };
-                if s_idx == 0 && cfg.verbose {
-                    eprintln!(
-                            "[bayes-sa] {}: T_crit={:.4}, max_Cv={:.4}, mu_null={:+.4}, best_energy={:+.3}",
-                            entry.bmrb_id, rep.t_crit, rep.max_cv, rep.mu_null, rep.best_energy
-                        );
-                }
-                let eff = priors.with_offsets(&rep.applied_offsets);
-                let det = rep.detailed_offsets;
-                let qc = rep.qc_report;
-                (bsys.clone(), res, eff, det, qc, lbl)
-            } else {
-                let eff_engine_opt = if cfg.solver == SolverKind::Standard
-                    && resolved_engine == EngineKind::Gpu
-                    && shared_gpu.is_none()
-                {
-                    Some(EngineKind::Cpu)
-                } else {
-                    cfg.engine_opt
-                };
-                let wf = match execute_assignment_workflow_with_options(
-                    cfg.solver,
-                    eff_engine_opt,
-                    &all_peaks,
-                    &truth_ref.sequence,
-                    &priors,
-                    &score_cfg,
-                    ToleranceOverrides::default(),
-                    cfg.runs_opt,
-                    cfg.steps_opt,
-                    STANDARD_CPU_CALIBRATED_RUNS,
-                    cur_seed,
-                    shared_gpu.as_ref(),
-                    shared_bayes_gpu.as_ref(),
-                ) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        assign_err = Some(e);
-                        break;
-                    }
-                };
-                (
-                    wf.systems,
-                    wf.result,
-                    wf.effective_priors,
-                    wf.detailed_offsets,
-                    wf.qc_report,
-                    wf.engine_label,
-                )
-            };
+            if !entry_trunc_warnings.is_empty() {
+                apply_truncated_fid_qc_warning(&mut res_for_seed, &mut qcr, &entry_trunc_warnings);
+            }
             solver_label = elbl;
 
             let (pred_ref, conf_by_k) = to_reference(
@@ -2787,6 +2838,7 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
          {pad2}\"hsqc_3d_support_frac\": {:.6},\n\
          {pad2}\"supported_roots_per_assignable\": {:.6},\n\
          {pad2}\"aliphatic_support_frac\": {:.6},\n\
+         {pad2}\"resolved_bidir_aliphatic_frac\": {:.6},\n\
          {pad2}\"hsqc_3d_rms_dh_ppm\": {:.6},\n\
          {pad2}\"hsqc_3d_rms_dn_ppm\": {:.6},\n\
          {pad2}\"hsqc_multiplicity_ratio\": {:.6},\n\
@@ -2794,9 +2846,12 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
          {pad2}\"offset_consistency_ok\": {},\n\
          {pad2}\"connectivity_frac\": {:.6},\n\
          {pad2}\"corroborated_connectivity_frac\": {:.6},\n\
+         {pad2}\"chain_corroborated_frac\": {:.6},\n\
+         {pad2}\"unary_specificity\": {:.6},\n\
          {pad2}\"solution_margin\": {:.6},\n\
          {pad2}\"hc_call_fraction\": {:.6},\n\
          {pad2}\"protein_hc_gate_triggered\": {},\n\
+         {pad2}\"truncated_fid_zero_filled\": {},\n\
          {pad2}\"reasons\": [{}],\n\
          {pad2}\"detailed_offsets\": {}\n\
          {pad}}}",
@@ -2813,6 +2868,7 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
         qc.hsqc_3d_support_frac,
         qc.supported_roots_per_assignable,
         qc.aliphatic_support_frac,
+        qc.resolved_bidir_aliphatic_frac,
         qc.hsqc_3d_rms_dh_ppm,
         qc.hsqc_3d_rms_dn_ppm,
         qc.hsqc_multiplicity_ratio,
@@ -2820,9 +2876,12 @@ pub(crate) fn render_qc_report_json(qc: &DatasetQcReport, indent: usize) -> Stri
         qc.offset_consistency_ok,
         qc.connectivity_frac,
         qc.corroborated_connectivity_frac,
+        qc.chain_corroborated_frac,
+        qc.unary_specificity,
         qc.solution_margin,
         qc.hc_call_fraction,
         qc.protein_hc_gate_triggered,
+        qc.truncated_fid_zero_filled,
         reasons_json,
         render_detailed_offsets_json(&qc.detailed_offsets, indent + 2),
     )
@@ -3158,6 +3217,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
     let mut no_crop = false;
     let mut lp = false;
     let mut no_axis_rescue = false;
+    let mut allow_truncated_fid = false;
     let mut json_out: Option<PathBuf> = None;
     let mut verbose = false;
 
@@ -3248,6 +3308,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
             "--no-crop" => no_crop = true,
             "--lp" => lp = true,
             "--no-axis-rescue" => no_axis_rescue = true,
+            "--allow-truncated-fid" => allow_truncated_fid = true,
             "-v" | "--verbose" => verbose = true,
             other => return Err(format!("unknown real-benchmark flag {other:?}")),
         }
@@ -3275,6 +3336,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
         no_crop,
         lp,
         no_axis_rescue,
+        allow_truncated_fid,
         json_out,
         verbose,
     })
@@ -3284,10 +3346,17 @@ pub fn cmd_real_benchmark(args: &[String]) -> Result<(), String> {
     let cfg = parse_real_benchmark_args(args)?;
     let no_crop = cfg.no_crop;
     let lp = cfg.lp;
-    run_real_benchmark_with_loaders(
+    let allow_trunc = cfg.allow_truncated_fid;
+    run_real_benchmark_with_loaders_and_warnings(
         &cfg,
-        &|dir| process_fid_dir_2d(dir, no_crop, lp).map(|(s, _)| s),
-        &|dir, exp| process_fid_dir_3d(dir, exp, no_crop, lp).map(|(s, _)| s),
+        &|dir| {
+            process_fid_dir_2d_opts(dir, no_crop, lp, allow_trunc)
+                .map(|(s, r)| (s, r.truncated_fid_warning))
+        },
+        &|dir, exp| {
+            process_fid_dir_3d_opts(dir, exp, no_crop, lp, allow_trunc)
+                .map(|(s, r)| (s, r.truncated_fid_warning))
+        },
     )
     .map(|_| ())
 }
@@ -3510,6 +3579,7 @@ mod tests {
             no_crop: false,
             lp: false,
             no_axis_rescue: false,
+            allow_truncated_fid: false,
             json_out: Some(dir.join("summary.json")),
             verbose: false,
         };
@@ -4042,13 +4112,11 @@ mod tests {
             fit_isotonic_monotone_knots, fit_isotonic_monotone_knots_beta,
             fit_isotonic_monotone_knots_shrunk_toward_beta,
             fit_protein_hc_gate_config_multi_engine, fit_protein_hc_gate_config_with_grids,
-            has_weak_likelihood_large_offset, is_unconverged_solution_margin,
-            select_gpu_shrinkage_weight_nested_lopo, DatasetQcVerdict, ProteinHcGateConfig,
-            ProteinHcTrainingSeed, ProteinReliabilityCurve, CANONICAL_CALIBRATION_GRID_12,
-            CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
-            CANONICAL_PROTEIN_HC_GATE, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
-            QC_STRONG_BELIEF_THRESHOLD, STANDARD_CPU_PRIOR_ALPHA, STANDARD_CPU_PRIOR_BETA,
-            STANDARD_GPU_PRIOR_ALPHA, STANDARD_GPU_PRIOR_BETA,
+            is_unconverged_solution_margin, select_gpu_shrinkage_weight_nested_lopo,
+            DatasetQcVerdict, ProteinHcGateConfig, ProteinHcTrainingSeed, ProteinReliabilityCurve,
+            CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+            CANONICAL_PROTEIN_HC_GATE, QC_STRONG_BELIEF_THRESHOLD, STANDARD_CPU_PRIOR_ALPHA,
+            STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_PRIOR_ALPHA, STANDARD_GPU_PRIOR_BETA,
         };
         use nmr_core::solver::{assign_uncalibrated, prepare_scoring_priors, AnnealConfig};
         use nmr_gpu::GpuEngine;
@@ -4083,26 +4151,7 @@ mod tests {
 
         let make_training_seed =
             |qc: &DatasetQcReport, raw_predictions: Vec<(f64, bool)>| -> ProteinHcTrainingSeed {
-                ProteinHcTrainingSeed {
-                    n_assignable_amides: qc.n_assignable_amides,
-                    n_amide_hsqc_roots: qc.n_amide_hsqc_roots,
-                    peaks_present: true,
-                    hsqc_3d_support_frac: qc.hsqc_3d_support_frac,
-                    supported_roots_per_assignable: qc.supported_roots_per_assignable,
-                    aliphatic_support_frac: qc.aliphatic_support_frac,
-                    hsqc_multiplicity_ratio: qc.hsqc_multiplicity_ratio,
-                    hsqc_3d_rms_dh_ppm: qc.hsqc_3d_rms_dh_ppm,
-                    hsqc_3d_rms_dn_ppm: qc.hsqc_3d_rms_dn_ppm,
-                    offset_consistency_ok: qc.offset_consistency_ok,
-                    weak_large_offset: has_weak_likelihood_large_offset(
-                        &qc.detailed_offsets,
-                        QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
-                    )
-                    .is_some(),
-                    connectivity_frac: qc.connectivity_frac,
-                    corroborated_connectivity_frac: qc.corroborated_connectivity_frac,
-                    raw_predictions,
-                }
+                ProteinHcTrainingSeed::from_qc_report(qc, true, raw_predictions)
             };
 
         // Fixed dataset convergence specification (`(0.65, 0.07, 1.60, 0.16)`) identical to
@@ -4932,6 +4981,9 @@ mod tests {
                 min_hc_call_fraction: 0.0,
                 min_crowded_solution_margin: 0.0,
                 multiplicity_penalty_floor: 0.0,
+                min_chain_corroborated_frac: 0.0,
+                min_unary_specificity: 0.0,
+                min_bidir_aliphatic_frac: 0.0,
             };
             let (z_ece10, z_hcps, z_capped) =
                 evaluate_protein_hc_gate_objective_multi_engine(&full_slices, &zero_gate);
@@ -5140,17 +5192,16 @@ mod tests {
         );
 
         if only_filter.is_none() {
-            let is_reference_gpu_adapter = gpu_engine.adapter_name.contains("Apple M5 Pro");
-            if is_reference_gpu_adapter {
-                assert!(
-                    (full_selected_gpu_w - CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT).abs() < 1e-9,
-                    "full-13 inner LOPO selected w={full_selected_gpu_w:.2} != CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT={CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT:.2}"
-                );
-                assert_eq!(
-                    full_canonical_gate, CANONICAL_PROTEIN_HC_GATE,
-                    "full-13 unified gate {full_canonical_gate:?} != CANONICAL_PROTEIN_HC_GATE {CANONICAL_PROTEIN_HC_GATE:?}"
-                );
-            }
+            // Note: In Phase 13 Wave 2 (`13.1:P1-7b`), `CANONICAL_*` knots, shrinkage weights,
+            // and `CANONICAL_PROTEIN_HC_GATE` were refit over the 26-protein non-cold pool
+            // (`dev` + `seen_p12` + `seen_p13`) and are asserted to `<= 2e-4` exactness in
+            // `w2_non_cold_26_lopo_calibration`. Here in the legacy 13-protein `dev`-only audit,
+            // we still verify the 13-fold OOF calibration gates and grid monotonicity.
+            let _ = (
+                &gpu_engine.adapter_name,
+                full_selected_gpu_w,
+                &full_canonical_gate,
+            );
             for LopoGateCheck {
                 solver_name,
                 oof_mean_ece,
@@ -5199,16 +5250,10 @@ mod tests {
                     full_knots.len(),
                     "{solver_name} committed knot count mismatch"
                 );
-                let tol = if solver_name == "STANDARD_GPU" && !is_reference_gpu_adapter {
-                    0.05
-                } else {
-                    2e-4
-                };
-                for ((cx, cy), (fx, fy)) in committed.iter().zip(full_knots.iter()) {
+                for w in full_knots.windows(2) {
                     assert!(
-                        (cx - fx).abs() <= tol && (cy - fy).abs() <= tol,
-                        "{solver_name} committed knot ({cx:.4}, {cy:.4}) drifted from fitted ({fx:.4}, {fy:.4}) beyond tol={tol} (adapter={:?})",
-                        gpu_engine.adapter_name
+                        w[1].0 >= w[0].0 - 1e-12 && w[1].1 >= w[0].1 - 1e-12,
+                        "{solver_name} fitted knots violated monotonicity: {w:?}"
                     );
                 }
             }
@@ -5379,6 +5424,1105 @@ mod tests {
             total_cubes_evaluated,
             total_would_apply,
             out_path.display()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn w2_non_cold_26_lopo_calibration() {
+        use nmr_core::evo_graph::{assign_evo_graph_from_peaks_with_minor_damping, EvoGraphConfig};
+        use nmr_core::priors::sync_detailed_reference_offsets;
+        use nmr_core::qc::{
+            evaluate_dataset_qc, evaluate_seed_predictions_with_gate, fit_isotonic_monotone_knots,
+            fit_isotonic_monotone_knots_beta, fit_isotonic_monotone_knots_shrunk_toward_beta,
+            fit_protein_hc_gate_config_multi_engine, is_unconverged_solution_margin,
+            select_gpu_shrinkage_weight_nested_lopo_beta, ProteinHcGateConfig,
+            ProteinHcTrainingSeed, ProteinReliabilityCurve, BAYES_SA_CPU_PRIOR_ALPHA,
+            BAYES_SA_CPU_PRIOR_BETA, BAYES_SA_GPU_PRIOR_ALPHA, BAYES_SA_GPU_PRIOR_BETA,
+            CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_CALIBRATION_GRID_12,
+            CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
+            QC_STRONG_BELIEF_THRESHOLD, STANDARD_CPU_PRIOR_ALPHA, STANDARD_CPU_PRIOR_BETA,
+            STANDARD_GPU_PRIOR_ALPHA, STANDARD_GPU_PRIOR_BETA,
+        };
+        use nmr_core::solver::{assign_uncalibrated, prepare_scoring_priors, AnnealConfig};
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        struct CachedProteinTelemetry {
+            bmrb_id: String,
+            protein: String,
+            split: String,
+            cohort: String,
+            evo_seeds: Vec<ProteinHcTrainingSeed>,
+            std_cpu_seeds: Vec<ProteinHcTrainingSeed>,
+            std_gpu_seeds: Vec<ProteinHcTrainingSeed>,
+            bayes_cpu_seeds: Vec<ProteinHcTrainingSeed>,
+            bayes_gpu_seeds: Vec<ProteinHcTrainingSeed>,
+        }
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        env::set_current_dir(&repo_root).expect("chdir repo_root");
+        let manifest_path = PathBuf::from("data/benchmark/real_manifest.tsv");
+        let manifest_txt = fs::read_to_string(&manifest_path).expect("read real_manifest.tsv");
+        let entries: Vec<RealManifestEntry> = parse_real_manifest_str(&manifest_txt)
+            .expect("parse real_manifest.tsv")
+            .into_iter()
+            .filter(|e| {
+                e.split == "dev"
+                    || e.cohort == "seen_p12"
+                    || (e.cohort == "seen_p13" && e.bmrb_id != "15822")
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            26,
+            "expected exact 26 default-solvable non-cold proteins (13 dev + 7 seen_p12 + 6 seen_p13)"
+        );
+        for e in &entries {
+            assert!(
+                !e.cohort.starts_with("cold_"),
+                "STRICT COLD FIREWALL VIOLATION: {}",
+                e.bmrb_id
+            );
+        }
+
+        let cache_path_opt = env::var("NMR_W2_RAW_CACHE").ok().map(PathBuf::from);
+        let force_recompute = env::var("NMR_W2_FORCE_RECOMPUTE")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+        let prots: Vec<CachedProteinTelemetry> = if let Some(ref cp) = cache_path_opt {
+            if cp.exists() && !force_recompute {
+                println!(
+                    "  [W2 LOPO] Loading cached raw 26-protein telemetry from {}",
+                    cp.display()
+                );
+                let txt = fs::read_to_string(cp).expect("read NMR_W2_RAW_CACHE");
+                let loaded: Vec<CachedProteinTelemetry> =
+                    serde_json::from_str(&txt).expect("parse NMR_W2_RAW_CACHE");
+                assert_eq!(loaded.len(), 26, "cached telemetry must have 26 proteins");
+                loaded
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let prots: Vec<CachedProteinTelemetry> = if !prots.is_empty() {
+            prots
+        } else {
+            let gpu_engine = GpuEngine::new_headless()
+                .expect("WebGPU headless adapter required for W2 5-engine LOPO calibration");
+            let bayes_gpu = BayesSaGpuSolver::new_headless().expect(
+                "WebGPU headless Bayes-SA solver required for W2 5-engine LOPO calibration",
+            );
+            println!(
+                "  [GPU ADAPTER] name={:?}, backend={:?}",
+                gpu_engine.adapter_name, gpu_engine.backend_name
+            );
+            let priors = load_priors(None).expect("load priors");
+            let score_cfg = ScoreConfig::default();
+            let picker_cfg = PickerConfig::default();
+            let data_root = env::var("NMR_REAL_DATA_DIR")
+                .map(|p| PathBuf::from(p).join("private/bmrb"))
+                .unwrap_or_else(|_| PathBuf::from("data/private/bmrb"));
+
+            let mut computed = Vec::with_capacity(entries.len());
+            for (p_idx, entry) in entries.iter().enumerate() {
+                let t0 = Instant::now();
+                let loc = resolve_local_entry_paths(&entry.bmrb_id, &data_root, true)
+                    .unwrap_or_else(|p| panic!("missing non-cold entry {}: {p:?}", entry.bmrb_id));
+                let truth_path = loc.truth_path.expect("truth STAR path");
+                let (truth_ref, _, _) = parse_truth_auto(&truth_path).expect("parse truth STAR");
+                let (discovered, _) =
+                    discover_entry_experiments(&loc.entry_dir, Some(entry.field_mhz))
+                        .expect("discover");
+                let required_set: BTreeSet<&str> =
+                    entry.experiments.iter().map(String::as_str).collect();
+                let hsqc_exp = discovered
+                    .iter()
+                    .find(|d| d.exp_type == "HSQC")
+                    .expect("HSQC");
+                let triple_exps: Vec<&DiscoveredFidExperiment> =
+                    discovered.iter().filter(|d| d.exp_type != "HSQC").collect();
+
+                let (hsqc_spec, _) =
+                    process_fid_dir_2d(&hsqc_exp.dir, false, false).expect("load 2D HSQC");
+                let roots = pick_hsqc_2d(&hsqc_spec, &picker_cfg);
+                let mut all_peaks: Vec<Peak> = roots.clone();
+                let mut used_exps = vec![("HSQC".to_string(), hsqc_exp.rel_path.clone())];
+                let mut strip_bank = StripBank3D::new();
+                for texp in &triple_exps {
+                    let is_req =
+                        required_set.is_empty() || required_set.contains(texp.exp_type.as_str());
+                    match process_fid_dir_3d(&texp.dir, &texp.exp_type, false, false) {
+                        Ok((mut spec3d, _)) => {
+                            let _ = register_3d_hn_to_hsqc_adaptive_with_audit(
+                                &mut spec3d,
+                                &hsqc_spec,
+                                true,
+                            );
+                            let pks = strip_bank.pick_and_record_3d(&spec3d, &roots, &picker_cfg);
+                            all_peaks.extend(pks);
+                            used_exps.push((texp.exp_type.clone(), texp.rel_path.clone()));
+                        }
+                        Err(e) => {
+                            if is_req {
+                                panic!(
+                                    "required 3D {} failed on non-cold {}: {e}",
+                                    texp.exp_type, entry.bmrb_id
+                                );
+                            }
+                        }
+                    }
+                }
+                if used_exps.len() >= 3 && !roots.is_empty() {
+                    all_peaks.extend(corroborated_re_pick_3d(
+                        &strip_bank,
+                        &roots,
+                        &all_peaks,
+                        &picker_cfg,
+                        &CorroboratedRepickConfig::default(),
+                    ));
+                }
+                let all_systems_for_eval =
+                    build_spin_systems(&all_peaks, &Tolerances::default(), 3, false)
+                        .expect("build_spin_systems");
+
+                let std_base_det = nmr_core::priors::estimate_reference_offsets_detailed(
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                );
+                let (std_eff_priors, std_offs) = prepare_scoring_priors(
+                    &all_systems_for_eval,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                );
+                let std_synced_det = sync_detailed_reference_offsets(&std_offs, &std_base_det);
+
+                let base_bcfg = build_bayes_sa_config_cli(
+                    false,
+                    &truth_ref.sequence,
+                    &score_cfg,
+                    ToleranceOverrides::default(),
+                    None,
+                    None,
+                    0,
+                );
+                let conditioned = if base_bcfg.enable_weak_root_penalty {
+                    condition_peaks_preserving_hsqc_roots(&all_peaks, &base_bcfg.tolerances)
+                } else {
+                    all_peaks.clone()
+                };
+                let bayes_systems = build_spin_systems(
+                    &conditioned,
+                    &base_bcfg.tolerances,
+                    base_bcfg.max_cands,
+                    false,
+                )
+                .expect("build_spin_systems bayes-sa");
+
+                let mut evo_seeds = Vec::with_capacity(5);
+                let mut std_cpu_seeds = Vec::with_capacity(5);
+                let mut std_gpu_seeds = Vec::with_capacity(5);
+                let mut bayes_cpu_seeds = Vec::with_capacity(5);
+                let mut bayes_gpu_seeds = Vec::with_capacity(5);
+
+                let eval_raw_seed = |res: &nmr_core::solver::AssignResult,
+                                     sys: &[nmr_core::spinsystems::SpinSystem],
+                                     eff_p: &nmr_core::priors::Priors|
+                 -> Vec<(f64, bool)> {
+                    let (pred, conf_k) = to_reference(
+                        res,
+                        sys,
+                        &truth_ref.sequence,
+                        &truth_ref.seq_ids,
+                        0.0,
+                        Some(eff_p),
+                    );
+                    let mut conf_seq = BTreeMap::new();
+                    for (k, c) in conf_k {
+                        conf_seq.insert(truth_ref.seq_ids[k], c);
+                    }
+                    evaluate_prediction_against_truth(
+                        &pred,
+                        &truth_ref,
+                        &conf_seq,
+                        Some(&all_systems_for_eval),
+                        0.80,
+                        true,
+                    )
+                    .placed_predictions
+                };
+
+                for seed in 0..5u64 {
+                    // 1. EVO_GRAPH (`runs = 64`, `apply_qc_calibration = false`)
+                    let evo_cfg_raw = EvoGraphConfig {
+                        score_cfg: score_cfg.clone(),
+                        auto_reference: true,
+                        apply_qc_calibration: false,
+                        seed,
+                        ..EvoGraphConfig::default()
+                    };
+                    let (evo_sys, evo_res_raw, evo_rep) =
+                        assign_evo_graph_from_peaks_with_minor_damping(
+                            &all_peaks,
+                            &truth_ref.sequence,
+                            &priors,
+                            &evo_cfg_raw,
+                            true,
+                        );
+                    let evo_eff = evo_rep.shifted_priors(&priors);
+                    let evo_preds = eval_raw_seed(&evo_res_raw, &evo_sys, &evo_eff);
+                    evo_seeds.push(ProteinHcTrainingSeed::from_qc_report(
+                        &evo_rep.qc_report,
+                        true,
+                        evo_preds,
+                    ));
+
+                    // 2. STANDARD_CPU (`runs = 16`, uncalibrated)
+                    let std_cpu_res = assign_uncalibrated(
+                        &all_systems_for_eval,
+                        &truth_ref.sequence,
+                        &priors,
+                        &score_cfg,
+                        &AnnealConfig {
+                            runs: 16,
+                            steps_per_system: 1500,
+                            seed,
+                            ..AnnealConfig::default()
+                        },
+                    );
+                    let qc_std_cpu = evaluate_dataset_qc(
+                        Some(&all_peaks),
+                        &all_systems_for_eval,
+                        &truth_ref.sequence,
+                        &priors,
+                        &score_cfg,
+                        &std_cpu_res,
+                        Some(&std_synced_det),
+                    );
+                    let std_cpu_preds =
+                        eval_raw_seed(&std_cpu_res, &all_systems_for_eval, &std_eff_priors);
+                    std_cpu_seeds.push(ProteinHcTrainingSeed::from_qc_report(
+                        &qc_std_cpu,
+                        true,
+                        std_cpu_preds,
+                    ));
+
+                    // 3. STANDARD_GPU (`runs = 64`, uncalibrated)
+                    let std_gpu_res = gpu_engine
+                        .assign_gpu_uncalibrated(
+                            &all_systems_for_eval,
+                            &truth_ref.sequence,
+                            &priors,
+                            &score_cfg,
+                            &AnnealConfig {
+                                runs: 64,
+                                steps_per_system: 1500,
+                                seed,
+                                ..AnnealConfig::default()
+                            },
+                        )
+                        .expect("assign_gpu_uncalibrated");
+                    let qc_std_gpu = evaluate_dataset_qc(
+                        Some(&all_peaks),
+                        &all_systems_for_eval,
+                        &truth_ref.sequence,
+                        &priors,
+                        &score_cfg,
+                        &std_gpu_res,
+                        Some(&std_synced_det),
+                    );
+                    let std_gpu_preds =
+                        eval_raw_seed(&std_gpu_res, &all_systems_for_eval, &std_eff_priors);
+                    std_gpu_seeds.push(ProteinHcTrainingSeed::from_qc_report(
+                        &qc_std_gpu,
+                        true,
+                        std_gpu_preds,
+                    ));
+
+                    // 4. BAYES_SA_CPU (`replicas = 32`, `apply_qc_calibration = false`)
+                    let mut bcfg_cpu = build_bayes_sa_config_cli(
+                        false,
+                        &truth_ref.sequence,
+                        &score_cfg,
+                        ToleranceOverrides::default(),
+                        None,
+                        None,
+                        seed,
+                    );
+                    bcfg_cpu.apply_qc_calibration = false;
+                    let (bcpu_res, bcpu_rep) = solve_bayes_sa_with_peaks(
+                        Some(&all_peaks),
+                        &bayes_systems,
+                        &truth_ref.sequence,
+                        &priors,
+                        &bcfg_cpu,
+                    );
+                    let bcpu_eff = priors.with_offsets(&bcpu_rep.applied_offsets);
+                    let bcpu_preds = eval_raw_seed(&bcpu_res, &bayes_systems, &bcpu_eff);
+                    bayes_cpu_seeds.push(ProteinHcTrainingSeed::from_qc_report(
+                        &bcpu_rep.qc_report,
+                        true,
+                        bcpu_preds,
+                    ));
+
+                    // 5. BAYES_SA_GPU (`replicas = 128`, `apply_qc_calibration = false`)
+                    let mut bcfg_gpu = build_bayes_sa_config_cli(
+                        true,
+                        &truth_ref.sequence,
+                        &score_cfg,
+                        ToleranceOverrides::default(),
+                        None,
+                        None,
+                        seed,
+                    );
+                    bcfg_gpu.apply_qc_calibration = false;
+                    let (bgpu_res, bgpu_rep) = bayes_gpu
+                        .solve_with_peaks(
+                            Some(&all_peaks),
+                            &bayes_systems,
+                            &truth_ref.sequence,
+                            &priors,
+                            &bcfg_gpu,
+                        )
+                        .expect("bayes_gpu.solve_with_peaks");
+                    let bgpu_eff = priors.with_offsets(&bgpu_rep.applied_offsets);
+                    let bgpu_preds = eval_raw_seed(&bgpu_res, &bayes_systems, &bgpu_eff);
+                    bayes_gpu_seeds.push(ProteinHcTrainingSeed::from_qc_report(
+                        &bgpu_rep.qc_report,
+                        true,
+                        bgpu_preds,
+                    ));
+                }
+
+                println!(
+                    "  [W2 RAW {:2}/26] {:8} {:16} {:14} | {:.1}s | evo_n={} std_n={} bayes_n={}",
+                    p_idx + 1,
+                    entry.cohort,
+                    entry.bmrb_id,
+                    entry.protein,
+                    t0.elapsed().as_secs_f64(),
+                    evo_seeds[0].raw_predictions.len(),
+                    std_cpu_seeds[0].raw_predictions.len(),
+                    bayes_cpu_seeds[0].raw_predictions.len(),
+                );
+
+                computed.push(CachedProteinTelemetry {
+                    bmrb_id: entry.bmrb_id.clone(),
+                    protein: entry.protein.clone(),
+                    split: entry.split.clone(),
+                    cohort: entry.cohort.clone(),
+                    evo_seeds,
+                    std_cpu_seeds,
+                    std_gpu_seeds,
+                    bayes_cpu_seeds,
+                    bayes_gpu_seeds,
+                });
+            }
+
+            if let Some(ref cp) = cache_path_opt {
+                if let Some(parent) = cp.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let txt = serde_json::to_string_pretty(&computed).expect("serialize raw cache");
+                fs::write(cp, txt).expect("write NMR_W2_RAW_CACHE");
+                println!(
+                    "  [W2 LOPO] Saved raw 26-protein telemetry cache -> {}",
+                    cp.display()
+                );
+            }
+            computed
+        };
+
+        let is_trainable_prot = |seeds: &[ProteinHcTrainingSeed]| -> bool {
+            let tot_n: usize = seeds.iter().map(|s| s.raw_predictions.len()).sum();
+            if tot_n == 0 {
+                return false;
+            }
+            let s0 = &seeds[0];
+            let strong: usize = seeds
+                .iter()
+                .map(|s| {
+                    s.raw_predictions
+                        .iter()
+                        .filter(|&&(p, _)| p >= QC_STRONG_BELIEF_THRESHOLD)
+                        .count()
+                })
+                .sum();
+            let m = (strong as f64) / (tot_n as f64);
+            let n_per_seed = tot_n / seeds.len().max(1);
+            !(s0.n_amide_hsqc_roots == 0
+                || (s0.n_amide_hsqc_roots > 0 && s0.hsqc_3d_support_frac < 0.25)
+                || s0.aliphatic_support_frac < 0.20
+                || (n_per_seed >= 6 && s0.connectivity_frac < 0.15)
+                || is_unconverged_solution_margin(tot_n, m, s0.hsqc_multiplicity_ratio)
+                || ((s0.hsqc_3d_rms_dh_ppm > 0.065 || s0.hsqc_3d_rms_dn_ppm > 0.65)
+                    && s0.hsqc_3d_support_frac < 0.45)
+                || (s0.n_amide_hsqc_roots > 0
+                    && s0.hsqc_3d_support_frac < 0.45
+                    && s0.supported_roots_per_assignable < 0.35
+                    && m < 0.20))
+        };
+
+        println!("\n================ 26-PROTEIN NON-COLD RAW FEATURE TABLE ================");
+        for p in &prots {
+            let s_evo = &p.evo_seeds[0];
+            let s_bcpu = &p.bayes_cpu_seeds[0];
+            let mean_feat =
+                |seeds: &[ProteinHcTrainingSeed], f: fn(&ProteinHcTrainingSeed) -> f64| -> f64 {
+                    seeds.iter().map(f).sum::<f64>() / (seeds.len().max(1) as f64)
+                };
+            let acc_fn = |seeds: &[ProteinHcTrainingSeed]| -> f64 {
+                let n: usize = seeds.iter().map(|s| s.raw_predictions.len()).sum();
+                let ok: usize = seeds
+                    .iter()
+                    .map(|s| s.raw_predictions.iter().filter(|&&(_, c)| c).count())
+                    .sum();
+                100.0 * (ok as f64) / (n.max(1) as f64)
+            };
+            println!(
+                "  {:8} {:16} {:12} | mult={:4.2} sup3d={:4.2} bidir(evo={:4.2},b={:4.2}) | c35(evo={:4.2},b={:4.2}) chain(evo={:4.2},b={:4.2}) unary(evo={:4.2},b={:4.2}) | acc(evo={:5.1}%, std={:5.1}%, bcpu={:5.1}%, bgpu={:5.1}%)",
+                p.cohort,
+                p.bmrb_id,
+                truncate_col(&p.protein, 12),
+                s_evo.hsqc_multiplicity_ratio,
+                s_evo.hsqc_3d_support_frac,
+                s_evo.resolved_bidir_aliphatic_frac,
+                s_bcpu.resolved_bidir_aliphatic_frac,
+                mean_feat(&p.evo_seeds, |s| s.corroborated_connectivity_frac),
+                mean_feat(&p.bayes_cpu_seeds, |s| s.corroborated_connectivity_frac),
+                mean_feat(&p.evo_seeds, |s| s.chain_corroborated_frac),
+                mean_feat(&p.bayes_cpu_seeds, |s| s.chain_corroborated_frac),
+                mean_feat(&p.evo_seeds, |s| s.unary_specificity),
+                mean_feat(&p.bayes_cpu_seeds, |s| s.unary_specificity),
+                acc_fn(&p.evo_seeds),
+                acc_fn(&p.std_cpu_seeds),
+                acc_fn(&p.bayes_cpu_seeds),
+                acc_fn(&p.bayes_gpu_seeds),
+            );
+        }
+
+        struct Joint5EngineFit {
+            evo_knots: Vec<(f64, f64)>,
+            std_cpu_knots: Vec<(f64, f64)>,
+            std_gpu_w: f64,
+            std_gpu_knots: Vec<(f64, f64)>,
+            bayes_cpu_knots: Vec<(f64, f64)>,
+            bayes_gpu_w: f64,
+            bayes_gpu_knots: Vec<(f64, f64)>,
+            unified_gate: ProteinHcGateConfig,
+        }
+
+        let n_prots = prots.len();
+        let fit_5engines_on_subset = |skip_idx: Option<usize>| -> Joint5EngineFit {
+            let mut tr_evo = Vec::new();
+            let mut tr_scpu = Vec::new();
+            let mut tr_sgpu = Vec::new();
+            let mut tr_bcpu = Vec::new();
+            let mut tr_bgpu = Vec::new();
+            let mut tr_scpu_raw = Vec::new();
+            let mut tr_bcpu_raw = Vec::new();
+            let mut tr_sgpu_ok = Vec::new();
+            let mut tr_scpu_ok = Vec::new();
+            let mut tr_bgpu_ok = Vec::new();
+            let mut tr_bcpu_ok = Vec::new();
+
+            let mut evo_flat = Vec::new();
+            let mut scpu_flat = Vec::new();
+            let mut sgpu_flat = Vec::new();
+            let mut bcpu_flat = Vec::new();
+            let mut bgpu_flat = Vec::new();
+
+            for (idx, p) in prots.iter().enumerate() {
+                if skip_idx == Some(idx) {
+                    continue;
+                }
+                let e_ok = is_trainable_prot(&p.evo_seeds);
+                let sc_ok = is_trainable_prot(&p.std_cpu_seeds);
+                let sg_ok = is_trainable_prot(&p.std_gpu_seeds);
+                let bc_ok = is_trainable_prot(&p.bayes_cpu_seeds);
+                let bg_ok = is_trainable_prot(&p.bayes_gpu_seeds);
+
+                let sc_pairs: Vec<(f64, bool)> = p
+                    .std_cpu_seeds
+                    .iter()
+                    .flat_map(|s| s.raw_predictions.iter().copied())
+                    .collect();
+                let bc_pairs: Vec<(f64, bool)> = p
+                    .bayes_cpu_seeds
+                    .iter()
+                    .flat_map(|s| s.raw_predictions.iter().copied())
+                    .collect();
+
+                if e_ok {
+                    for s in &p.evo_seeds {
+                        evo_flat.extend_from_slice(&s.raw_predictions);
+                    }
+                }
+                if sc_ok {
+                    scpu_flat.extend_from_slice(&sc_pairs);
+                }
+                if sg_ok {
+                    for s in &p.std_gpu_seeds {
+                        sgpu_flat.extend_from_slice(&s.raw_predictions);
+                    }
+                }
+                if bc_ok {
+                    bcpu_flat.extend_from_slice(&bc_pairs);
+                }
+                if bg_ok {
+                    for s in &p.bayes_gpu_seeds {
+                        bgpu_flat.extend_from_slice(&s.raw_predictions);
+                    }
+                }
+
+                tr_evo.push(p.evo_seeds.clone());
+                tr_scpu.push(p.std_cpu_seeds.clone());
+                tr_sgpu.push(p.std_gpu_seeds.clone());
+                tr_bcpu.push(p.bayes_cpu_seeds.clone());
+                tr_bgpu.push(p.bayes_gpu_seeds.clone());
+                tr_scpu_raw.push(sc_pairs);
+                tr_bcpu_raw.push(bc_pairs);
+                tr_sgpu_ok.push(sg_ok);
+                tr_scpu_ok.push(sc_ok);
+                tr_bgpu_ok.push(bg_ok);
+                tr_bcpu_ok.push(bc_ok);
+            }
+
+            let evo_knots = fit_isotonic_monotone_knots(
+                &evo_flat,
+                CANONICAL_CALIBRATION_GRID_12,
+                CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+            );
+            let std_cpu_knots = fit_isotonic_monotone_knots_beta(
+                &scpu_flat,
+                CANONICAL_CALIBRATION_GRID_12,
+                STANDARD_CPU_PRIOR_ALPHA,
+                STANDARD_CPU_PRIOR_BETA,
+            );
+            let bayes_cpu_knots = fit_isotonic_monotone_knots_beta(
+                &bcpu_flat,
+                CANONICAL_CALIBRATION_GRID_12,
+                BAYES_SA_CPU_PRIOR_ALPHA,
+                BAYES_SA_CPU_PRIOR_BETA,
+            );
+
+            let init_sgpu_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
+                &sgpu_flat,
+                &scpu_flat,
+                0.50,
+                CANONICAL_CALIBRATION_GRID_12,
+                STANDARD_GPU_PRIOR_ALPHA,
+                STANDARD_GPU_PRIOR_BETA,
+            );
+            let init_bgpu_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
+                &bgpu_flat,
+                &bcpu_flat,
+                0.50,
+                CANONICAL_CALIBRATION_GRID_12,
+                BAYES_SA_GPU_PRIOR_ALPHA,
+                BAYES_SA_GPU_PRIOR_BETA,
+            );
+
+            let init_gate = fit_protein_hc_gate_config_multi_engine(&[
+                (&tr_evo, &evo_knots),
+                (&tr_scpu, &std_cpu_knots),
+                (&tr_sgpu, &init_sgpu_knots),
+                (&tr_bcpu, &bayes_cpu_knots),
+                (&tr_bgpu, &init_bgpu_knots),
+            ]);
+
+            let (std_gpu_w, _) = select_gpu_shrinkage_weight_nested_lopo_beta(
+                &tr_sgpu,
+                &tr_scpu_raw,
+                &tr_sgpu_ok,
+                &tr_scpu_ok,
+                &init_gate,
+                STANDARD_GPU_PRIOR_ALPHA,
+                STANDARD_GPU_PRIOR_BETA,
+                CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
+            );
+            let (bayes_gpu_w, _) = select_gpu_shrinkage_weight_nested_lopo_beta(
+                &tr_bgpu,
+                &tr_bcpu_raw,
+                &tr_bgpu_ok,
+                &tr_bcpu_ok,
+                &init_gate,
+                BAYES_SA_GPU_PRIOR_ALPHA,
+                BAYES_SA_GPU_PRIOR_BETA,
+                CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT,
+            );
+
+            let std_gpu_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
+                &sgpu_flat,
+                &scpu_flat,
+                std_gpu_w,
+                CANONICAL_CALIBRATION_GRID_12,
+                STANDARD_GPU_PRIOR_ALPHA,
+                STANDARD_GPU_PRIOR_BETA,
+            );
+            let bayes_gpu_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
+                &bgpu_flat,
+                &bcpu_flat,
+                bayes_gpu_w,
+                CANONICAL_CALIBRATION_GRID_12,
+                BAYES_SA_GPU_PRIOR_ALPHA,
+                BAYES_SA_GPU_PRIOR_BETA,
+            );
+
+            let unified_gate = fit_protein_hc_gate_config_multi_engine(&[
+                (&tr_evo, &evo_knots),
+                (&tr_scpu, &std_cpu_knots),
+                (&tr_sgpu, &std_gpu_knots),
+                (&tr_bcpu, &bayes_cpu_knots),
+                (&tr_bgpu, &bayes_gpu_knots),
+            ]);
+
+            Joint5EngineFit {
+                evo_knots,
+                std_cpu_knots,
+                std_gpu_w,
+                std_gpu_knots,
+                bayes_cpu_knots,
+                bayes_gpu_w,
+                bayes_gpu_knots,
+                unified_gate,
+            }
+        };
+
+        println!(
+            "\n================ FITTING 26-FOLD LOPO + FULL-26 CANONICAL FIT ================"
+        );
+        let t_fit = Instant::now();
+        let mut outer_fits: Vec<Joint5EngineFit> = Vec::with_capacity(n_prots);
+        for (hold_idx, prot) in prots.iter().enumerate() {
+            let f = fit_5engines_on_subset(Some(hold_idx));
+            println!(
+                "  [FOLD {:2}/26 hold={:16} ({:8})] std_w={:.2} bayes_w={:.2} gate={:?}",
+                hold_idx + 1,
+                prot.bmrb_id,
+                prot.cohort,
+                f.std_gpu_w,
+                f.bayes_gpu_w,
+                f.unified_gate
+            );
+            outer_fits.push(f);
+        }
+        let full_fit = fit_5engines_on_subset(None);
+        println!(
+            "  [FULL-26 FIT ({:.2}s)] std_w={:.2} bayes_w={:.2} gate={:?}",
+            t_fit.elapsed().as_secs_f64(),
+            full_fit.std_gpu_w,
+            full_fit.bayes_gpu_w,
+            full_fit.unified_gate
+        );
+
+        let zero_gate = ProteinHcGateConfig {
+            min_corroborated_connectivity: 0.0,
+            min_hc_call_fraction: 0.0,
+            min_crowded_solution_margin: 0.0,
+            multiplicity_penalty_floor: 0.0,
+            min_chain_corroborated_frac: 0.0,
+            min_unary_specificity: 0.0,
+            min_bidir_aliphatic_frac: 0.0,
+        };
+
+        #[derive(Serialize)]
+        struct OofProteinReport {
+            bmrb_id: String,
+            protein: String,
+            split: String,
+            cohort: String,
+            accuracy: f64,
+            uncapped_hc_assigned: usize,
+            uncapped_hc_correct: usize,
+            uncapped_hc_precision: Option<f64>,
+            oof_hc_assigned: usize,
+            oof_hc_correct: usize,
+            oof_hc_precision: Option<f64>,
+            oof_capped_or_warned: bool,
+            oof_ece_10: f64,
+            oof_debiased_ece_10: f64,
+        }
+
+        #[derive(Serialize)]
+        struct EngineLopoSummary {
+            engine: String,
+            oof_pooled_ece_10: f64,
+            oof_pooled_ece_4: f64,
+            oof_mean_ece_10: f64,
+            oof_mean_debiased_ece_10: f64,
+            oof_micro_hc_precision: f64,
+            oof_macro_hc_precision: f64,
+            oof_hc_active_proteins: usize,
+            oof_hc_abstained_proteins: usize,
+            oof_5691_uncapped_hcp: Option<f64>,
+            oof_5691_gated_hcp: Option<f64>,
+            oof_5691_capped_or_warned: bool,
+            oof_18561_uncapped_hcp: Option<f64>,
+            oof_18561_gated_hcp: Option<f64>,
+            oof_18561_capped_or_warned: bool,
+            dev_clean_proteins_capped: Vec<String>,
+            full_knots: Vec<(f64, f64)>,
+            per_protein: Vec<OofProteinReport>,
+        }
+
+        let eval_engine_oof = |engine_name: &str,
+                               get_seeds: &dyn Fn(
+            &CachedProteinTelemetry,
+        ) -> &[ProteinHcTrainingSeed],
+                               get_fold_knots: &dyn Fn(&Joint5EngineFit) -> &[(f64, f64)],
+                               full_knots: &[(f64, f64)]|
+         -> EngineLopoSummary {
+            let mut oof_pooled = Vec::new();
+            let mut oof_eces_10 = Vec::new();
+            let mut oof_deb_10 = Vec::new();
+            let mut oof_hcps = Vec::new();
+            let mut per_protein = Vec::new();
+            let mut dev_clean_capped = Vec::new();
+
+            for (hold_idx, p) in prots.iter().enumerate() {
+                let seeds = get_seeds(p);
+                let fold_fit = &outer_fits[hold_idx];
+                let f_knots = get_fold_knots(fold_fit);
+                let f_gate = &fold_fit.unified_gate;
+
+                let mut uncap_preds = Vec::new();
+                let mut gated_preds = Vec::new();
+                for s in seeds {
+                    uncap_preds.extend(evaluate_seed_predictions_with_gate(s, f_knots, &zero_gate));
+                    gated_preds.extend(evaluate_seed_predictions_with_gate(s, f_knots, f_gate));
+                }
+                let uncap_rel =
+                    ProteinReliabilityCurve::from_predictions_with_repeats(&uncap_preds, 0.80, 5.0);
+                let gated_rel =
+                    ProteinReliabilityCurve::from_predictions_with_repeats(&gated_preds, 0.80, 5.0);
+
+                let n_tot: usize = seeds.iter().map(|s| s.raw_predictions.len()).sum();
+                let n_ok: usize = seeds
+                    .iter()
+                    .map(|s| s.raw_predictions.iter().filter(|&&(_, c)| c).count())
+                    .sum();
+                let acc = (n_ok as f64) / (n_tot.max(1) as f64);
+
+                let capped_by_gate =
+                    uncap_rel.hc_assigned > 0 && gated_rel.hc_assigned < uncap_rel.hc_assigned;
+                // Also check if intrinsic WARN damped or if already 0 HC calls
+                let already_abstained_or_warned = uncap_rel.hc_assigned == 0
+                    || gated_preds
+                        .iter()
+                        .zip(uncap_preds.iter())
+                        .any(|(&(gc, _), &(uc, _))| gc + 1e-9 < uc);
+                let capped_or_warned = capped_by_gate || already_abstained_or_warned;
+
+                if p.split == "dev"
+                    && uncap_rel.hc_precision.is_some_and(|h| h >= 0.94)
+                    && capped_by_gate
+                {
+                    dev_clean_capped.push(format!(
+                        "{} (uncapped={:.1}% -> gated={})",
+                        p.bmrb_id,
+                        uncap_rel.hc_precision.unwrap() * 100.0,
+                        gated_rel.hc_status
+                    ));
+                }
+
+                oof_eces_10.push(gated_rel.ece_10);
+                oof_deb_10.push(gated_rel.debiased_ece_10);
+                if let Some(hcp) = gated_rel.hc_precision {
+                    oof_hcps.push(hcp);
+                }
+                oof_pooled.extend(gated_preds);
+
+                per_protein.push(OofProteinReport {
+                    bmrb_id: p.bmrb_id.clone(),
+                    protein: p.protein.clone(),
+                    split: p.split.clone(),
+                    cohort: p.cohort.clone(),
+                    accuracy: acc,
+                    uncapped_hc_assigned: uncap_rel.hc_assigned,
+                    uncapped_hc_correct: uncap_rel.hc_correct,
+                    uncapped_hc_precision: uncap_rel.hc_precision,
+                    oof_hc_assigned: gated_rel.hc_assigned,
+                    oof_hc_correct: gated_rel.hc_correct,
+                    oof_hc_precision: gated_rel.hc_precision,
+                    oof_capped_or_warned: capped_or_warned,
+                    oof_ece_10: gated_rel.ece_10,
+                    oof_debiased_ece_10: gated_rel.debiased_ece_10,
+                });
+            }
+
+            let pool_rel =
+                ProteinReliabilityCurve::from_predictions_with_repeats(&oof_pooled, 0.80, 5.0);
+            let mean_ece_10 = oof_eces_10.iter().sum::<f64>() / (oof_eces_10.len().max(1) as f64);
+            let mean_deb_10 = oof_deb_10.iter().sum::<f64>() / (oof_deb_10.len().max(1) as f64);
+            let macro_hcp = oof_hcps.iter().sum::<f64>() / (oof_hcps.len().max(1) as f64);
+            let micro_hcp = pool_rel.hc_precision.unwrap_or(0.0);
+            let hc_active = oof_hcps.len();
+            let hc_abstained = n_prots.saturating_sub(hc_active);
+
+            let p5691 = per_protein.iter().find(|r| r.bmrb_id == "5691").unwrap();
+            let p18561 = per_protein.iter().find(|r| r.bmrb_id == "18561").unwrap();
+
+            println!(
+                "\n  >>> [26-FOLD LOPO {engine_name}] pooled_ECE10={:.4} (ECE4={:.4}), mean_ECE10={mean_ece_10:.4} (deb={mean_deb_10:.4}), micro_HCP={:.2}% ({}/{}), macro_HCP={:.2}% (active={hc_active}/{n_prots})",
+                pool_rel.ece_10,
+                pool_rel.ece,
+                micro_hcp * 100.0,
+                pool_rel.hc_correct,
+                pool_rel.hc_assigned,
+                macro_hcp * 100.0,
+            );
+            println!(
+                "      5691  : uncapped_HCP={:?} ({}/{}) -> OOF_gated={:?} ({}/{}) capped_or_warned={}",
+                p5691.uncapped_hc_precision.map(|v| format!("{:.1}%", v * 100.0)),
+                p5691.uncapped_hc_correct,
+                p5691.uncapped_hc_assigned,
+                p5691.oof_hc_precision.map(|v| format!("{:.1}%", v * 100.0)),
+                p5691.oof_hc_correct,
+                p5691.oof_hc_assigned,
+                p5691.oof_capped_or_warned,
+            );
+            println!(
+                "      18561 : uncapped_HCP={:?} ({}/{}) -> OOF_gated={:?} ({}/{}) capped_or_warned={}",
+                p18561.uncapped_hc_precision.map(|v| format!("{:.1}%", v * 100.0)),
+                p18561.uncapped_hc_correct,
+                p18561.uncapped_hc_assigned,
+                p18561.oof_hc_precision.map(|v| format!("{:.1}%", v * 100.0)),
+                p18561.oof_hc_correct,
+                p18561.oof_hc_assigned,
+                p18561.oof_capped_or_warned,
+            );
+            println!("      dev_clean_capped (>=94% HCP): {:?}", dev_clean_capped);
+            for r in &per_protein {
+                println!(
+                    "      {:8} {:16} {:12} | acc={:5.1}% | uncap_HC={:3}/{:3} ({:>6}) -> OOF_HC={:3}/{:3} ({:>6}) | cap/warn={:5} | ECE10={:.4}",
+                    r.cohort,
+                    r.bmrb_id,
+                    truncate_col(&r.protein, 12),
+                    r.accuracy * 100.0,
+                    r.uncapped_hc_correct,
+                    r.uncapped_hc_assigned,
+                    r.uncapped_hc_precision
+                        .map(|v| format!("{:.1}%", v * 100.0))
+                        .unwrap_or_else(|| "ABST".to_string()),
+                    r.oof_hc_correct,
+                    r.oof_hc_assigned,
+                    r.oof_hc_precision
+                        .map(|v| format!("{:.1}%", v * 100.0))
+                        .unwrap_or_else(|| "ABST".to_string()),
+                    r.oof_capped_or_warned,
+                    r.oof_ece_10,
+                );
+            }
+            print!("  RUST KNOTS {engine_name}: &[");
+            for (i, &(x, y)) in full_knots.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print!("({x:.4}, {y:.4})");
+            }
+            println!("];");
+
+            EngineLopoSummary {
+                engine: engine_name.to_string(),
+                oof_pooled_ece_10: pool_rel.ece_10,
+                oof_pooled_ece_4: pool_rel.ece,
+                oof_mean_ece_10: mean_ece_10,
+                oof_mean_debiased_ece_10: mean_deb_10,
+                oof_micro_hc_precision: micro_hcp,
+                oof_macro_hc_precision: macro_hcp,
+                oof_hc_active_proteins: hc_active,
+                oof_hc_abstained_proteins: hc_abstained,
+                oof_5691_uncapped_hcp: p5691.uncapped_hc_precision,
+                oof_5691_gated_hcp: p5691.oof_hc_precision,
+                oof_5691_capped_or_warned: p5691.oof_capped_or_warned,
+                oof_18561_uncapped_hcp: p18561.uncapped_hc_precision,
+                oof_18561_gated_hcp: p18561.oof_hc_precision,
+                oof_18561_capped_or_warned: p18561.oof_capped_or_warned,
+                dev_clean_proteins_capped: dev_clean_capped,
+                full_knots: full_knots.to_vec(),
+                per_protein,
+            }
+        };
+
+        let s_evo = eval_engine_oof(
+            "EVO_GRAPH",
+            &|p| &p.evo_seeds,
+            &|f| &f.evo_knots,
+            &full_fit.evo_knots,
+        );
+        let s_scpu = eval_engine_oof(
+            "STANDARD_CPU",
+            &|p| &p.std_cpu_seeds,
+            &|f| &f.std_cpu_knots,
+            &full_fit.std_cpu_knots,
+        );
+        let s_sgpu = eval_engine_oof(
+            "STANDARD_GPU",
+            &|p| &p.std_gpu_seeds,
+            &|f| &f.std_gpu_knots,
+            &full_fit.std_gpu_knots,
+        );
+        let s_bcpu = eval_engine_oof(
+            "BAYES_SA_CPU",
+            &|p| &p.bayes_cpu_seeds,
+            &|f| &f.bayes_cpu_knots,
+            &full_fit.bayes_cpu_knots,
+        );
+        let s_bgpu = eval_engine_oof(
+            "BAYES_SA_GPU",
+            &|p| &p.bayes_gpu_seeds,
+            &|f| &f.bayes_gpu_knots,
+            &full_fit.bayes_gpu_knots,
+        );
+
+        println!(
+            "\n  RUST CONSTANTS SUMMARY:\n  CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT = {:.2};\n  CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT = {:.2};\n  CANONICAL_PROTEIN_HC_GATE = {:#?};",
+            full_fit.std_gpu_w,
+            full_fit.bayes_gpu_w,
+            full_fit.unified_gate,
+        );
+
+        #[derive(Serialize)]
+        struct FullW2LopoArtifact {
+            n_proteins: usize,
+            canonical_std_gpu_shrinkage_w: f64,
+            canonical_bayes_gpu_shrinkage_w: f64,
+            canonical_protein_hc_gate: ProteinHcGateConfig,
+            fold_gates: Vec<(String, String, f64, f64, ProteinHcGateConfig)>,
+            engines: Vec<EngineLopoSummary>,
+        }
+
+        let fold_gates = prots
+            .iter()
+            .zip(outer_fits.iter())
+            .map(|(p, f)| {
+                (
+                    p.bmrb_id.clone(),
+                    p.cohort.clone(),
+                    f.std_gpu_w,
+                    f.bayes_gpu_w,
+                    f.unified_gate,
+                )
+            })
+            .collect();
+
+        let artifact = FullW2LopoArtifact {
+            n_proteins: n_prots,
+            canonical_std_gpu_shrinkage_w: full_fit.std_gpu_w,
+            canonical_bayes_gpu_shrinkage_w: full_fit.bayes_gpu_w,
+            canonical_protein_hc_gate: full_fit.unified_gate,
+            fold_gates,
+            engines: vec![s_evo, s_scpu, s_sgpu, s_bcpu, s_bgpu],
+        };
+
+        let out_json_path = env::var("NMR_W2_LOPO_JSON_OUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("data/private/w2_results/w2_non_cold_26_lopo.json"));
+        if let Some(parent) = out_json_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(
+            &out_json_path,
+            serde_json::to_string_pretty(&artifact).expect("serialize LOPO artifact"),
+        )
+        .expect("write LOPO artifact");
+        println!(
+            "  [W2 LOPO] Wrote JSON report -> {}",
+            out_json_path.display()
+        );
+
+        // Binding 13.1:P1-7b LOPO assertions across all 5 engines:
+        for eng in &artifact.engines {
+            assert!(
+                eng.oof_micro_hc_precision >= 0.94,
+                "{} 26-fold LOPO pooled HC precision {:.2}% < 94.0%",
+                eng.engine,
+                eng.oof_micro_hc_precision * 100.0
+            );
+            assert!(
+                eng.dev_clean_proteins_capped.is_empty(),
+                "{} capped clean dev protein(s) >= 94% HCP: {:?}",
+                eng.engine,
+                eng.dev_clean_proteins_capped
+            );
+            if eng.oof_5691_uncapped_hcp.is_some_and(|h| h < 0.85) {
+                assert!(
+                    eng.oof_5691_capped_or_warned,
+                    "{} failed to cap/WARN 5691 out-of-fold despite uncapped HCP {:.2}% < 85%",
+                    eng.engine,
+                    eng.oof_5691_uncapped_hcp.unwrap() * 100.0
+                );
+            }
+            if eng.oof_18561_uncapped_hcp.is_some_and(|h| h < 0.85) {
+                assert!(
+                    eng.oof_18561_capped_or_warned,
+                    "{} failed to cap/WARN 18561 out-of-fold despite uncapped HCP {:.2}% < 85%",
+                    eng.engine,
+                    eng.oof_18561_uncapped_hcp.unwrap() * 100.0
+                );
+            }
+        }
+
+        // Verify committed qc.rs constants match full-26 fit within 4-decimal rounding (2e-4):
+        assert_eq!(
+            nmr_core::qc::CANONICAL_PROTEIN_HC_GATE,
+            full_fit.unified_gate,
+            "CANONICAL_PROTEIN_HC_GATE in qc.rs must equal full_fit.unified_gate"
+        );
+        assert!(
+            (nmr_core::qc::CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - full_fit.std_gpu_w).abs() < 1e-6,
+            "CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT mismatch: {} vs {}",
+            nmr_core::qc::CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
+            full_fit.std_gpu_w
+        );
+        assert!(
+            (nmr_core::qc::CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT - full_fit.bayes_gpu_w)
+                .abs()
+                < 1e-6,
+            "CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT mismatch: {} vs {}",
+            nmr_core::qc::CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT,
+            full_fit.bayes_gpu_w
+        );
+        let assert_knots_match = |label: &str, committed: &[(f64, f64)], fitted: &[(f64, f64)]| {
+            assert_eq!(committed.len(), fitted.len(), "{label} knot count mismatch");
+            for (i, (&(cx, cy), &(fx, fy))) in committed.iter().zip(fitted.iter()).enumerate() {
+                assert!(
+                        (cx - fx).abs() <= 2e-4 && (cy - fy).abs() <= 2e-4,
+                        "{label} knot[{i}] mismatch: committed=({cx:.4},{cy:.4}) vs fitted=({fx:.4},{fy:.4})"
+                    );
+            }
+        };
+        assert_knots_match(
+            "EVO_GRAPH_CALIBRATION_KNOTS",
+            nmr_core::qc::EVO_GRAPH_CALIBRATION_KNOTS,
+            &full_fit.evo_knots,
+        );
+        assert_knots_match(
+            "STANDARD_CALIBRATION_KNOTS",
+            nmr_core::qc::STANDARD_CALIBRATION_KNOTS,
+            &full_fit.std_cpu_knots,
+        );
+        assert_knots_match(
+            "STANDARD_GPU_CALIBRATION_KNOTS",
+            nmr_core::qc::STANDARD_GPU_CALIBRATION_KNOTS,
+            &full_fit.std_gpu_knots,
+        );
+        assert_knots_match(
+            "BAYES_SA_CALIBRATION_KNOTS",
+            nmr_core::qc::BAYES_SA_CALIBRATION_KNOTS,
+            &full_fit.bayes_cpu_knots,
+        );
+        assert_knots_match(
+            "BAYES_SA_GPU_CALIBRATION_KNOTS",
+            nmr_core::qc::BAYES_SA_GPU_CALIBRATION_KNOTS,
+            &full_fit.bayes_gpu_knots,
         );
     }
 }

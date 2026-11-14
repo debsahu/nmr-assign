@@ -13,7 +13,8 @@ use std::process::{self, Command};
 use nmr_core::qc::{
     eval_monotone_calibration_map, fit_isotonic_monotone_knots, fit_isotonic_monotone_knots_beta,
     fit_isotonic_monotone_knots_shrunk_toward, DatasetQcReport, DatasetQcVerdict,
-    ProteinReliabilityCurve, CANDIDATE_GPU_SHRINKAGE_WEIGHTS, CANONICAL_CALIBRATION_GRID_12,
+    ProteinReliabilityCurve, CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
+    CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_CALIBRATION_GRID_12,
     CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
     CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATED_RUNS, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
     QC_PROTEIN_HC_CONFIDENCE_CAP, STANDARD_CPU_CALIBRATED_RUNS, STANDARD_CPU_PRIOR_ALPHA,
@@ -524,13 +525,17 @@ fn test_phase13_p1_7_p1_8_q4_cli_json_and_calibration_contracts() {
         CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
         &[0.0, 0.20, 0.35, 0.50, 0.65, 0.80, 1.0]
     );
-    assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.50).abs() < 1e-12);
+    assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.00).abs() < 1e-12);
+    assert!((CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT - 0.20).abs() < 1e-12);
     assert!((QC_PROTEIN_HC_CONFIDENCE_CAP - 0.79).abs() < 1e-12);
     assert!((QC_MIN_LARGE_OFFSET_GAIN_PER_OBS - 0.15).abs() < 1e-12);
     assert!((CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity - 0.45).abs() < 1e-12);
-    assert!((CANONICAL_PROTEIN_HC_GATE.min_hc_call_fraction - 0.04).abs() < 1e-12);
-    assert!((CANONICAL_PROTEIN_HC_GATE.min_crowded_solution_margin - 0.25).abs() < 1e-12);
-    assert!((CANONICAL_PROTEIN_HC_GATE.multiplicity_penalty_floor - 0.06).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_hc_call_fraction - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_crowded_solution_margin - 0.55).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.multiplicity_penalty_floor - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_chain_corroborated_frac - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_unary_specificity - 0.0).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_bidir_aliphatic_frac - 0.58).abs() < 1e-12);
     assert!((STANDARD_GPU_PRIOR_ALPHA - 0.35).abs() < 1e-12);
     assert!((STANDARD_GPU_PRIOR_BETA - 0.65).abs() < 1e-12);
 
@@ -563,25 +568,30 @@ fn test_phase13_p1_7_p1_8_q4_cli_json_and_calibration_contracts() {
         "Beta(0.75, 2.25) must be strictly more conservative than symmetric Beta(0.25, 0.25) on sparse bins"
     );
 
-    // 4. Verify `real_manifest.tsv` spent-cohort relabel (`cold_p12` -> `seen_p12`, `P1-7`)
+    // 4. Verify `real_manifest.tsv` spent-cohort relabels (`cold_p12` -> `seen_p12`, `cold_p13` -> `seen_p13`; `P1-7` & `F4`)
     let manifest_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/benchmark/real_manifest.tsv");
     let manifest_txt = fs::read_to_string(&manifest_path).expect("read real_manifest.tsv");
     let mut n_seen_p12 = 0usize;
+    let mut n_seen_p13 = 0usize;
     for line in manifest_txt.lines() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') || t.starts_with("bmrb_id") {
             continue;
         }
         assert!(
-            !t.ends_with("\tcold_p12"),
-            "spent cohort `cold_p12` must be relabeled `seen_p12` per P1-7: {t}"
+            !t.ends_with("\tcold_p12") && !t.ends_with("\tcold_p13"),
+            "spent cohorts `cold_p12` / `cold_p13` must be relabeled `seen_*`: {t}"
         );
         if t.ends_with("\tseen_p12") {
             n_seen_p12 += 1;
         }
+        if t.ends_with("\tseen_p13") {
+            n_seen_p13 += 1;
+        }
     }
     assert_eq!(n_seen_p12, 7, "expected 7 relabeled `seen_p12` rows");
+    assert_eq!(n_seen_p13, 7, "expected 7 relabeled `seen_p13` rows");
 
     // 5. CLI `real-benchmark --json-out` schema check for Phase 13 ECE_10 / debiased_ece_10 / Bernoulli floor fields
     let dir = std::env::temp_dir().join(format!("nmr_p13_cal_cli_{}", process::id()));

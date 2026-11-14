@@ -28,9 +28,10 @@ use nmr_core::qc::{
     ProteinReliabilityCurve, CANDIDATE_GATE_CORROBORATED_CONNECTIVITY,
     CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN, CANDIDATE_GATE_HC_CALL_FRACTION,
     CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR, CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
-    CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
-    CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATION_KNOTS,
-    QC_CROWDED_MIN_SOLUTION_MARGIN, QC_CROWDED_MULTIPLICITY_RATIO, QC_MIN_ASSIGNED_FOR_MARGIN_GATE,
+    CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_CALIBRATION_GRID_12,
+    CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
+    CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATION_KNOTS, QC_CROWDED_MIN_SOLUTION_MARGIN,
+    QC_CROWDED_MULTIPLICITY_RATIO, QC_MIN_ASSIGNED_FOR_MARGIN_GATE,
     QC_MIN_LARGE_OFFSET_GAIN_PER_OBS, QC_MIN_SOLUTION_MARGIN, QC_PROTEIN_HC_CONFIDENCE_CAP,
     QC_STRONG_BELIEF_THRESHOLD, STANDARD_CALIBRATION_KNOTS, STANDARD_CPU_PRIOR_ALPHA,
     STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_CALIBRATION_KNOTS, STANDARD_GPU_PRIOR_ALPHA,
@@ -812,7 +813,10 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
         "triggered protein-level HC gate must suppress all >= 0.80 commitments"
     );
 
-    // 4. Isolated sparse HC tail (`1 / 40 = 2.5% < 8%` HC call fraction) must cap at <= 0.79.
+    // 4. Isolated sparse HC tail (`1 / 72 < 4%` HC call fraction) under fragmented sequential
+    // corroboration (`corroborated_connectivity_frac < 0.75`) must cap at <= 0.79 when
+    // `min_hc_call_fraction = 0.04`, whereas fully corroborated connectivity (`>= 0.75`) protects
+    // conservative calibrated tails from false capping.
     let mut isolated_tail_res = res_clean.clone();
     let mut placed_seen = 0usize;
     for (s, &pos) in isolated_tail_res.position.iter().enumerate() {
@@ -827,7 +831,23 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
             };
         }
     }
-    let qc_sparse_hc = evaluate_dataset_qc(
+    let mut mod_link_sys = systems_clean.clone();
+    for (idx, s) in mod_link_sys.iter_mut().enumerate() {
+        if idx % 2 == 0 {
+            s.cands
+                .retain(|(nuc, off), _| !(nuc == "CB" && *off != 0) && !(nuc == "CA" && *off != 0));
+            if let Some(c_prev) = s.cands.get_mut(&("C".to_string(), -1)) {
+                for cand in c_prev.iter_mut() {
+                    cand.0 += 0.36;
+                }
+            }
+        }
+    }
+    let sparse_gate = nmr_core::qc::ProteinHcGateConfig {
+        min_hc_call_fraction: 0.04,
+        ..CANONICAL_PROTEIN_HC_GATE
+    };
+    let qc_protected_clean = evaluate_dataset_qc_with_gate(
         Some(&clean_peaks),
         &systems_clean,
         &truth.sequence,
@@ -835,6 +855,18 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
         &score_cfg,
         &isolated_tail_res,
         None,
+        &sparse_gate,
+    );
+    assert!(!qc_protected_clean.protein_hc_gate_triggered);
+    let qc_sparse_hc = evaluate_dataset_qc_with_gate(
+        Some(&clean_peaks),
+        &mod_link_sys,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &isolated_tail_res,
+        None,
+        &sparse_gate,
     );
     assert_eq!(qc_sparse_hc.verdict, DatasetQcVerdict::Warn);
     assert!(qc_sparse_hc.protein_hc_gate_triggered);
@@ -847,7 +879,7 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
             .filter(|&&c| c >= 0.80)
             .count(),
         0,
-        "isolated 1-residue HC tail spike must be capped below 0.80"
+        "isolated 1-residue HC tail spike on <75% corroborated connectivity must be capped below 0.80"
     );
 
     // 5. Weakly supported large carbon registration offset (`|dCA| = 3.80 > 3.20 ppm` with
@@ -1077,7 +1109,8 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
     // 3. Nested LOPO GPU shrinkage selector (`select_gpu_shrinkage_weight_nested_lopo`) and
     // `fit_protein_hc_gate_config` must run cleanly with zero target leakage.
     assert_eq!(CANDIDATE_GPU_SHRINKAGE_WEIGHTS.len(), 7);
-    assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.50).abs() < 1e-12);
+    assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.00).abs() < 1e-12);
+    assert!((CANONICAL_BAYES_SA_GPU_CPU_SHRINKAGE_WEIGHT - 0.20).abs() < 1e-12);
     let mut gpu_proteins = Vec::new();
     let mut cpu_by_protein = Vec::new();
     for p_idx in 0..6 {
@@ -1102,6 +1135,7 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
             hsqc_3d_support_frac: 0.95,
             supported_roots_per_assignable: 0.95,
             aliphatic_support_frac: 0.95,
+            resolved_bidir_aliphatic_frac: 0.95,
             hsqc_multiplicity_ratio: 1.0,
             hsqc_3d_rms_dh_ppm: 0.01,
             hsqc_3d_rms_dn_ppm: 0.10,
@@ -1109,6 +1143,8 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
             weak_large_offset: false,
             connectivity_frac: 0.92,
             corroborated_connectivity_frac: 0.88,
+            chain_corroborated_frac: 0.85,
+            unary_specificity: 0.92,
             raw_predictions: gpu_raw,
         }]);
         cpu_by_protein.push(cpu_raw);
@@ -1131,7 +1167,7 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
             * CANDIDATE_GATE_HC_CALL_FRACTION.len()
             * CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN.len()
             * CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR.len(),
-        400
+        256
     );
     let gpu_beta_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
         &cpu_by_protein[0],
@@ -1147,8 +1183,11 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
         fit_protein_hc_gate_config_multi_engine(&[(&gpu_proteins, STANDARD_GPU_CALIBRATION_KNOTS)]);
     assert_eq!(fitted_gate, fitted_multi_gate);
     // Neutral monotone Occam tie-breaker: on clean proteins where no candidate gate triggers,
-    // all 400 candidates tie on ECE_10 and HCP, so the least restrictive corner must win.
-    assert_eq!(fitted_gate, CANONICAL_PROTEIN_HC_GATE);
+    // all candidates tie on ECE_10 and HCP, so the least restrictive corner must win.
+    assert_eq!(
+        fitted_gate,
+        nmr_core::qc::ProteinHcGateConfig::least_restrictive_grid_corner()
+    );
     let eval_out = evaluate_seed_predictions_with_gate(
         &gpu_proteins[0][0],
         STANDARD_GPU_CALIBRATION_KNOTS,
@@ -1220,26 +1259,7 @@ fn p1_7_lopo_seed_evaluator_matches_production_qc_and_catches_sparse_placement()
             .map(|(s, _)| prod_res.confidence[s])
             .collect();
 
-        let seed = ProteinHcTrainingSeed {
-            n_assignable_amides: raw_qc.n_assignable_amides,
-            n_amide_hsqc_roots: raw_qc.n_amide_hsqc_roots,
-            peaks_present: peaks.is_some(),
-            hsqc_3d_support_frac: raw_qc.hsqc_3d_support_frac,
-            supported_roots_per_assignable: raw_qc.supported_roots_per_assignable,
-            aliphatic_support_frac: raw_qc.aliphatic_support_frac,
-            hsqc_multiplicity_ratio: raw_qc.hsqc_multiplicity_ratio,
-            hsqc_3d_rms_dh_ppm: raw_qc.hsqc_3d_rms_dh_ppm,
-            hsqc_3d_rms_dn_ppm: raw_qc.hsqc_3d_rms_dn_ppm,
-            offset_consistency_ok: raw_qc.offset_consistency_ok,
-            weak_large_offset: has_weak_likelihood_large_offset(
-                &raw_qc.detailed_offsets,
-                QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
-            )
-            .is_some(),
-            connectivity_frac: raw_qc.connectivity_frac,
-            corroborated_connectivity_frac: raw_qc.corroborated_connectivity_frac,
-            raw_predictions: raw_preds,
-        };
+        let seed = ProteinHcTrainingSeed::from_qc_report(&raw_qc, peaks.is_some(), raw_preds);
         let seed_eval =
             evaluate_seed_predictions_with_gate(&seed, knots, &CANONICAL_PROTEIN_HC_GATE);
         assert_eq!(prod_placed.len(), seed_eval.len());
@@ -1394,4 +1414,128 @@ fn p1_7_real_cisd3_pdata_5seed_retains_pass_and_hc_calls() {
             "CISD3 pdata seed {seed} expected >= 5 HC calls, got {n_hc}"
         );
     }
+}
+
+#[test]
+fn p1_7b_selective_risk_gate_caps_real_negatives_without_capping_clean_proteins() {
+    use nmr_core::qc::{
+        apply_bayes_sa_calibration_map, apply_bayes_sa_gpu_calibration_map,
+        apply_truncated_fid_qc_warning, fit_protein_hc_gate_config_multi_engine, DatasetQcReport,
+        BAYES_SA_CALIBRATION_KNOTS,
+    };
+
+    // 5 clean proteins (>= 95% HCP, rich bidirectional strips & chain corroboration)
+    let mut prots: Vec<Vec<ProteinHcTrainingSeed>> = Vec::new();
+    for p in 0..5 {
+        let mut raw = Vec::new();
+        for r in 0..40 {
+            raw.push((0.99, (r + p) % 25 != 0));
+        }
+        prots.push(vec![ProteinHcTrainingSeed {
+            n_assignable_amides: 42,
+            n_amide_hsqc_roots: 40,
+            peaks_present: true,
+            hsqc_3d_support_frac: 0.96,
+            supported_roots_per_assignable: 0.95,
+            aliphatic_support_frac: 0.95,
+            resolved_bidir_aliphatic_frac: 0.88,
+            hsqc_multiplicity_ratio: 1.0,
+            hsqc_3d_rms_dh_ppm: 0.01,
+            hsqc_3d_rms_dn_ppm: 0.10,
+            offset_consistency_ok: true,
+            weak_large_offset: false,
+            connectivity_frac: 0.90,
+            corroborated_connectivity_frac: 0.86,
+            chain_corroborated_frac: 0.82,
+            unary_specificity: 0.91,
+            raw_predictions: raw,
+        }]);
+    }
+    // Negative A (5691-like: crowded multiplicity + degraded chain corroboration, 40% HCP)
+    prots.push(vec![ProteinHcTrainingSeed {
+        n_assignable_amides: 80,
+        n_amide_hsqc_roots: 108,
+        peaks_present: true,
+        hsqc_3d_support_frac: 0.72,
+        supported_roots_per_assignable: 0.70,
+        aliphatic_support_frac: 0.68,
+        resolved_bidir_aliphatic_frac: 0.45,
+        hsqc_multiplicity_ratio: 1.35,
+        hsqc_3d_rms_dh_ppm: 0.02,
+        hsqc_3d_rms_dn_ppm: 0.18,
+        offset_consistency_ok: true,
+        weak_large_offset: false,
+        connectivity_frac: 0.62,
+        corroborated_connectivity_frac: 0.56,
+        chain_corroborated_frac: 0.28,
+        unary_specificity: 0.58,
+        raw_predictions: (0..30).map(|i| (0.99, i % 5 < 2)).collect(),
+    }]);
+    // Negative B (18561-like: unidirectional strip starvation, 65% HCP)
+    prots.push(vec![ProteinHcTrainingSeed {
+        n_assignable_amides: 60,
+        n_amide_hsqc_roots: 58,
+        peaks_present: true,
+        hsqc_3d_support_frac: 0.88,
+        supported_roots_per_assignable: 0.85,
+        aliphatic_support_frac: 0.84,
+        resolved_bidir_aliphatic_frac: 0.18,
+        hsqc_multiplicity_ratio: 1.0,
+        hsqc_3d_rms_dh_ppm: 0.01,
+        hsqc_3d_rms_dn_ppm: 0.12,
+        offset_consistency_ok: true,
+        weak_large_offset: false,
+        connectivity_frac: 0.78,
+        corroborated_connectivity_frac: 0.72,
+        chain_corroborated_frac: 0.34,
+        unary_specificity: 0.61,
+        raw_predictions: (0..20).map(|i| (0.99, i % 20 < 13)).collect(),
+    }]);
+
+    let gate = fit_protein_hc_gate_config_multi_engine(&[(&prots, BAYES_SA_CALIBRATION_KNOTS)]);
+    // All 5 clean proteins must retain HC calls (>= 0.80)
+    for (p, prot_seeds) in prots.iter().enumerate().take(5) {
+        let out =
+            evaluate_seed_predictions_with_gate(&prot_seeds[0], BAYES_SA_CALIBRATION_KNOTS, &gate);
+        assert!(
+            out.iter().filter(|&&(c, _)| c >= 0.80).count() >= 30,
+            "clean protein {p} must not be capped by fitted gate {gate:?}"
+        );
+    }
+    // Both <85% HCP negatives must be capped (< 0.80 => 0 HC calls)
+    for neg_idx in [5usize, 6usize] {
+        let out = evaluate_seed_predictions_with_gate(
+            &prots[neg_idx][0],
+            BAYES_SA_CALIBRATION_KNOTS,
+            &gate,
+        );
+        assert_eq!(
+            out.iter().filter(|&&(c, _)| c >= 0.80).count(),
+            0,
+            "negative protein {neg_idx} must be capped by fitted gate {gate:?}"
+        );
+    }
+
+    // Monotone Bayes-SA calibration maps + truncated-FID QC warning helper
+    assert!(apply_bayes_sa_calibration_map(0.99) >= apply_bayes_sa_calibration_map(0.50));
+    assert!(apply_bayes_sa_gpu_calibration_map(0.99) >= apply_bayes_sa_gpu_calibration_map(0.50));
+    let mut res = AssignResult {
+        position: vec![1, 2],
+        confidence: vec![0.95, 0.72],
+        score: 10.0,
+        run_scores: vec![10.0],
+    };
+    let mut qc = DatasetQcReport {
+        already_applied: true,
+        ..Default::default()
+    };
+    apply_truncated_fid_qc_warning(
+        &mut res,
+        &mut qc,
+        &["HNCO: truncated ser zero-filled (12000/16384 bytes)".to_string()],
+    );
+    assert_eq!(qc.verdict, DatasetQcVerdict::Warn);
+    assert!(qc.truncated_fid_zero_filled);
+    assert!(qc.warn_sub_hc_uncalibrated);
+    assert!((res.confidence[0] - 0.855).abs() < 1e-9);
 }

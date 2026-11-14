@@ -1302,6 +1302,8 @@ version = "0.8.0"
 dependencies = [
  "nmr-core",
  "nmr-gpu",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
