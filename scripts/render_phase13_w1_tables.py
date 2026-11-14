@@ -123,29 +123,35 @@ def parse_dev_lopo_log(log_path: Path) -> dict[str, Any]:
 
 def summarize_cold_json(json_path: Path) -> dict[str, Any]:
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    entries = [e for e in data.get("entries", []) if e.get("status") == "OK"]
-    hc_ok = sum(int(e["reliability_curve"]["hc_correct"]) for e in entries)
-    hc_tot = sum(int(e["reliability_curve"]["hc_assigned"]) for e in entries)
+    all_entries = data.get("entries", [])
+    entries = [e for e in all_entries if e.get("status") == "OK"]
+    counts = data.get("counts", {})
+    macro = data.get("macro_average", {})
+    micro = data.get("micro_average", {})
+    cal = data.get("calibration_summary", {})
+    rel = cal.get("pooled_reliability_curve", data.get("pooled_reliability", {}))
+    hc_ok = int(micro.get("hc_correct", sum(int(e["reliability_curve"]["hc_correct"]) for e in entries)))
+    hc_tot = int(micro.get("hc_assigned", sum(int(e["reliability_curve"]["hc_assigned"]) for e in entries)))
     pass_entries = [e for e in entries if e.get("qc_verdict") == "PASS"]
     warn_entries = [e for e in entries if e.get("qc_verdict") == "WARN"]
     abst_entries = [e for e in entries if e.get("qc_verdict") == "ABSTAIN"]
+    failed_entries = [e for e in all_entries if e.get("status") != "OK"]
     pass_hc_ok = sum(int(e["reliability_curve"]["hc_correct"]) for e in pass_entries)
     pass_hc_tot = sum(int(e["reliability_curve"]["hc_assigned"]) for e in pass_entries)
     gated_count = sum(
         1 for e in entries if e.get("qc_report", {}).get("protein_hc_gate_triggered")
     )
-    rel = data.get("pooled_reliability", {})
+    macro_hcp_raw = macro.get("hc_precision", data.get("macro_hc_precision"))
     return {
         "solver": data.get("solver", "?"),
-        "evaluated": data.get("evaluated_entries", len(entries)),
-        "total": data.get("total_entries", len(entries)),
-        "macro_acc": 100.0 * float(data.get("macro_accuracy", 0.0)),
-        "macro_rec": 100.0 * float(data.get("macro_recall", 0.0)),
-        "macro_hcp": (
-            100.0 * float(data["macro_hc_precision"])
-            if data.get("macro_hc_precision") is not None
-            else None
-        ),
+        "evaluated": counts.get("evaluated", data.get("evaluated_entries", len(entries))),
+        "total": counts.get("total", data.get("total_entries", len(all_entries))),
+        "failed": counts.get("failed", len(failed_entries)),
+        "macro_acc": 100.0 * float(macro.get("accuracy", data.get("macro_accuracy", 0.0))),
+        "macro_rec": 100.0 * float(macro.get("recall", data.get("macro_recall", 0.0))),
+        "micro_acc": 100.0 * float(micro.get("accuracy", 0.0)),
+        "micro_rec": 100.0 * float(micro.get("recall", 0.0)),
+        "macro_hcp": (100.0 * float(macro_hcp_raw) if macro_hcp_raw is not None else None),
         "micro_hcp": (100.0 * hc_ok / hc_tot) if hc_tot > 0 else None,
         "hc_ok": hc_ok,
         "hc_tot": hc_tot,
@@ -159,11 +165,19 @@ def summarize_cold_json(json_path: Path) -> dict[str, Any]:
         "pooled_ece4": float(rel.get("ece", 0.0)),
         "pooled_ece10": float(rel.get("ece_10", 0.0)),
         "pooled_ece12": float(rel.get("ece_12", 0.0)),
-        "mean_ece4": float(data.get("mean_protein_ece", 0.0)),
-        "mean_ece10": float(data.get("mean_protein_ece_10", 0.0)),
-        "mean_deb_ece10": float(data.get("mean_protein_debiased_ece_10", 0.0)),
-        "mean_floor10": float(data.get("mean_protein_ece_10_bernoulli_floor", 0.0)),
+        "mean_ece4": float(cal.get("mean_protein_ece", data.get("mean_protein_ece", 0.0))),
+        "mean_ece10": float(cal.get("mean_protein_ece_10", data.get("mean_protein_ece_10", 0.0))),
+        "mean_deb_ece10": float(
+            cal.get("mean_protein_debiased_ece_10", data.get("mean_protein_debiased_ece_10", 0.0))
+        ),
+        "mean_floor10": float(
+            cal.get(
+                "mean_protein_ece_10_bernoulli_floor",
+                data.get("mean_protein_ece_10_bernoulli_floor", 0.0),
+            )
+        ),
         "entries": entries,
+        "all_entries": all_entries,
     }
 
 
@@ -359,8 +373,16 @@ def render_markdown(root: Path, extra_files: list[Path], section: str = "all") -
             "`standard (gpu)` QC / Gate / Acc / HC / `ECE_10` (Deb) |"
         )
         lines.append("|---|---|---|---|---|")
-        for e_ev, e_cp, e_gp in zip(c_evo["entries"], c_cpu["entries"], c_gpu["entries"]):
+        for e_ev, e_cp, e_gp in zip(
+            c_evo["all_entries"], c_cpu["all_entries"], c_gpu["all_entries"]
+        ):
             def cell(e: dict[str, Any]) -> str:
+                if e.get("status") != "OK":
+                    fail = e.get("failure", {})
+                    stage = fail.get("stage", "err")
+                    exp = fail.get("experiment", "?")
+                    reason = fail.get("reason", "failed")
+                    return f"`ERR [{stage}:{exp}]` ({reason})"
                 qc = e["qc_verdict"]
                 gated = "GATE" if e["qc_report"].get("protein_hc_gate_triggered") else "open"
                 acc = 100.0 * float(e["accuracy"])
