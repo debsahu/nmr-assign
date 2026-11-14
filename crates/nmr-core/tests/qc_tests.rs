@@ -19,17 +19,22 @@ use nmr_core::qc::{
     apply_dataset_qc_to_assignments, apply_evo_graph_calibration_map,
     apply_standard_calibration_map, apply_standard_gpu_calibration_map, check_offset_consistency,
     compute_debiased_grid_ece, compute_grid_ece, compute_grid_ece_bernoulli_floor,
-    eval_monotone_calibration_map, evaluate_dataset_qc, evaluate_seed_predictions_with_gate,
-    fit_isotonic_monotone_knots, fit_isotonic_monotone_knots_beta, fit_protein_hc_gate_config,
+    eval_monotone_calibration_map, evaluate_dataset_qc, evaluate_dataset_qc_with_gate,
+    evaluate_seed_predictions_with_gate, fit_isotonic_monotone_knots,
+    fit_isotonic_monotone_knots_beta, fit_isotonic_monotone_knots_shrunk_toward_beta,
+    fit_protein_hc_gate_config, fit_protein_hc_gate_config_multi_engine,
     has_weak_likelihood_large_offset, is_unconverged_solution_margin,
     select_gpu_shrinkage_weight_nested_lopo, DatasetQcVerdict, ProteinHcTrainingSeed,
-    ProteinReliabilityCurve, CANDIDATE_GPU_SHRINKAGE_WEIGHTS, CANONICAL_CALIBRATION_GRID_12,
-    CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
-    CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATION_KNOTS, QC_CROWDED_MIN_SOLUTION_MARGIN,
-    QC_CROWDED_MULTIPLICITY_RATIO, QC_MIN_ASSIGNED_FOR_MARGIN_GATE, QC_MIN_SOLUTION_MARGIN,
-    QC_PROTEIN_HC_CONFIDENCE_CAP, QC_STRONG_BELIEF_THRESHOLD, STANDARD_CALIBRATION_KNOTS,
-    STANDARD_CPU_PRIOR_ALPHA, STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_CALIBRATION_KNOTS,
-    UNIFORM_CALIBRATION_GRID_10,
+    ProteinReliabilityCurve, CANDIDATE_GATE_CORROBORATED_CONNECTIVITY,
+    CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN, CANDIDATE_GATE_HC_CALL_FRACTION,
+    CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR, CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
+    CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+    CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATION_KNOTS,
+    QC_CROWDED_MIN_SOLUTION_MARGIN, QC_CROWDED_MULTIPLICITY_RATIO, QC_MIN_ASSIGNED_FOR_MARGIN_GATE,
+    QC_MIN_LARGE_OFFSET_GAIN_PER_OBS, QC_MIN_SOLUTION_MARGIN, QC_PROTEIN_HC_CONFIDENCE_CAP,
+    QC_STRONG_BELIEF_THRESHOLD, STANDARD_CALIBRATION_KNOTS, STANDARD_CPU_PRIOR_ALPHA,
+    STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_CALIBRATION_KNOTS, STANDARD_GPU_PRIOR_ALPHA,
+    STANDARD_GPU_PRIOR_BETA, UNIFORM_CALIBRATION_GRID_10,
 };
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::solver::{AssignResult, ScoreConfig};
@@ -766,16 +771,18 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
     );
     assert!(qc_sparse_aliph.warn_sub_hc_uncalibrated);
 
-    // 3. Low corroborated connectivity (`P >= 3.5` < 0.70 while weak `P >= 1.0` stays >= 0.15):
-    // strip CB and sequential CA(i-1) and perturb single-channel C'(i-1) by +0.26 ppm so single-channel
-    // C' links sit in [1.0, 3.5) nats, triggering protein HC cap <= 0.79.
+    // 3. Low corroborated connectivity (`P >= 3.5` < 0.45 while weak `P >= 1.0` stays >= 0.15):
+    // strip CB and sequential CA(i-1) and perturb single-channel C'(i-1) (+0.26 ppm on 40% of strips,
+    // +0.36 ppm on 60% of strips) so weak links survive (>= 0.15) while corroborated links fall
+    // below `CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity` (0.45), triggering HC cap <= 0.79.
     let mut weak_link_sys = systems_clean.clone();
-    for s in &mut weak_link_sys {
+    for (idx, s) in weak_link_sys.iter_mut().enumerate() {
         s.cands
             .retain(|(nuc, off), _| nuc != "CB" && !(nuc == "CA" && *off != 0));
+        let shift_delta = if idx % 5 < 2 { 0.26 } else { 0.36 };
         if let Some(c_prev) = s.cands.get_mut(&("C".to_string(), -1)) {
             for cand in c_prev.iter_mut() {
-                cand.0 += 0.26;
+                cand.0 += shift_delta;
             }
         }
     }
@@ -789,7 +796,13 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
         None,
     );
     assert_eq!(qc_weak_corr.verdict, DatasetQcVerdict::Warn);
-    assert!(qc_weak_corr.corroborated_connectivity_frac < 0.66);
+    assert!(
+        qc_weak_corr.corroborated_connectivity_frac
+            < CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity,
+        "expected corroborated_connectivity_frac < {}, got {}",
+        CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity,
+        qc_weak_corr.corroborated_connectivity_frac
+    );
     assert!(qc_weak_corr.protein_hc_gate_triggered);
     assert!((qc_weak_corr.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
     let mut capped_weak = res_clean.clone();
@@ -875,6 +888,49 @@ fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
     assert_eq!(qc_weak_off.verdict, DatasetQcVerdict::Warn);
     assert!(qc_weak_off.protein_hc_gate_triggered);
     assert!((qc_weak_off.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
+
+    // 6. Large `15N` registration shift (`|dN| = 1.85 ppm`, strictly inside `check_offset_consistency`'s
+    // `<= 2.50 ppm` ceiling and `> 1.50 ppm`) must pass `has_weak_likelihood_large_offset` when
+    // strongly supported (`ΔLL/n = 0.20 >= 0.075`) and trigger `Warn` + `offset_low_margin` HC cap
+    // when weakly supported (`ΔLL/n = 0.05 < 0.075`).
+    let strong_dn_off = DetailedReferenceOffsets {
+        h: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+        n: mk_fit(OffsetFitStatus::Fitted, 1.85, 8.0, 40),
+        ca: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+        cb: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 48),
+        c: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+    };
+    assert!(check_offset_consistency(&strong_dn_off).0);
+    assert!(
+        has_weak_likelihood_large_offset(&strong_dn_off, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS)
+            .is_none()
+    );
+
+    let weak_dn_off = DetailedReferenceOffsets {
+        n: mk_fit(OffsetFitStatus::Fitted, -1.85, 2.0, 40),
+        ..strong_dn_off
+    };
+    assert!(
+        check_offset_consistency(&weak_dn_off).0,
+        "|dN|=1.85 ppm must stay below the unconditional 2.50 ppm check_offset_consistency ceiling"
+    );
+    let dn_msg = has_weak_likelihood_large_offset(&weak_dn_off, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS)
+        .expect("expected weak-likelihood 15N shift flag for |dN|=1.85 ppm with ΔLL/n=0.05");
+    assert!(dn_msg.contains("dN"), "unexpected message: {dn_msg}");
+    let qc_weak_dn = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &low_margin_res,
+        Some(&weak_dn_off),
+    );
+    assert!(qc_weak_dn.offset_consistency_ok);
+    assert_eq!(qc_weak_dn.verdict, DatasetQcVerdict::Warn);
+    assert!((qc_weak_dn.confidence_scale - 0.78).abs() < 1e-12);
+    assert!(qc_weak_dn.protein_hc_gate_triggered);
+    assert!((qc_weak_dn.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
 }
 
 #[test]
@@ -1041,6 +1097,8 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
         }
         gpu_proteins.push(vec![ProteinHcTrainingSeed {
             n_assignable_amides: 32,
+            n_amide_hsqc_roots: 30,
+            peaks_present: true,
             hsqc_3d_support_frac: 0.95,
             supported_roots_per_assignable: 0.95,
             aliphatic_support_frac: 0.95,
@@ -1068,13 +1126,214 @@ fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
         sel_w > 0.0,
         "expected positive CPU anchor weight when sparse GPU bins overcommit, got sel_w={sel_w}, stats={stats:?}"
     );
+    assert_eq!(
+        CANDIDATE_GATE_CORROBORATED_CONNECTIVITY.len()
+            * CANDIDATE_GATE_HC_CALL_FRACTION.len()
+            * CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN.len()
+            * CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR.len(),
+        400
+    );
+    let gpu_beta_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
+        &cpu_by_protein[0],
+        &cpu_by_protein[1],
+        0.50,
+        CANONICAL_CALIBRATION_GRID_12,
+        STANDARD_GPU_PRIOR_ALPHA,
+        STANDARD_GPU_PRIOR_BETA,
+    );
+    assert_eq!(gpu_beta_knots.len(), 15);
     let fitted_gate = fit_protein_hc_gate_config(&gpu_proteins, STANDARD_GPU_CALIBRATION_KNOTS);
+    let fitted_multi_gate =
+        fit_protein_hc_gate_config_multi_engine(&[(&gpu_proteins, STANDARD_GPU_CALIBRATION_KNOTS)]);
+    assert_eq!(fitted_gate, fitted_multi_gate);
+    // Neutral monotone Occam tie-breaker: on clean proteins where no candidate gate triggers,
+    // all 400 candidates tie on ECE_10 and HCP, so the least restrictive corner must win.
+    assert_eq!(fitted_gate, CANONICAL_PROTEIN_HC_GATE);
     let eval_out = evaluate_seed_predictions_with_gate(
         &gpu_proteins[0][0],
         STANDARD_GPU_CALIBRATION_KNOTS,
         &fitted_gate,
     );
     assert_eq!(eval_out.len(), 30);
+}
+
+#[test]
+fn p1_7_lopo_seed_evaluator_matches_production_qc_and_catches_sparse_placement() {
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+    let score_cfg = ScoreConfig::default();
+
+    let (clean_peaks, _) = simulate(&truth, &SimConfig::default());
+    let (systems_clean, res_clean, _) = assign_evo_graph_from_peaks(
+        &clean_peaks,
+        &truth.sequence,
+        &priors,
+        &EvoGraphConfig {
+            apply_qc_calibration: false,
+            ..EvoGraphConfig::default()
+        },
+    );
+
+    let assert_exact_parity = |peaks: Option<&[Peak]>,
+                               systems: &[nmr_core::spinsystems::SpinSystem],
+                               raw_res: &AssignResult,
+                               opt_off: Option<&DetailedReferenceOffsets>,
+                               knots: &[(f64, f64)]|
+     -> nmr_core::qc::DatasetQcReport {
+        // Production pipeline: map raw confidences through `knots` -> `evaluate_dataset_qc_with_gate`
+        // -> `apply_dataset_qc_to_assignments`
+        let mut prod_res = raw_res.clone();
+        let mut raw_preds = Vec::new();
+        for (s, &pos) in raw_res.position.iter().enumerate() {
+            if pos >= 0 && (pos as usize) < truth.sequence.len() {
+                raw_preds.push((raw_res.confidence[s], (s % 3) != 0));
+            }
+            prod_res.confidence[s] = eval_monotone_calibration_map(prod_res.confidence[s], knots);
+        }
+        let raw_qc = evaluate_dataset_qc_with_gate(
+            peaks,
+            systems,
+            &truth.sequence,
+            &priors,
+            &score_cfg,
+            raw_res,
+            opt_off,
+            &CANONICAL_PROTEIN_HC_GATE,
+        );
+        let prod_qc = evaluate_dataset_qc_with_gate(
+            peaks,
+            systems,
+            &truth.sequence,
+            &priors,
+            &score_cfg,
+            &prod_res,
+            opt_off,
+            &CANONICAL_PROTEIN_HC_GATE,
+        );
+        apply_dataset_qc_to_assignments(&mut prod_res, &prod_qc);
+        let prod_placed: Vec<f64> = prod_res
+            .position
+            .iter()
+            .enumerate()
+            .filter(|&(_, &pos)| pos >= 0 && (pos as usize) < truth.sequence.len())
+            .map(|(s, _)| prod_res.confidence[s])
+            .collect();
+
+        let seed = ProteinHcTrainingSeed {
+            n_assignable_amides: raw_qc.n_assignable_amides,
+            n_amide_hsqc_roots: raw_qc.n_amide_hsqc_roots,
+            peaks_present: peaks.is_some(),
+            hsqc_3d_support_frac: raw_qc.hsqc_3d_support_frac,
+            supported_roots_per_assignable: raw_qc.supported_roots_per_assignable,
+            aliphatic_support_frac: raw_qc.aliphatic_support_frac,
+            hsqc_multiplicity_ratio: raw_qc.hsqc_multiplicity_ratio,
+            hsqc_3d_rms_dh_ppm: raw_qc.hsqc_3d_rms_dh_ppm,
+            hsqc_3d_rms_dn_ppm: raw_qc.hsqc_3d_rms_dn_ppm,
+            offset_consistency_ok: raw_qc.offset_consistency_ok,
+            weak_large_offset: has_weak_likelihood_large_offset(
+                &raw_qc.detailed_offsets,
+                QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
+            )
+            .is_some(),
+            connectivity_frac: raw_qc.connectivity_frac,
+            corroborated_connectivity_frac: raw_qc.corroborated_connectivity_frac,
+            raw_predictions: raw_preds,
+        };
+        let seed_eval =
+            evaluate_seed_predictions_with_gate(&seed, knots, &CANONICAL_PROTEIN_HC_GATE);
+        assert_eq!(prod_placed.len(), seed_eval.len());
+        for (idx, (&pc, &(sc, _))) in prod_placed.iter().zip(seed_eval.iter()).enumerate() {
+            assert!(
+                (pc - sc).abs() < 1e-12,
+                "residue {idx} production post-QC confidence ({pc}) != LOPO seed evaluator ({sc})"
+            );
+        }
+        prod_qc
+    };
+
+    // (a) Clean Pass
+    let qc_a = assert_exact_parity(
+        Some(&clean_peaks),
+        &systems_clean,
+        &res_clean,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert_eq!(qc_a.verdict, DatasetQcVerdict::Pass);
+
+    // (b) `peaks = None` with `hsqc_multiplicity_ratio > 1.45` (verifying `peaks_present: false` parity)
+    let mut crowded_sys = systems_clean.clone();
+    while crowded_sys.len() <= ((qc_a.n_assignable_amides as f64) * 1.55) as usize {
+        let mut dup = systems_clean[0].clone();
+        dup.h += 0.04;
+        crowded_sys.push(dup);
+    }
+    let mut crowded_res = res_clean.clone();
+    while crowded_res.position.len() < crowded_sys.len() {
+        crowded_res.position.push(-1);
+        crowded_res.confidence.push(0.0);
+    }
+    let qc_b = assert_exact_parity(
+        None,
+        &crowded_sys,
+        &crowded_res,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert_eq!(qc_b.verdict, DatasetQcVerdict::Warn);
+
+    // (c) Abstain (broken 3D registration)
+    let mut broken_peaks = clean_peaks.clone();
+    for p in &mut broken_peaks {
+        if p.exp != "HSQC" {
+            p.n += 9.0;
+        }
+    }
+    let qc_c = assert_exact_parity(
+        Some(&broken_peaks),
+        &systems_clean,
+        &res_clean,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert_eq!(qc_c.verdict, DatasetQcVerdict::Abstain);
+
+    // (d) Sparse sequence placement (`assigned_count = 13 >= 12` contiguous residues `1..=13` on
+    // `n_assignable_amides = 72 > 60`, so `connectivity_frac == 1.0` and `hc_count == 13 > 0`, while
+    // `13 * 5 = 65 < 72`, `< 20%` placed): BOTH production QC and LOPO seed evaluator must trigger
+    // `protein_hc_gate[sparse_sequence_placement]` and cap at `<= 0.79`!
+    let mut sparse_seq_res = res_clean.clone();
+    let mut kept = 0usize;
+    for s in 0..sparse_seq_res.position.len() {
+        let pos = sparse_seq_res.position[s];
+        if (1..=13).contains(&pos) {
+            sparse_seq_res.confidence[s] = 0.9999;
+            kept += 1;
+        } else {
+            sparse_seq_res.position[s] = -1;
+            sparse_seq_res.confidence[s] = 0.0;
+        }
+    }
+    assert!(kept >= 12 && kept * 5 < qc_a.n_assignable_amides);
+    let qc_d = assert_exact_parity(
+        Some(&clean_peaks),
+        &systems_clean,
+        &sparse_seq_res,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert!(qc_d.n_assignable_amides > 65);
+    assert_eq!(qc_d.verdict, DatasetQcVerdict::Warn);
+    assert!(qc_d.protein_hc_gate_triggered);
+    assert!(
+        qc_d.reasons
+            .iter()
+            .any(|r| r.contains("sparse_sequence_placement")),
+        "expected sparse_sequence_placement in {:?}",
+        qc_d.reasons
+    );
+    assert!((qc_d.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
 }
 
 #[test]

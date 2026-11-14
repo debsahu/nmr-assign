@@ -295,24 +295,39 @@ pub fn check_offset_consistency(offsets: &DetailedReferenceOffsets) -> (bool, Ve
     (issues.is_empty(), issues)
 }
 
-/// Whether `offsets` carries a large carbon/nitrogen registration shift (`|dCA| > 3.20` or
-/// `|dCB| > 3.20` or `|dN| > 2.55` ppm) backed by weak per-observation log-likelihood gain
-/// (`log_likelihood_gain / n_values < min_gain_per_obs`), indicating likely spectral aliasing or
-/// wrong-nucleus folding rather than uniform TMS/DSS chemical-shift referencing (`P1-7`).
+/// Whether `offsets` carries a large carbon/nitrogen registration shift (`|dN| > 1.50` or
+/// `|dCA| > 3.20` or `|dCB| > 3.20` ppm) backed by weak per-observation unlabelled log-likelihood
+/// gain (`log_likelihood_gain / n_values < gain_scale * min_gain_per_obs`), indicating likely
+/// spectral aliasing or wrong-nucleus folding rather than uniform chemical-shift referencing (`P1-7`).
+///
+/// Notes:
+/// - The `1.50` ppm `15N` threshold sits strictly below the unconditional `2.50` ppm
+///   [`check_offset_consistency`] ceiling and scales `min_gain_per_obs` by `0.50` (`0.075` nats/obs)
+///   to reflect the broader amino-acid-marginal `15N` prior dispersion relative to `13CA`/`13CB`.
+/// - Pass-2 sequence-anchor-refined offsets synchronized via `sync_detailed_reference_offsets`
+///   (where `applied_ppm` diverges from Pass-1 `candidate_ppm` or carries the `1.0`-nat sync floor
+///   from a Pass-1 `NotSignificant` channel) are excluded because `fit.log_likelihood_gain` records
+///   only the unlabelled Pass-1 marginal curve, not the Pass-2 sequence-anchored likelihood.
 pub fn has_weak_likelihood_large_offset(
     offsets: &DetailedReferenceOffsets,
     min_gain_per_obs: f64,
 ) -> Option<String> {
-    for (label, fit, ppm_thresh) in [
-        ("dN", &offsets.n, 2.55_f64),
-        ("dCA", &offsets.ca, 3.20_f64),
-        ("dCB", &offsets.cb, 3.20_f64),
+    for (label, fit, ppm_thresh, gain_scale) in [
+        ("dN", &offsets.n, 1.50_f64, 0.50_f64),
+        ("dCA", &offsets.ca, 3.20_f64, 1.0_f64),
+        ("dCB", &offsets.cb, 3.20_f64, 1.0_f64),
     ] {
-        if fit.status == OffsetFitStatus::Fitted && fit.applied_ppm.abs() > ppm_thresh {
+        let is_pass2_anchor_synced = (fit.applied_ppm - fit.candidate_ppm).abs() > 0.05
+            || (fit.log_likelihood_gain - 1.0).abs() < 1e-9;
+        if fit.status == OffsetFitStatus::Fitted
+            && !is_pass2_anchor_synced
+            && fit.applied_ppm.abs() > ppm_thresh
+        {
             let gain_per_obs = fit.log_likelihood_gain / (fit.n_values.max(1) as f64);
-            if gain_per_obs < min_gain_per_obs {
+            let req_gain = min_gain_per_obs * gain_scale;
+            if gain_per_obs < req_gain {
                 return Some(format!(
-                    "weakly supported large {label} registration shift ({}, ΔLL/n={gain_per_obs:.3} < {min_gain_per_obs:.3})",
+                    "weakly supported large {label} registration shift ({}, ΔLL/n={gain_per_obs:.3} < {req_gain:.3})",
                     fit.format_compact(label)
                 ));
             }
@@ -320,6 +335,11 @@ pub fn has_weak_likelihood_large_offset(
     }
     None
 }
+
+/// Fixed per-observation log-likelihood gain threshold (`0.15` nats/observation for `13CA`/`13CB`;
+/// scaled by `0.50` to `0.075` nats/observation for `15N`) required when a large Pass-1 unlabelled
+/// registration offset (`|dN| > 1.50` or `|dCA|, |dCB| > 3.20` ppm) is fitted (`P1-7`).
+pub const QC_MIN_LARGE_OFFSET_GAIN_PER_OBS: f64 = 0.15;
 
 /// Fixed per-spin belief threshold (`>= 0.65`) defining the fraction of strongly supported
 /// placements (`solution_margin`) in [`evaluate_dataset_qc`].
@@ -352,31 +372,47 @@ pub const QC_CORROBORATED_PAIR_THRESHOLD: f64 = 3.5;
 /// `[0.45, 0.79]` rankings.
 pub const QC_PROTEIN_HC_CONFIDENCE_CAP: f64 = 0.79;
 
+/// Pre-registered broad candidate grid for `ProteinHcGateConfig::min_corroborated_connectivity`
+/// searched inside each 13-fold `dev` LOPO training split (`P1-7`).
+pub const CANDIDATE_GATE_CORROBORATED_CONNECTIVITY: &[f64] = &[0.45, 0.50, 0.55, 0.60, 0.65];
+
+/// Pre-registered broad candidate grid for `ProteinHcGateConfig::min_hc_call_fraction`
+/// searched inside each 13-fold `dev` LOPO training split (`P1-7`).
+pub const CANDIDATE_GATE_HC_CALL_FRACTION: &[f64] = &[0.04, 0.06, 0.08, 0.10, 0.12];
+
+/// Pre-registered broad candidate grid for `ProteinHcGateConfig::min_crowded_solution_margin`
+/// searched inside each 13-fold `dev` LOPO training split (`P1-7`).
+pub const CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN: &[f64] = &[0.25, 0.35, 0.45, 0.55];
+
+/// Pre-registered broad candidate grid for `ProteinHcGateConfig::multiplicity_penalty_floor`
+/// searched inside each 13-fold `dev` LOPO training split (`P1-7`).
+pub const CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR: &[f64] = &[0.06, 0.08, 0.10, 0.12];
+
 /// Low-DOF label-free configuration for the protein-level HC cap gate (`P1-7`), fitted strictly
-/// inside 13-fold `dev` Leave-One-Protein-Out (LOPO) cross-validation.
+/// inside 13-fold `dev` Leave-One-Protein-Out (LOPO) cross-validation over the 400-point product
+/// grid (`CANDIDATE_GATE_*`) with a neutral monotone Occam tie-breaker (`1e-4 * sum_of_thresholds`,
+/// preferring the least restrictive gate whenever training `ECE_10` and `HCP >= 94.5%` tie).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProteinHcGateConfig {
     /// Minimum corroborated sequential link density (`P >= 3.5` nats) required to emit `>= 0.80` HC calls.
     pub min_corroborated_connectivity: f64,
     /// Minimum fraction of placed spin systems reaching `>= 0.80` (`n_hc / n_assigned`) required
-    /// so isolated tail spikes (`1–5%` of residues) cannot emit false HC commitments.
+    /// so isolated tail spikes (`1–3%` of residues) cannot emit false HC commitments.
     pub min_hc_call_fraction: f64,
     /// Minimum `solution_margin` required on severely crowded multi-conformer datasets (`supported_roots_per_assignable > 1.60`).
     pub min_crowded_solution_margin: f64,
     /// Minimum floor on the multiplicative crowding damping penalty when `hsqc_multiplicity_ratio > 1.45`
-    /// and `supported_roots_per_assignable > 1.35`.
+    /// and (`!peaks_present` or `supported_roots_per_assignable > 1.35`).
     pub multiplicity_penalty_floor: f64,
-    /// Minimum `log_likelihood_gain / n_values` required when a large registration offset (`|dCA|, |dCB| > 3.2` ppm) is fitted.
-    pub min_large_offset_gain_per_obs: f64,
 }
 
-/// Canonical protein-level HC gate parameters fitted on the 13-protein `dev` split (`P1-7`).
+/// Canonical unified protein-level HC gate parameters fitted across all 3 engines (`evo-graph`,
+/// CPU `standard`, WebGPU `standard`) on the 13-protein `dev` split (`P1-7`).
 pub const CANONICAL_PROTEIN_HC_GATE: ProteinHcGateConfig = ProteinHcGateConfig {
-    min_corroborated_connectivity: 0.66,
-    min_hc_call_fraction: 0.08,
-    min_crowded_solution_margin: 0.45,
-    multiplicity_penalty_floor: 0.10,
-    min_large_offset_gain_per_obs: 0.15,
+    min_corroborated_connectivity: 0.45,
+    min_hc_call_fraction: 0.04,
+    min_crowded_solution_margin: 0.25,
+    multiplicity_penalty_floor: 0.06,
 };
 
 impl Default for ProteinHcGateConfig {
@@ -390,6 +426,8 @@ impl Default for ProteinHcGateConfig {
 #[derive(Clone, Debug)]
 pub struct ProteinHcTrainingSeed {
     pub n_assignable_amides: usize,
+    pub n_amide_hsqc_roots: usize,
+    pub peaks_present: bool,
     pub hsqc_3d_support_frac: f64,
     pub supported_roots_per_assignable: f64,
     pub aliphatic_support_frac: f64,
@@ -403,79 +441,82 @@ pub struct ProteinHcTrainingSeed {
     pub raw_predictions: Vec<(f64, bool)>,
 }
 
-/// Evaluate a single seed's post-QC `(confidence, is_correct)` predictions from raw `(p_raw, is_ok)`
-/// pairs, isotonic `knots`, and `gate_cfg`, mirroring [`evaluate_dataset_qc_with_gate`] +
-/// [`apply_dataset_qc_to_assignments`] identically for zero-leakage LOPO cross-validation.
-pub fn evaluate_seed_predictions_with_gate(
+#[inline]
+fn eval_precached_seed_with_gate(
     seed: &ProteinHcTrainingSeed,
-    knots: &[(f64, f64)],
+    cals: &[f64],
+    solution_margin: f64,
     gate_cfg: &ProteinHcGateConfig,
 ) -> Vec<(f64, bool)> {
     let n_ass = seed.raw_predictions.len();
     if n_ass == 0 {
         return Vec::new();
     }
-    let cals: Vec<f64> = seed
-        .raw_predictions
-        .iter()
-        .map(|&(p, _)| eval_monotone_calibration_map(p, knots))
-        .collect();
-    let solution_margin = (cals
-        .iter()
-        .filter(|&&c| c >= QC_STRONG_BELIEF_THRESHOLD)
-        .count() as f64)
-        / (n_ass as f64);
 
-    let is_abstain = seed.hsqc_3d_support_frac < 0.25
+    let is_abstain = seed.n_amide_hsqc_roots == 0
+        || (seed.n_amide_hsqc_roots > 0 && seed.hsqc_3d_support_frac < 0.25)
         || seed.aliphatic_support_frac < 0.20
         || (n_ass >= 6 && seed.connectivity_frac < 0.15)
         || is_unconverged_solution_margin(n_ass, solution_margin, seed.hsqc_multiplicity_ratio)
         || ((seed.hsqc_3d_rms_dh_ppm > 0.065 || seed.hsqc_3d_rms_dn_ppm > 0.65)
             && seed.hsqc_3d_support_frac < 0.45)
-        || (seed.hsqc_3d_support_frac < 0.45
+        || (seed.n_amide_hsqc_roots > 0
+            && seed.hsqc_3d_support_frac < 0.45
             && seed.supported_roots_per_assignable < 0.35
             && solution_margin < 0.20);
     if is_abstain {
         return cals
-            .into_iter()
+            .iter()
             .zip(seed.raw_predictions.iter())
-            .map(|(c, &(_, ok))| (c.clamp(0.0, 0.45), ok))
+            .map(|(&c, &(_, ok))| (c.clamp(0.0, 0.45), ok))
             .collect();
     }
 
     let mut scale = 1.0_f64;
-    if seed.hsqc_multiplicity_ratio > 1.45 && seed.supported_roots_per_assignable > 1.35 {
+    let mut warned = false;
+    if seed.hsqc_multiplicity_ratio > 1.45
+        && (!seed.peaks_present || seed.supported_roots_per_assignable > 1.35)
+    {
         let pen = ((seed.hsqc_multiplicity_ratio - 1.45) * 0.20)
             .clamp(gate_cfg.multiplicity_penalty_floor, 0.22);
         scale *= 1.0 - pen;
+        warned = true;
     }
     if seed.hsqc_3d_support_frac < 0.55 && seed.supported_roots_per_assignable < 0.80 {
         let pen = ((0.55 - seed.hsqc_3d_support_frac) * 0.45).clamp(0.06, 0.18);
         scale *= 1.0 - pen;
+        warned = true;
     }
     if seed.aliphatic_support_frac < 0.50 {
         scale *= 0.90;
+        warned = true;
     }
     if seed.hsqc_3d_rms_dh_ppm > 0.028 || seed.hsqc_3d_rms_dn_ppm > 0.26 {
         scale *= 0.88;
+        warned = true;
     }
     if !seed.offset_consistency_ok || seed.weak_large_offset {
         scale *= 0.78;
+        warned = true;
     }
     if n_ass >= 8 && seed.connectivity_frac < 0.38 {
         let pen = ((0.38 - seed.connectivity_frac) * 0.55).clamp(0.06, 0.16);
         scale *= 1.0 - pen;
+        warned = true;
     }
     if n_ass >= 8 && seed.corroborated_connectivity_frac < gate_cfg.min_corroborated_connectivity {
         scale *= 0.90;
+        warned = true;
     }
-    if scale < 1.0 {
-        scale = scale.clamp(0.65, 0.92);
-    }
+    let applied_scale = if !warned {
+        1.0
+    } else {
+        scale.clamp(0.65, 0.92)
+    };
 
     let scaled: Vec<f64> = cals
-        .into_iter()
-        .map(|c| (c * scale).clamp(0.0, 1.0))
+        .iter()
+        .map(|&c| (c * applied_scale).clamp(0.0, 1.0))
         .collect();
     let hc_cnt = scaled.iter().filter(|&&c| c >= 0.80).count();
     let hc_frac = (hc_cnt as f64) / (n_ass as f64);
@@ -500,62 +541,142 @@ pub fn evaluate_seed_predictions_with_gate(
         .collect()
 }
 
-/// Fit [`ProteinHcGateConfig`] strictly on training proteins (`train_proteins`, each a slice of
-/// [`ProteinHcTrainingSeed`] seeds) by minimizing pooled 10-bin `ECE_10` subject to `>= 94.5%`
-/// training micro HC-precision over a compact 27-point low-DOF grid (`P1-7`).
-pub fn fit_protein_hc_gate_config(
-    train_proteins: &[Vec<ProteinHcTrainingSeed>],
+/// Evaluate a single seed's post-QC `(confidence, is_correct)` predictions from raw `(p_raw, is_ok)`
+/// pairs, isotonic `knots`, and `gate_cfg`, mirroring [`evaluate_dataset_qc_with_gate`] +
+/// [`apply_dataset_qc_to_assignments`] identically for zero-leakage LOPO cross-validation.
+pub fn evaluate_seed_predictions_with_gate(
+    seed: &ProteinHcTrainingSeed,
     knots: &[(f64, f64)],
-) -> ProteinHcGateConfig {
-    if train_proteins.is_empty() {
-        return CANONICAL_PROTEIN_HC_GATE;
+    gate_cfg: &ProteinHcGateConfig,
+) -> Vec<(f64, bool)> {
+    let n_ass = seed.raw_predictions.len();
+    if n_ass == 0 {
+        return Vec::new();
     }
-    let mut best_cfg = CANONICAL_PROTEIN_HC_GATE;
-    let mut best_obj = f64::INFINITY;
-    for &min_c35 in &[0.65_f64, 0.66, 0.68] {
-        for &min_hcf in &[0.06_f64, 0.08, 0.10] {
-            for &mpen in &[0.08_f64, 0.10, 0.12] {
-                let cand = ProteinHcGateConfig {
-                    min_corroborated_connectivity: min_c35,
-                    min_hc_call_fraction: min_hcf,
-                    min_crowded_solution_margin: 0.45,
-                    multiplicity_penalty_floor: mpen,
-                    min_large_offset_gain_per_obs: 0.15,
-                };
-                let mut pool = Vec::new();
-                for seeds in train_proteins {
-                    for s in seeds {
-                        pool.extend(evaluate_seed_predictions_with_gate(s, knots, &cand));
-                    }
-                }
-                if pool.is_empty() {
+    let cals: Vec<f64> = seed
+        .raw_predictions
+        .iter()
+        .map(|&(p, _)| eval_monotone_calibration_map(p, knots))
+        .collect();
+    let solution_margin = (cals
+        .iter()
+        .filter(|&&c| c >= QC_STRONG_BELIEF_THRESHOLD)
+        .count() as f64)
+        / (n_ass as f64);
+    eval_precached_seed_with_gate(seed, &cals, solution_margin, gate_cfg)
+}
+
+/// Borrowed `(training_proteins, calibration_knots)` pair for one solver engine in
+/// [`fit_protein_hc_gate_config_multi_engine`].
+pub type EngineTrainingSlice<'a> = (&'a [Vec<ProteinHcTrainingSeed>], &'a [(f64, f64)]);
+
+/// Fit a single shared [`ProteinHcGateConfig`] strictly on training proteins across one or more
+/// solver engines (`engines`, each `(train_proteins, knots)`) over the broad 400-point 4D product
+/// grid (`CANDIDATE_GATE_*`) by minimizing mean pooled 10-bin `ECE_10` subject to `>= 94.5%`
+/// training micro HC-precision per engine, with a neutral monotone Occam tie-breaker
+/// (`1e-4 * sum_of_thresholds`, preferring the least restrictive gate whenever training accuracy
+/// ties; `P1-7`).
+pub fn fit_protein_hc_gate_config_multi_engine(
+    engines: &[EngineTrainingSlice<'_>],
+) -> ProteinHcGateConfig {
+    struct CachedSeed<'a> {
+        seed: &'a ProteinHcTrainingSeed,
+        cals: Vec<f64>,
+        solution_margin: f64,
+    }
+    let mut cached_engines: Vec<Vec<CachedSeed<'_>>> = Vec::with_capacity(engines.len());
+    for &(train_proteins, knots) in engines {
+        let mut engine_seeds = Vec::new();
+        for seeds in train_proteins {
+            for s in seeds {
+                if s.raw_predictions.is_empty() {
                     continue;
                 }
-                let ece10 = compute_grid_ece(&pool, UNIFORM_CALIBRATION_GRID_10);
-                let hc_tot = pool.iter().filter(|&&(c, _)| c >= 0.80).count();
-                let hc_ok = pool.iter().filter(|&&(c, ok)| c >= 0.80 && ok).count();
-                let hcp = if hc_tot > 0 {
-                    (hc_ok as f64) / (hc_tot as f64)
-                } else {
-                    1.0
-                };
-                let hcp_pen = if hcp >= 0.945 {
-                    0.0
-                } else {
-                    (0.945 - hcp) * 5.0
-                };
-                // Mild tie-breaking preference toward canonical (0.66, 0.08, 0.10) center
-                let reg =
-                    1e-4 * ((min_c35 - 0.66).abs() + (min_hcf - 0.08).abs() + (mpen - 0.10).abs());
-                let obj = ece10 + hcp_pen + reg;
-                if obj < best_obj {
-                    best_obj = obj;
-                    best_cfg = cand;
+                let cals: Vec<f64> = s
+                    .raw_predictions
+                    .iter()
+                    .map(|&(p, _)| eval_monotone_calibration_map(p, knots))
+                    .collect();
+                let solution_margin = (cals
+                    .iter()
+                    .filter(|&&c| c >= QC_STRONG_BELIEF_THRESHOLD)
+                    .count() as f64)
+                    / (cals.len() as f64);
+                engine_seeds.push(CachedSeed {
+                    seed: s,
+                    cals,
+                    solution_margin,
+                });
+            }
+        }
+        if !engine_seeds.is_empty() {
+            cached_engines.push(engine_seeds);
+        }
+    }
+    if cached_engines.is_empty() {
+        return CANONICAL_PROTEIN_HC_GATE;
+    }
+
+    let n_eng = cached_engines.len() as f64;
+    let mut best_cfg = CANONICAL_PROTEIN_HC_GATE;
+    let mut best_obj = f64::INFINITY;
+    for &min_c35 in CANDIDATE_GATE_CORROBORATED_CONNECTIVITY {
+        for &min_hcf in CANDIDATE_GATE_HC_CALL_FRACTION {
+            for &min_cmarg in CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN {
+                for &mpen in CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR {
+                    let cand = ProteinHcGateConfig {
+                        min_corroborated_connectivity: min_c35,
+                        min_hc_call_fraction: min_hcf,
+                        min_crowded_solution_margin: min_cmarg,
+                        multiplicity_penalty_floor: mpen,
+                    };
+                    let mut ece_sum = 0.0_f64;
+                    let mut pen_sum = 0.0_f64;
+                    for eng_seeds in &cached_engines {
+                        let mut pool = Vec::new();
+                        for cs in eng_seeds {
+                            pool.extend(eval_precached_seed_with_gate(
+                                cs.seed,
+                                &cs.cals,
+                                cs.solution_margin,
+                                &cand,
+                            ));
+                        }
+                        ece_sum += compute_grid_ece(&pool, UNIFORM_CALIBRATION_GRID_10);
+                        let hc_tot = pool.iter().filter(|&&(c, _)| c >= 0.80).count();
+                        let hc_ok = pool.iter().filter(|&&(c, ok)| c >= 0.80 && ok).count();
+                        let hcp = if hc_tot > 0 {
+                            (hc_ok as f64) / (hc_tot as f64)
+                        } else {
+                            1.0
+                        };
+                        if hcp < 0.945 {
+                            pen_sum += (0.945 - hcp) * 5.0;
+                        }
+                    }
+                    // Strictly neutral monotone Occam tie-breaker: prefer the least restrictive
+                    // (smallest) gate thresholds whenever training ECE_10 and HCP >= 94.5% tie.
+                    let reg = 1e-4 * (min_c35 + min_hcf + min_cmarg + mpen);
+                    let obj = (ece_sum / n_eng) + pen_sum + reg;
+                    if obj < best_obj {
+                        best_obj = obj;
+                        best_cfg = cand;
+                    }
                 }
             }
         }
     }
     best_cfg
+}
+
+/// Fit [`ProteinHcGateConfig`] strictly on training proteins (`train_proteins`, each a slice of
+/// [`ProteinHcTrainingSeed`] seeds) for a single engine by delegating to
+/// [`fit_protein_hc_gate_config_multi_engine`] (`P1-7`).
+pub fn fit_protein_hc_gate_config(
+    train_proteins: &[Vec<ProteinHcTrainingSeed>],
+    knots: &[(f64, f64)],
+) -> ProteinHcGateConfig {
+    fit_protein_hc_gate_config_multi_engine(&[(train_proteins, knots)])
 }
 
 /// Fixed ensemble-convergence specification predicate (`(0.65, 0.07, 1.60, 0.16)`) shared by
@@ -968,7 +1089,7 @@ pub fn evaluate_dataset_qc_with_gate(
         .unwrap_or_else(|| estimate_reference_offsets_detailed(systems, &norm_seq, priors));
     let (offset_consistency_ok, offset_issues) = check_offset_consistency(&detailed_offsets);
     let weak_offset_issue =
-        has_weak_likelihood_large_offset(&detailed_offsets, gate_cfg.min_large_offset_gain_per_obs);
+        has_weak_likelihood_large_offset(&detailed_offsets, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS);
 
     // Sequential `(i, i-1)` link coverage (`P >= 1.0` and corroborated `P >= 3.5`; `P1-7`)
     let k_len = norm_seq.len();
@@ -1240,7 +1361,8 @@ pub fn evaluate_dataset_qc_with_gate(
                 solution_margin * 100.0
             ));
         }
-    } else if hc_count > 0 && assigned_count * 5 < n_assignable_amides {
+    }
+    if hc_count > 0 && assigned_count * 5 < n_assignable_amides {
         hc_gate_reasons.push(format!(
             "protein_hc_gate[sparse_sequence_placement]: only {}/{} assignable amides placed (< 20.0%)",
             assigned_count, n_assignable_amides
@@ -1691,6 +1813,16 @@ pub const STANDARD_CPU_PRIOR_ALPHA: f64 = 0.75;
 /// Negative pseudocount (`beta_neg = 2.25`) paired with [`STANDARD_CPU_PRIOR_ALPHA`] (`P1-8`).
 pub const STANDARD_CPU_PRIOR_BETA: f64 = 2.25;
 
+/// Mild conservative conjugate `Beta(alpha_pos = 0.35, beta_neg = 0.65)` prior (`1.0` total
+/// pseudocount, prior mean `0.35`, intermediate between `evo-graph`'s symmetric `Beta(0.25, 0.25)`
+/// mean `0.50` and CPU `standard`'s `Beta(0.75, 2.25)` mean `0.25`) used for WebGPU `standard`
+/// (`runs = 64`, `P1-8`) so sparse upper-intermediate bins (`[0.68, 0.79]`) do not cross the
+/// `0.80` HC boundary prematurely.
+pub const STANDARD_GPU_PRIOR_ALPHA: f64 = 0.35;
+
+/// Negative pseudocount (`beta_neg = 0.65`) paired with [`STANDARD_GPU_PRIOR_ALPHA`] (`P1-8`).
+pub const STANDARD_GPU_PRIOR_BETA: f64 = 0.65;
+
 /// Pre-registered candidate empirical-Bayes CPU shrinkage weights evaluated by inner 12-fold LOPO
 /// inside each outer `dev` LOPO fold when calibrating `STANDARD_GPU` (`P1-8`).
 pub const CANDIDATE_GPU_SHRINKAGE_WEIGHTS: &[f64] = &[0.0, 0.20, 0.35, 0.50, 0.65, 0.80, 1.0];
@@ -1796,20 +1928,21 @@ pub fn fit_isotonic_monotone_knots(
     fit_isotonic_monotone_knots_beta(samples, grid, half, half)
 }
 
-/// Hierarchical empirical-Bayes isotonic PAV fitter (`Q2` / `P1-8`): pools primary `samples`
-/// (weight `1.0` per observation) with `anchor_samples` from the matched CPU Hamiltonian
-/// (`weight = anchor_weight` per observation) plus symmetric `Beta(laplace_prior / 2, laplace_prior / 2)`
-/// smoothing on `grid`. When `anchor_weight <= 0.0` or `anchor_samples` is empty, reduces
-/// identically to [`fit_isotonic_monotone_knots`].
-pub fn fit_isotonic_monotone_knots_shrunk_toward(
+/// Hierarchical empirical-Bayes isotonic PAV fitter with general conjugate `Beta(alpha_pos, beta_neg)`
+/// prior (`Q2` / `P1-8`): pools primary `samples` (weight `1.0` per observation) with
+/// `anchor_samples` from the matched CPU Hamiltonian (`weight = anchor_weight` per observation)
+/// plus `Beta(alpha_pos, beta_neg)` smoothing on `grid`. When `anchor_weight <= 0.0` or
+/// `anchor_samples` is empty, reduces identically to [`fit_isotonic_monotone_knots_beta`].
+pub fn fit_isotonic_monotone_knots_shrunk_toward_beta(
     samples: &[(f64, bool)],
     anchor_samples: &[(f64, bool)],
     anchor_weight: f64,
     grid: &[f64],
-    laplace_prior: f64,
+    alpha_pos: f64,
+    beta_neg: f64,
 ) -> Vec<(f64, f64)> {
     if anchor_weight <= 0.0 || anchor_samples.is_empty() {
-        return fit_isotonic_monotone_knots(samples, grid, laplace_prior);
+        return fit_isotonic_monotone_knots_beta(samples, grid, alpha_pos, beta_neg);
     }
     if grid.len() < 2 {
         return vec![(0.0, 0.0), (1.0, 1.0)];
@@ -1818,11 +1951,15 @@ pub fn fit_isotonic_monotone_knots_shrunk_toward(
     let mut weights = vec![0.0_f64; n_bins];
     let mut pos_sums = vec![0.0_f64; n_bins];
     let mut x_sums = vec![0.0_f64; n_bins];
+    let a = alpha_pos.max(0.0);
+    let b_neg = beta_neg.max(0.0);
+    let prior_w = (a + b_neg).max(1e-6);
+    let prior_pos = if a + b_neg > 0.0 { a } else { 0.5 * prior_w };
+
     for b in 0..n_bins {
         let mid = 0.5 * (grid[b] + grid[b + 1]);
-        let prior_w = laplace_prior.max(1e-6);
         weights[b] = prior_w;
-        pos_sums[b] = 0.5 * prior_w;
+        pos_sums[b] = prior_pos;
         x_sums[b] = prior_w * mid;
     }
 
@@ -1895,6 +2032,29 @@ pub fn fit_isotonic_monotone_knots_shrunk_toward(
     knots
 }
 
+/// Hierarchical empirical-Bayes isotonic PAV fitter (`Q2` / `P1-8`): pools primary `samples`
+/// (weight `1.0` per observation) with `anchor_samples` from the matched CPU Hamiltonian
+/// (`weight = anchor_weight` per observation) plus symmetric `Beta(laplace_prior / 2, laplace_prior / 2)`
+/// smoothing on `grid`. When `anchor_weight <= 0.0` or `anchor_samples` is empty, reduces
+/// identically to [`fit_isotonic_monotone_knots`].
+pub fn fit_isotonic_monotone_knots_shrunk_toward(
+    samples: &[(f64, bool)],
+    anchor_samples: &[(f64, bool)],
+    anchor_weight: f64,
+    grid: &[f64],
+    laplace_prior: f64,
+) -> Vec<(f64, f64)> {
+    let half = 0.5 * laplace_prior.max(1e-6);
+    fit_isotonic_monotone_knots_shrunk_toward_beta(
+        samples,
+        anchor_samples,
+        anchor_weight,
+        grid,
+        half,
+        half,
+    )
+}
+
 /// Nested Leave-One-Protein-Out (LOPO) selector for `STANDARD_GPU` CPU-anchor shrinkage weight
 /// (`P1-8`): given an outer training set of `(gpu_seeds, cpu_raw_pairs, gpu_trainable, cpu_trainable)`
 /// per protein, runs an inner `M`-fold LOPO over [`CANDIDATE_GPU_SHRINKAGE_WEIGHTS`], selecting
@@ -1931,12 +2091,13 @@ pub fn select_gpu_shrinkage_weight_nested_lopo(
                     cpu_tr.extend_from_slice(&cpu_raw_by_protein[j]);
                 }
             }
-            let inner_knots = fit_isotonic_monotone_knots_shrunk_toward(
+            let inner_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
                 &gpu_tr,
                 &cpu_tr,
                 w,
                 CANONICAL_CALIBRATION_GRID_12,
-                CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+                STANDARD_GPU_PRIOR_ALPHA,
+                STANDARD_GPU_PRIOR_BETA,
             );
             for s in &gpu_proteins[hold] {
                 inner_pooled.extend(evaluate_seed_predictions_with_gate(
@@ -2028,26 +2189,27 @@ pub const STANDARD_CALIBRATION_KNOTS: &[(f64, f64)] = &[
 ];
 
 /// Monotone calibration knot table for WebGPU `standard` (`runs = 64` `f32` multi-replica elite
-/// consensus, [`STANDARD_GPU_CALIBRATED_RUNS`]; `P1-8` / `Q2`), fitted via CPU-anchored isotonic
-/// PAV ([`fit_isotonic_monotone_knots_shrunk_toward`] with nested-LOPO-selected
+/// consensus, [`STANDARD_GPU_CALIBRATED_RUNS`]; `P1-8` / `Q2`), fitted via CPU-anchored
+/// `Beta(0.35, 0.65)` isotonic PAV ([`fit_isotonic_monotone_knots_shrunk_toward_beta`] with
+/// [`STANDARD_GPU_PRIOR_ALPHA`], [`STANDARD_GPU_PRIOR_BETA`] and nested-LOPO-selected
 /// [`CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT`] `= 0.50`) on [`CANONICAL_CALIBRATION_GRID_12`] (`g12`)
 /// across the 13-entry `dev` split on `Apple M5 Pro` (`Metal` via `wgpu`).
 pub const STANDARD_GPU_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.0000, 0.0000),
     (0.0264, 0.0961),
     (0.0529, 0.1922),
-    (0.2199, 0.4211),
-    (0.3801, 0.5339),
-    (0.5116, 0.6633),
-    (0.6273, 0.6896),
-    (0.7200, 0.8427),
-    (0.7975, 0.8596),
-    (0.8630, 0.9351),
-    (0.9227, 0.9574),
-    (0.9585, 0.9574),
-    (0.9840, 0.9574),
-    (0.9995, 0.9574),
-    (1.0000, 0.9574),
+    (0.2199, 0.4207),
+    (0.3801, 0.5333),
+    (0.5116, 0.6625),
+    (0.6273, 0.6883),
+    (0.7200, 0.8414),
+    (0.7975, 0.8584),
+    (0.8630, 0.9341),
+    (0.9227, 0.9562),
+    (0.9585, 0.9562),
+    (0.9840, 0.9562),
+    (0.9995, 0.9562),
+    (1.0000, 0.9562),
 ];
 
 /// Map raw physical (`T = 1.0`) `evo-graph` marginal belief into calibrated probability.

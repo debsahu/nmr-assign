@@ -15,9 +15,10 @@ use nmr_core::qc::{
     fit_isotonic_monotone_knots_shrunk_toward, DatasetQcReport, DatasetQcVerdict,
     ProteinReliabilityCurve, CANDIDATE_GPU_SHRINKAGE_WEIGHTS, CANONICAL_CALIBRATION_GRID_12,
     CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
-    CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATED_RUNS, QC_PROTEIN_HC_CONFIDENCE_CAP,
-    STANDARD_CPU_CALIBRATED_RUNS, STANDARD_CPU_PRIOR_ALPHA, STANDARD_CPU_PRIOR_BETA,
-    STANDARD_GPU_CALIBRATED_RUNS, UNIFORM_CALIBRATION_GRID_10,
+    CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATED_RUNS, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
+    QC_PROTEIN_HC_CONFIDENCE_CAP, STANDARD_CPU_CALIBRATED_RUNS, STANDARD_CPU_PRIOR_ALPHA,
+    STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_CALIBRATED_RUNS, STANDARD_GPU_PRIOR_ALPHA,
+    STANDARD_GPU_PRIOR_BETA, UNIFORM_CALIBRATION_GRID_10,
 };
 
 fn nmrassign_bin() -> PathBuf {
@@ -384,8 +385,13 @@ fn test_phase13_p1_7_p1_8_q4_cli_json_and_calibration_contracts() {
     );
     assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.50).abs() < 1e-12);
     assert!((QC_PROTEIN_HC_CONFIDENCE_CAP - 0.79).abs() < 1e-12);
-    assert!((CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity - 0.66).abs() < 1e-12);
-    assert!((CANONICAL_PROTEIN_HC_GATE.min_hc_call_fraction - 0.08).abs() < 1e-12);
+    assert!((QC_MIN_LARGE_OFFSET_GAIN_PER_OBS - 0.15).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity - 0.45).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_hc_call_fraction - 0.04).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.min_crowded_solution_margin - 0.25).abs() < 1e-12);
+    assert!((CANONICAL_PROTEIN_HC_GATE.multiplicity_penalty_floor - 0.06).abs() < 1e-12);
+    assert!((STANDARD_GPU_PRIOR_ALPHA - 0.35).abs() < 1e-12);
+    assert!((STANDARD_GPU_PRIOR_BETA - 0.65).abs() < 1e-12);
 
     // 2. Q4 `warn_sub_hc_uncalibrated` & `is_call_calibrated` invariants
     let mut warn_qc = DatasetQcReport {
