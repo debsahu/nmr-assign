@@ -3,7 +3,8 @@
 //! per-protein reliability curves (`ProteinReliabilityCurve`), and detailed chemical-shift
 //! reference offset diagnostics (`OffsetFitStatus`, `NucleusOffsetFit`, `DetailedReferenceOffsets`).
 //!
-//! Provenance: Clean-room verification of `nmr_core::qc` and `nmr_core::priors` (`P1-1`, `P1-3`).
+//! Provenance: Clean-room verification of `nmr_core::qc` and `nmr_core::priors` (`P1-1`, `P1-3`,
+//! `P1-7`, `P1-8`, `Q4`).
 
 use std::path::PathBuf;
 
@@ -17,12 +18,23 @@ use nmr_core::priors::{
 use nmr_core::qc::{
     apply_dataset_qc_to_assignments, apply_evo_graph_calibration_map,
     apply_standard_calibration_map, apply_standard_gpu_calibration_map, check_offset_consistency,
-    eval_monotone_calibration_map, evaluate_dataset_qc, fit_isotonic_monotone_knots,
-    is_unconverged_solution_margin, DatasetQcVerdict, ProteinReliabilityCurve,
+    compute_debiased_grid_ece, compute_grid_ece, compute_grid_ece_bernoulli_floor,
+    eval_monotone_calibration_map, evaluate_dataset_qc, evaluate_dataset_qc_with_gate,
+    evaluate_seed_predictions_with_gate, fit_isotonic_monotone_knots,
+    fit_isotonic_monotone_knots_beta, fit_isotonic_monotone_knots_shrunk_toward_beta,
+    fit_protein_hc_gate_config, fit_protein_hc_gate_config_multi_engine,
+    has_weak_likelihood_large_offset, is_unconverged_solution_margin,
+    select_gpu_shrinkage_weight_nested_lopo, DatasetQcVerdict, ProteinHcTrainingSeed,
+    ProteinReliabilityCurve, CANDIDATE_GATE_CORROBORATED_CONNECTIVITY,
+    CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN, CANDIDATE_GATE_HC_CALL_FRACTION,
+    CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR, CANDIDATE_GPU_SHRINKAGE_WEIGHTS,
     CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
-    EVO_GRAPH_CALIBRATION_KNOTS, QC_CROWDED_MIN_SOLUTION_MARGIN, QC_CROWDED_MULTIPLICITY_RATIO,
-    QC_MIN_ASSIGNED_FOR_MARGIN_GATE, QC_MIN_SOLUTION_MARGIN, QC_STRONG_BELIEF_THRESHOLD,
-    STANDARD_CALIBRATION_KNOTS, STANDARD_GPU_CALIBRATION_KNOTS,
+    CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_PROTEIN_HC_GATE, EVO_GRAPH_CALIBRATION_KNOTS,
+    QC_CROWDED_MIN_SOLUTION_MARGIN, QC_CROWDED_MULTIPLICITY_RATIO, QC_MIN_ASSIGNED_FOR_MARGIN_GATE,
+    QC_MIN_LARGE_OFFSET_GAIN_PER_OBS, QC_MIN_SOLUTION_MARGIN, QC_PROTEIN_HC_CONFIDENCE_CAP,
+    QC_STRONG_BELIEF_THRESHOLD, STANDARD_CALIBRATION_KNOTS, STANDARD_CPU_PRIOR_ALPHA,
+    STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_CALIBRATION_KNOTS, STANDARD_GPU_PRIOR_ALPHA,
+    STANDARD_GPU_PRIOR_BETA, UNIFORM_CALIBRATION_GRID_10,
 };
 use nmr_core::simulate::{simulate, SimConfig};
 use nmr_core::solver::{AssignResult, ScoreConfig};
@@ -625,4 +637,761 @@ fn monotone_calibration_maps_isotonic_pav_and_unconverged_margin_abstention() {
         "collapsed solution_margin must trigger Abstain: {qc_unconv:?}"
     );
     assert!(qc_unconv.solution_margin < 0.07);
+}
+
+#[test]
+fn p1_7_hnco_absent_complementary_4exp_earns_pass_even_with_partial_hncaco_dropout() {
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+
+    // Simulate HNCO-absent / HNCA-absent complementary 4-experiment set:
+    // HSQC + HNCACB + CBCACONH + HNCOCA + HNCACO (providing full CA(i/i-1), CB(i/i-1), C'(i/i-1)),
+    // with Asn/Gln NH2 doublets, a multi-day (+0.024 H, -0.22 N) ppm lock shift on HNCOCA,
+    // and 35% HNCACO sensitivity dropout so roots missing their own HNCACO peak sit near neighbors.
+    let (mut peaks, _) = simulate(
+        &truth,
+        &SimConfig {
+            experiments: vec![
+                "HSQC".to_string(),
+                "HNCACB".to_string(),
+                "CBCACONH".to_string(),
+                "HNCOCA".to_string(),
+                "HNCACO".to_string(),
+            ],
+            sidechain_nh2: true,
+            nh2_sidechain_3d: true,
+            seed: 13,
+            ..SimConfig::default()
+        },
+    );
+    let mut hncaco_idx = 0usize;
+    peaks.retain_mut(|p| {
+        if p.exp == "HNCOCA" {
+            p.h += 0.024;
+            p.n -= 0.22;
+        }
+        if p.exp == "HNCACO" {
+            hncaco_idx += 1;
+            if hncaco_idx.is_multiple_of(3) {
+                return false;
+            }
+        }
+        true
+    });
+
+    let (_systems, res, rep) =
+        assign_evo_graph_from_peaks(&peaks, &truth.sequence, &priors, &EvoGraphConfig::default());
+    assert_eq!(
+        rep.qc_report.verdict,
+        DatasetQcVerdict::Pass,
+        "HNCO-absent complementary 4-exp set with complete CA+CB+C' connectivity must earn PASS (`P1-7a`), got {:?}",
+        rep.qc_report
+    );
+    assert!(!rep.qc_report.warn_sub_hc_uncalibrated);
+    assert!(!rep.qc_report.protein_hc_gate_triggered);
+    assert!(
+        rep.qc_report.hsqc_3d_rms_dn_ppm < 0.26,
+        "Voronoi-nearest HNCACO root matching must prevent artificial dN inflation: {}",
+        rep.qc_report.hsqc_3d_rms_dn_ppm
+    );
+    assert!(rep.qc_report.aliphatic_support_frac >= 0.85);
+    assert!(rep.qc_report.corroborated_connectivity_frac >= 0.70);
+    assert!(
+        res.confidence.iter().filter(|&&c| c >= 0.80).count() >= 30,
+        "clean complementary 4-exp set must retain strong HC coverage"
+    );
+}
+
+#[test]
+fn p1_7_degraded_regimes_trigger_aliphatic_abstain_warn_and_protein_hc_cap() {
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+    let score_cfg = ScoreConfig::default();
+
+    // 1. HNCO-only dataset (`aliphatic_support_frac < 0.20`) must ABSTAIN even when HSQC 3D support is ~100%.
+    let (hnco_only_peaks, _) = simulate(
+        &truth,
+        &SimConfig {
+            experiments: vec!["HSQC".to_string(), "HNCO".to_string()],
+            seed: 5,
+            ..SimConfig::default()
+        },
+    );
+    let (_sys_hnco, res_hnco, rep_hnco) = assign_evo_graph_from_peaks(
+        &hnco_only_peaks,
+        &truth.sequence,
+        &priors,
+        &EvoGraphConfig::default(),
+    );
+    assert_eq!(
+        rep_hnco.qc_report.verdict,
+        DatasetQcVerdict::Abstain,
+        "HNCO-only dataset lacking CA/CB support must ABSTAIN (`P1-7b`), got {:?}",
+        rep_hnco.qc_report
+    );
+    assert!(rep_hnco.qc_report.aliphatic_support_frac < 0.20);
+    assert!((rep_hnco.qc_report.confidence_cap - 0.45).abs() < 1e-12);
+    assert!(res_hnco.confidence.iter().all(|&c| c <= 0.45));
+
+    // Baseline clean Ubiquitin spin systems for controlled degraded-regime probes
+    let (clean_peaks, _) = simulate(&truth, &SimConfig::default());
+    let (systems_clean, res_clean, _) = assign_evo_graph_from_peaks(
+        &clean_peaks,
+        &truth.sequence,
+        &priors,
+        &EvoGraphConfig::default(),
+    );
+
+    // 2. Sparse aliphatic support (`0.20 <= aliphatic_support_frac < 0.50`) must trigger WARN + Q4 flag.
+    let mut sparse_aliph_sys = systems_clean.clone();
+    for (idx, s) in sparse_aliph_sys.iter_mut().enumerate() {
+        if idx * 10 >= 4 * systems_clean.len() {
+            s.cands.retain(|(nuc, _), _| nuc != "CA" && nuc != "CB");
+            s.cands
+                .entry(("C".to_string(), -1))
+                .or_insert_with(|| vec![(175.5, 1)]);
+        }
+    }
+    let qc_sparse_aliph = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &sparse_aliph_sys,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &res_clean,
+        None,
+    );
+    assert_eq!(qc_sparse_aliph.verdict, DatasetQcVerdict::Warn);
+    assert!(
+        (0.20..0.50).contains(&qc_sparse_aliph.aliphatic_support_frac),
+        "expected aliphatic_support_frac in [0.20, 0.50), got {}",
+        qc_sparse_aliph.aliphatic_support_frac
+    );
+    assert!(qc_sparse_aliph.warn_sub_hc_uncalibrated);
+
+    // 3. Low corroborated connectivity (`P >= 3.5` < 0.45 while weak `P >= 1.0` stays >= 0.15):
+    // strip CB and sequential CA(i-1) and perturb single-channel C'(i-1) (+0.26 ppm on 40% of strips,
+    // +0.36 ppm on 60% of strips) so weak links survive (>= 0.15) while corroborated links fall
+    // below `CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity` (0.45), triggering HC cap <= 0.79.
+    let mut weak_link_sys = systems_clean.clone();
+    for (idx, s) in weak_link_sys.iter_mut().enumerate() {
+        s.cands
+            .retain(|(nuc, off), _| nuc != "CB" && !(nuc == "CA" && *off != 0));
+        let shift_delta = if idx % 5 < 2 { 0.26 } else { 0.36 };
+        if let Some(c_prev) = s.cands.get_mut(&("C".to_string(), -1)) {
+            for cand in c_prev.iter_mut() {
+                cand.0 += shift_delta;
+            }
+        }
+    }
+    let qc_weak_corr = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &weak_link_sys,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &res_clean,
+        None,
+    );
+    assert_eq!(qc_weak_corr.verdict, DatasetQcVerdict::Warn);
+    assert!(
+        qc_weak_corr.corroborated_connectivity_frac
+            < CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity,
+        "expected corroborated_connectivity_frac < {}, got {}",
+        CANONICAL_PROTEIN_HC_GATE.min_corroborated_connectivity,
+        qc_weak_corr.corroborated_connectivity_frac
+    );
+    assert!(qc_weak_corr.protein_hc_gate_triggered);
+    assert!((qc_weak_corr.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
+    let mut capped_weak = res_clean.clone();
+    apply_dataset_qc_to_assignments(&mut capped_weak, &qc_weak_corr);
+    assert!(
+        capped_weak.confidence.iter().all(|&c| c < 0.80),
+        "triggered protein-level HC gate must suppress all >= 0.80 commitments"
+    );
+
+    // 4. Isolated sparse HC tail (`1 / 40 = 2.5% < 8%` HC call fraction) must cap at <= 0.79.
+    let mut isolated_tail_res = res_clean.clone();
+    let mut placed_seen = 0usize;
+    for (s, &pos) in isolated_tail_res.position.iter().enumerate() {
+        if pos >= 0 {
+            placed_seen += 1;
+            isolated_tail_res.confidence[s] = if placed_seen == 1 {
+                0.93
+            } else if placed_seen <= 12 {
+                0.70
+            } else {
+                0.48
+            };
+        }
+    }
+    let qc_sparse_hc = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &isolated_tail_res,
+        None,
+    );
+    assert_eq!(qc_sparse_hc.verdict, DatasetQcVerdict::Warn);
+    assert!(qc_sparse_hc.protein_hc_gate_triggered);
+    assert!((qc_sparse_hc.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
+    apply_dataset_qc_to_assignments(&mut isolated_tail_res, &qc_sparse_hc);
+    assert_eq!(
+        isolated_tail_res
+            .confidence
+            .iter()
+            .filter(|&&c| c >= 0.80)
+            .count(),
+        0,
+        "isolated 1-residue HC tail spike must be capped below 0.80"
+    );
+
+    // 5. Weakly supported large carbon registration offset (`|dCA| = 3.80 > 3.20 ppm` with
+    // `log_likelihood_gain / n_values = 2.0 / 50 = 0.04 < 0.15` and `solution_margin < 0.50`)
+    // must flag `has_weak_likelihood_large_offset` and trigger protein-level HC cap.
+    let mk_fit = |status, applied: f64, gain: f64, n: usize| NucleusOffsetFit {
+        status,
+        applied_ppm: applied,
+        candidate_ppm: applied,
+        log_likelihood_gain: gain,
+        n_values: n,
+    };
+    let weak_large_off = DetailedReferenceOffsets {
+        h: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+        n: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+        ca: mk_fit(OffsetFitStatus::Fitted, -3.80, 2.0, 50),
+        cb: mk_fit(OffsetFitStatus::Fitted, -3.75, 2.0, 48),
+        c: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+    };
+    assert!(has_weak_likelihood_large_offset(&weak_large_off, 0.15).is_some());
+    let mut low_margin_res = res_clean.clone();
+    let mut k_seen = 0usize;
+    for (s, &pos) in low_margin_res.position.iter().enumerate() {
+        if pos >= 0 {
+            k_seen += 1;
+            low_margin_res.confidence[s] = if k_seen <= 15 { 0.94 } else { 0.52 };
+        }
+    }
+    let qc_weak_off = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &low_margin_res,
+        Some(&weak_large_off),
+    );
+    assert_eq!(qc_weak_off.verdict, DatasetQcVerdict::Warn);
+    assert!(qc_weak_off.protein_hc_gate_triggered);
+    assert!((qc_weak_off.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
+
+    // 6. Large `15N` registration shift (`|dN| = 1.85 ppm`, strictly inside `check_offset_consistency`'s
+    // `<= 2.50 ppm` ceiling and `> 1.50 ppm`) must pass `has_weak_likelihood_large_offset` when
+    // strongly supported (`ΔLL/n = 0.20 >= 0.075`) and trigger `Warn` + `offset_low_margin` HC cap
+    // when weakly supported (`ΔLL/n = 0.05 < 0.075`).
+    let strong_dn_off = DetailedReferenceOffsets {
+        h: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+        n: mk_fit(OffsetFitStatus::Fitted, 1.85, 8.0, 40),
+        ca: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+        cb: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 48),
+        c: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 50),
+    };
+    assert!(check_offset_consistency(&strong_dn_off).0);
+    assert!(
+        has_weak_likelihood_large_offset(&strong_dn_off, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS)
+            .is_none()
+    );
+
+    let weak_dn_off = DetailedReferenceOffsets {
+        n: mk_fit(OffsetFitStatus::Fitted, -1.85, 2.0, 40),
+        ..strong_dn_off
+    };
+    assert!(
+        check_offset_consistency(&weak_dn_off).0,
+        "|dN|=1.85 ppm must stay below the unconditional 2.50 ppm check_offset_consistency ceiling"
+    );
+    let dn_msg = has_weak_likelihood_large_offset(&weak_dn_off, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS)
+        .expect("expected weak-likelihood 15N shift flag for |dN|=1.85 ppm with ΔLL/n=0.05");
+    assert!(dn_msg.contains("dN"), "unexpected message: {dn_msg}");
+    let qc_weak_dn = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &low_margin_res,
+        Some(&weak_dn_off),
+    );
+    assert!(qc_weak_dn.offset_consistency_ok);
+    assert_eq!(qc_weak_dn.verdict, DatasetQcVerdict::Warn);
+    assert!((qc_weak_dn.confidence_scale - 0.78).abs() < 1e-12);
+    assert!(qc_weak_dn.protein_hc_gate_triggered);
+    assert!((qc_weak_dn.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
+}
+
+#[test]
+fn q4_warn_marks_sub_hc_calls_uncalibrated_and_preserves_pass_calibration() {
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+    let score_cfg = ScoreConfig::default();
+
+    let (clean_peaks, _) = simulate(&truth, &SimConfig::default());
+    let (systems_clean, res_clean, rep_clean) = assign_evo_graph_from_peaks(
+        &clean_peaks,
+        &truth.sequence,
+        &priors,
+        &EvoGraphConfig::default(),
+    );
+
+    // Under PASS: `warn_sub_hc_uncalibrated == false`; both sub-HC and HC calls are calibrated.
+    assert_eq!(rep_clean.qc_report.verdict, DatasetQcVerdict::Pass);
+    assert!(!rep_clean.qc_report.warn_sub_hc_uncalibrated);
+    assert!(rep_clean.qc_report.is_call_calibrated(0.45));
+    assert!(rep_clean.qc_report.is_call_calibrated(0.85));
+
+    // Under WARN (e.g. aliphatic offset mismatch with high solution_margin):
+    // `warn_sub_hc_uncalibrated == true`; sub-HC calls (`< 0.80`) are uncalibrated (`Q4`),
+    // while surviving `>= 0.80` HC calls remain certified when `confidence_calibrated == true`.
+    let mk_fit = |status, applied: f64, gain: f64, n: usize| NucleusOffsetFit {
+        status,
+        applied_ppm: applied,
+        candidate_ppm: applied,
+        log_likelihood_gain: gain,
+        n_values: n,
+    };
+    let mismatch_off = DetailedReferenceOffsets {
+        h: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 60),
+        n: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 60),
+        ca: mk_fit(OffsetFitStatus::Fitted, -2.60, 42.0, 60),
+        cb: mk_fit(OffsetFitStatus::Fitted, 1.40, 38.0, 55),
+        c: mk_fit(OffsetFitStatus::NotSignificant, 0.0, 0.1, 60),
+    };
+    let qc_warn = evaluate_dataset_qc(
+        Some(&clean_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &res_clean,
+        Some(&mismatch_off),
+    );
+    assert_eq!(qc_warn.verdict, DatasetQcVerdict::Warn);
+    assert!(qc_warn.warn_sub_hc_uncalibrated);
+    assert!(!qc_warn.is_call_calibrated(0.799));
+    assert!(!qc_warn.is_call_calibrated(0.50));
+    assert!(qc_warn.is_call_calibrated(0.80));
+    assert!(qc_warn.is_call_calibrated(0.92));
+
+    // Under ABSTAIN: `warn_sub_hc_uncalibrated == false`, and `is_call_calibrated` is false everywhere.
+    let mut broken_peaks = clean_peaks.clone();
+    for p in &mut broken_peaks {
+        if p.exp != "HSQC" {
+            p.n += 9.0;
+        }
+    }
+    let qc_abs = evaluate_dataset_qc(
+        Some(&broken_peaks),
+        &systems_clean,
+        &truth.sequence,
+        &priors,
+        &score_cfg,
+        &res_clean,
+        None,
+    );
+    assert_eq!(qc_abs.verdict, DatasetQcVerdict::Abstain);
+    assert!(!qc_abs.warn_sub_hc_uncalibrated);
+    assert!(!qc_abs.is_call_calibrated(0.40));
+    assert!(!qc_abs.is_call_calibrated(0.85));
+}
+
+#[test]
+fn p1_8_debiased_ece_bernoulli_floor_beta_pav_and_nested_lopo_shrinkage() {
+    // 1. Small-N Bernoulli oracle floor vs Ferro-Fricker (2012) debiased ECE_10:
+    // Generate exact-oracle predictions where empirical rate deviates only by finite-sample quantization
+    // across 10 bins of N = 40 total residues (`4` per bin).
+    let mut small_oracle = Vec::new();
+    for b in 0..10 {
+        let p = 0.05 + 0.10 * (b as f64);
+        let k_true = (4.0 * p).round() as usize;
+        for j in 0..4 {
+            small_oracle.push((p, j < k_true));
+        }
+    }
+    let raw_ece_10 = compute_grid_ece(&small_oracle, UNIFORM_CALIBRATION_GRID_10);
+    let floor_10 =
+        compute_grid_ece_bernoulli_floor(&small_oracle, UNIFORM_CALIBRATION_GRID_10, 1.0);
+    let deb_ece_10 = compute_debiased_grid_ece(&small_oracle, UNIFORM_CALIBRATION_GRID_10, 1.0);
+    assert!(
+        floor_10 > 0.06,
+        "analytical 10-bin Bernoulli floor at N=40 must exceed 0.06, got {floor_10}"
+    );
+    assert!(
+        deb_ece_10 < raw_ece_10 && deb_ece_10 < 0.02,
+        "debiased ECE_10 ({deb_ece_10}) must eliminate small-sample plug-in bias ({raw_ece_10})"
+    );
+    let curve = ProteinReliabilityCurve::from_predictions(&small_oracle, 0.80);
+    assert!((curve.ece_10 - raw_ece_10).abs() < 1e-12);
+    assert!((curve.debiased_ece_10 - deb_ece_10).abs() < 1e-12);
+    assert!((curve.ece_10_bernoulli_floor - floor_10).abs() < 1e-12);
+
+    // Large-N asymptotic consistency: as N -> 4000, floor -> ~0 and debiased_ece_10 -> raw_ece_10.
+    let mut large_miscal = Vec::new();
+    for i in 0..4000 {
+        // Consistently overconfident by +0.15 (`p = 0.85`, true accuracy `0.70`)
+        large_miscal.push((0.85, (i % 10) < 7));
+    }
+    let raw_large = compute_grid_ece(&large_miscal, UNIFORM_CALIBRATION_GRID_10);
+    let deb_large = compute_debiased_grid_ece(&large_miscal, UNIFORM_CALIBRATION_GRID_10, 1.0);
+    let floor_large =
+        compute_grid_ece_bernoulli_floor(&large_miscal, UNIFORM_CALIBRATION_GRID_10, 1.0);
+    assert!(floor_large < 0.01);
+    assert!((raw_large - 0.15).abs() < 1e-3);
+    assert!((deb_large - raw_large).abs() < 2e-3);
+
+    // 2. Conservative conjugate Beta(0.75, 2.25) PAV prior for CPU `standard` (`P1-8`) must shrink
+    // sparse upper-intermediate bins strictly below symmetric Beta(0.25, 0.25).
+    let sparse_samples = vec![(0.80, true), (0.81, true), (0.98, true)];
+    let sym_knots = fit_isotonic_monotone_knots(
+        &sparse_samples,
+        CANONICAL_CALIBRATION_GRID_12,
+        CANONICAL_CALIBRATION_LAPLACE_PRIOR,
+    );
+    let cons_knots = fit_isotonic_monotone_knots_beta(
+        &sparse_samples,
+        CANONICAL_CALIBRATION_GRID_12,
+        STANDARD_CPU_PRIOR_ALPHA,
+        STANDARD_CPU_PRIOR_BETA,
+    );
+    let y_sym = eval_monotone_calibration_map(0.80, &sym_knots);
+    let y_cons = eval_monotone_calibration_map(0.80, &cons_knots);
+    assert!(
+        y_cons + 0.10 < y_sym,
+        "Beta(0.75, 2.25) prior ({y_cons}) must curb sparse-bin overconfidence relative to Beta(0.25, 0.25) ({y_sym})"
+    );
+
+    // 3. Nested LOPO GPU shrinkage selector (`select_gpu_shrinkage_weight_nested_lopo`) and
+    // `fit_protein_hc_gate_config` must run cleanly with zero target leakage.
+    assert_eq!(CANDIDATE_GPU_SHRINKAGE_WEIGHTS.len(), 7);
+    assert!((CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT - 0.50).abs() < 1e-12);
+    let mut gpu_proteins = Vec::new();
+    let mut cpu_by_protein = Vec::new();
+    for p_idx in 0..6 {
+        let mut gpu_raw = Vec::new();
+        let mut cpu_raw = Vec::new();
+        for r in 0..30 {
+            if r < 10 {
+                // Sparse noisy GPU bin around 0.85 where true rate is 0.60, while CPU has dense observations
+                gpu_raw.push((0.85, ((r + p_idx) % 5) < 3));
+                for rep in 0..3 {
+                    cpu_raw.push((0.85, ((r + rep) % 5) < 3));
+                }
+            } else {
+                gpu_raw.push((0.995, (r % 20) != 0));
+                cpu_raw.push((0.995, (r % 20) != 0));
+            }
+        }
+        gpu_proteins.push(vec![ProteinHcTrainingSeed {
+            n_assignable_amides: 32,
+            n_amide_hsqc_roots: 30,
+            peaks_present: true,
+            hsqc_3d_support_frac: 0.95,
+            supported_roots_per_assignable: 0.95,
+            aliphatic_support_frac: 0.95,
+            hsqc_multiplicity_ratio: 1.0,
+            hsqc_3d_rms_dh_ppm: 0.01,
+            hsqc_3d_rms_dn_ppm: 0.10,
+            offset_consistency_ok: true,
+            weak_large_offset: false,
+            connectivity_frac: 0.92,
+            corroborated_connectivity_frac: 0.88,
+            raw_predictions: gpu_raw,
+        }]);
+        cpu_by_protein.push(cpu_raw);
+    }
+    let trainable = vec![true; 6];
+    let (sel_w, stats) = select_gpu_shrinkage_weight_nested_lopo(
+        &gpu_proteins,
+        &cpu_by_protein,
+        &trainable,
+        &trainable,
+        &CANONICAL_PROTEIN_HC_GATE,
+    );
+    assert_eq!(stats.len(), CANDIDATE_GPU_SHRINKAGE_WEIGHTS.len());
+    assert!(
+        sel_w > 0.0,
+        "expected positive CPU anchor weight when sparse GPU bins overcommit, got sel_w={sel_w}, stats={stats:?}"
+    );
+    assert_eq!(
+        CANDIDATE_GATE_CORROBORATED_CONNECTIVITY.len()
+            * CANDIDATE_GATE_HC_CALL_FRACTION.len()
+            * CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN.len()
+            * CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR.len(),
+        400
+    );
+    let gpu_beta_knots = fit_isotonic_monotone_knots_shrunk_toward_beta(
+        &cpu_by_protein[0],
+        &cpu_by_protein[1],
+        0.50,
+        CANONICAL_CALIBRATION_GRID_12,
+        STANDARD_GPU_PRIOR_ALPHA,
+        STANDARD_GPU_PRIOR_BETA,
+    );
+    assert_eq!(gpu_beta_knots.len(), 15);
+    let fitted_gate = fit_protein_hc_gate_config(&gpu_proteins, STANDARD_GPU_CALIBRATION_KNOTS);
+    let fitted_multi_gate =
+        fit_protein_hc_gate_config_multi_engine(&[(&gpu_proteins, STANDARD_GPU_CALIBRATION_KNOTS)]);
+    assert_eq!(fitted_gate, fitted_multi_gate);
+    // Neutral monotone Occam tie-breaker: on clean proteins where no candidate gate triggers,
+    // all 400 candidates tie on ECE_10 and HCP, so the least restrictive corner must win.
+    assert_eq!(fitted_gate, CANONICAL_PROTEIN_HC_GATE);
+    let eval_out = evaluate_seed_predictions_with_gate(
+        &gpu_proteins[0][0],
+        STANDARD_GPU_CALIBRATION_KNOTS,
+        &fitted_gate,
+    );
+    assert_eq!(eval_out.len(), 30);
+}
+
+#[test]
+fn p1_7_lopo_seed_evaluator_matches_production_qc_and_catches_sparse_placement() {
+    let star_path = workspace_root().join("data/fixtures/synthetic_ubiquitin.str");
+    let truth = read_star(&star_path, None).expect("read synthetic_ubiquitin.str");
+    let priors = Priors::bmrb();
+    let score_cfg = ScoreConfig::default();
+
+    let (clean_peaks, _) = simulate(&truth, &SimConfig::default());
+    let (systems_clean, res_clean, _) = assign_evo_graph_from_peaks(
+        &clean_peaks,
+        &truth.sequence,
+        &priors,
+        &EvoGraphConfig {
+            apply_qc_calibration: false,
+            ..EvoGraphConfig::default()
+        },
+    );
+
+    let assert_exact_parity = |peaks: Option<&[Peak]>,
+                               systems: &[nmr_core::spinsystems::SpinSystem],
+                               raw_res: &AssignResult,
+                               opt_off: Option<&DetailedReferenceOffsets>,
+                               knots: &[(f64, f64)]|
+     -> nmr_core::qc::DatasetQcReport {
+        // Production pipeline: map raw confidences through `knots` -> `evaluate_dataset_qc_with_gate`
+        // -> `apply_dataset_qc_to_assignments`
+        let mut prod_res = raw_res.clone();
+        let mut raw_preds = Vec::new();
+        for (s, &pos) in raw_res.position.iter().enumerate() {
+            if pos >= 0 && (pos as usize) < truth.sequence.len() {
+                raw_preds.push((raw_res.confidence[s], (s % 3) != 0));
+            }
+            prod_res.confidence[s] = eval_monotone_calibration_map(prod_res.confidence[s], knots);
+        }
+        let raw_qc = evaluate_dataset_qc_with_gate(
+            peaks,
+            systems,
+            &truth.sequence,
+            &priors,
+            &score_cfg,
+            raw_res,
+            opt_off,
+            &CANONICAL_PROTEIN_HC_GATE,
+        );
+        let prod_qc = evaluate_dataset_qc_with_gate(
+            peaks,
+            systems,
+            &truth.sequence,
+            &priors,
+            &score_cfg,
+            &prod_res,
+            opt_off,
+            &CANONICAL_PROTEIN_HC_GATE,
+        );
+        apply_dataset_qc_to_assignments(&mut prod_res, &prod_qc);
+        let prod_placed: Vec<f64> = prod_res
+            .position
+            .iter()
+            .enumerate()
+            .filter(|&(_, &pos)| pos >= 0 && (pos as usize) < truth.sequence.len())
+            .map(|(s, _)| prod_res.confidence[s])
+            .collect();
+
+        let seed = ProteinHcTrainingSeed {
+            n_assignable_amides: raw_qc.n_assignable_amides,
+            n_amide_hsqc_roots: raw_qc.n_amide_hsqc_roots,
+            peaks_present: peaks.is_some(),
+            hsqc_3d_support_frac: raw_qc.hsqc_3d_support_frac,
+            supported_roots_per_assignable: raw_qc.supported_roots_per_assignable,
+            aliphatic_support_frac: raw_qc.aliphatic_support_frac,
+            hsqc_multiplicity_ratio: raw_qc.hsqc_multiplicity_ratio,
+            hsqc_3d_rms_dh_ppm: raw_qc.hsqc_3d_rms_dh_ppm,
+            hsqc_3d_rms_dn_ppm: raw_qc.hsqc_3d_rms_dn_ppm,
+            offset_consistency_ok: raw_qc.offset_consistency_ok,
+            weak_large_offset: has_weak_likelihood_large_offset(
+                &raw_qc.detailed_offsets,
+                QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
+            )
+            .is_some(),
+            connectivity_frac: raw_qc.connectivity_frac,
+            corroborated_connectivity_frac: raw_qc.corroborated_connectivity_frac,
+            raw_predictions: raw_preds,
+        };
+        let seed_eval =
+            evaluate_seed_predictions_with_gate(&seed, knots, &CANONICAL_PROTEIN_HC_GATE);
+        assert_eq!(prod_placed.len(), seed_eval.len());
+        for (idx, (&pc, &(sc, _))) in prod_placed.iter().zip(seed_eval.iter()).enumerate() {
+            assert!(
+                (pc - sc).abs() < 1e-12,
+                "residue {idx} production post-QC confidence ({pc}) != LOPO seed evaluator ({sc})"
+            );
+        }
+        prod_qc
+    };
+
+    // (a) Clean Pass
+    let qc_a = assert_exact_parity(
+        Some(&clean_peaks),
+        &systems_clean,
+        &res_clean,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert_eq!(qc_a.verdict, DatasetQcVerdict::Pass);
+
+    // (b) `peaks = None` with `hsqc_multiplicity_ratio > 1.45` (verifying `peaks_present: false` parity)
+    let mut crowded_sys = systems_clean.clone();
+    while crowded_sys.len() <= ((qc_a.n_assignable_amides as f64) * 1.55) as usize {
+        let mut dup = systems_clean[0].clone();
+        dup.h += 0.04;
+        crowded_sys.push(dup);
+    }
+    let mut crowded_res = res_clean.clone();
+    while crowded_res.position.len() < crowded_sys.len() {
+        crowded_res.position.push(-1);
+        crowded_res.confidence.push(0.0);
+    }
+    let qc_b = assert_exact_parity(
+        None,
+        &crowded_sys,
+        &crowded_res,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert_eq!(qc_b.verdict, DatasetQcVerdict::Warn);
+
+    // (c) Abstain (broken 3D registration)
+    let mut broken_peaks = clean_peaks.clone();
+    for p in &mut broken_peaks {
+        if p.exp != "HSQC" {
+            p.n += 9.0;
+        }
+    }
+    let qc_c = assert_exact_parity(
+        Some(&broken_peaks),
+        &systems_clean,
+        &res_clean,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert_eq!(qc_c.verdict, DatasetQcVerdict::Abstain);
+
+    // (d) Sparse sequence placement (`assigned_count = 13 >= 12` contiguous residues `1..=13` on
+    // `n_assignable_amides = 72 > 60`, so `connectivity_frac == 1.0` and `hc_count == 13 > 0`, while
+    // `13 * 5 = 65 < 72`, `< 20%` placed): BOTH production QC and LOPO seed evaluator must trigger
+    // `protein_hc_gate[sparse_sequence_placement]` and cap at `<= 0.79`!
+    let mut sparse_seq_res = res_clean.clone();
+    let mut kept = 0usize;
+    for s in 0..sparse_seq_res.position.len() {
+        let pos = sparse_seq_res.position[s];
+        if (1..=13).contains(&pos) {
+            sparse_seq_res.confidence[s] = 0.9999;
+            kept += 1;
+        } else {
+            sparse_seq_res.position[s] = -1;
+            sparse_seq_res.confidence[s] = 0.0;
+        }
+    }
+    assert!(kept >= 12 && kept * 5 < qc_a.n_assignable_amides);
+    let qc_d = assert_exact_parity(
+        Some(&clean_peaks),
+        &systems_clean,
+        &sparse_seq_res,
+        None,
+        EVO_GRAPH_CALIBRATION_KNOTS,
+    );
+    assert!(qc_d.n_assignable_amides > 65);
+    assert_eq!(qc_d.verdict, DatasetQcVerdict::Warn);
+    assert!(qc_d.protein_hc_gate_triggered);
+    assert!(
+        qc_d.reasons
+            .iter()
+            .any(|r| r.contains("sparse_sequence_placement")),
+        "expected sparse_sequence_placement in {:?}",
+        qc_d.reasons
+    );
+    assert!((qc_d.confidence_cap - QC_PROTEIN_HC_CONFIDENCE_CAP).abs() < 1e-12);
+}
+
+#[test]
+fn p1_7_real_cisd3_pdata_5seed_retains_pass_and_hc_calls() {
+    let Ok(real_dir) = std::env::var("NMR_REAL_DATA_DIR") else {
+        return;
+    };
+    let cisd3_dir = PathBuf::from(real_dir).join("private/bmrb51439_cisd3");
+    if !cisd3_dir.exists() {
+        return;
+    }
+    let fasta_txt = std::fs::read_to_string(cisd3_dir.join("cisd3.fasta")).unwrap();
+    let sequence: Vec<String> = fasta_txt
+        .lines()
+        .filter(|l| !l.trim().starts_with('>'))
+        .flat_map(|l| l.trim().chars())
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(|c| nmr_core::priors::one_to_three(c).to_string())
+        .collect();
+    let pcfg = nmr_core::picker::PickerConfig::default();
+    let hsqc = nmr_core::spectrum::read_bruker_pdata_2d(
+        cisd3_dir.join("CISD3_15N_HSQC_diamagnetic/pdata/1"),
+    )
+    .unwrap();
+    let hsqc_roots = nmr_core::picker::pick_hsqc_2d(&hsqc, &pcfg);
+    let mut raw_peaks = hsqc_roots.clone();
+    for (rel_path, exp_name) in [
+        ("CISD3_HNCA/pdata/1", "HNCA"),
+        ("CISD3_HNCOCA/pdata/1", "HNCOCA"),
+        ("CISD3_CBCACONH/pdata/1", "CBCACONH"),
+        ("CISD3_HNCO/pdata/1", "HNCO"),
+    ] {
+        let spec3d =
+            nmr_core::spectrum::read_bruker_pdata_3d(cisd3_dir.join(rel_path), exp_name).unwrap();
+        raw_peaks.extend(nmr_core::picker::pick_triple_3d(
+            &spec3d,
+            &hsqc_roots,
+            &pcfg,
+        ));
+    }
+    let priors = Priors::bmrb();
+    for seed in 0..5u64 {
+        let cfg = EvoGraphConfig {
+            structure_torsions: None,
+            seed,
+            ..Default::default()
+        };
+        let (_sys, res, rep) = assign_evo_graph_from_peaks(&raw_peaks, &sequence, &priors, &cfg);
+        let n_hc = res.confidence.iter().filter(|&&c| c >= 0.80).count();
+        assert_eq!(
+            rep.qc_report.verdict,
+            DatasetQcVerdict::Pass,
+            "CISD3 pdata seed {seed} expected PASS, got {:?}",
+            rep.qc_report
+        );
+        assert!(
+            n_hc >= 5,
+            "CISD3 pdata seed {seed} expected >= 5 HC calls, got {n_hc}"
+        );
+    }
 }
