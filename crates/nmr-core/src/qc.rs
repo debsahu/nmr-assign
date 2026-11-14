@@ -570,15 +570,67 @@ pub fn evaluate_seed_predictions_with_gate(
 /// [`fit_protein_hc_gate_config_multi_engine`].
 pub type EngineTrainingSlice<'a> = (&'a [Vec<ProteinHcTrainingSeed>], &'a [(f64, f64)]);
 
-/// Fit a single shared [`ProteinHcGateConfig`] strictly on training proteins across one or more
-/// solver engines (`engines`, each `(train_proteins, knots)`) over the broad 400-point 4D product
-/// grid (`CANDIDATE_GATE_*`) by minimizing mean pooled 10-bin `ECE_10` subject to `>= 94.5%`
-/// training micro HC-precision per engine, with a neutral monotone Occam tie-breaker
-/// (`1e-4 * sum_of_thresholds`, preferring the least restrictive gate whenever training accuracy
-/// ties; `P1-7`).
-pub fn fit_protein_hc_gate_config_multi_engine(
+/// Evaluate `(mean_pooled_ece_10, per_engine_micro_hcp, total_capped_seeds)` for a candidate
+/// [`ProteinHcGateConfig`] across `engines` (`P1-7`).
+pub fn evaluate_protein_hc_gate_objective_multi_engine(
     engines: &[EngineTrainingSlice<'_>],
-) -> ProteinHcGateConfig {
+    cand: &ProteinHcGateConfig,
+) -> (f64, Vec<f64>, usize) {
+    if engines.is_empty() {
+        return (0.0, Vec::new(), 0);
+    }
+    let mut ece_sum = 0.0_f64;
+    let mut hcps = Vec::with_capacity(engines.len());
+    let mut n_capped = 0usize;
+    for &(train_proteins, knots) in engines {
+        let mut pool = Vec::new();
+        for seeds in train_proteins {
+            for s in seeds {
+                if s.raw_predictions.is_empty() {
+                    continue;
+                }
+                let uncapped = evaluate_seed_predictions_with_gate(
+                    s,
+                    knots,
+                    &ProteinHcGateConfig {
+                        min_corroborated_connectivity: 0.0,
+                        min_hc_call_fraction: 0.0,
+                        min_crowded_solution_margin: 0.0,
+                        multiplicity_penalty_floor: cand.multiplicity_penalty_floor,
+                    },
+                );
+                let gated = evaluate_seed_predictions_with_gate(s, knots, cand);
+                let had_hc_before = uncapped.iter().any(|&(c, _)| c >= 0.80);
+                let has_hc_after = gated.iter().any(|&(c, _)| c >= 0.80);
+                if had_hc_before && !has_hc_after {
+                    n_capped += 1;
+                }
+                pool.extend(gated);
+            }
+        }
+        ece_sum += compute_grid_ece(&pool, UNIFORM_CALIBRATION_GRID_10);
+        let hc_tot = pool.iter().filter(|&&(c, _)| c >= 0.80).count();
+        let hc_ok = pool.iter().filter(|&&(c, ok)| c >= 0.80 && ok).count();
+        hcps.push(if hc_tot > 0 {
+            (hc_ok as f64) / (hc_tot as f64)
+        } else {
+            1.0
+        });
+    }
+    (ece_sum / (engines.len() as f64), hcps, n_capped)
+}
+
+/// Fit [`ProteinHcGateConfig`] across `engines` over caller-supplied 4D candidate axes and
+/// Occam regularization weight `occam_reg_weight` (`1e-4` in [`fit_protein_hc_gate_config_multi_engine`],
+/// or `0.0` for unconstrained floor diagnostics; `P1-7`).
+pub fn fit_protein_hc_gate_config_with_grids(
+    engines: &[EngineTrainingSlice<'_>],
+    grid_c35: &[f64],
+    grid_hcf: &[f64],
+    grid_cmarg: &[f64],
+    grid_mpen: &[f64],
+    occam_reg_weight: f64,
+) -> (ProteinHcGateConfig, f64) {
     struct CachedSeed<'a> {
         seed: &'a ProteinHcTrainingSeed,
         cals: Vec<f64>,
@@ -614,16 +666,16 @@ pub fn fit_protein_hc_gate_config_multi_engine(
         }
     }
     if cached_engines.is_empty() {
-        return CANONICAL_PROTEIN_HC_GATE;
+        return (CANONICAL_PROTEIN_HC_GATE, 0.0);
     }
 
     let n_eng = cached_engines.len() as f64;
     let mut best_cfg = CANONICAL_PROTEIN_HC_GATE;
     let mut best_obj = f64::INFINITY;
-    for &min_c35 in CANDIDATE_GATE_CORROBORATED_CONNECTIVITY {
-        for &min_hcf in CANDIDATE_GATE_HC_CALL_FRACTION {
-            for &min_cmarg in CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN {
-                for &mpen in CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR {
+    for &min_c35 in grid_c35 {
+        for &min_hcf in grid_hcf {
+            for &min_cmarg in grid_cmarg {
+                for &mpen in grid_mpen {
                     let cand = ProteinHcGateConfig {
                         min_corroborated_connectivity: min_c35,
                         min_hc_call_fraction: min_hcf,
@@ -654,9 +706,7 @@ pub fn fit_protein_hc_gate_config_multi_engine(
                             pen_sum += (0.945 - hcp) * 5.0;
                         }
                     }
-                    // Strictly neutral monotone Occam tie-breaker: prefer the least restrictive
-                    // (smallest) gate thresholds whenever training ECE_10 and HCP >= 94.5% tie.
-                    let reg = 1e-4 * (min_c35 + min_hcf + min_cmarg + mpen);
+                    let reg = occam_reg_weight * (min_c35 + min_hcf + min_cmarg + mpen);
                     let obj = (ece_sum / n_eng) + pen_sum + reg;
                     if obj < best_obj {
                         best_obj = obj;
@@ -666,7 +716,27 @@ pub fn fit_protein_hc_gate_config_multi_engine(
             }
         }
     }
-    best_cfg
+    (best_cfg, best_obj)
+}
+
+/// Fit a single shared [`ProteinHcGateConfig`] strictly on training proteins across one or more
+/// solver engines (`engines`, each `(train_proteins, knots)`) over the broad 400-point 4D product
+/// grid (`CANDIDATE_GATE_*`) by minimizing mean pooled 10-bin `ECE_10` subject to `>= 94.5%`
+/// training micro HC-precision per engine, with a neutral monotone Occam tie-breaker
+/// (`1e-4 * sum_of_thresholds`, preferring the least restrictive gate whenever training accuracy
+/// ties; `P1-7`).
+pub fn fit_protein_hc_gate_config_multi_engine(
+    engines: &[EngineTrainingSlice<'_>],
+) -> ProteinHcGateConfig {
+    fit_protein_hc_gate_config_with_grids(
+        engines,
+        CANDIDATE_GATE_CORROBORATED_CONNECTIVITY,
+        CANDIDATE_GATE_HC_CALL_FRACTION,
+        CANDIDATE_GATE_CROWDED_SOLUTION_MARGIN,
+        CANDIDATE_GATE_MULTIPLICITY_PENALTY_FLOOR,
+        1e-4,
+    )
+    .0
 }
 
 /// Fit [`ProteinHcGateConfig`] strictly on training proteins (`train_proteins`, each a slice of

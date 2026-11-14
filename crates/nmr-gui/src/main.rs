@@ -67,8 +67,11 @@ use nmr_core::picker::{estimate_noise_mad, pick_hsqc_2d, PickerConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_core::picker::{pick_c13_hsqc_2d, pick_triple_3d_two_pass, CorroboratedRepickConfig};
 use nmr_core::priors::{one_to_three, three_to_one, Priors, ATOMS};
+use nmr_core::process::AxisRescueAuditRecord;
 #[cfg(not(target_arch = "wasm32"))]
-use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d, register_3d_hn_to_hsqc_2d};
+use nmr_core::process::{
+    process_fid_dir_2d, process_fid_dir_3d, register_3d_hn_to_hsqc_2d_with_audit,
+};
 use nmr_core::qc::{evaluate_dataset_qc, DatasetQcReport};
 use nmr_core::report::{generate_quality_report_html, predict_csi_dihedrals, ReportInput};
 use nmr_core::rng::Rng;
@@ -1594,6 +1597,9 @@ struct NmrWorkbenchApp {
     #[cfg(not(target_arch = "wasm32"))]
     use_gpu: bool,
     use_neural_picker: bool,
+    enable_axis_rescue: bool,
+    axis_rescue_notices: Vec<String>,
+    axis_rescue_audits: Vec<AxisRescueAuditRecord>,
     status_msg: String,
     last_solve_ms: Option<f64>,
 
@@ -1756,6 +1762,9 @@ impl NmrWorkbenchApp {
             #[cfg(not(target_arch = "wasm32"))]
             gpu_engine,
             use_neural_picker: true,
+            enable_axis_rescue: true,
+            axis_rescue_notices: Vec::new(),
+            axis_rescue_audits: Vec::new(),
             adapter_label,
             status_msg: String::new(),
             last_solve_ms: None,
@@ -5483,11 +5492,18 @@ impl NmrWorkbenchApp {
             .count();
         self.unprocessed_fids_remaining = self.raw_fids_total;
 
+        self.axis_rescue_notices.clear();
+        self.axis_rescue_audits.clear();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut ingested_recipes: BTreeMap<String, nmr_core::process::ProcessingRecipe> =
+            BTreeMap::new();
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut primary_2d: Option<Spectrum2D> = None;
             let mut overlays_2d: Vec<(String, Spectrum2D)> = Vec::new();
-            let mut cubes_3d: Vec<Spectrum3D> = Vec::new();
+            let mut cubes_3d: Vec<(String, Spectrum3D)> = Vec::new();
             let mut processed_fids = 0usize;
 
             for item in &plan.selected_experiments {
@@ -5499,11 +5515,10 @@ impl NmrWorkbenchApp {
                     ExperimentDimensionality::Dim2D => {
                         let loaded_2d = if item.experiment.data_state == DataState::RawFid {
                             match process_fid_dir_2d(path, false, false) {
-                                Ok((s2, recipe)) => {
+                                Ok((s2, mut recipe)) => {
+                                    recipe.enable_axis_rescue = self.enable_axis_rescue;
                                     processed_fids += 1;
-                                    self.session
-                                        .state
-                                        .processing_recipes
+                                    ingested_recipes
                                         .insert(item.experiment.display_name.clone(), recipe);
                                     Some(s2)
                                 }
@@ -5532,11 +5547,10 @@ impl NmrWorkbenchApp {
                     ExperimentDimensionality::Dim3D => {
                         let loaded_3d = if item.experiment.data_state == DataState::RawFid {
                             match process_fid_dir_3d(path, exp_token, false, false) {
-                                Ok((s3, recipe)) => {
+                                Ok((s3, mut recipe)) => {
+                                    recipe.enable_axis_rescue = self.enable_axis_rescue;
                                     processed_fids += 1;
-                                    self.session
-                                        .state
-                                        .processing_recipes
+                                    ingested_recipes
                                         .insert(item.experiment.display_name.clone(), recipe);
                                     Some(s3)
                                 }
@@ -5558,7 +5572,7 @@ impl NmrWorkbenchApp {
                             }
                         };
                         if let Some(s3) = loaded_3d {
-                            cubes_3d.push(s3);
+                            cubes_3d.push((item.experiment.display_name.clone(), s3));
                         }
                     }
                     _ => {}
@@ -5571,8 +5585,22 @@ impl NmrWorkbenchApp {
                 primary_2d = Some(overlays_2d.remove(0).1);
             }
             if let Some(hsqc) = primary_2d {
-                for s3 in &mut cubes_3d {
-                    let _ = register_3d_hn_to_hsqc_2d(s3, &hsqc, 0.08, 0.60);
+                for (disp_name, s3) in &mut cubes_3d {
+                    let rescue_flag = ingested_recipes
+                        .get(disp_name)
+                        .map(|r| r.enable_axis_rescue)
+                        .unwrap_or(self.enable_axis_rescue);
+                    let (_, _, audit_opt) =
+                        register_3d_hn_to_hsqc_2d_with_audit(s3, &hsqc, 0.08, 0.60, rescue_flag);
+                    if let Some(audit) = audit_opt {
+                        if let Some(warn) = audit.warning_message() {
+                            self.axis_rescue_notices.push(warn);
+                        }
+                        if let Some(rec) = ingested_recipes.get_mut(disp_name) {
+                            rec.axis_rescue_audit = Some(audit.clone());
+                        }
+                        self.axis_rescue_audits.push(audit);
+                    }
                 }
                 self.hsqc_arc = Arc::new(hsqc.data.clone());
                 self.hsqc_gen = self.hsqc_gen.wrapping_add(1);
@@ -5605,7 +5633,7 @@ impl NmrWorkbenchApp {
                     } else {
                         pick_hsqc_2d(hsqc, &pcfg)
                     };
-                    let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().collect();
+                    let c_refs: Vec<&Spectrum3D> = cubes_3d.iter().map(|(_, s)| s).collect();
                     if !c_refs.is_empty() && !roots.is_empty() {
                         let p3 = pick_triple_3d_two_pass(
                             &c_refs,
@@ -5626,7 +5654,7 @@ impl NmrWorkbenchApp {
 
             self.hncacb_3d = None;
             self.hnco_3d = None;
-            for s3 in cubes_3d {
+            for (_, s3) in cubes_3d {
                 if s3.exp == "HNCO" || s3.exp == "HNCACO" {
                     if self.hnco_3d.is_none() {
                         self.hnco_3d = Some(s3);
@@ -5641,9 +5669,15 @@ impl NmrWorkbenchApp {
         }
 
         self.sync_session_from_app_fresh(&plan.root_name);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.session.state.processing_recipes = ingested_recipes;
+        }
         self.rebuild_systems_and_matrices();
         if run_full_pipeline && !self.sequence.is_empty() && !self.peaks.is_empty() {
             self.run_assignment();
+        } else if let Some(first_warn) = self.axis_rescue_notices.first() {
+            self.status_msg = first_warn.clone();
         } else {
             self.status_msg = format!(
                 "Loaded '{}' ({} selected experiment(s), {} peaks, {} aa)",
@@ -5717,6 +5751,7 @@ impl NmrWorkbenchApp {
                     inp.n_peaks = Some(self.peaks.len());
                     inp.n_spin_systems = Some(self.systems.len());
                     inp.dihedrals = predict_csi_dihedrals(&pred);
+                    inp.axis_rescue_records = self.axis_rescue_audits.clone();
                     if let Some(res) = &self.assign_res {
                         inp.solver_score = Some(res.score);
                         inp.systems_and_assignment = Some((self.systems.clone(), res.clone()));
@@ -5764,6 +5799,8 @@ impl NmrWorkbenchApp {
                 self.hsqc_spec = None;
                 self.hncacb_3d = None;
                 self.hnco_3d = None;
+                self.axis_rescue_notices.clear();
+                self.axis_rescue_audits.clear();
                 self.session = WorkbenchSessionController::default();
                 self.status_msg = "Workspace reset".to_string();
             }
@@ -5784,15 +5821,45 @@ impl NmrWorkbenchApp {
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref hsqc) = self.hsqc_spec {
                     let mut n_reg = 0usize;
+                    self.axis_rescue_notices.clear();
+                    self.axis_rescue_audits.clear();
                     if let Some(ref mut s3) = self.hncacb_3d {
-                        let _ = register_3d_hn_to_hsqc_2d(s3, hsqc, 0.08, 0.60);
+                        let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
+                            s3,
+                            hsqc,
+                            0.08,
+                            0.60,
+                            self.enable_axis_rescue,
+                        );
+                        if let Some(audit) = audit_opt {
+                            if let Some(warn) = audit.warning_message() {
+                                self.axis_rescue_notices.push(warn);
+                            }
+                            self.axis_rescue_audits.push(audit);
+                        }
                         n_reg += 1;
                     }
                     if let Some(ref mut s3) = self.hnco_3d {
-                        let _ = register_3d_hn_to_hsqc_2d(s3, hsqc, 0.08, 0.60);
+                        let (_, _, audit_opt) = register_3d_hn_to_hsqc_2d_with_audit(
+                            s3,
+                            hsqc,
+                            0.08,
+                            0.60,
+                            self.enable_axis_rescue,
+                        );
+                        if let Some(audit) = audit_opt {
+                            if let Some(warn) = audit.warning_message() {
+                                self.axis_rescue_notices.push(warn);
+                            }
+                            self.axis_rescue_audits.push(audit);
+                        }
                         n_reg += 1;
                     }
-                    self.status_msg = format!("Registered {n_reg} 3D cube(s) to 2D HSQC reference");
+                    self.status_msg = if let Some(first_warn) = self.axis_rescue_notices.first() {
+                        first_warn.clone()
+                    } else {
+                        format!("Registered {n_reg} 3D cube(s) to 2D HSQC reference")
+                    };
                 }
             }
             WorkbenchAction::ExportProcessingRecipeJson => {
@@ -6544,6 +6611,35 @@ impl eframe::App for NmrWorkbenchApp {
             WorkspaceMode::ProteinNmr => {
                 egui::Panel::top("top_controls_panel").show(ui, |ui| {
                     self.draw_top_bar(ui);
+                    if !self.axis_rescue_notices.is_empty() {
+                        ui.add_space(3.0);
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(72, 46, 8))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(234, 179, 8)))
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Axis Rescue Applied:")
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(254, 240, 138)),
+                                    );
+                                    for msg in &self.axis_rescue_notices {
+                                        ui.label(
+                                            egui::RichText::new(msg)
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(254, 249, 195)),
+                                        );
+                                    }
+                                    ui.checkbox(&mut self.enable_axis_rescue, "Enable Axis Rescue");
+                                    if ui.small_button("Dismiss").clicked() {
+                                        self.axis_rescue_notices.clear();
+                                    }
+                                });
+                            });
+                    }
                     ui.add_space(4.0);
                     self.draw_sequence_ribbon(ui);
                 });

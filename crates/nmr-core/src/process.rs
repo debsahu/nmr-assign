@@ -197,6 +197,61 @@ impl Default for NusIstConfig {
     }
 }
 
+/// Compact serializable audit record for empirical 3D indirect-axis `{sign, fold}` verification
+/// against a `2D 15N-HSQC` (`docs/specs/11-fid-processing.md` §1.5; `13.3:P1-1`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AxisRescueAuditRecord {
+    pub experiment: String,
+    pub selected: NamedAxisHypothesis,
+    pub enabled: bool,
+    pub applied: bool,
+    pub polarity_flipped: bool,
+    pub ln_bayes_factor_vs_canonical: f64,
+    pub canonical_matched_fraction: f64,
+    pub selected_matched_fraction: f64,
+}
+
+impl AxisRescueAuditRecord {
+    pub fn from_verification(
+        experiment: impl Into<String>,
+        ver: &AxisHypothesisVerification,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            experiment: experiment.into(),
+            selected: ver.selected,
+            enabled,
+            applied: ver.applied,
+            polarity_flipped: ver.polarity_flipped,
+            ln_bayes_factor_vs_canonical: ver.ln_bayes_factor_vs_canonical,
+            canonical_matched_fraction: ver.canonical_matched_fraction,
+            selected_matched_fraction: ver.selected_matched_fraction,
+        }
+    }
+
+    /// Returns a standardized `warning:` diagnostic whenever a non-canonical 3D axis transform
+    /// or polarity flip was applied to a cube (`13.3:P1-1`).
+    pub fn warning_message(&self) -> Option<String> {
+        if self.applied || self.polarity_flipped {
+            Some(format!(
+                "warning: [axis-rescue] applied non-canonical 3D axis transform {:?} on {} (ln_BF={:.2}, matched_HSQC={:.1}% -> {:.1}%, polarity_flipped={}); pass --no-axis-rescue (or enable_axis_rescue=false) to disable",
+                self.selected,
+                self.experiment,
+                self.ln_bayes_factor_vs_canonical,
+                self.canonical_matched_fraction * 100.0,
+                self.selected_matched_fraction * 100.0,
+                self.polarity_flipped,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+fn default_axis_rescue_enabled() -> bool {
+    true
+}
+
 /// Complete deterministic processing recipe for 1D, 2D, or 3D FIDs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProcessingRecipe {
@@ -204,6 +259,12 @@ pub struct ProcessingRecipe {
     pub dims: Vec<DimRecipe>,
     /// NUS IST/FISTA reconstruction parameters (populated when `nus_mask.is_some()`, or used as fallback if NUS).
     pub nus: Option<NusIstConfig>,
+    /// Enable empirical `{sign, fold}` indirect-axis likelihood rescue against `2D 15N-HSQC` (`default = true`; `--no-axis-rescue` sets `false`).
+    #[serde(default = "default_axis_rescue_enabled")]
+    pub enable_axis_rescue: bool,
+    /// Provenance audit record populated when 3D `(1H, 15N)` registration evaluates `{sign, fold}` axis hypotheses against `2D 15N-HSQC`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis_rescue_audit: Option<AxisRescueAuditRecord>,
 }
 
 impl DimRecipe {
@@ -389,6 +450,8 @@ impl ProcessingRecipe {
         Self {
             dims: vec![DimRecipe::from_axis_meta(&fid.axis_x, 0)],
             nus: None,
+            enable_axis_rescue: true,
+            axis_rescue_audit: None,
         }
     }
 
@@ -399,6 +462,8 @@ impl ProcessingRecipe {
                 DimRecipe::from_axis_meta(&fid.axis_y, 1),
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+            enable_axis_rescue: true,
+            axis_rescue_audit: None,
         };
         let axes = [&fid.axis_x, &fid.axis_y];
         if fid.vendor == FidVendor::Varian {
@@ -429,6 +494,8 @@ impl ProcessingRecipe {
                 DimRecipe::from_axis_meta(&fid.axis_z, 2),
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
+            enable_axis_rescue: true,
+            axis_rescue_audit: None,
         };
         let axes = [&fid.axis_x, &fid.axis_y, &fid.axis_z];
         if fid.vendor == FidVendor::Varian {
@@ -500,6 +567,17 @@ impl ProcessingRecipe {
     /// Builder helper to toggle indirect Mirror-Image Linear Prediction.
     pub fn with_linear_prediction(mut self, enabled: bool) -> Self {
         self.set_linear_prediction(enabled);
+        self
+    }
+
+    /// Enable or disable empirical `{sign, fold}` indirect-axis likelihood rescue (`--no-axis-rescue`).
+    pub fn set_axis_rescue(&mut self, enabled: bool) {
+        self.enable_axis_rescue = enabled;
+    }
+
+    /// Builder helper to toggle empirical `{sign, fold}` indirect-axis likelihood rescue.
+    pub fn with_axis_rescue(mut self, enabled: bool) -> Self {
+        self.enable_axis_rescue = enabled;
         self
     }
 
@@ -3728,6 +3806,24 @@ pub fn register_3d_hn_to_hsqc_2d(
     max_dh_ppm: f64,
     max_dn_ppm: f64,
 ) -> (f64, f64) {
+    let (dh, dn, _) =
+        register_3d_hn_to_hsqc_2d_with_audit(spec_3d, hsqc_2d, max_dh_ppm, max_dn_ppm, true);
+    (dh, dn)
+}
+
+/// Align a 3D `(1H, 15N, 13C)` cube to a 2D `15N-HSQC` while returning a full
+/// [`AxisRescueAuditRecord`] (`13.3:P1-1`). When `enable_axis_rescue` is `true` and a
+/// non-canonical `{sign, fold}` hypothesis beats `Canonical` by `>= MIN_AXIS_RESCUE_LN_BF`,
+/// applies the transform in-place and emits a loud `warning:` line on `stderr`; when
+/// `enable_axis_rescue` is `false` (`--no-axis-rescue`), evaluates the diagnostic scores
+/// read-only without mutating the 3D axes (`applied = false`).
+pub fn register_3d_hn_to_hsqc_2d_with_audit(
+    spec_3d: &mut Spectrum3D,
+    hsqc_2d: &Spectrum2D,
+    max_dh_ppm: f64,
+    max_dn_ppm: f64,
+    enable_axis_rescue: bool,
+) -> (f64, f64, Option<AxisRescueAuditRecord>) {
     let nx3 = spec_3d.axis_x.size;
     let ny3 = spec_3d.axis_y.size;
     let nz3 = spec_3d.axis_z.size;
@@ -3741,14 +3837,24 @@ pub fn register_3d_hn_to_hsqc_2d(
         || max_dh_ppm <= 0.0
         || max_dn_ppm <= 0.0
     {
-        return (0.0, 0.0);
+        return (0.0, 0.0, None);
     }
 
     // 0. Empirical `{sign, fold}` indirect-axis likelihood verification against `hsqc_2d`
-    //    (`docs/specs/11-fid-processing.md` §1.5): rescues inverted (`REVERSE`) or half-SW-shifted
-    //    (`States` <-> `States-TPPI`) indirect 15N/13C axes when log-Bayes factor exceeds
-    //    `MIN_AXIS_RESCUE_LN_BF` (`12.0` nats), leaving canonical well-referenced cubes untouched.
-    let _ = crate::pulprog::verify_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None);
+    //    (`docs/specs/11-fid-processing.md` §1.5; `13.3:P1-1`): rescues inverted (`REVERSE`) or
+    //    half-SW-shifted (`States` <-> `States-TPPI`) indirect 15N/13C axes when log-Bayes factor
+    //    exceeds `MIN_AXIS_RESCUE_LN_BF` (`12.0` nats) and `enable_axis_rescue` is `true`,
+    //    recording full provenance and emitting a `stderr` warning whenever a transform fires.
+    let ver = if enable_axis_rescue {
+        crate::pulprog::verify_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None)
+    } else {
+        crate::pulprog::evaluate_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None)
+    };
+    let audit =
+        AxisRescueAuditRecord::from_verification(spec_3d.exp.clone(), &ver, enable_axis_rescue);
+    if let Some(warn_msg) = audit.warning_message() {
+        eprintln!("{warn_msg}");
+    }
 
     // 1. Build 2D `(15N, 1H)` max-abs sky-projection of `spec_3d` (supports both AllPositive & Biphasic cubes)
     let plane3 = ny3 * nx3;
@@ -3763,7 +3869,7 @@ pub fn register_3d_hn_to_hsqc_2d(
     }
     let max3 = proj.iter().copied().fold(0.0_f64, f64::max);
     if max3 <= 0.0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     let mut scratch = proj.clone();
     let med3 = median_in_place(&mut scratch);
@@ -3794,7 +3900,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         }
     }
     if pts3.len() < 4 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     pts3.sort_by(|a, b| b.0.total_cmp(&a.0));
     pts3.truncate(256);
@@ -3806,7 +3912,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         .map(|&v| v as f64)
         .fold(0.0_f64, f64::max);
     if max2 <= 0.0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     let mut scratch2: Vec<f64> = hsqc_2d.data.iter().map(|&v| v as f64).collect();
     let med2 = median_in_place(&mut scratch2);
@@ -3836,7 +3942,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         }
     }
     if pts2.len() < 4 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
     pts2.sort_by(|a, b| b.0.total_cmp(&a.0));
     pts2.truncate(256);
@@ -3857,7 +3963,7 @@ pub fn register_3d_hn_to_hsqc_2d(
         }
     }
     if pairs.is_empty() {
-        return (0.0, 0.0);
+        return (0.0, 0.0, Some(audit));
     }
 
     let inv_vh = 1.0 / (sig_h * sig_h);
@@ -3915,9 +4021,9 @@ pub fn register_3d_hn_to_hsqc_2d(
     if best_score > 0.0 && best_score > zero_score * 1.08 + 1e-6 {
         spec_3d.axis_x.first_ppm += best_dh;
         spec_3d.axis_y.first_ppm += best_dn;
-        (best_dh, best_dn)
+        (best_dh, best_dn, Some(audit))
     } else {
-        (0.0, 0.0)
+        (0.0, 0.0, Some(audit))
     }
 }
 

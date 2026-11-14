@@ -17,7 +17,8 @@ use nmr_core::classify::{
 };
 use nmr_core::fid::{read_bruker_pseudo3d_planes_2d, read_fid_2d, read_fid_3d, QuadMode};
 use nmr_core::process::{
-    process_fid_2d, process_fid_3d, register_3d_hn_to_hsqc_2d, ProcessingRecipe,
+    process_fid_2d, process_fid_3d, register_3d_hn_to_hsqc_2d,
+    register_3d_hn_to_hsqc_2d_with_audit, AxisRescueAuditRecord, ProcessingRecipe,
 };
 use nmr_core::pulprog::{
     apply_indirect_axis_transform_3d, decode_nuslist_str, evaluate_3d_axis_hypotheses_against_hsqc,
@@ -4796,4 +4797,168 @@ fn test_conditional_real_dev_cisd3_pulprog_and_canonical_non_corruption() {
         ver_rescued.canonical_matched_fraction,
         ver_rescued.selected_matched_fraction
     );
+}
+
+// ============================================================================
+// Test 6 (`13.3:P1-1`): Axis-Rescue Audit Record, Recipe/NEF/Report Provenance,
+// `stderr` Warning Format, and `--no-axis-rescue` Opt-Out
+// ============================================================================
+
+#[test]
+fn test_p1_1_axis_rescue_audit_record_recipe_nef_report_and_opt_out() {
+    use nmr_core::nmrstar::Reference;
+    use nmr_core::report::{generate_quality_report_html, ReportInput};
+    use nmr_core::session::{read_session_nef_str, write_session_nef_str, WorkbenchSessionState};
+    use std::collections::BTreeMap;
+
+    let ax_h = AxisPpm {
+        label: "1H".to_string(),
+        size: 96,
+        first_ppm: 10.5,
+        step_ppm: -4.5 / 96.0,
+        obs_mhz: 600.13,
+    };
+    let ax_n = AxisPpm {
+        label: "15N".to_string(),
+        size: 64,
+        first_ppm: 134.0,
+        step_ppm: -32.0 / 64.0,
+        obs_mhz: 60.81,
+    };
+    let ax_co = AxisPpm {
+        label: "13C".to_string(),
+        size: 64,
+        first_ppm: 184.0,
+        step_ppm: -16.0 / 64.0,
+        obs_mhz: 150.90,
+    };
+
+    let mut hsqc = Spectrum2D {
+        name: "p1_1_hsqc".to_string(),
+        axis_x: ax_h.clone(),
+        axis_y: ax_n.clone(),
+        data: (0..96 * 64)
+            .map(|i| deterministic_noise(301, i) * 1.1)
+            .collect(),
+    };
+    let mut hnco_clean = Spectrum3D {
+        name: "p1_1_hnco".to_string(),
+        exp: "HNCO".to_string(),
+        axis_x: ax_h,
+        axis_y: ax_n,
+        axis_z: ax_co,
+        data: (0..96 * 64 * 64)
+            .map(|i| deterministic_noise(302, i) * 1.2)
+            .collect(),
+    };
+    for k in 0..32 {
+        let h_k = 6.80 + ((k % 8) as f64) * 0.36 + ((k / 8) as f64) * 0.05;
+        let n_k = 107.0 + ((k / 8) as f64) * 6.0 + ((k % 8) as f64) * 0.65;
+        let co_k = 172.5 + ((k % 7) as f64) * 1.1;
+        add_gaussian_2d(&mut hsqc, h_k, n_k, 130.0, 0.030, 0.30);
+        add_gaussian_3d(&mut hnco_clean, h_k, n_k, co_k, 120.0, 0.030, 0.30, 0.24);
+    }
+
+    // 1. Canonical cube -> audit record emitted with `Canonical`, `applied == false`, `warning_message() == None`.
+    let mut hnco_canon_test = hnco_clean.clone();
+    let (_, _, audit_canon_opt) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut hnco_canon_test, &hsqc, 0.08, 0.60, true);
+    let audit_canon = audit_canon_opt.expect("audit record emitted on canonical 3D cube");
+    assert_eq!(audit_canon.selected, NamedAxisHypothesis::Canonical);
+    assert!(audit_canon.enabled);
+    assert!(!audit_canon.applied);
+    assert!(!audit_canon.polarity_flipped);
+    assert!(audit_canon.warning_message().is_none());
+
+    // 2. Corrupt `15N` by `HalfSwShift`:
+    let mut hnco_corrupted = hnco_clean.clone();
+    apply_indirect_axis_transform_3d(
+        &mut hnco_corrupted,
+        AxisTransformOp::HalfSwShift,
+        AxisTransformOp::Canonical,
+        Some("HNCO"),
+        false,
+    );
+    let corrupted_snapshot = hnco_corrupted.data.clone();
+
+    // 2a. With `enable_axis_rescue == false` (`--no-axis-rescue`), cube is NEVER mutated!
+    let mut hnco_opt_out = hnco_corrupted.clone();
+    let (dh_off, dn_off, audit_off_opt) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut hnco_opt_out, &hsqc, 0.08, 0.60, false);
+    assert_eq!(
+        hnco_opt_out.data, corrupted_snapshot,
+        "opt-out (`enable_axis_rescue = false`) must not mutate 3D cube intensities"
+    );
+    let _ = (dh_off, dn_off);
+    let audit_off = audit_off_opt.expect("audit record emitted even when opt-out is set");
+    assert!(!audit_off.enabled);
+    assert!(!audit_off.applied);
+    assert!(audit_off.warning_message().is_none());
+
+    // 2b. With `enable_axis_rescue == true` (default), rescue applies and emits full provenance!
+    let mut hnco_rescued = hnco_corrupted;
+    let (_, _, audit_on_opt) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut hnco_rescued, &hsqc, 0.08, 0.60, true);
+    let audit_on: AxisRescueAuditRecord =
+        audit_on_opt.expect("audit record emitted when axis rescue applies");
+    assert_eq!(audit_on.experiment, "HNCO");
+    assert_eq!(audit_on.selected, NamedAxisHypothesis::HalfSwShiftN);
+    assert!(audit_on.enabled);
+    assert!(audit_on.applied);
+    assert!(audit_on.ln_bayes_factor_vs_canonical >= MIN_AXIS_RESCUE_LN_BF);
+    assert!(audit_on.canonical_matched_fraction < 0.25);
+    assert!(audit_on.selected_matched_fraction > 0.85);
+    let warn_str = audit_on
+        .warning_message()
+        .expect("applied rescue must produce warning_message()");
+    assert!(
+        warn_str.starts_with("warning: [axis-rescue]"),
+        "unexpected warning format: {warn_str}"
+    );
+    assert!(warn_str.contains("HalfSwShiftN"));
+
+    // 3. Round-trip provenance through `ProcessingRecipe` JSON AND NEF `WorkbenchSessionState`!
+    let mut recipe = ProcessingRecipe {
+        dims: Vec::new(),
+        nus: None,
+        enable_axis_rescue: true,
+        axis_rescue_audit: Some(audit_on.clone()),
+    };
+    let recipe_json = recipe.to_json_pretty().expect("serialize recipe JSON");
+    assert!(recipe_json.contains("\"axis_rescue_audit\""));
+    assert!(recipe_json.contains("\"HalfSwShiftN\""));
+    let recipe_back = ProcessingRecipe::from_json_str(&recipe_json).expect("deserialize recipe");
+    assert_eq!(recipe_back.axis_rescue_audit.as_ref(), Some(&audit_on));
+    recipe.set_axis_rescue(false);
+    assert!(!recipe.enable_axis_rescue);
+
+    let mut session = WorkbenchSessionState::new("p1_1_nef_test", vec!["ALA".to_string()]);
+    session
+        .processing_recipes
+        .insert("HNCO".to_string(), recipe_back);
+    let nef_txt = write_session_nef_str(&session);
+    let restored = read_session_nef_str(&nef_txt).expect("decode session from NEF");
+    assert_eq!(
+        restored
+            .processing_recipes
+            .get("HNCO")
+            .and_then(|r| r.axis_rescue_audit.as_ref()),
+        Some(&audit_on),
+        "NEF round-trip must preserve AxisRescueAuditRecord losslessly"
+    );
+
+    // 4. Verify HTML Quality Report provenance section renders the applied transform!
+    let mut conf_map = BTreeMap::new();
+    conf_map.insert(0, 0.95);
+    conf_map.insert(1, 0.92);
+    let mut rep = ReportInput::new(
+        "p1_1_report",
+        Reference::new(vec!["ALA".into(), "GLY".into()], vec![1, 2]),
+        conf_map,
+    );
+    rep.axis_rescue_records = vec![audit_canon, audit_on];
+    let html = generate_quality_report_html(&rep);
+    assert!(html.contains("id=\"axis-rescue-provenance\""));
+    assert!(html.contains("HalfSwShiftN"));
+    assert!(html.contains("[Non-canonical transform applied]"));
 }

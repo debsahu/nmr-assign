@@ -24,7 +24,7 @@ use nmr_core::picker::{
     corroborated_re_pick_3d, pick_hsqc_2d, CorroboratedRepickConfig, PickerConfig, StripBank3D,
 };
 use nmr_core::priors::{DetailedReferenceOffsets, NucleusOffsetFit, OffsetFitStatus, ShiftOffsets};
-use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d};
+use nmr_core::process::{process_fid_dir_2d, process_fid_dir_3d, AxisRescueAuditRecord};
 use nmr_core::qc::{DatasetQcReport, ProteinReliabilityCurve, STANDARD_CPU_CALIBRATED_RUNS};
 use nmr_core::solver::ScoreConfig;
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
@@ -33,7 +33,8 @@ use nmr_core::spinsystems::{build_spin_systems, Tolerances};
 use crate::{
     evaluate_prediction_against_truth, execute_assignment_workflow, load_priors,
     parse_bounded_runs, parse_bounded_steps, parse_engine, parse_solver, parse_truth_auto,
-    register_3d_hn_to_hsqc_adaptive, resolve_solver_engine, version_string, EngineKind, SolverKind,
+    register_3d_hn_to_hsqc_adaptive_with_audit, resolve_solver_engine, version_string, EngineKind,
+    SolverKind,
 };
 
 // ============================================================================
@@ -1508,6 +1509,7 @@ pub struct EntryFailureDiagnostic {
 pub struct EntrySuccessMetrics {
     pub seeds: usize,
     pub discovered_experiments: Vec<(String, String)>,
+    pub axis_rescue_audits: Vec<AxisRescueAuditRecord>,
     pub n_hsqc_roots: usize,
     pub n_total_peaks: usize,
     pub assignable_per_seed: usize,
@@ -1591,6 +1593,7 @@ pub struct RealBenchmarkConfig {
     pub hc_threshold: f64,
     pub no_crop: bool,
     pub lp: bool,
+    pub no_axis_rescue: bool,
     pub json_out: Option<PathBuf>,
     pub verbose: bool,
 }
@@ -1827,13 +1830,21 @@ pub fn run_real_benchmark_with_loaders(
 
         // 4. Process each 3D triple-resonance raw FID one cube at a time & pick strips
         let mut strip_bank = StripBank3D::new();
+        let mut axis_rescue_audits: Vec<AxisRescueAuditRecord> = Vec::new();
         for texp in &triple_exps {
             let is_required =
                 required_set.is_empty() || required_set.contains(texp.exp_type.as_str());
             match load_fid_3d(&texp.dir, &texp.exp_type) {
                 Ok(mut spec3d) => {
-                    // Align 3D HN plane to HSQC via two-stage rigid (dH, dN) registration
-                    let (dh, dn) = register_3d_hn_to_hsqc_adaptive(&mut spec3d, &hsqc_spec);
+                    // Align 3D HN plane to HSQC via two-stage rigid (dH, dN) registration + audited `{sign, fold}` check (`13.3:P1-1`)
+                    let (dh, dn, audit_opt) = register_3d_hn_to_hsqc_adaptive_with_audit(
+                        &mut spec3d,
+                        &hsqc_spec,
+                        !cfg.no_axis_rescue,
+                    );
+                    if let Some(audit) = audit_opt {
+                        axis_rescue_audits.push(audit);
+                    }
                     if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
                         eprintln!(
                             "[register] {}: aligned {} to HSQC: dH={:+.4} ppm, dN={:+.3} ppm",
@@ -2021,6 +2032,7 @@ pub fn run_real_benchmark_with_loaders(
             outcome: EntryBenchmarkOutcome::Succeeded(Box::new(EntrySuccessMetrics {
                 seeds: num_seeds,
                 discovered_experiments: used_exps,
+                axis_rescue_audits,
                 n_hsqc_roots: roots.len(),
                 n_total_peaks: all_peaks.len(),
                 assignable_per_seed,
@@ -2918,14 +2930,33 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let audits_json = m
+                    .axis_rescue_audits
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{{\"experiment\":\"{}\",\"selected\":\"{:?}\",\"enabled\":{},\"applied\":{},\"polarity_flipped\":{},\"ln_bayes_factor_vs_canonical\":{:.4},\"canonical_matched_fraction\":{:.6},\"selected_matched_fraction\":{:.6}}}",
+                            json_escape(&a.experiment),
+                            a.selected,
+                            a.enabled,
+                            a.applied,
+                            a.polarity_flipped,
+                            a.ln_bayes_factor_vs_canonical,
+                            a.canonical_matched_fraction,
+                            a.selected_matched_fraction,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let entry_hcp_json = match m.reliability.hc_precision {
                     Some(v) => format!("{v:.6}"),
                     None => "null".to_string(),
                 };
                 j.push_str(&format!(
-                    "      \"status\": \"OK\",\n      \"qc_verdict\": \"{}\",\n      \"discovered_experiments\": [{}],\n      \"hsqc_roots\": {},\n      \"total_peaks\": {},\n      \"assignable_per_seed\": {},\n      \"accuracy\": {:.6},\n      \"recall\": {:.6},\n      \"hc_abstained\": {},\n      \"hc_precision\": {},\n      \"hc_status\": \"{}\",\n      \"hc_recall\": {:.6},\n      \"global_offsets_ppm\": {{ \"H\": {:.4}, \"N\": {:.4}, \"CA\": {:.4}, \"CB\": {:.4}, \"C\": {:.4} }},\n      \"detailed_offsets_compact\": \"{}\",\n      \"detailed_offsets\": {},\n      \"prior_detailed_offsets\": {},\n      \"qc_report\": {},\n      \"reliability_curve\": {},\n      \"elapsed_secs\": {:.3}\n",
+                    "      \"status\": \"OK\",\n      \"qc_verdict\": \"{}\",\n      \"discovered_experiments\": [{}],\n      \"axis_rescue_audits\": [{}],\n      \"hsqc_roots\": {},\n      \"total_peaks\": {},\n      \"assignable_per_seed\": {},\n      \"accuracy\": {:.6},\n      \"recall\": {:.6},\n      \"hc_abstained\": {},\n      \"hc_precision\": {},\n      \"hc_status\": \"{}\",\n      \"hc_recall\": {:.6},\n      \"global_offsets_ppm\": {{ \"H\": {:.4}, \"N\": {:.4}, \"CA\": {:.4}, \"CB\": {:.4}, \"C\": {:.4} }},\n      \"detailed_offsets_compact\": \"{}\",\n      \"detailed_offsets\": {},\n      \"prior_detailed_offsets\": {},\n      \"qc_report\": {},\n      \"reliability_curve\": {},\n      \"elapsed_secs\": {:.3}\n",
                     m.qc_report.verdict.as_str(),
                     exps_json,
+                    audits_json,
                     m.n_hsqc_roots,
                     m.n_total_peaks,
                     m.assignable_per_seed,
@@ -2970,6 +3001,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
     let mut hc_threshold = 0.8f64;
     let mut no_crop = false;
     let mut lp = false;
+    let mut no_axis_rescue = false;
     let mut json_out: Option<PathBuf> = None;
     let mut verbose = false;
 
@@ -3059,6 +3091,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
             }
             "--no-crop" => no_crop = true,
             "--lp" => lp = true,
+            "--no-axis-rescue" => no_axis_rescue = true,
             "-v" | "--verbose" => verbose = true,
             other => return Err(format!("unknown real-benchmark flag {other:?}")),
         }
@@ -3085,6 +3118,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
         hc_threshold,
         no_crop,
         lp,
+        no_axis_rescue,
         json_out,
         verbose,
     })
@@ -3319,6 +3353,7 @@ mod tests {
             hc_threshold: 0.8,
             no_crop: false,
             lp: false,
+            no_axis_rescue: false,
             json_out: Some(dir.join("summary.json")),
             verbose: false,
         };
@@ -3663,6 +3698,7 @@ mod tests {
                     detailed_offsets: det_mixed,
                     ..DatasetQcReport::default()
                 },
+                axis_rescue_audits: Vec::new(),
                 reliability: rel_good,
                 predictions: preds_good,
                 elapsed_secs: 0.5,
@@ -3700,6 +3736,7 @@ mod tests {
                     reasons: vec!["catastrophic 3D strip support (12.0% < 25.0%)".into()],
                     ..DatasetQcReport::default()
                 },
+                axis_rescue_audits: Vec::new(),
                 reliability: rel_abstain,
                 predictions: preds_abstain,
                 elapsed_secs: 0.3,
@@ -3738,6 +3775,7 @@ mod tests {
                     reasons: vec!["elevated HSQC root multiplicity (1.60x)".into()],
                     ..DatasetQcReport::default()
                 },
+                axis_rescue_audits: Vec::new(),
                 reliability: rel_wrong_hc,
                 predictions: preds_wrong_hc,
                 elapsed_secs: 0.4,
@@ -3809,15 +3847,17 @@ mod tests {
         use nmr_core::qc::{
             apply_evo_graph_calibration_map, apply_standard_calibration_map,
             apply_standard_gpu_calibration_map, evaluate_dataset_qc,
-            evaluate_seed_predictions_with_gate, fit_isotonic_monotone_knots,
-            fit_isotonic_monotone_knots_beta, fit_isotonic_monotone_knots_shrunk_toward_beta,
-            fit_protein_hc_gate_config_multi_engine, has_weak_likelihood_large_offset,
-            is_unconverged_solution_margin, select_gpu_shrinkage_weight_nested_lopo,
-            DatasetQcVerdict, ProteinHcGateConfig, ProteinHcTrainingSeed, ProteinReliabilityCurve,
-            CANONICAL_CALIBRATION_GRID_12, CANONICAL_CALIBRATION_LAPLACE_PRIOR,
-            CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT, CANONICAL_PROTEIN_HC_GATE,
-            QC_MIN_LARGE_OFFSET_GAIN_PER_OBS, QC_STRONG_BELIEF_THRESHOLD, STANDARD_CPU_PRIOR_ALPHA,
-            STANDARD_CPU_PRIOR_BETA, STANDARD_GPU_PRIOR_ALPHA, STANDARD_GPU_PRIOR_BETA,
+            evaluate_protein_hc_gate_objective_multi_engine, evaluate_seed_predictions_with_gate,
+            fit_isotonic_monotone_knots, fit_isotonic_monotone_knots_beta,
+            fit_isotonic_monotone_knots_shrunk_toward_beta,
+            fit_protein_hc_gate_config_multi_engine, fit_protein_hc_gate_config_with_grids,
+            has_weak_likelihood_large_offset, is_unconverged_solution_margin,
+            select_gpu_shrinkage_weight_nested_lopo, DatasetQcVerdict, ProteinHcGateConfig,
+            ProteinHcTrainingSeed, ProteinReliabilityCurve, CANONICAL_CALIBRATION_GRID_12,
+            CANONICAL_CALIBRATION_LAPLACE_PRIOR, CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT,
+            CANONICAL_PROTEIN_HC_GATE, QC_MIN_LARGE_OFFSET_GAIN_PER_OBS,
+            QC_STRONG_BELIEF_THRESHOLD, STANDARD_CPU_PRIOR_ALPHA, STANDARD_CPU_PRIOR_BETA,
+            STANDARD_GPU_PRIOR_ALPHA, STANDARD_GPU_PRIOR_BETA,
         };
         use nmr_core::solver::{assign_uncalibrated, prepare_scoring_priors, AnnealConfig};
         use nmr_gpu::GpuEngine;
@@ -3957,7 +3997,8 @@ mod tests {
                 if let Ok((mut spec3d, _)) =
                     process_fid_dir_3d(&texp.dir, &texp.exp_type, false, false)
                 {
-                    let _ = register_3d_hn_to_hsqc_adaptive(&mut spec3d, &hsqc_spec);
+                    let _ =
+                        register_3d_hn_to_hsqc_adaptive_with_audit(&mut spec3d, &hsqc_spec, true);
                     let pks = strip_bank.pick_and_record_3d(&spec3d, &roots, &picker_cfg);
                     all_peaks.extend(pks);
                     used_exps.push((texp.exp_type.clone(), texp.rel_path.clone()));
@@ -4655,6 +4696,117 @@ mod tests {
             );
         }
 
+        // 13.1:P1-2 — Log all 13 per-fold refit `ProteinHcGateConfig`s + nested `gpu_w` AND
+        // evaluate an extended diagnostic grid reaching `[0.0, 0.0, 0.0, 0.0]` below the
+        // bounded `CANDIDATE_GATE_*` floors `[0.45, 0.04, 0.25, 0.06]`!
+        println!(
+            "\n================ 13-FOLD PER-FOLD REFIT GATE & SHRINKAGE AUDIT ================"
+        );
+        for (hold_idx, fit) in outer_fits.iter().enumerate() {
+            let (ref hold_id, ref hold_name, _, _) = evo_by_prot[hold_idx];
+            let g = fit.unified_gate;
+            println!(
+                "  [FOLD {:02}] held_out={:16} ({:12}) | gpu_w={:.2} | gate={{ c35: {:.2}, hcf: {:.2}, cmarg: {:.2}, mpen: {:.2} }}",
+                hold_idx,
+                hold_id,
+                hold_name,
+                fit.gpu_w,
+                g.min_corroborated_connectivity,
+                g.min_hc_call_fraction,
+                g.min_crowded_solution_margin,
+                g.multiplicity_penalty_floor,
+            );
+        }
+
+        {
+            let full_evo_prots: Vec<Vec<ProteinHcTrainingSeed>> =
+                evo_by_prot.iter().map(|(_, _, _, s)| s.clone()).collect();
+            let full_cpu_prots: Vec<Vec<ProteinHcTrainingSeed>> =
+                std_by_prot.iter().map(|(_, _, _, s)| s.clone()).collect();
+            let full_gpu_prots: Vec<Vec<ProteinHcTrainingSeed>> = std_gpu_by_prot
+                .iter()
+                .map(|(_, _, _, s)| s.clone())
+                .collect();
+            let full_slices = [
+                (full_evo_prots.as_slice(), full_fit.evo_knots.as_slice()),
+                (full_cpu_prots.as_slice(), full_fit.cpu_knots.as_slice()),
+                (full_gpu_prots.as_slice(), full_fit.gpu_knots.as_slice()),
+            ];
+            let ext_c35 = &[0.00, 0.20, 0.35, 0.45, 0.50, 0.55, 0.60, 0.65];
+            let ext_hcf = &[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12];
+            let ext_cmarg = &[0.00, 0.15, 0.25, 0.35, 0.45, 0.55];
+            let ext_mpen = &[0.00, 0.03, 0.06, 0.08, 0.10, 0.12];
+            let zero_gate = ProteinHcGateConfig {
+                min_corroborated_connectivity: 0.0,
+                min_hc_call_fraction: 0.0,
+                min_crowded_solution_margin: 0.0,
+                multiplicity_penalty_floor: 0.0,
+            };
+            let (z_ece10, z_hcps, z_capped) =
+                evaluate_protein_hc_gate_objective_multi_engine(&full_slices, &zero_gate);
+            let (c_ece10, c_hcps, c_capped) =
+                evaluate_protein_hc_gate_objective_multi_engine(&full_slices, &full_canonical_gate);
+            let (ext_occam_gate, ext_occam_obj) = fit_protein_hc_gate_config_with_grids(
+                &full_slices,
+                ext_c35,
+                ext_hcf,
+                ext_cmarg,
+                ext_mpen,
+                1e-4,
+            );
+            let (eo_ece10, eo_hcps, eo_capped) =
+                evaluate_protein_hc_gate_objective_multi_engine(&full_slices, &ext_occam_gate);
+            let (ext_raw_gate, ext_raw_obj) = fit_protein_hc_gate_config_with_grids(
+                &full_slices,
+                ext_c35,
+                ext_hcf,
+                ext_cmarg,
+                ext_mpen,
+                0.0,
+            );
+            let (er_ece10, er_hcps, er_capped) =
+                evaluate_protein_hc_gate_objective_multi_engine(&full_slices, &ext_raw_gate);
+            println!(
+                "\n================ EXTENDED GATE FLOOR DIAGNOSTIC (FULL-13 DEV) ================"
+            );
+            println!(
+                "  [GATE DIAG zero_floor] gate={{ c35: 0.00, hcf: 0.00, cmarg: 0.00, mpen: 0.00 }} | mean_ECE10={z_ece10:.6} | hcps=[{:.2}%, {:.2}%, {:.2}%] | capped_seeds={z_capped}",
+                z_hcps[0] * 100.0,
+                z_hcps[1] * 100.0,
+                z_hcps[2] * 100.0,
+            );
+            println!(
+                "  [GATE DIAG canonical ] gate={{ c35: {:.2}, hcf: {:.2}, cmarg: {:.2}, mpen: {:.2} }} | mean_ECE10={c_ece10:.6} | hcps=[{:.2}%, {:.2}%, {:.2}%] | capped_seeds={c_capped}",
+                full_canonical_gate.min_corroborated_connectivity,
+                full_canonical_gate.min_hc_call_fraction,
+                full_canonical_gate.min_crowded_solution_margin,
+                full_canonical_gate.multiplicity_penalty_floor,
+                c_hcps[0] * 100.0,
+                c_hcps[1] * 100.0,
+                c_hcps[2] * 100.0,
+            );
+            println!(
+                "  [GATE DIAG ext_occam ] gate={{ c35: {:.2}, hcf: {:.2}, cmarg: {:.2}, mpen: {:.2} }} | obj={ext_occam_obj:.6} | mean_ECE10={eo_ece10:.6} | hcps=[{:.2}%, {:.2}%, {:.2}%] | capped_seeds={eo_capped}",
+                ext_occam_gate.min_corroborated_connectivity,
+                ext_occam_gate.min_hc_call_fraction,
+                ext_occam_gate.min_crowded_solution_margin,
+                ext_occam_gate.multiplicity_penalty_floor,
+                eo_hcps[0] * 100.0,
+                eo_hcps[1] * 100.0,
+                eo_hcps[2] * 100.0,
+            );
+            println!(
+                "  [GATE DIAG ext_unreg ] gate={{ c35: {:.2}, hcf: {:.2}, cmarg: {:.2}, mpen: {:.2} }} | obj={ext_raw_obj:.6} | mean_ECE10={er_ece10:.6} | hcps=[{:.2}%, {:.2}%, {:.2}%] | capped_seeds={er_capped}",
+                ext_raw_gate.min_corroborated_connectivity,
+                ext_raw_gate.min_hc_call_fraction,
+                ext_raw_gate.min_crowded_solution_margin,
+                ext_raw_gate.multiplicity_penalty_floor,
+                er_hcps[0] * 100.0,
+                er_hcps[1] * 100.0,
+                er_hcps[2] * 100.0,
+            );
+        }
+
         let mut summarize_engine_lopo =
             |solver_name: &str,
              by_prot: &[ProtRecord],
@@ -4870,5 +5022,172 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn audit_readonly_3d_axis_hypotheses_dev_and_cold_p13() {
+        use nmr_core::pulprog::{evaluate_3d_axis_hypotheses_against_hsqc, NamedAxisHypothesis};
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        env::set_current_dir(&repo_root).expect("chdir repo_root");
+        let manifest_path = PathBuf::from("data/benchmark/real_manifest.tsv");
+        let manifest_txt = fs::read_to_string(&manifest_path).expect("read real_manifest.tsv");
+        let entries: Vec<RealManifestEntry> = parse_real_manifest_str(&manifest_txt)
+            .expect("parse real_manifest.tsv")
+            .into_iter()
+            .filter(|e| e.split == "dev" || e.cohort == "cold_p13")
+            .collect();
+        let data_root = env::var("NMR_REAL_DATA_DIR")
+            .map(|p| PathBuf::from(p).join("private/bmrb"))
+            .unwrap_or_else(|_| PathBuf::from("data/private/bmrb"));
+
+        let mut json_entries = Vec::new();
+        let mut total_cubes_evaluated = 0usize;
+        let mut total_would_apply = 0usize;
+
+        for entry in &entries {
+            let loc = resolve_local_entry_paths(&entry.bmrb_id, &data_root, true)
+                .unwrap_or_else(|p| panic!("missing entry {}: {p:?}", entry.bmrb_id));
+            let (discovered, _) = discover_entry_experiments(&loc.entry_dir, Some(entry.field_mhz))
+                .expect("discover_entry_experiments");
+            let required_set: BTreeSet<&str> =
+                entry.experiments.iter().map(String::as_str).collect();
+            let Some(hsqc_exp) = discovered.iter().find(|d| d.exp_type == "HSQC") else {
+                panic!("missing HSQC in {}", entry.bmrb_id);
+            };
+            let mut cube_items = Vec::new();
+            let mut entry_status = "OK".to_string();
+            let mut fail_reason: Option<String> = None;
+
+            let hsqc_spec = match process_fid_dir_2d(&hsqc_exp.dir, false, false) {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    entry_status = "PROCESS_FAILED".to_string();
+                    fail_reason = Some(format!("HSQC: {e}"));
+                    println!(
+                        "  [AXIS AUDIT] {:8} {:16} {:12} {:9} | PROCESS_FAILED ({})",
+                        entry.cohort, entry.bmrb_id, entry.protein, "HSQC", e
+                    );
+                    let fail_json = format!("\"{}\"", json_escape(fail_reason.as_deref().unwrap()));
+                    json_entries.push(format!(
+                        "    {{\n      \"bmrb_id\": \"{}\",\n      \"protein\": \"{}\",\n      \"vendor\": \"{}\",\n      \"split\": \"{}\",\n      \"cohort\": \"{}\",\n      \"status\": \"{}\",\n      \"process_failure\": {},\n      \"cubes\": []\n    }}",
+                        json_escape(&entry.bmrb_id),
+                        json_escape(&entry.protein),
+                        json_escape(&entry.vendor),
+                        json_escape(&entry.split),
+                        json_escape(&entry.cohort),
+                        entry_status,
+                        fail_json,
+                    ));
+                    continue;
+                }
+            };
+
+            for texp in discovered.iter().filter(|d| d.exp_type != "HSQC") {
+                let is_required =
+                    required_set.is_empty() || required_set.contains(texp.exp_type.as_str());
+                match process_fid_dir_3d(&texp.dir, &texp.exp_type, false, false) {
+                    Ok((spec3d, _)) => {
+                        // Strictly read-only evaluation — ZERO cube mutation, ZERO solver runs!
+                        let ver = evaluate_3d_axis_hypotheses_against_hsqc(
+                            &spec3d,
+                            &hsqc_spec,
+                            Some(&texp.exp_type),
+                        );
+                        let would_apply = ver.selected != NamedAxisHypothesis::Canonical;
+                        total_cubes_evaluated += 1;
+                        if would_apply {
+                            total_would_apply += 1;
+                        }
+                        let canon_lp = ver
+                            .candidates
+                            .iter()
+                            .find(|c| c.hypothesis == NamedAxisHypothesis::Canonical)
+                            .map(|c| c.ln_posterior)
+                            .unwrap_or(f64::NEG_INFINITY);
+                        let best_non_canon = ver
+                            .candidates
+                            .iter()
+                            .filter(|c| c.hypothesis != NamedAxisHypothesis::Canonical)
+                            .max_by(|a, b| a.ln_posterior.total_cmp(&b.ln_posterior));
+                        let (runner_hyp, runner_ln_bf) = match best_non_canon {
+                            Some(c) => (format!("{:?}", c.hypothesis), c.ln_posterior - canon_lp),
+                            None => ("None".to_string(), 0.0),
+                        };
+                        println!(
+                            "  [AXIS AUDIT] {:8} {:16} {:12} {:9} | selected={:14?} would_apply={:5} ln_BF={:+7.2} | canon_match={:5.1}% -> sel_match={:5.1}% | best_alt={:14} ({:+8.2})",
+                            entry.cohort,
+                            entry.bmrb_id,
+                            entry.protein,
+                            texp.exp_type,
+                            ver.selected,
+                            would_apply,
+                            ver.ln_bayes_factor_vs_canonical,
+                            ver.canonical_matched_fraction * 100.0,
+                            ver.selected_matched_fraction * 100.0,
+                            runner_hyp.as_str(),
+                            runner_ln_bf,
+                        );
+                        cube_items.push(format!(
+                            "        {{ \"experiment\": \"{}\", \"rel_path\": \"{}\", \"selected\": \"{:?}\", \"would_apply\": {}, \"ln_bayes_factor_vs_canonical\": {:.4}, \"canonical_matched_fraction\": {:.6}, \"selected_matched_fraction\": {:.6}, \"best_non_canonical_hypothesis\": \"{}\", \"best_non_canonical_ln_bf\": {:.4} }}",
+                            json_escape(&texp.exp_type),
+                            json_escape(&texp.rel_path),
+                            ver.selected,
+                            would_apply,
+                            ver.ln_bayes_factor_vs_canonical,
+                            ver.canonical_matched_fraction,
+                            ver.selected_matched_fraction,
+                            json_escape(&runner_hyp),
+                            runner_ln_bf,
+                        ));
+                    }
+                    Err(e) => {
+                        if is_required {
+                            entry_status = "PROCESS_FAILED".to_string();
+                            fail_reason = Some(format!("{}: {}", texp.exp_type, e));
+                            println!(
+                                "  [AXIS AUDIT] {:8} {:16} {:12} {:9} | PROCESS_FAILED ({})",
+                                entry.cohort, entry.bmrb_id, entry.protein, texp.exp_type, e
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let fail_json = match fail_reason {
+                Some(ref r) => format!("\"{}\"", json_escape(r)),
+                None => "null".to_string(),
+            };
+            json_entries.push(format!(
+                "    {{\n      \"bmrb_id\": \"{}\",\n      \"protein\": \"{}\",\n      \"vendor\": \"{}\",\n      \"split\": \"{}\",\n      \"cohort\": \"{}\",\n      \"status\": \"{}\",\n      \"process_failure\": {},\n      \"cubes\": [\n{}\n      ]\n    }}",
+                json_escape(&entry.bmrb_id),
+                json_escape(&entry.protein),
+                json_escape(&entry.vendor),
+                json_escape(&entry.split),
+                json_escape(&entry.cohort),
+                entry_status,
+                fail_json,
+                cube_items.join(",\n"),
+            ));
+        }
+
+        let out_json = format!(
+            "{{\n  \"mode\": \"readonly_evaluate_3d_axis_hypotheses_against_hsqc\",\n  \"solver_runs_executed\": 0,\n  \"total_entries\": {},\n  \"total_cubes_evaluated\": {},\n  \"total_rescues_would_apply\": {},\n  \"entries\": [\n{}\n  ]\n}}\n",
+            entries.len(),
+            total_cubes_evaluated,
+            total_would_apply,
+            json_entries.join(",\n"),
+        );
+        let out_path = PathBuf::from("data/private/phase13_w1_axis_rescue_audit.json");
+        fs::write(&out_path, out_json).expect("write phase13_w1_axis_rescue_audit.json");
+        println!(
+            "\n  [AXIS AUDIT SUMMARY] entries={}, cubes_evaluated={}, rescues_would_apply={} -> {}",
+            entries.len(),
+            total_cubes_evaluated,
+            total_would_apply,
+            out_path.display()
+        );
     }
 }

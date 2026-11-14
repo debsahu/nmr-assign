@@ -75,7 +75,8 @@ use nmr_core::priors::{
     one_to_three, sync_detailed_reference_offsets, DetailedReferenceOffsets, Priors, ShiftOffsets,
 };
 use nmr_core::process::{
-    process_fid_2d_mut, process_fid_3d_mut, register_3d_hn_to_hsqc_2d, ProcessingRecipe,
+    process_fid_2d_mut, process_fid_3d_mut, register_3d_hn_to_hsqc_2d_with_audit,
+    AxisRescueAuditRecord, ProcessingRecipe,
 };
 use nmr_core::qc::{
     apply_dataset_qc_to_assignments, evaluate_dataset_qc, DatasetQcReport, DatasetQcVerdict,
@@ -341,21 +342,26 @@ pub(crate) fn parse_bounded_r_bleach(raw: &str) -> Result<f64, String> {
 }
 
 /// Two-stage rigid `(dH, dN)` alignment of a 3D `(1H, 15N, 13C)` spectrum to a 2D `15N`-HSQC:
-/// - Stage 1 runs conservative `(±0.08 ppm H, ±0.60 ppm N)` alignment so well-calibrated
+/// - Stage 1 runs empirical `{sign, fold}` indirect-axis likelihood verification (`enable_axis_rescue`)
+///   plus conservative `(±0.08 ppm H, ±0.60 ppm N)` alignment so well-calibrated
 ///   single-spectrometer suites remain bit-for-bit unchanged.
 /// - Stage 2 triggers strictly when Stage 1 rails against its search boundary (`|dH| >= 0.0795`
 ///   or `|dN| >= 0.595`), allowing cross-spectrometer / cross-temperature `O1` water shifts
-///   (e.g. `5..45 °C` H2O carrier differences up to `±0.24 ppm H`, `±1.20 ppm N`) to converge.
-pub(crate) fn register_3d_hn_to_hsqc_adaptive(
+///   (e.g. `5..45 °C` H2O carrier differences up to `±0.24 ppm H`, `±1.20 ppm N`) to converge
+///   while preserving the Stage-1 [`AxisRescueAuditRecord`] (`13.3:P1-1`).
+pub(crate) fn register_3d_hn_to_hsqc_adaptive_with_audit(
     spec_3d: &mut Spectrum3D,
     hsqc_2d: &Spectrum2D,
-) -> (f64, f64) {
-    let (dh1, dn1) = register_3d_hn_to_hsqc_2d(spec_3d, hsqc_2d, 0.08, 0.60);
+    enable_axis_rescue: bool,
+) -> (f64, f64, Option<AxisRescueAuditRecord>) {
+    let (dh1, dn1, audit1) =
+        register_3d_hn_to_hsqc_2d_with_audit(spec_3d, hsqc_2d, 0.08, 0.60, enable_axis_rescue);
     if dh1.abs() >= 0.0795 || dn1.abs() >= 0.595 {
-        let (dh2, dn2) = register_3d_hn_to_hsqc_2d(spec_3d, hsqc_2d, 0.16, 0.60);
-        (dh1 + dh2, dn1 + dn2)
+        let (dh2, dn2, _) =
+            register_3d_hn_to_hsqc_2d_with_audit(spec_3d, hsqc_2d, 0.16, 0.60, false);
+        (dh1 + dh2, dn1 + dn2, audit1)
     } else {
-        (dh1, dn1)
+        (dh1, dn1, audit1)
     }
 }
 
@@ -2617,6 +2623,7 @@ struct FidCliOpts {
     phase_z: Option<(f64, f64)>,
     hilbert: bool,
     nus_fista: Option<bool>,
+    no_axis_rescue: bool,
 }
 
 fn parse_crop_h_arg(raw: &str) -> Result<[f64; 2], String> {
@@ -2698,6 +2705,9 @@ fn build_recipe_for_fid_2d(fid: &Fid2D, opts: &FidCliOpts) -> Result<ProcessingR
     if let Some(fista) = opts.nus_fista {
         recipe.set_nus_method_fista(fista);
     }
+    if opts.no_axis_rescue {
+        recipe.set_axis_rescue(false);
+    }
     Ok(recipe)
 }
 
@@ -2739,6 +2749,9 @@ fn build_recipe_for_fid_3d(fid: &Fid3D, opts: &FidCliOpts) -> Result<ProcessingR
     if let Some(fista) = opts.nus_fista {
         recipe.set_nus_method_fista(fista);
     }
+    if opts.no_axis_rescue {
+        recipe.set_axis_rescue(false);
+    }
     Ok(recipe)
 }
 
@@ -2773,6 +2786,7 @@ fn recipe_sidecar_for_file(out_file: &Path) -> PathBuf {
 fn cmd_process(args: &[String]) -> Result<(), String> {
     let mut in_dir: Option<PathBuf> = None;
     let mut out_path: Option<PathBuf> = None;
+    let mut hsqc_ref_path: Option<PathBuf> = None;
     let mut exp_arg: Option<String> = None;
     let mut opts = FidCliOpts::default();
 
@@ -2786,6 +2800,12 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
             "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
+            }
+            "--hsqc" => {
+                i += 1;
+                hsqc_ref_path = Some(PathBuf::from(
+                    args.get(i).ok_or("missing value for --hsqc")?,
+                ));
             }
             "--exp" => {
                 i += 1;
@@ -2812,6 +2832,7 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
             "--no-crop" => opts.no_crop = true,
             "--lp" => opts.lp = true,
             "--auto-phase" => opts.auto_phase = true,
+            "--no-axis-rescue" => opts.no_axis_rescue = true,
             "--phase-x" => {
                 i += 1;
                 opts.phase_x = Some(parse_phase_pair_arg(
@@ -2908,7 +2929,27 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
                 .or_else(|| real_benchmark::infer_single_fid_experiment(&in_p))
                 .unwrap_or_else(|| "HNCA".to_string());
             let mut recipe = build_recipe_for_fid_3d(&fid3, &opts)?;
-            let spec = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
+            let mut spec = process_fid_3d_mut(&fid3, &exp, &mut recipe)?;
+            if let Some(ref hp) = hsqc_ref_path {
+                let hsqc_2d = match read_fid_auto(hp) {
+                    Ok(RawFid::Dim2(f2)) => {
+                        let mut r2 = build_recipe_for_fid_2d(&f2, &opts)?;
+                        process_fid_2d_mut(&f2, &mut r2)?
+                    }
+                    _ => load_2d_auto(hp)?,
+                };
+                let (dh, dn, audit) = register_3d_hn_to_hsqc_adaptive_with_audit(
+                    &mut spec,
+                    &hsqc_2d,
+                    recipe.enable_axis_rescue,
+                );
+                recipe.axis_rescue_audit = audit;
+                if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
+                    eprintln!(
+                        "[register] aligned 3D {exp} to HSQC: dH={dh:+.4} ppm, dN={dn:+.3} ppm"
+                    );
+                }
+            }
             let dt = t0.elapsed().as_secs_f64();
             let recipe_out = match ext_low.as_str() {
                 "ft3" | "pipe" => {
@@ -2963,24 +3004,36 @@ fn cmd_process(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn pick_in_memory_spectra(
+type PickedInMemoryWithAudit = (
+    Vec<Peak>,
+    Vec<Peak>,
+    String,
+    Vec<Option<AxisRescueAuditRecord>>,
+);
+
+fn pick_in_memory_spectra_with_audit(
     hsqc_spec: Option<&Spectrum2D>,
     triples: &mut [(String, Spectrum3D)],
     method: &str,
     engine: EngineKind,
     snr: f32,
     prob: f32,
-) -> Result<(Vec<Peak>, Vec<Peak>, String), String> {
+    enable_axis_rescue: bool,
+) -> Result<PickedInMemoryWithAudit, String> {
     // Register each 3D spectrum to the HSQC via rigid (dH, dN) carrier alignment
-    // (cross-correlation of sky-projected HN planes). Conservative bounds guard
-    // against false shifts on well-calibrated single-spectrometer datasets.
+    // (cross-correlation of sky-projected HN planes) + empirical `{sign, fold}` verification (`13.3:P1-1`).
+    let mut audits: Vec<Option<AxisRescueAuditRecord>> = Vec::with_capacity(triples.len());
     if let Some(s2) = hsqc_spec {
         for (_exp, s3) in triples.iter_mut() {
-            let (dh, dn) = register_3d_hn_to_hsqc_adaptive(s3, s2);
+            let (dh, dn, audit) =
+                register_3d_hn_to_hsqc_adaptive_with_audit(s3, s2, enable_axis_rescue);
             if dh.abs() > 1e-6 || dn.abs() > 1e-6 {
                 eprintln!("[register] aligned 3D {_exp} to HSQC: dH={dh:+.4} ppm, dN={dn:+.3} ppm");
             }
+            audits.push(audit);
         }
+    } else {
+        audits.resize(triples.len(), None);
     }
     match method {
         "classical" => {
@@ -3006,7 +3059,7 @@ fn pick_in_memory_spectra(
                     &CorroboratedRepickConfig::default(),
                 ));
             }
-            Ok((r, all, "classical".to_string()))
+            Ok((r, all, "classical".to_string(), audits))
         }
         "neural" | "cnn" => {
             let model = NeuralPicker::pretrained();
@@ -3036,6 +3089,7 @@ fn pick_in_memory_spectra(
                             "neural (WebGPU: {}, {})",
                             gpu_picker.adapter_name, gpu_picker.backend_name
                         ),
+                        audits,
                     ))
                 }
                 EngineKind::Cpu => {
@@ -3047,7 +3101,7 @@ fn pick_in_memory_spectra(
                     for (exp, s3) in triples.iter() {
                         all.extend(model.pick_3d(s3, exp, &cfg_3d));
                     }
-                    Ok((r, all, "neural (CPU)".to_string()))
+                    Ok((r, all, "neural (CPU)".to_string(), audits))
                 }
             }
         }
@@ -3057,27 +3111,39 @@ fn pick_in_memory_spectra(
     }
 }
 
-fn pick_spectra_bundle(
+type PickedBundleWithAudit = (Vec<Peak>, Vec<Peak>, String, Vec<AxisRescueAuditRecord>);
+type ProcessedFidBundleWithAudit = (
+    Vec<Peak>,
+    Vec<Peak>,
+    String,
+    String,
+    Vec<AxisRescueAuditRecord>,
+);
+
+fn pick_spectra_bundle_with_audit(
     hsqc_path: &Path,
     triples: &[(String, PathBuf)],
     method: &str,
     engine: EngineKind,
     snr: f32,
     prob: f32,
-) -> Result<(Vec<Peak>, Vec<Peak>, String), String> {
+    enable_axis_rescue: bool,
+) -> Result<PickedBundleWithAudit, String> {
     let hsqc_spec = load_2d_auto(hsqc_path)?;
     let mut loaded_triples = Vec::with_capacity(triples.len());
     for (exp, path) in triples {
         loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
     }
-    pick_in_memory_spectra(
+    let (r, all, lbl, raw_audits) = pick_in_memory_spectra_with_audit(
         Some(&hsqc_spec),
         &mut loaded_triples,
         method,
         engine,
         snr,
         prob,
-    )
+        enable_axis_rescue,
+    )?;
+    Ok((r, all, lbl, raw_audits.into_iter().flatten().collect()))
 }
 
 fn indent_json_block(json: &str, prefix: &str) -> String {
@@ -3102,48 +3168,66 @@ fn process_and_pick_fid_bundle(
     engine: EngineKind,
     snr: f32,
     prob: f32,
-) -> Result<(Vec<Peak>, Vec<Peak>, String, String), String> {
+) -> Result<ProcessedFidBundleWithAudit, String> {
     let (hsqc_spec, hsqc_recipe) = process_fid_2d_with_opts(fid_hsqc, fid_opts)?;
     let mut loaded_triples = Vec::with_capacity(fid_triples.len() + proc_triples.len());
-    let mut triple_recipe_entries: Vec<(String, String)> = Vec::new();
+    let mut triple_recipes: Vec<(String, ProcessingRecipe)> = Vec::new();
 
     for (exp, dir) in fid_triples {
         let (s3, r3) = process_fid_3d_with_opts(dir, exp, fid_opts)?;
-        triple_recipe_entries.push((exp.clone(), r3.to_json_pretty()?));
+        triple_recipes.push((exp.clone(), r3));
         loaded_triples.push((exp.clone(), s3));
     }
     for (exp, path) in proc_triples {
         loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
     }
 
-    let (roots, all_peaks, label) = pick_in_memory_spectra(
+    let enable_axis_rescue = !fid_opts.no_axis_rescue
+        && hsqc_recipe.enable_axis_rescue
+        && triple_recipes.iter().all(|(_, r)| r.enable_axis_rescue);
+
+    let (roots, all_peaks, label, raw_audits) = pick_in_memory_spectra_with_audit(
         Some(&hsqc_spec),
         &mut loaded_triples,
         method,
         engine,
         snr,
         prob,
+        enable_axis_rescue,
     )?;
+
+    for ((_, r3), maybe_audit) in triple_recipes.iter_mut().zip(raw_audits.iter()) {
+        r3.axis_rescue_audit = maybe_audit.clone();
+    }
+
     let hsqc_json = hsqc_recipe.to_json_pretty()?;
-    let bundle_recipe_json = if triple_recipe_entries.is_empty() {
+    let bundle_recipe_json = if triple_recipes.is_empty() {
         hsqc_json
     } else {
         let mut s = String::from("{\n  \"hsqc\": ");
         s.push_str(&indent_json_block(&hsqc_json, "  "));
         s.push_str(",\n  \"triples\": {\n");
-        for (idx, (exp, rjson)) in triple_recipe_entries.iter().enumerate() {
+        for (idx, (exp, r3)) in triple_recipes.iter().enumerate() {
+            let rjson = r3.to_json_pretty()?;
             if idx > 0 {
                 s.push_str(",\n");
             }
             s.push_str("    \"");
             s.push_str(&exp.replace('\\', "\\\\").replace('"', "\\\""));
             s.push_str("\": ");
-            s.push_str(&indent_json_block(rjson, "    "));
+            s.push_str(&indent_json_block(&rjson, "    "));
         }
         s.push_str("\n  }\n}");
         s
     };
-    Ok((roots, all_peaks, label, bundle_recipe_json))
+    let collected_audits: Vec<AxisRescueAuditRecord> = raw_audits.into_iter().flatten().collect();
+    Ok((
+        roots,
+        all_peaks,
+        label,
+        bundle_recipe_json,
+        collected_audits,
+    ))
 }
 
 fn discover_fid_bundle_dirs(
@@ -3243,6 +3327,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
             "--no-crop" => fid_opts.no_crop = true,
             "--lp" => fid_opts.lp = true,
             "--auto-phase" => fid_opts.auto_phase = true,
+            "--no-axis-rescue" => fid_opts.no_axis_rescue = true,
             "--out" | "-o" => {
                 i += 1;
                 out_path = args.get(i).map(PathBuf::from);
@@ -3292,7 +3377,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
     let out_p = out_path.ok_or("pick requires --out <peaks.tsv> (or -o <peaks.tsv>)")?;
 
     let (roots, all_peaks, method_label) = if let Some(fh) = &fid_hsqc_path {
-        let (r, all, lbl, _) = process_and_pick_fid_bundle(
+        let (r, all, lbl, _, _) = process_and_pick_fid_bundle(
             fh,
             &fid_triples,
             &triples,
@@ -3309,11 +3394,11 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 let mut recipe = build_recipe_for_fid_2d(&fid2, &fid_opts)?;
                 let spec2 = process_fid_2d_mut(&fid2, &mut recipe)?;
                 let mut loaded_triples = Vec::new();
+                let mut rescue_ok = !fid_opts.no_axis_rescue && recipe.enable_axis_rescue;
                 for (exp, dir) in &fid_triples {
-                    loaded_triples.push((
-                        exp.clone(),
-                        process_fid_3d_with_opts(dir, exp, &fid_opts)?.0,
-                    ));
+                    let (s3, r3) = process_fid_3d_with_opts(dir, exp, &fid_opts)?;
+                    rescue_ok &= r3.enable_axis_rescue;
+                    loaded_triples.push((exp.clone(), s3));
                 }
                 for (exp, path) in &triples {
                     loaded_triples.push((exp.clone(), load_3d_auto(path, exp)?));
@@ -3331,14 +3416,16 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                     );
                     (Vec::new(), pks, "classical (C13HSQC)".to_string())
                 } else {
-                    pick_in_memory_spectra(
+                    let (r, all, lbl, _) = pick_in_memory_spectra_with_audit(
                         Some(&spec2),
                         &mut loaded_triples,
                         &method,
                         engine,
                         snr,
                         prob,
-                    )?
+                        rescue_ok,
+                    )?;
+                    (r, all, lbl)
                 }
             }
             Ok(RawFid::Dim3(fid3)) => {
@@ -3352,14 +3439,16 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 } else {
                     None
                 };
-                pick_in_memory_spectra(
+                let (r, all, lbl, _) = pick_in_memory_spectra_with_audit(
                     opt_hsqc.as_ref(),
                     &mut [(exp, spec3)],
                     &method,
                     engine,
                     snr,
                     prob,
-                )?
+                    !fid_opts.no_axis_rescue && recipe.enable_axis_rescue,
+                )?;
+                (r, all, lbl)
             }
             Ok(RawFid::Dim1(_)) => {
                 return Err(format!(
@@ -3371,7 +3460,7 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
                 if fp.is_dir() {
                     match discover_fid_bundle_dirs(fp) {
                         Ok((disc_hsqc, disc_triples)) => {
-                            let (r, all, lbl, _) = process_and_pick_fid_bundle(
+                            let (r, all, lbl, _, _) = process_and_pick_fid_bundle(
                                 &disc_hsqc,
                                 &disc_triples,
                                 &triples,
@@ -3394,7 +3483,16 @@ fn cmd_pick(args: &[String]) -> Result<(), String> {
         let hsqc_p = hsqc_path.ok_or(
             "pick requires --hsqc <pdata_dir_ft2_or_ucsf>, --fid <dir>, or --fid-hsqc <dir>",
         )?;
-        pick_spectra_bundle(&hsqc_p, &triples, &method, engine, snr, prob)?
+        let (r, all, lbl, _) = pick_spectra_bundle_with_audit(
+            &hsqc_p,
+            &triples,
+            &method,
+            engine,
+            snr,
+            prob,
+            !fid_opts.no_axis_rescue,
+        )?;
+        (r, all, lbl)
     };
 
     write_peaks(&out_p, &all_peaks)?;
@@ -5554,6 +5652,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             "--no-crop" => fid_opts.no_crop = true,
             "--lp" => fid_opts.lp = true,
             "--auto-phase" => fid_opts.auto_phase = true,
+            "--no-axis-rescue" => fid_opts.no_axis_rescue = true,
             "--peaks" => {
                 i += 1;
                 peaks_path = args.get(i).map(PathBuf::from);
@@ -5906,11 +6005,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     };
 
     let t_total = Instant::now();
+    let mut pipeline_axis_audits: Vec<AxisRescueAuditRecord> = Vec::new();
     let (base_ref, peaks, project_name) = if let Some(np) = &nef_path {
         let doc = read_nef_file(np)?;
         let r = doc.to_reference()?;
         let pks = if let Some((ref fhsqc, ref ftriples)) = resolved_fid {
-            let (_, all_pks, _, recipe_json) = process_and_pick_fid_bundle(
+            let (_, all_pks, _, recipe_json, audits) = process_and_pick_fid_bundle(
                 fhsqc,
                 ftriples,
                 &triples,
@@ -5920,6 +6020,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 snr,
                 prob,
             )?;
+            pipeline_axis_audits = audits;
             fs::write(
                 dir.join("processing_recipe.json"),
                 format!("{recipe_json}\n"),
@@ -5927,7 +6028,17 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("failed to write processing_recipe.json: {e}"))?;
             all_pks
         } else if let Some(hp) = &hsqc_path {
-            pick_spectra_bundle(hp, &triples, &method, picker_engine, snr, prob)?.1
+            let (_, all_pks, _, audits) = pick_spectra_bundle_with_audit(
+                hp,
+                &triples,
+                &method,
+                picker_engine,
+                snr,
+                prob,
+                !fid_opts.no_axis_rescue,
+            )?;
+            pipeline_axis_audits = audits;
+            all_pks
         } else if let Some(pp) = &peaks_path {
             read_peaks(pp)?
         } else {
@@ -5970,7 +6081,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .to_string(),
             );
         };
-        let (roots, pks, method_label, recipe_json) = process_and_pick_fid_bundle(
+        let (roots, pks, method_label, recipe_json, audits) = process_and_pick_fid_bundle(
             fhsqc,
             ftriples,
             &triples,
@@ -5980,6 +6091,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             snr,
             prob,
         )?;
+        pipeline_axis_audits = audits;
         fs::write(
             dir.join("processing_recipe.json"),
             format!("{recipe_json}\n"),
@@ -6016,8 +6128,16 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         } else {
             return Err("pipeline with --hsqc requires --seq <SEQ|fasta> (or --star)".to_string());
         };
-        let (roots, pks, method_label) =
-            pick_spectra_bundle(hp, &triples, &method, picker_engine, snr, prob)?;
+        let (roots, pks, method_label, audits) = pick_spectra_bundle_with_audit(
+            hp,
+            &triples,
+            &method,
+            picker_engine,
+            snr,
+            prob,
+            !fid_opts.no_axis_rescue,
+        )?;
+        pipeline_axis_audits = audits;
         println!(
             "[{method_label}] picked {} HSQC roots and {} total peaks",
             roots.len(),
@@ -6201,6 +6321,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     rep.engine_label = Some(engine_label.clone());
     rep.systems_and_assignment = Some((systems, result));
     rep.dihedrals = predict_csi_dihedrals(&pred_ref);
+    rep.axis_rescue_records = pipeline_axis_audits;
     if report_opts.include_idp_propensity_track {
         let prop_cfg = build_propensity_config(report_opts.temp_k, report_opts.ph)?;
         let prop_rep = compute_idp_propensity(&pred_ref, &prop_cfg);
@@ -7486,8 +7607,16 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             "unexpected err: {err_msg}"
         );
 
-        let (_, _, lbl_gpu_2d) =
-            pick_spectra_bundle(&hsqc_ucsf, &[], "neural", EngineKind::Gpu, 5.0, 0.45).unwrap();
+        let (_, _, lbl_gpu_2d, _) = pick_spectra_bundle_with_audit(
+            &hsqc_ucsf,
+            &[],
+            "neural",
+            EngineKind::Gpu,
+            5.0,
+            0.45,
+            true,
+        )
+        .unwrap();
         assert!(
             lbl_gpu_2d.starts_with("neural (WebGPU:"),
             "expected WebGPU label, got {lbl_gpu_2d}"

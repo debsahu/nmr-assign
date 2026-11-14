@@ -101,6 +101,8 @@ pub struct ReportInput {
     /// Optional multi-medium Residual Dipolar Coupling (`RDC`) Saupe tensor fit and
     /// Cornilescu `Q` / `Q_free` `D_calc` vs `D_obs` validation report.
     pub rdc_report: Option<crate::rdc::RdcValidationSummary>,
+    /// Optional 3D `{sign, fold}` indirect-axis likelihood verification provenance records (`13.3:P1-1`).
+    pub axis_rescue_records: Vec<crate::process::AxisRescueAuditRecord>,
 }
 
 impl ReportInput {
@@ -127,6 +129,7 @@ impl ReportInput {
             structure_summary: None,
             propensity_report: None,
             rdc_report: None,
+            axis_rescue_records: Vec::new(),
         }
     }
 
@@ -614,6 +617,40 @@ pub fn generate_quality_report_html(input: &ReportInput) -> String {
         sub_parts.join(" &nbsp;&bull;&nbsp; ")
     ));
     html.push_str("</div>\n</header>\n");
+
+    if !input.axis_rescue_records.is_empty() {
+        let any_applied = input
+            .axis_rescue_records
+            .iter()
+            .any(|r| r.applied || r.polarity_flipped);
+        let border = if any_applied { "#d97706" } else { "#cbd5e1" };
+        let bg = if any_applied { "#fffbeb" } else { "#f8fafc" };
+        html.push_str(&format!(
+            "<section id=\"axis-rescue-provenance\" style=\"margin: 0 0 18px 0; padding: 12px 16px; border-left: 4px solid {border}; background: {bg}; border-radius: 6px; font-size: 13px;\">\n"
+        ));
+        html.push_str(&format!(
+            "<strong>3D Indirect-Axis Verification Provenance (HSQC Strip Likelihood):</strong>{}\n<ul style=\"margin: 6px 0 0 18px; padding: 0;\">\n",
+            if any_applied {
+                " <span style=\"color:#b45309;font-weight:700;\">[Non-canonical transform applied]</span>"
+            } else {
+                ""
+            }
+        ));
+        for rec in &input.axis_rescue_records {
+            html.push_str(&format!(
+                "<li><code>{}</code>: selected=<code>{:?}</code>, enabled=<code>{}</code>, applied=<code>{}</code>, polarity_flipped=<code>{}</code>, ln_BF=<code>{:.2}</code>, matched_HSQC=<code>{:.1}% &rarr; {:.1}%</code></li>\n",
+                escape_xml(&rec.experiment),
+                rec.selected,
+                rec.enabled,
+                rec.applied,
+                rec.polarity_flipped,
+                rec.ln_bayes_factor_vs_canonical,
+                rec.canonical_matched_fraction * 100.0,
+                rec.selected_matched_fraction * 100.0,
+            ));
+        }
+        html.push_str("</ul>\n</section>\n");
+    }
 
     // 1. Executive Metrics Cards
     let pct_assigned = if n_assignable > 0 {

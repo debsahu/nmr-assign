@@ -374,6 +374,147 @@ fn test_p1_8_default_cpu_assign_is_calibrated_and_mismatched_runs_warns_and_mark
 }
 
 #[test]
+fn test_p1_1_cli_pick_and_pipeline_stderr_warning_report_and_no_axis_rescue() {
+    use nmr_core::nmrstar::read_star;
+    use nmr_core::pulprog::{apply_indirect_axis_transform_3d, AxisTransformOp};
+    use nmr_core::simulate::{
+        render_hsqc_2d, render_triple_3d, simulate, SimConfig, SpectrumRenderConfig,
+    };
+    use nmr_core::spectrum::{write_ucsf_2d, write_ucsf_3d};
+
+    let dir = std::env::temp_dir().join(format!("nmr_p13_p1_1_cli_{}", process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let ref_data = read_star(fixture_star_path(), None).unwrap();
+    let (sim_peaks, _) = simulate(
+        &ref_data,
+        &SimConfig {
+            p_missing_peak: 0.0,
+            spurious_rate: 0.0,
+            seed: 13,
+            ..SimConfig::default()
+        },
+    );
+    let rcfg = SpectrumRenderConfig {
+        nx_h: 128,
+        ny_n: 64,
+        nz_c: 64,
+        ..SpectrumRenderConfig::default()
+    };
+    let hsqc = render_hsqc_2d(&sim_peaks, &rcfg);
+    let mut hnco_corrupted = render_triple_3d("HNCO", &sim_peaks, &rcfg);
+    apply_indirect_axis_transform_3d(
+        &mut hnco_corrupted,
+        AxisTransformOp::HalfSwShift,
+        AxisTransformOp::Canonical,
+        Some("HNCO"),
+        false,
+    );
+
+    let hsqc_path = dir.join("HSQC.ucsf");
+    let hnco_path = dir.join("HNCO_halfsw.ucsf");
+    write_ucsf_2d(&hsqc_path, &hsqc).unwrap();
+    write_ucsf_3d(&hnco_path, &hnco_corrupted).unwrap();
+
+    // 1. Default `nmrassign pick`: emits `warning: [axis-rescue]` on `stderr`!
+    let out_on = dir.join("peaks_on.tsv");
+    let res_on = Command::new(nmrassign_bin())
+        .args([
+            "pick",
+            "--hsqc",
+            hsqc_path.to_str().unwrap(),
+            "--triple",
+            &format!("HNCO={}", hnco_path.display()),
+            "--method",
+            "classical",
+            "--out",
+            out_on.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign pick (rescue on)");
+    assert!(
+        res_on.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_on.stderr)
+    );
+    let stderr_on = String::from_utf8_lossy(&res_on.stderr);
+    assert!(
+        stderr_on.contains("warning: [axis-rescue]"),
+        "expected `warning: [axis-rescue]` on stderr, got:\n{stderr_on}"
+    );
+    assert!(
+        stderr_on.contains("HalfSwShiftN"),
+        "expected `HalfSwShiftN` in stderr warning, got:\n{stderr_on}"
+    );
+
+    // 2. Opt-out `nmrassign pick --no-axis-rescue`: NO `[axis-rescue]` warning on `stderr`!
+    let out_off = dir.join("peaks_off.tsv");
+    let res_off = Command::new(nmrassign_bin())
+        .args([
+            "pick",
+            "--hsqc",
+            hsqc_path.to_str().unwrap(),
+            "--triple",
+            &format!("HNCO={}", hnco_path.display()),
+            "--method",
+            "classical",
+            "--no-axis-rescue",
+            "--out",
+            out_off.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign pick (--no-axis-rescue)");
+    assert!(
+        res_off.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_off.stderr)
+    );
+    let stderr_off = String::from_utf8_lossy(&res_off.stderr);
+    assert!(
+        !stderr_off.contains("[axis-rescue]"),
+        "expected zero axis-rescue warnings with --no-axis-rescue, got:\n{stderr_off}"
+    );
+
+    // 3. `nmrassign pipeline` records the applied rescue inside `report.html` (`id="axis-rescue-provenance"`)!
+    let pipe_dir = dir.join("pipe_out");
+    let res_pipe = Command::new(nmrassign_bin())
+        .args([
+            "pipeline",
+            "--star",
+            fixture_star_path().to_str().unwrap(),
+            "--hsqc",
+            hsqc_path.to_str().unwrap(),
+            "--triple",
+            &format!("HNCO={}", hnco_path.display()),
+            "--method",
+            "classical",
+            "--solver",
+            "standard",
+            "--engine",
+            "cpu",
+            "--runs",
+            "1",
+            "--steps",
+            "100",
+            "--out-dir",
+            pipe_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run nmrassign pipeline");
+    assert!(
+        res_pipe.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res_pipe.stderr)
+    );
+    let report_html = fs::read_to_string(pipe_dir.join("report.html")).expect("read report.html");
+    assert!(report_html.contains("id=\"axis-rescue-provenance\""));
+    assert!(report_html.contains("HalfSwShiftN"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_phase13_p1_7_p1_8_q4_cli_json_and_calibration_contracts() {
     // 1. Primary 10-bin calibration grid (`ECE_10`), nested LOPO shrinkage candidates, and protein HC gate constants
     assert_eq!(UNIFORM_CALIBRATION_GRID_10.len(), 11);
