@@ -41,6 +41,13 @@ use crate::ops::{
     auto_phase_1d, auto_phase_direct_nd, auto_phase_indirect_nd, hilbert_transform_in_place,
     lock_all_positive_polarity_3d, lock_biphasic_ca_polarity_3d, AutoPhaseConfig, PolarityMode,
 };
+pub use crate::pulprog::{
+    apply_indirect_axis_transform_3d, evaluate_3d_axis_hypotheses_against_hsqc,
+    evaluate_3d_axis_hypotheses_against_roots, extract_hsqc_2d_roots_for_verification,
+    verify_3d_axis_hypotheses_against_hsqc, verify_3d_axis_hypotheses_against_roots,
+    AxisHypothesisScore, AxisHypothesisVerification, AxisTransformOp, NamedAxisHypothesis,
+    MIN_AXIS_RESCUE_LN_BF,
+};
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
 // ============================================================================
@@ -365,6 +372,16 @@ impl DimRecipe {
         self.phase_source = PhaseSource::Auto;
         self.fcor = 0.5;
     }
+
+    /// Switch this dimension to `PhaseSource::Auto` while preserving an explicit acquisition-time
+    /// `FCOR` (`stored_fcor`, e.g. `1.0` for half-dwell $t_1(0) = \Delta t_1 / 2$ or Varian
+    /// `f1180='y'`) and defaulting to `0.5` otherwise (Otting et al. 1986; Marion et al. 1989).
+    fn set_auto_phase_with_stored_fcor(&mut self, stored_fcor: Option<f64>) {
+        self.p0_deg = None;
+        self.p1_deg = None;
+        self.phase_source = PhaseSource::Auto;
+        self.fcor = stored_fcor.unwrap_or(0.5);
+    }
 }
 
 impl ProcessingRecipe {
@@ -383,17 +400,21 @@ impl ProcessingRecipe {
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
         };
+        let axes = [&fid.axis_x, &fid.axis_y];
         if fid.vendor == FidVendor::Varian {
             // Varian `.fid/procpar` stores VnmrJ 1D interactive scout cursor `rp*`/`lp*` rather
-            // than calibrated 2D spectral phases; solve both dimensions via blind autophasing.
-            rec.set_auto_phase();
+            // than calibrated 2D spectral phases; solve both dimensions via blind autophasing,
+            // preserving explicit `fcor = Some(1.0)` when `f1180 = 'y'` (Marion et al. 1989).
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
+                d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
+            }
         } else {
-            for d in &mut rec.dims {
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
                 if matches!(
                     d.phase_source,
                     PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
                 ) {
-                    d.set_auto_phase();
+                    d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
                 }
             }
         }
@@ -409,15 +430,18 @@ impl ProcessingRecipe {
             ],
             nus: fid.nus_mask.as_ref().map(|_| NusIstConfig::default()),
         };
+        let axes = [&fid.axis_x, &fid.axis_y, &fid.axis_z];
         if fid.vendor == FidVendor::Varian {
-            rec.set_auto_phase();
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
+                d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
+            }
         } else {
-            for d in &mut rec.dims {
+            for (d, ax) in rec.dims.iter_mut().zip(axes) {
                 if matches!(
                     d.phase_source,
                     PhaseSource::AutoChen2002 | PhaseSource::DefaultZero
                 ) {
-                    d.set_auto_phase();
+                    d.set_auto_phase_with_stored_fcor(ax.stored_proc.fcor);
                 }
             }
         }
@@ -2316,6 +2340,12 @@ pub fn process_fid_2d_mut(
     let auto_solved_y = dim_y.p0_deg.is_none()
         && dim_y.p1_deg.is_none()
         && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
+    if auto_solved_y {
+        if let Some(fc) = fid.axis_y.stored_proc.fcor {
+            dim_y.fcor = fc;
+            recipe.dims[1].fcor = fc;
+        }
+    }
 
     let (p0_y, p1_y) = match (dim_y.p0_deg, dim_y.p1_deg, dim_y.phase_source) {
         (Some(p0), Some(p1), _) => (p0, p1),
@@ -3099,6 +3129,18 @@ fn process_fid_3d_inner(
     let need_auto_z = dim_z.p0_deg.is_none()
         && dim_z.p1_deg.is_none()
         && !matches!(dim_z.phase_source, PhaseSource::DefaultZero);
+    if need_auto_y {
+        if let Some(fc) = fid.axis_y.stored_proc.fcor {
+            dim_y.fcor = fc;
+            recipe.dims[1].fcor = fc;
+        }
+    }
+    if need_auto_z {
+        if let Some(fc) = fid.axis_z.stored_proc.fcor {
+            dim_z.fcor = fc;
+            recipe.dims[2].fcor = fc;
+        }
+    }
 
     let (mut p0_y, p1_y) = (dim_y.p0_deg.unwrap_or(0.0), dim_y.p1_deg.unwrap_or(0.0));
     let (mut p0_z, p1_z) = (dim_z.p0_deg.unwrap_or(0.0), dim_z.p1_deg.unwrap_or(0.0));
@@ -3648,10 +3690,10 @@ fn process_fid_3d_inner(
             if is_mirrored_aliphatic_cacb_3d(&out_spec, full_c_axis, c0_off) {
                 recipe.dims[c_dim].conjugate_for_fft = !recipe.dims[c_dim].conjugate_for_fft;
                 if need_auto_y {
-                    recipe.dims[1].set_auto_phase();
+                    recipe.dims[1].set_auto_phase_with_stored_fcor(fid.axis_y.stored_proc.fcor);
                 }
                 if need_auto_z {
-                    recipe.dims[2].set_auto_phase();
+                    recipe.dims[2].set_auto_phase_with_stored_fcor(fid.axis_z.stored_proc.fcor);
                 }
                 return process_fid_3d_inner(fid, exp, recipe, false);
             }
@@ -3705,6 +3747,12 @@ pub fn register_3d_hn_to_hsqc_2d(
     {
         return (0.0, 0.0);
     }
+
+    // 0. Empirical `{sign, fold}` indirect-axis likelihood verification against `hsqc_2d`
+    //    (`docs/specs/11-fid-processing.md` §1.5): rescues inverted (`REVERSE`) or half-SW-shifted
+    //    (`States` <-> `States-TPPI`) indirect 15N/13C axes when log-Bayes factor exceeds
+    //    `MIN_AXIS_RESCUE_LN_BF` (`12.0` nats), leaving canonical well-referenced cubes untouched.
+    let _ = crate::pulprog::verify_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None);
 
     // 1. Build 2D `(15N, 1H)` max-abs sky-projection of `spec_3d` (supports both AllPositive & Biphasic cubes)
     let plane3 = ny3 * nx3;

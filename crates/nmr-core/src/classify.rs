@@ -1218,8 +1218,10 @@ fn classify_file_read_action(rel_path: &str) -> FileReadAction {
             | "proc4"
             | "title"
             | "pulseprogram"
+            | "pulseprogram.precomp"
             | "pulprog"
             | "nuslist"
+            | "difflist"
             | "vdlist"
             | "vclist"
             | "valist"
@@ -1237,6 +1239,10 @@ fn classify_file_read_action(rel_path: &str) -> FileReadAction {
             | "text"
             | "sampling.sch"
     ) {
+        return FileReadAction::BoundedText(MAX_TEXT_HEADER_BYTES);
+    }
+
+    if lower.ends_with(".incl") {
         return FileReadAction::BoundedText(MAX_TEXT_HEADER_BYTES);
     }
 
@@ -1841,14 +1847,16 @@ fn collect_virtual_entries_from_dir(
         }
 
         let lower = fname.to_ascii_lowercase();
-        // Skip duplicate Bruker non-status parameter files (`acqu`, `acqu2`, `acqu3`, `acqu4`,
-        // and `pulseprogram`) when the status parameter file (`acqus`, `acqu2s`, ...) is present!
+        // Skip duplicate Bruker non-status parameter files (`acqu`, `acqu2`, `acqu3`, `acqu4`)
+        // when the status parameter file (`acqus`, `acqu2s`, ...) is present, and skip duplicate
+        // `pulseprogram.precomp`/`pulprog` when executed `pulseprogram` is already present!
         if is_exp_root
             && ((lower == "acqu" && child_names_lower.contains("acqus"))
                 || (lower == "acqu2" && child_names_lower.contains("acqu2s"))
                 || (lower == "acqu3" && child_names_lower.contains("acqu3s"))
                 || (lower == "acqu4" && child_names_lower.contains("acqu4s"))
-                || ((lower == "pulseprogram" || lower == "pulprog") && has_acqus))
+                || ((lower == "pulseprogram.precomp" || lower == "pulprog")
+                    && child_names_lower.contains("pulseprogram")))
         {
             continue;
         }
@@ -2733,9 +2741,11 @@ struct BrukerFolderGroup {
     title: Option<Vec<u8>>,
     pulseprogram: Option<Vec<u8>>,
     nuslist: Option<Vec<u8>>,
+    difflist: Option<Vec<u8>>,
     vdlist: Option<Vec<u8>>,
     vclist: Option<Vec<u8>>,
     fqlist: Option<Vec<u8>>,
+    local_includes: std::collections::HashMap<String, String>,
     raw_bytes: u64,
     processed_bytes: u64,
 }
@@ -2776,8 +2786,10 @@ fn find_bruker_root_for_path(rel_path: &str) -> Option<(String, &str)> {
             | "acqu4s"
             | "acqu4"
             | "pulseprogram"
+            | "pulseprogram.precomp"
             | "pulprog"
             | "nuslist"
+            | "difflist"
             | "vdlist"
             | "vclist"
             | "valist"
@@ -3113,11 +3125,155 @@ fn build_bruker_experiment(
         .as_deref()
         .map(count_nonempty_schedule_lines)
         .unwrap_or(0);
+    let diff_len = grp
+        .difflist
+        .as_deref()
+        .map(count_nonempty_schedule_lines)
+        .unwrap_or(0);
+
+    // Run `nmr-core::pulprog` symbolic pulseprogram & acquisition-physics interpreter when
+    // `acqus` is present and either:
+    // - `PULPROG` name heuristics cannot classify the sequence (custom/renamed laboratory sequence),
+    // - any indirect axis has `QF` or `Unknown` `FnMODE` (manual `ip*`/`dp*` `States-TPPI`, pseudo-3D, or DOSY),
+    // - variable delay/counter/frequency/diffusion lists are present, or
+    // - `AQSEQ == 1` (`312` transposed) or 3D `AQSEQ` is omitted.
+    let prelim_dim = match ndim_raw {
+        1 => ExperimentDimensionality::Dim1D,
+        2 => ExperimentDimensionality::Dim2D,
+        3 => ExperimentDimensionality::Dim3D,
+        _ => ExperimentDimensionality::Dim4D,
+    };
+    let prelim_pulprog_known = pulprog
+        .as_deref()
+        .and_then(|pp| classify_pulse_token(pp, prelim_dim, &axes))
+        .is_some_and(|c| c != PulseSequenceClass::Unknown);
+    let has_qf_or_unknown_indirect = axes
+        .iter()
+        .skip(1)
+        .any(|a| matches!(a.quadrature, QuadratureKind::Qf | QuadratureKind::Unknown));
+    let needs_pulprog_interp = grp.acqus.is_some()
+        && (grp.difflist.is_some()
+            || (grp.pulseprogram.is_some()
+                && ((!prelim_pulprog_known && ndim_raw >= 2)
+                    || has_qf_or_unknown_indirect
+                    || vd_len > 0
+                    || vc_len > 0
+                    || fq_len > 0
+                    || jcamp_usize(&a1, "AQSEQ") == Some(1)
+                    || ndim_raw >= 3)));
+
+    let pulprog_interp = if needs_pulprog_interp {
+        let a1_s = grp
+            .acqus
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let a2_s = grp
+            .acqu2s
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let a3_s = grp
+            .acqu3s
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let a4_s = grp
+            .acqu4s
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let pp_s = grp
+            .pulseprogram
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let nl_s = grp
+            .nuslist
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let vd_s = grp
+            .vdlist
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let vc_s = grp
+            .vclist
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let fq_s = grp
+            .fqlist
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let df_s = grp
+            .difflist
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        let inp = crate::pulprog::BrukerExperimentInputs {
+            acqus_text: &a1_s,
+            acqu2s_text: a2_s.as_deref(),
+            acqu3s_text: a3_s.as_deref(),
+            acqu4s_text: a4_s.as_deref(),
+            pulseprogram_text: pp_s.as_deref(),
+            nuslist_text: nl_s.as_deref(),
+            vdlist_text: vd_s.as_deref(),
+            vclist_text: vc_s.as_deref(),
+            fqlist_text: fq_s.as_deref(),
+            difflist_text: df_s.as_deref(),
+            local_includes: grp.local_includes.clone(),
+        };
+        crate::pulprog::interpret_bruker_experiment(&inp).ok()
+    } else {
+        None
+    };
+
+    // Upgrade indirect axes whose manual `ip*`/`dp*`/`igrad` loops synthesize hypercomplex quadrature under `FnMODE = 0 / QF`
+    if let Some(ref pi) = pulprog_interp {
+        for (ind_idx, ind_phys) in pi.indirect_dims.iter().enumerate() {
+            let ax_idx = ind_idx + 1;
+            if ax_idx >= axes.len() {
+                break;
+            }
+            if matches!(
+                ind_phys.quad_source,
+                crate::pulprog::QuadSource::SynthesizedManualLoop { .. }
+            ) {
+                let upgraded = match ind_phys.quad_mode {
+                    crate::pulprog::DecodedQuadMode::States => Some(QuadratureKind::States),
+                    crate::pulprog::DecodedQuadMode::StatesTppi => Some(QuadratureKind::StatesTppi),
+                    crate::pulprog::DecodedQuadMode::EchoAntiecho => {
+                        Some(QuadratureKind::EchoAntiecho)
+                    }
+                    _ => None,
+                };
+                if let Some(q) = upgraded {
+                    axes[ax_idx].quadrature = q;
+                    if axes[ax_idx].nucleus == "Delay" || axes[ax_idx].nucleus.is_empty() {
+                        axes[ax_idx].nucleus = ind_phys.nucleus.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    let is_dosy = diff_len > 0
+        || pulprog_interp.as_ref().is_some_and(|pi| {
+            pi.transfer_graph.deduced_family == crate::pulprog::PulprogSequenceFamily::Dosy
+        })
+        || pulprog.as_deref().is_some_and(|s| {
+            let low = s.to_ascii_lowercase();
+            low.starts_with("dstebpgp")
+                || low.starts_with("ledbpgp")
+                || low.contains("dosy")
+                || (low.contains("ste") && low.contains("gp") && has_qf_or_unknown_indirect)
+        });
 
     let d3_is_qf = ndim_raw == 3
         && axes
             .get(2)
             .is_some_and(|a| a.quadrature == QuadratureKind::Qf);
+    let d2_inner_is_qf_in_3d = ndim_raw == 3
+        && axes
+            .get(1)
+            .is_some_and(|a| a.quadrature == QuadratureKind::Qf)
+        && axes
+            .get(2)
+            .is_some_and(|a| a.quadrature != QuadratureKind::Qf);
     let any_indirect_qf_matches = |sched_len: usize| -> bool {
         sched_len > 0
             && axes
@@ -3126,34 +3282,57 @@ fn build_bruker_experiment(
                 .any(|a| a.quadrature == QuadratureKind::Qf && a.points == sched_len)
     };
     let mut notes = Vec::new();
-    let mut pseudo_kind: Option<&'static str> = None;
-    let dimensionality =
-        if vd_len > 1 || (vd_len > 0 && (d3_is_qf || any_indirect_qf_matches(vd_len))) {
-            pseudo_kind = Some("vdlist");
-            notes.push(format!("pseudo-3D variable delay list ({vd_len} planes)"));
-            ExperimentDimensionality::Pseudo3D
-        } else if vc_len > 1 || (vc_len > 0 && (d3_is_qf || any_indirect_qf_matches(vc_len))) {
-            pseudo_kind = Some("vclist");
-            notes.push(format!("pseudo-3D variable counter list ({vc_len} planes)"));
-            ExperimentDimensionality::Pseudo3D
-        } else if fq_len >= 4 && (ndim_raw == 2 || d3_is_qf || any_indirect_qf_matches(fq_len)) {
-            pseudo_kind = Some("fqlist");
-            notes.push(format!(
-                "pseudo-3D frequency offset list ({fq_len} offsets)"
-            ));
-            ExperimentDimensionality::Pseudo3D
-        } else if d3_is_qf {
-            pseudo_kind = Some("qf_planes");
-            notes.push("pseudo-3D QF plane stack".to_string());
-            ExperimentDimensionality::Pseudo3D
-        } else {
-            match ndim_raw {
-                1 => ExperimentDimensionality::Dim1D,
-                2 => ExperimentDimensionality::Dim2D,
-                3 => ExperimentDimensionality::Dim3D,
-                _ => ExperimentDimensionality::Dim4D,
+    if let Some(ref pi) = pulprog_interp {
+        if pi.aqseq == crate::pulprog::AcquisitionOrder::Aqseq312 {
+            notes.push("AQSEQ=312 transposed indirect acquisition order".to_string());
+        }
+        match pi.pseudo_3d_order {
+            crate::pulprog::Pseudo3DStorageOrder::T1Interleaved => {
+                notes.push("pseudo-3D t1-interleaved storage".to_string());
             }
-        };
+            crate::pulprog::Pseudo3DStorageOrder::PlaneQueued if !is_dosy => {
+                notes.push("pseudo-3D plane-queued storage".to_string());
+            }
+            _ => {}
+        }
+    } else if jcamp_usize(&a1, "AQSEQ") == Some(1) && ndim_raw == 3 {
+        notes.push("AQSEQ=312 transposed indirect acquisition order".to_string());
+    }
+
+    let mut pseudo_kind: Option<&'static str> = None;
+    let dimensionality = if is_dosy {
+        notes.push("DOSY diffusion (Stejskal-Tanner / BPP-LED, QF)".to_string());
+        match ndim_raw {
+            1 => ExperimentDimensionality::Dim1D,
+            2 => ExperimentDimensionality::Dim2D,
+            _ => ExperimentDimensionality::Pseudo3D,
+        }
+    } else if vd_len > 1 || (vd_len > 0 && (d3_is_qf || any_indirect_qf_matches(vd_len))) {
+        pseudo_kind = Some("vdlist");
+        notes.push(format!("pseudo-3D variable delay list ({vd_len} planes)"));
+        ExperimentDimensionality::Pseudo3D
+    } else if vc_len > 1 || (vc_len > 0 && (d3_is_qf || any_indirect_qf_matches(vc_len))) {
+        pseudo_kind = Some("vclist");
+        notes.push(format!("pseudo-3D variable counter list ({vc_len} planes)"));
+        ExperimentDimensionality::Pseudo3D
+    } else if fq_len >= 4 && (ndim_raw == 2 || d3_is_qf || any_indirect_qf_matches(fq_len)) {
+        pseudo_kind = Some("fqlist");
+        notes.push(format!(
+            "pseudo-3D frequency offset list ({fq_len} offsets)"
+        ));
+        ExperimentDimensionality::Pseudo3D
+    } else if d3_is_qf || d2_inner_is_qf_in_3d {
+        pseudo_kind = Some("qf_planes");
+        notes.push("pseudo-3D QF plane stack".to_string());
+        ExperimentDimensionality::Pseudo3D
+    } else {
+        match ndim_raw {
+            1 => ExperimentDimensionality::Dim1D,
+            2 => ExperimentDimensionality::Dim2D,
+            3 => ExperimentDimensionality::Dim3D,
+            _ => ExperimentDimensionality::Dim4D,
+        }
+    };
 
     // NUS detection: strictly `FnTYPE == 2` or `nuslist` present (avoids TopSpin `FnTYPE=0` template false positives!)
     let fn_type = jcamp_usize(&a1, "FnTYPE").unwrap_or(0);
@@ -3209,16 +3388,36 @@ fn build_bruker_experiment(
     };
 
     // Pulse-sequence classification:
-    // Priority 1: `PULPROG` + axis nuclei/dimensionality
-    // Priority 2: `title` / folder name (ONLY when `dimensionality != 1D` and `PULPROG` was generic/absent)
-    // Priority 3: Pure axis-physics `(nuclei, carrier_ppm, sw_ppm)`
+    // Priority 1: `PULPROG` + axis nuclei/dimensionality (blocked on DOSY diffusion!)
+    // Priority 2: Symbolic `nmr-core::pulprog` `MagnetizationTransferGraph` (executed `pulseprogram` RF/CNST/transfer topology!)
+    // Priority 3: `title` / folder name (ONLY when `dimensionality != 1D` and `PULPROG` + transfer graph were absent/generic)
+    // Priority 4: Pure axis-physics `(nuclei, carrier_ppm, sw_ppm)`
     let disp = display_name_from_rel(rel_root, root_name);
-    let mut pulse_class = pulprog
-        .as_deref()
-        .and_then(|pp| classify_pulse_token(pp, dimensionality, &axes))
-        .unwrap_or(PulseSequenceClass::Unknown);
+    let mut pulse_class = if is_dosy {
+        PulseSequenceClass::Unknown
+    } else {
+        pulprog
+            .as_deref()
+            .and_then(|pp| classify_pulse_token(pp, dimensionality, &axes))
+            .unwrap_or(PulseSequenceClass::Unknown)
+    };
 
-    if pulse_class == PulseSequenceClass::Unknown
+    if !is_dosy
+        && (pulse_class == PulseSequenceClass::Unknown
+            || (dimensionality == ExperimentDimensionality::Pseudo3D && !pulse_class.is_dynamics()))
+    {
+        if let Some(ref pi) = pulprog_interp {
+            let c = pi.transfer_graph.deduced_family.to_pulse_sequence_class();
+            if c != PulseSequenceClass::Unknown
+                && (dimensionality != ExperimentDimensionality::Pseudo3D || c.is_dynamics())
+            {
+                pulse_class = c;
+            }
+        }
+    }
+
+    if !is_dosy
+        && pulse_class == PulseSequenceClass::Unknown
         && dimensionality != ExperimentDimensionality::Dim1D
     {
         if let Some(t) = title.as_deref() {
@@ -3229,7 +3428,8 @@ fn build_bruker_experiment(
             }
         }
     }
-    if pulse_class == PulseSequenceClass::Unknown
+    if !is_dosy
+        && pulse_class == PulseSequenceClass::Unknown
         && dimensionality != ExperimentDimensionality::Dim1D
     {
         if let Some(c) = classify_pulse_token(&disp, dimensionality, &axes) {
@@ -3245,8 +3445,9 @@ fn build_bruker_experiment(
     if is_known_specialized_j {
         notes.push("3D HNHA scalar-coupling experiment".to_string());
     }
-    if (!is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown)
-        || (dimensionality == ExperimentDimensionality::Pseudo3D && !pulse_class.is_dynamics())
+    if !is_dosy
+        && ((!is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown)
+            || (dimensionality == ExperimentDimensionality::Pseudo3D && !pulse_class.is_dynamics()))
     {
         let phys = infer_pulse_class_from_axis_physics(dimensionality, &axes, pseudo_kind);
         if phys != PulseSequenceClass::Unknown {
@@ -3517,7 +3718,7 @@ fn build_varian_experiment(
         });
     }
 
-    // Check Varian `array` for non-phase arrayed relaxation/CPMG/CEST (`d2`, `relaxT`, `ncyc`, `satfrq`, etc.)
+    // Check Varian `array` for non-phase arrayed relaxation/CPMG/CEST/DOSY (`d2`, `relaxT`, `ncyc`, `satfrq`, `gzlvl1`, etc.)
     let non_phase_array: Vec<&str> = array_str
         .split([',', ';', ' '])
         .map(str::trim)
@@ -3525,10 +3726,25 @@ fn build_varian_experiment(
             !tok.is_empty() && !tok.starts_with("phase") && !tok.eq_ignore_ascii_case("izar")
         })
         .collect();
+    let is_varian_dosy = non_phase_array
+        .iter()
+        .any(|v| v.to_ascii_lowercase().starts_with("gzlvl"))
+        || map.get("gzlvl1").is_some_and(|v| v.len() >= 4)
+        || seqfil.as_deref().is_some_and(|s| {
+            let sl = s.to_ascii_lowercase();
+            sl.contains("dosy") || sl.contains("bppste") || sl.starts_with("dbpp")
+        });
 
     let mut notes = Vec::new();
     let mut pseudo_kind: Option<&'static str> = None;
-    let dimensionality = if !non_phase_array.is_empty() && axes.len() == 2 {
+    let dimensionality = if is_varian_dosy {
+        notes.push("DOSY diffusion (arrayed gzlvl1, QF)".to_string());
+        if axes.len() <= 2 {
+            ExperimentDimensionality::Dim2D
+        } else {
+            ExperimentDimensionality::Pseudo3D
+        }
+    } else if !non_phase_array.is_empty() && axes.len() == 2 {
         let var = non_phase_array[0];
         let arr_len = map.get(var).map(|v| v.len()).unwrap_or(0);
         let low_var = var.to_ascii_lowercase();
@@ -3540,6 +3756,23 @@ fn build_varian_experiment(
             pseudo_kind = Some("vdlist");
         }
         notes.push(format!("pseudo-3D Varian array={var} ({arr_len} planes)"));
+        // Record `T1Interleaved` vs `PlaneQueued` from Varian `array` token order (`d2,relaxT,phase` vs `relaxT,phase`)
+        let arr_tokens: Vec<&str> = array_str
+            .split([',', ';', ' '])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let d2_pos = arr_tokens.iter().position(|t| t.eq_ignore_ascii_case("d2"));
+        let var_pos = arr_tokens.iter().position(|t| *t == var);
+        if let (Some(dp), Some(vp)) = (d2_pos, var_pos) {
+            if dp < vp {
+                notes.push("pseudo-3D t1-interleaved storage".to_string());
+            } else {
+                notes.push("pseudo-3D plane-queued storage".to_string());
+            }
+        } else {
+            notes.push("pseudo-3D plane-queued storage".to_string());
+        }
         ExperimentDimensionality::Pseudo3D
     } else {
         match axes.len() {
@@ -3593,18 +3826,38 @@ fn build_varian_experiment(
         .or_else(|| sfrq.and_then(|sf| infer_proton_base_mhz(&axes[0].nucleus, sf)));
 
     let disp = display_name_from_rel(rel_root, root_name);
-    let mut pulse_class = seqfil
-        .as_deref()
-        .and_then(|s| classify_pulse_token(s, dimensionality, &axes))
-        .unwrap_or(PulseSequenceClass::Unknown);
-    if pulse_class == PulseSequenceClass::Unknown {
+    let mut pulse_class = if is_varian_dosy {
+        PulseSequenceClass::Unknown
+    } else {
+        seqfil
+            .as_deref()
+            .and_then(|s| classify_pulse_token(s, dimensionality, &axes))
+            .unwrap_or(PulseSequenceClass::Unknown)
+    };
+    if !is_varian_dosy && pulse_class == PulseSequenceClass::Unknown {
         if let Some(ps) = pslabel.as_deref() {
             if let Some(c) = classify_pulse_token(ps, dimensionality, &axes) {
                 pulse_class = c;
             }
         }
     }
-    if pulse_class == PulseSequenceClass::Unknown
+    if !is_varian_dosy && pulse_class == PulseSequenceClass::Unknown {
+        let pp_txt = String::from_utf8_lossy(procpar_bytes);
+        let sch_txt = grp
+            .sampling_sch
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+        if let Ok(vi) = crate::pulprog::interpret_varian_procpar(&pp_txt, sch_txt.as_deref()) {
+            let c = vi.transfer_graph.deduced_family.to_pulse_sequence_class();
+            if c != PulseSequenceClass::Unknown
+                && (dimensionality != ExperimentDimensionality::Pseudo3D || c.is_dynamics())
+            {
+                pulse_class = c;
+            }
+        }
+    }
+    if !is_varian_dosy
+        && pulse_class == PulseSequenceClass::Unknown
         && dimensionality != ExperimentDimensionality::Dim1D
     {
         if let Some(c) = classify_pulse_token(&disp, dimensionality, &axes) {
@@ -3618,8 +3871,9 @@ fn build_varian_experiment(
     if is_known_specialized_j {
         notes.push("3D HNHA scalar-coupling experiment".to_string());
     }
-    if (!is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown)
-        || (dimensionality == ExperimentDimensionality::Pseudo3D && !pulse_class.is_dynamics())
+    if !is_varian_dosy
+        && ((!is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown)
+            || (dimensionality == ExperimentDimensionality::Pseudo3D && !pulse_class.is_dynamics()))
     {
         let phys = infer_pulse_class_from_axis_physics(dimensionality, &axes, pseudo_kind);
         if phys != PulseSequenceClass::Unknown {
@@ -3901,10 +4155,12 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                     "proc4s" => grp.proc4s = Some(e.header_bytes.clone()),
                     "proc4" if grp.proc4s.is_none() => grp.proc4s = Some(e.header_bytes.clone()),
                     "title" if grp.title.is_none() => grp.title = Some(e.header_bytes.clone()),
-                    "pulseprogram" | "pulprog" if grp.pulseprogram.is_none() => {
+                    "pulseprogram" => grp.pulseprogram = Some(e.header_bytes.clone()),
+                    "pulseprogram.precomp" | "pulprog" if grp.pulseprogram.is_none() => {
                         grp.pulseprogram = Some(e.header_bytes.clone())
                     }
                     "nuslist" => grp.nuslist = Some(e.header_bytes.clone()),
+                    "difflist" => grp.difflist = Some(e.header_bytes.clone()),
                     "vdlist" => grp.vdlist = Some(e.header_bytes.clone()),
                     "vclist" | "valist" | "vplist" if grp.vclist.is_none() => {
                         grp.vclist = Some(e.header_bytes.clone())
@@ -4024,6 +4280,17 @@ fn classify_nmr_entries_named(root_name: &str, raw_entries: &[VirtualEntry]) -> 
                 if let Some(bgrp) = bruker_groups.get_mut(&enclosing) {
                     if lower == "fid" || lower == "origfid" {
                         bgrp.raw_bytes += e.effective_bytes();
+                    } else if lower.ends_with(".incl") {
+                        let rel_in_exp = if enclosing == "." {
+                            rel.clone()
+                        } else {
+                            rel.strip_prefix(&format!("{enclosing}/"))
+                                .unwrap_or(&rel)
+                                .to_string()
+                        };
+                        let inc_txt = String::from_utf8_lossy(&e.header_bytes).into_owned();
+                        bgrp.local_includes.insert(rel_in_exp, inc_txt.clone());
+                        bgrp.local_includes.insert(fname.to_string(), inc_txt);
                     } else if lower.ends_with(".ft1")
                         || lower.ends_with(".ft2")
                         || lower.ends_with(".ft3")
