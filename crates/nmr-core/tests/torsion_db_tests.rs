@@ -10,8 +10,8 @@ use nmr_core::torsion_db::{
     format_torsions_json, format_torsions_json_with_options, format_torsions_tsv,
     format_torsions_tsv_with_options, is_ramachandran_outlier, needleman_wunsch_stats,
     predict_torsions, predict_torsions_with_firewall, sha256_hex, shares_7mer_within_1_mismatch,
-    smith_waterman_stats, tm_score_ca, HomologFirewallQuery, TorsionDb, TorsionExportOptions,
-    TorsionPredictionClass,
+    smith_waterman_stats, tm_score_ca, HomologFirewall, HomologFirewallQuery, TorsionDb,
+    TorsionExportOptions, TorsionPredictionClass,
 };
 
 fn workspace_root() -> PathBuf {
@@ -912,4 +912,243 @@ fn test_torsions_tsv_json_and_nef_roundtrip() {
         parsed.dihedral_restraint_lists[0].restraints.len(),
         nef_list.restraints.len()
     );
+}
+
+#[test]
+fn test_build_torsion_corpus_script_verify_and_spot_check() {
+    let root = workspace_root();
+    let script = root.join("scripts/build_torsion_corpus.py");
+    assert!(
+        script.exists(),
+        "scripts/build_torsion_corpus.py must exist"
+    );
+
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--verify")
+        .arg(root.join("data/torsion_db/torsion_corpus.tsv"))
+        .arg("--spot-check-pdb")
+        .arg(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .arg("--spot-check-star")
+        .arg(root.join("data/benchmark/bmr5387.str"))
+        .arg("--chain")
+        .arg("1UBQ_A")
+        .output()
+        .expect("invoke python3 scripts/build_torsion_corpus.py");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "build_torsion_corpus.py --verify failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("SPOT_CHECK_OK chain=1UBQ_A residues=76"),
+        "expected SPOT_CHECK_OK on 1UBQ_A, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "VERIFY_OK chains=129 residues=13647 lines=13781 sha256=e34d3001d4c6989564d6bdfacff9dc401f92566aa77b499a23933b202045d88b"
+        ),
+        "expected VERIFY_OK with exact corpus SHA-256, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_torsion_db_20pct_vs_25pct_seq_identity_cutoff_sensitivity() {
+    let root = workspace_root();
+    let manifest_text = fs::read_to_string(root.join("data/benchmark/manifest.tsv")).unwrap();
+    let bench_refs = load_benchmark_refs();
+
+    #[derive(Default)]
+    struct CutoffSummary {
+        folded_total_res: usize,
+        folded_struct_res: usize,
+        folded_good_res: usize,
+        folded_struct_good_res: usize,
+        folded_rama_outliers: usize,
+        phi_errs: Vec<f64>,
+        psi_errs: Vec<f64>,
+        circ_errs: Vec<f64>,
+        chi1_errs: Vec<f64>,
+        wrong_basin_count: usize,
+        good_truth_count: usize,
+        idp_total_res: usize,
+        idp_good_res: usize,
+        max_retained_sid: f64,
+    }
+
+    let mut summaries: Vec<(f64, CutoffSummary)> = Vec::new();
+
+    println!("\n=== P2 HOMOLOG FIREWALL SEQUENCE-IDENTITY CUTOFF SENSITIVITY (20% vs 25%) ===");
+    for cutoff in [0.25f64, 0.20f64] {
+        let mut sum = CutoffSummary::default();
+        println!(
+            "\n--- Cutoff max_seq_identity <= {:.0}% ---",
+            cutoff * 100.0
+        );
+        for (line_idx, line) in manifest_text.lines().enumerate() {
+            if line_idx == 0 || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            let bmrb_id = cols[0];
+            let rel_path = cols[5];
+            let shifts = read_star_all_atoms(root.join(rel_path), None).expect("read STAR");
+            let bref = &bench_refs[bmrb_id];
+            let query = HomologFirewallQuery {
+                query_pdb_ids: vec![bref.pdb_id.clone()],
+                query_bmrb_ids: vec![bref.bmrb_id.clone()],
+                query_uniprot_id: bref.uniprot_id.clone(),
+                query_family_id: bref.family_id.clone(),
+                query_topology_id: bref.topology_id.clone(),
+                query_ca_coords: if bref.is_folded {
+                    Some(bref.residues.iter().map(|r| r.ca_coord).collect())
+                } else {
+                    None
+                },
+            };
+            let firewall = HomologFirewall::new(query).with_max_seq_identity(cutoff);
+            let rep = firewall.predict(&shifts);
+
+            assert!(
+                rep.max_retained_seq_identity <= cutoff + 1e-12,
+                "{bmrb_id} @ cutoff {cutoff}: retained template seq identity {:.4} > {cutoff}",
+                rep.max_retained_seq_identity
+            );
+            assert!(
+                rep.nearest_template_seq_identities
+                    .iter()
+                    .all(|&sid| sid <= cutoff + 1e-12),
+                "{bmrb_id} @ cutoff {cutoff}: nearest_template_seq_identities exceeded {cutoff}"
+            );
+            sum.max_retained_sid = sum.max_retained_sid.max(rep.max_retained_seq_identity);
+
+            let n_res = rep.residues.len();
+            let n_good = rep
+                .residues
+                .iter()
+                .filter(|r| r.class == TorsionPredictionClass::Good)
+                .count();
+            if !bref.is_folded {
+                sum.idp_total_res += n_res;
+                sum.idp_good_res += n_good;
+                let abstain_pct = 100.0 * ((n_res - n_good) as f64) / (n_res as f64);
+                assert!(
+                    abstain_pct >= 90.0,
+                    "{bmrb_id} @ cutoff {cutoff}: IDP abstention {abstain_pct:.1}% < 90%"
+                );
+                continue;
+            }
+
+            let p_keys: Vec<(i32, &str)> = rep
+                .residues
+                .iter()
+                .map(|r| (r.seq_id, r.res_name.as_str()))
+                .collect();
+            let t_keys: Vec<(i32, &str)> = bref
+                .residues
+                .iter()
+                .map(|r| (r.seq_id, r.res_name.as_str()))
+                .collect();
+            let pairs = align_by_res_names(&p_keys, &t_keys);
+
+            let mut prot_circ = Vec::new();
+            let mut prot_wb = 0usize;
+            let mut prot_gt = 0usize;
+            for r in &rep.residues {
+                sum.folded_total_res += 1;
+                if r.rci_s2 >= 0.65 {
+                    sum.folded_struct_res += 1;
+                    if r.class == TorsionPredictionClass::Good {
+                        sum.folded_struct_good_res += 1;
+                    }
+                }
+                if r.class == TorsionPredictionClass::Good {
+                    sum.folded_good_res += 1;
+                    if is_ramachandran_outlier(&r.res_name, r.phi_deg.unwrap(), r.psi_deg.unwrap())
+                    {
+                        sum.folded_rama_outliers += 1;
+                    }
+                }
+            }
+            for (pi, ti) in pairs {
+                let pr = &rep.residues[pi];
+                let tr = &bref.residues[ti];
+                if pr.class == TorsionPredictionClass::Good {
+                    if let (Some(pp), Some(ps), Some(tp), Some(ts)) =
+                        (pr.phi_deg, pr.psi_deg, tr.phi_deg, tr.psi_deg)
+                    {
+                        let ep = periodic_angle_abs_diff_deg(pp, tp);
+                        let es = periodic_angle_abs_diff_deg(ps, ts);
+                        let ec = 0.5 * (ep + es);
+                        sum.phi_errs.push(ep);
+                        sum.psi_errs.push(es);
+                        sum.circ_errs.push(ec);
+                        prot_circ.push(ec);
+                        sum.good_truth_count += 1;
+                        prot_gt += 1;
+                        if classify_rama_basin(pp, ps) != classify_rama_basin(tp, ts) {
+                            sum.wrong_basin_count += 1;
+                            prot_wb += 1;
+                        }
+                    }
+                    if let (Some(pc), Some(tc)) = (pr.chi1_deg, tr.chi1_deg) {
+                        sum.chi1_errs.push(periodic_angle_abs_diff_deg(pc, tc));
+                    }
+                }
+            }
+            println!(
+                "  {:<10} {:<5} Excl={:>3} MaxSid={:>5.1}% Good={:>5.1}% CircMAE={:>6.2} deg WrongBasin={:>5.2}%",
+                bmrb_id,
+                bref.pdb_id,
+                rep.excluded_template_ids.len(),
+                rep.max_retained_seq_identity * 100.0,
+                100.0 * (n_good as f64) / (n_res as f64),
+                prot_circ.iter().sum::<f64>() / (prot_circ.len().max(1) as f64),
+                100.0 * (prot_wb as f64) / (prot_gt.max(1) as f64),
+            );
+        }
+
+        let good_pct = 100.0 * (sum.folded_good_res as f64) / (sum.folded_total_res as f64);
+        let sgood_pct =
+            100.0 * (sum.folded_struct_good_res as f64) / (sum.folded_struct_res as f64);
+        let phi_mae = sum.phi_errs.iter().sum::<f64>() / (sum.phi_errs.len() as f64);
+        let psi_mae = sum.psi_errs.iter().sum::<f64>() / (sum.psi_errs.len() as f64);
+        let circ_mae = sum.circ_errs.iter().sum::<f64>() / (sum.circ_errs.len() as f64);
+        let chi1_mae = sum.chi1_errs.iter().sum::<f64>() / (sum.chi1_errs.len().max(1) as f64);
+        let wb_pct = 100.0 * (sum.wrong_basin_count as f64) / (sum.good_truth_count.max(1) as f64);
+        let idp_leak_pct = 100.0 * (sum.idp_good_res as f64) / (sum.idp_total_res as f64);
+        println!(
+            "[CUTOFF <= {:.0}%] MaxRetainedSid={:.2}%, Good={}/{} ({:.1}%), StructGood={}/{} ({:.1}%), PhiMAE={:.2}, PsiMAE={:.2}, CircMAE={:.2}, Chi1MAE={:.2} (n={}), WrongBasin={}/{} ({:.2}%), IDPLeak={}/{} ({:.2}%)",
+            cutoff * 100.0,
+            sum.max_retained_sid * 100.0,
+            sum.folded_good_res,
+            sum.folded_total_res,
+            good_pct,
+            sum.folded_struct_good_res,
+            sum.folded_struct_res,
+            sgood_pct,
+            phi_mae,
+            psi_mae,
+            circ_mae,
+            chi1_mae,
+            sum.chi1_errs.len(),
+            sum.wrong_basin_count,
+            sum.good_truth_count,
+            wb_pct,
+            sum.idp_good_res,
+            sum.idp_total_res,
+            idp_leak_pct,
+        );
+
+        assert!(
+            good_pct >= 65.0 && sgood_pct >= 75.0 && circ_mae <= 14.5 && wb_pct < 8.5,
+            "cutoff {cutoff} sensitivity check out of bounds: Good={good_pct:.1}%, StructGood={sgood_pct:.1}%, CircMAE={circ_mae:.2}, WrongBasin={wb_pct:.2}%"
+        );
+        summaries.push((cutoff, sum));
+    }
+
+    assert!(summaries[1].1.max_retained_sid <= 0.20 + 1e-12);
 }
