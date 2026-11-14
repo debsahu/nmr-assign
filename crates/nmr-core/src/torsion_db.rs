@@ -247,6 +247,10 @@ impl GlobalShiftOffsets {
     }
 }
 
+/// Default maximum sequence identity (`0.25`, i.e., `25%` Rost 1999 twilight-zone cutoff)
+/// enforced by `Layer 3` of [`HomologFirewall`].
+pub const DEFAULT_FIREWALL_MAX_SEQ_IDENTITY: f64 = 0.25;
+
 /// 4-Layer `HomologFirewall` (`L1`–`L4` exclusion filters + Audit Digest & Identity Stratification, `Q5`)
 /// query descriptor for strict non-homologous evaluation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -263,6 +267,64 @@ pub struct HomologFirewallQuery {
     pub query_topology_id: Option<String>,
     /// Optional reference `C_alpha` coordinates (`Layer 4`: excludes `TM-score >= 0.50`).
     pub query_ca_coords: Option<Vec<[f64; 3]>>,
+}
+
+/// Configurable 4-Layer `HomologFirewall` combining a [`HomologFirewallQuery`] descriptor with an
+/// explicit `Layer 3` maximum sequence-identity cutoff (`max_seq_identity`, default `0.25`; e.g., `0.20`
+/// for stricter `20%` sequence-identity sensitivity evaluation).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HomologFirewall {
+    pub query: HomologFirewallQuery,
+    pub max_seq_identity: f64,
+}
+
+impl Default for HomologFirewall {
+    fn default() -> Self {
+        Self {
+            query: HomologFirewallQuery::default(),
+            max_seq_identity: DEFAULT_FIREWALL_MAX_SEQ_IDENTITY,
+        }
+    }
+}
+
+impl HomologFirewall {
+    /// Construct a [`HomologFirewall`] with the default `25%` (`0.25`) sequence-identity cutoff.
+    pub fn new(query: HomologFirewallQuery) -> Self {
+        Self {
+            query,
+            max_seq_identity: DEFAULT_FIREWALL_MAX_SEQ_IDENTITY,
+        }
+    }
+
+    /// Override the `Layer 3` maximum sequence-identity cutoff (clamped to `[0.0, 1.0]`).
+    pub fn with_max_seq_identity(mut self, max_seq_identity: f64) -> Self {
+        self.max_seq_identity = max_seq_identity.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Apply this firewall against `db` for `query_seq1`.
+    pub fn apply<'a>(
+        &self,
+        db: &'a TorsionDb,
+        query_seq1: &[u8],
+    ) -> (
+        Vec<&'a TorsionCorpusChain>,
+        Vec<ExcludedTemplateRecord>,
+        String,
+        f64,
+    ) {
+        apply_homolog_firewall_with_cutoff(db, query_seq1, &self.query, self.max_seq_identity)
+    }
+
+    /// Predict `(phi, psi, chi1)` torsions from `shifts` using the embedded [`TorsionDb`] and this firewall.
+    pub fn predict(&self, shifts: &Reference) -> TorsionPredictionReport {
+        predict_torsions_with_db_and_cutoff(
+            TorsionDb::embedded(),
+            shifts,
+            &self.query,
+            self.max_seq_identity,
+        )
+    }
 }
 
 /// Detailed audit record for a template chain excluded by `HomologFirewall`.
@@ -690,6 +752,20 @@ impl SeqAlignmentStats {
 
     #[inline]
     pub fn exceeds_firewall(self, query_len: usize, template_len: usize) -> bool {
+        self.exceeds_firewall_with_cutoff(
+            query_len,
+            template_len,
+            DEFAULT_FIREWALL_MAX_SEQ_IDENTITY,
+        )
+    }
+
+    #[inline]
+    pub fn exceeds_firewall_with_cutoff(
+        self,
+        query_len: usize,
+        template_len: usize,
+        max_seq_identity: f64,
+    ) -> bool {
         if query_len == 0
             || template_len == 0
             || self.aligned_pairs == 0
@@ -699,7 +775,7 @@ impl SeqAlignmentStats {
         }
         let q_cov = (self.aligned_pairs as f64) / (query_len as f64);
         let t_cov = (self.aligned_pairs as f64) / (template_len as f64);
-        (q_cov >= 0.50 || t_cov >= 0.50) && self.identity_over_pairs() > 0.25
+        (q_cov >= 0.50 || t_cov >= 0.50) && self.identity_over_pairs() > max_seq_identity
     }
 }
 
@@ -1357,7 +1433,8 @@ pub fn tm_score_ca(query_ca: &[[f64; 3]], template_ca: &[[f64; 3]]) -> f64 {
 }
 
 /// Apply all 4 exclusion layers (`L1`–`L4`) of `HomologFirewall` plus Audit Digest & Identity Stratification (`Q5`),
-/// returning `(retained_chains, excluded_records, exclusion_list_sha256, max_retained_seq_id)`.
+/// returning `(retained_chains, excluded_records, exclusion_list_sha256, max_retained_seq_id)` at the default
+/// `25%` (`0.25`) sequence-identity cutoff.
 pub fn apply_homolog_firewall<'a>(
     db: &'a TorsionDb,
     query_seq1: &[u8],
@@ -1368,6 +1445,23 @@ pub fn apply_homolog_firewall<'a>(
     String,
     f64,
 ) {
+    apply_homolog_firewall_with_cutoff(db, query_seq1, firewall, DEFAULT_FIREWALL_MAX_SEQ_IDENTITY)
+}
+
+/// Apply all 4 exclusion layers (`L1`–`L4`) of `HomologFirewall` with an explicit `Layer 3` maximum
+/// sequence-identity cutoff (`max_seq_identity`, e.g. `0.20` or `0.25`).
+pub fn apply_homolog_firewall_with_cutoff<'a>(
+    db: &'a TorsionDb,
+    query_seq1: &[u8],
+    firewall: &HomologFirewallQuery,
+    max_seq_identity: f64,
+) -> (
+    Vec<&'a TorsionCorpusChain>,
+    Vec<ExcludedTemplateRecord>,
+    String,
+    f64,
+) {
+    let cutoff = max_seq_identity.clamp(0.0, 1.0);
     let q_pdbs: Vec<String> = firewall
         .query_pdb_ids
         .iter()
@@ -1435,17 +1529,17 @@ pub fn apply_homolog_firewall<'a>(
         }
 
         // Layer 3: Global/shorter-spanning NW + Local SW (BLOSUM62 AND exact-identity scoring,
-        // > 25% seq identity over >= 50% query OR template coverage) + 7-mer <= 1 mismatch
+        // > cutoff seq identity over >= 50% query OR template coverage) + 7-mer <= 1 mismatch
         let qlen = query_seq1.len();
         let tlen = ch.seq1.len();
         let nw = needleman_wunsch_stats(query_seq1, &ch.seq1);
         let nw_id = needleman_wunsch_identity_stats(query_seq1, &ch.seq1);
         let best_nw_sid = [nw, nw_id]
             .into_iter()
-            .filter(|st| st.exceeds_firewall(qlen, tlen))
+            .filter(|st| st.exceeds_firewall_with_cutoff(qlen, tlen, cutoff))
             .map(|st| st.identity_over_pairs())
             .fold(0.0f64, f64::max);
-        if best_nw_sid > 0.25 {
+        if best_nw_sid > cutoff {
             reasons.push(format!("L3:nw_seq_id({best_nw_sid:.3})"));
         }
 
@@ -1453,10 +1547,10 @@ pub fn apply_homolog_firewall<'a>(
         let sw_id = smith_waterman_identity_stats(query_seq1, &ch.seq1);
         let best_sw_sid = [sw, sw_id]
             .into_iter()
-            .filter(|st| st.exceeds_firewall(qlen, tlen))
+            .filter(|st| st.exceeds_firewall_with_cutoff(qlen, tlen, cutoff))
             .map(|st| st.identity_over_pairs())
             .fold(0.0f64, f64::max);
-        if best_sw_sid > 0.25 {
+        if best_sw_sid > cutoff {
             reasons.push(format!("L3:sw_seq_id({best_sw_sid:.3})"));
         }
 
@@ -1793,7 +1887,22 @@ pub fn predict_torsions_with_firewall(
     shifts: &Reference,
     firewall: &HomologFirewallQuery,
 ) -> TorsionPredictionReport {
-    predict_torsions_with_db(TorsionDb::embedded(), shifts, firewall)
+    predict_torsions_with_db_and_cutoff(
+        TorsionDb::embedded(),
+        shifts,
+        firewall,
+        DEFAULT_FIREWALL_MAX_SEQ_IDENTITY,
+    )
+}
+
+/// Predict `(phi, psi, chi1)` torsions from assigned chemical shifts enforcing `HomologFirewall`
+/// with an explicit `Layer 3` maximum sequence-identity cutoff (`max_seq_identity`, e.g. `0.20` or `0.25`).
+pub fn predict_torsions_with_firewall_cutoff(
+    shifts: &Reference,
+    firewall: &HomologFirewallQuery,
+    max_seq_identity: f64,
+) -> TorsionPredictionReport {
+    predict_torsions_with_db_and_cutoff(TorsionDb::embedded(), shifts, firewall, max_seq_identity)
 }
 
 /// Predict `(phi, psi, chi1)` torsions against an explicit `TorsionDb` instance and `HomologFirewallQuery`.
@@ -1801,6 +1910,17 @@ pub fn predict_torsions_with_db(
     db: &TorsionDb,
     shifts: &Reference,
     firewall: &HomologFirewallQuery,
+) -> TorsionPredictionReport {
+    predict_torsions_with_db_and_cutoff(db, shifts, firewall, DEFAULT_FIREWALL_MAX_SEQ_IDENTITY)
+}
+
+/// Predict `(phi, psi, chi1)` torsions against an explicit `TorsionDb`, `HomologFirewallQuery`,
+/// and `Layer 3` maximum sequence-identity cutoff (`max_seq_identity`).
+pub fn predict_torsions_with_db_and_cutoff(
+    db: &TorsionDb,
+    shifts: &Reference,
+    firewall: &HomologFirewallQuery,
+    max_seq_identity: f64,
 ) -> TorsionPredictionReport {
     const INV_VAR: [f64; 6] = [
         1.0 / (0.35 * 0.35),
@@ -1813,7 +1933,7 @@ pub fn predict_torsions_with_db(
     const POS_NUC_W: [[f64; 6]; 3] = [
         [0.6, 0.8, 1.4, 1.1, 2.0, 1.3], // i - 1: C'_{i-1} couples directly across peptide bond to phi_i
         [1.3, 1.6, 2.4, 1.9, 2.1, 2.2], // i: all 6 nuclei
-        [1.4, 1.8, 1.4, 1.1, 1.2, 1.3], // i + 1: N_{i+1}, H_{i+1} couple directly to psi_i
+        [1.4, 1.8, 1.4, 1.1, 1.2, 1.3], // i + 1: N_{i+1}, H_{i+1} couples directly to psi_i
     ];
 
     let n = shifts.sequence.len();
@@ -1823,7 +1943,7 @@ pub fn predict_torsions_with_db(
         .map(|r| three_to_one(r) as u8)
         .collect();
     let (kept_chains, excluded_details, exclusion_list_sha256, max_retained_seq_identity) =
-        apply_homolog_firewall(db, &q_seq1, firewall);
+        apply_homolog_firewall_with_cutoff(db, &q_seq1, firewall, max_seq_identity);
     let excluded_template_ids: Vec<String> = excluded_details
         .iter()
         .map(|e| e.chain_key.clone())

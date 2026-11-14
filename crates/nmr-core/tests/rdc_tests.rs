@@ -10,15 +10,19 @@ use nmr_core::noesy::{
 };
 use nmr_core::rdc::{
     calc_rdc_from_unit_vec, cornilescu_q, count_unresolved_rdc_restraints, evaluate_rdc_validation,
-    fit_saupe_tensor_svd, format_rdc_tsv, parse_rdc_tsv_str, partition_rdc_free_set,
-    rdc_q_is_better, read_rdc_tsv, saupe_matrix_from_pas, RdcBondType, RdcMediumSet, RdcRestraint,
+    fit_saupe_tensor_svd, format_rdc_tsv, normalize_rdc_sign_convention, parse_rdc_tsv_str,
+    parse_rdc_tsv_str_with_convention, partition_rdc_free_set, partition_rdc_free_set_with_mode,
+    rdc_peptide_plane_id, rdc_q_is_better, read_rdc_tsv, saupe_matrix_from_pas, RdcBondType,
+    RdcFreeStratification, RdcMediumSet, RdcRestraint, RdcSignConvention, DMAX_CAHA_HZ, DMAX_NH_HZ,
+    R_CAHA_EFF_A, R_CAHA_GEOM_A, R_NH_EFF_A, R_NH_GEOM_A,
 };
 use nmr_core::report::{generate_quality_report_html, ReportInput};
 use nmr_core::rng::Rng;
 use nmr_core::structure::{
-    build_backbone_from_torsions, calculate_structure_with_rdcs_and_dihedrals,
-    evaluate_energy_and_gradients_with_rdcs, evaluate_rdc_torsion_energy_and_gradients_fixed_saupe,
-    validate_ensemble, EnergyWeights, StructureCalcConfig,
+    backbone_rmsd_seq_range, build_backbone_from_torsions,
+    calculate_structure_with_rdcs_and_dihedrals, evaluate_energy_and_gradients_with_rdcs,
+    evaluate_rdc_torsion_energy_and_gradients_fixed_saupe, fold_from_experimental_noes_and_rdcs,
+    read_exp_noe_tsv, validate_ensemble, EnergyWeights, StructureCalcConfig, BOND_CA_HA,
 };
 use nmr_core::torsion_db::{predict_torsions_with_firewall, HomologFirewallQuery};
 
@@ -495,6 +499,171 @@ fn test_analytical_rdc_torsion_gradients_vs_finite_differences() {
         );
     }
     assert_eq!(go_var[l - 1], 0.0);
+
+    // 4. Exact analytical (grad_phi, grad_psi, grad_omega) for Kabsch-Sander 4-site H-bond electrostatics (`w_hbond = 1.75`)
+    let mut gp_hb = vec![0.0; l];
+    let mut gs_hb = vec![0.0; l];
+    let mut go_hb = vec![0.0; l];
+    let _ = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+        &seq,
+        &seq_ids,
+        &phi,
+        &psi,
+        &omg_pert,
+        &[],
+        &dihs,
+        &media,
+        0.25,
+        115.0,
+        1.75,
+        &weights,
+        &mut gp_hb,
+        &mut gs_hb,
+        Some(&mut go_hb),
+    );
+    for i in 1..l {
+        let mut p_plus = phi.clone();
+        let mut p_minus = phi.clone();
+        p_plus[i] += eps;
+        p_minus[i] -= eps;
+        let (_, ebp) = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            &seq,
+            &seq_ids,
+            &p_plus,
+            &psi,
+            &omg_pert,
+            &[],
+            &dihs,
+            &media,
+            0.25,
+            115.0,
+            1.75,
+            &weights,
+            &mut dummy_gp,
+            &mut dummy_gs,
+            None,
+        );
+        let (_, ebm) = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            &seq,
+            &seq_ids,
+            &p_minus,
+            &psi,
+            &omg_pert,
+            &[],
+            &dihs,
+            &media,
+            0.25,
+            115.0,
+            1.75,
+            &weights,
+            &mut dummy_gp,
+            &mut dummy_gs,
+            None,
+        );
+        let fd = (ebp.total - ebm.total) / (2.0 * eps);
+        let rel = (gp_hb[i] - fd).abs() / fd.abs().max(1.0);
+        assert!(
+            rel < 1e-6,
+            "Kabsch-Sander H-bond grad_phi[{i}] mismatch: ana={} vs fd={} (rel={rel})",
+            gp_hb[i],
+            fd
+        );
+    }
+    for i in 0..(l - 1) {
+        let mut s_plus = psi.clone();
+        let mut s_minus = psi.clone();
+        s_plus[i] += eps;
+        s_minus[i] -= eps;
+        let (_, ebp) = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            &seq,
+            &seq_ids,
+            &phi,
+            &s_plus,
+            &omg_pert,
+            &[],
+            &dihs,
+            &media,
+            0.25,
+            115.0,
+            1.75,
+            &weights,
+            &mut dummy_gp,
+            &mut dummy_gs,
+            None,
+        );
+        let (_, ebm) = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            &seq,
+            &seq_ids,
+            &phi,
+            &s_minus,
+            &omg_pert,
+            &[],
+            &dihs,
+            &media,
+            0.25,
+            115.0,
+            1.75,
+            &weights,
+            &mut dummy_gp,
+            &mut dummy_gs,
+            None,
+        );
+        let fd = (ebp.total - ebm.total) / (2.0 * eps);
+        let rel = (gs_hb[i] - fd).abs() / fd.abs().max(1.0);
+        assert!(
+            rel < 1e-6,
+            "Kabsch-Sander H-bond grad_psi[{i}] mismatch: ana={} vs fd={} (rel={rel})",
+            gs_hb[i],
+            fd
+        );
+
+        let mut o_plus = omg_pert.clone();
+        let mut o_minus = omg_pert.clone();
+        o_plus[i] += eps;
+        o_minus[i] -= eps;
+        let (_, ebop) = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            &seq,
+            &seq_ids,
+            &phi,
+            &psi,
+            &o_plus,
+            &[],
+            &dihs,
+            &media,
+            0.25,
+            115.0,
+            1.75,
+            &weights,
+            &mut dummy_gp,
+            &mut dummy_gs,
+            None,
+        );
+        let (_, ebom) = nmr_core::structure::evaluate_energy_and_gradients_with_rdcs_omega_hbond(
+            &seq,
+            &seq_ids,
+            &phi,
+            &psi,
+            &o_minus,
+            &[],
+            &dihs,
+            &media,
+            0.25,
+            115.0,
+            1.75,
+            &weights,
+            &mut dummy_gp,
+            &mut dummy_gs,
+            None,
+        );
+        let fdo = (ebop.total - ebom.total) / (2.0 * eps);
+        let relo = (go_hb[i] - fdo).abs() / fdo.abs().max(1.0);
+        assert!(
+            relo < 1e-6,
+            "Kabsch-Sander H-bond grad_omega[{i}] mismatch: ana={} vs fd={} (rel={relo})",
+            go_hb[i],
+            fdo
+        );
+    }
 }
 
 #[test]
@@ -786,8 +955,9 @@ fn test_experimental_ubiquitin_1d3z_cross_validated_rdc_refinement() {
     }
 
     assert!(
-        after_rdc_val.overall_q_free < 0.25,
-        "held-out 1D3Z Q_free {:.4} must be < 0.25!",
+        after_rdc_val.overall_q_work < 0.14 && after_rdc_val.overall_q_free < 0.34,
+        "1D3Z ByPeptidePlane Q_work={:.4} (< 0.14) or Q_free={:.4} (< 0.34) out of bounds!",
+        after_rdc_val.overall_q_work,
         after_rdc_val.overall_q_free
     );
     assert!(
@@ -797,7 +967,7 @@ fn test_experimental_ubiquitin_1d3z_cross_validated_rdc_refinement() {
         after_rdc_val.overall_q_free
     );
     assert!(
-        rmsd_after < rmsd_before && mean_after < mean_before,
+        rmsd_after < 0.80 && rmsd_after < rmsd_before && mean_after < mean_before,
         "RDC refinement must lower backbone RMSD to 1D3Z vs NOE-only folding (lowE: {rmsd_before:.3} -> {rmsd_after:.3} A; mean: {mean_before:.3} -> {mean_after:.3} A)"
     );
 }
@@ -924,5 +1094,564 @@ fn test_p1_6_gly_explicit_ha2_ha3_tetrahedral_rdc_and_unresolved_counts() {
     assert_eq!(
         count_unresolved_rdc_restraints(&chain, &[med_with_drops]),
         2
+    );
+}
+
+#[test]
+fn test_rdc_free_stratification_by_peptide_plane_zero_plane_leakage() {
+    let root = workspace_root();
+    let media_raw =
+        read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).expect("read 1D3Z RDC TSV");
+    assert_eq!(
+        RdcFreeStratification::default(),
+        RdcFreeStratification::ByPeptidePlane
+    );
+
+    // 1. Default `partition_rdc_free_set` (ByPeptidePlane): ZERO peptide planes have mixed work/free
+    //    couplings within or across alignment media!
+    let mut media_plane = media_raw.clone();
+    partition_rdc_free_set(&mut media_plane, 0.20, 199807);
+
+    let mut plane_states: std::collections::BTreeMap<i32, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for m in &media_plane {
+        let mut med_work = 0usize;
+        for r in &m.restraints {
+            if !r.is_free {
+                med_work += 1;
+            }
+            let pid = rdc_peptide_plane_id(r);
+            let entry = plane_states.entry(pid).or_insert((0, 0));
+            if r.is_free {
+                entry.1 += 1;
+            } else {
+                entry.0 += 1;
+            }
+        }
+        assert!(
+            med_work >= 6,
+            "medium '{}' must retain >= 6 work RDCs",
+            m.medium_id
+        );
+    }
+    let split_planes_plane_mode = plane_states
+        .iter()
+        .filter(|(_, &(w, f))| w > 0 && f > 0)
+        .count();
+    let free_planes = plane_states.iter().filter(|(_, &(_, f))| f > 0).count();
+    assert_eq!(
+        split_planes_plane_mode, 0,
+        "ByPeptidePlane must hold out whole peptide planes with zero mixed work/free planes"
+    );
+    assert!(
+        free_planes >= 10,
+        "expected >= 10 held-out peptide planes at 20% holdout, got {free_planes}"
+    );
+
+    // Verify specific coplanar group mapping: NH(i), NC'(i-1,i), HNC'(i-1,i), CACO(i-1), CAHA(i) -> plane_id = i
+    for m in &media_plane {
+        for r in &m.restraints {
+            let pid = rdc_peptide_plane_id(r);
+            match r.bond_type {
+                RdcBondType::NH | RdcBondType::CAHA => assert_eq!(pid, r.seq_id_1.max(r.seq_id_2)),
+                RdcBondType::NCPrime | RdcBondType::HNCPrime => {
+                    assert_eq!(pid, r.seq_id_1.max(r.seq_id_2))
+                }
+                RdcBondType::CACO => assert_eq!(pid, r.seq_id_1.min(r.seq_id_2) + 1),
+            }
+        }
+    }
+
+    // 2. Legacy `ByCoupling` mode remains accessible and splits multi-coupling peptide planes
+    let mut media_coupling = media_raw;
+    partition_rdc_free_set_with_mode(
+        &mut media_coupling,
+        0.20,
+        199807,
+        RdcFreeStratification::ByCoupling,
+    );
+    let mut coupling_plane_states: std::collections::BTreeMap<i32, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for m in &media_coupling {
+        for r in &m.restraints {
+            let entry = coupling_plane_states
+                .entry(rdc_peptide_plane_id(r))
+                .or_insert((0, 0));
+            if r.is_free {
+                entry.1 += 1;
+            } else {
+                entry.0 += 1;
+            }
+        }
+    }
+    let split_planes_coupling_mode = coupling_plane_states
+        .iter()
+        .filter(|(_, &(w, f))| w > 0 && f > 0)
+        .count();
+    assert!(
+        split_planes_coupling_mode > 0,
+        "ByCoupling mode should split peptide planes across bond types, got 0 split planes"
+    );
+}
+
+#[test]
+fn test_rdc_signed_dmax_and_physical_gamma_sign_convention() {
+    // Verify harmonized covalent geometry vs libration-averaged effective bond lengths and IUPAC labels
+    assert!((R_NH_GEOM_A - 1.010).abs() < 1e-12);
+    assert!((R_NH_EFF_A - 1.040).abs() < 1e-12);
+    assert!((R_CAHA_GEOM_A - 1.090).abs() < 1e-12);
+    assert!((BOND_CA_HA - R_CAHA_GEOM_A).abs() < 1e-12);
+    assert!((R_CAHA_EFF_A - 1.105).abs() < 1e-12);
+    assert!((DMAX_CAHA_HZ / DMAX_NH_HZ - 2.0679).abs() < 1e-3);
+    assert_eq!(RdcBondType::HNCPrime.canonical_label(), "1D_HNC'");
+    assert_eq!(RdcBondType::HNCPrime.iupac_coupling_label(), "2D_HNC'");
+    assert_eq!(
+        RdcBondType::parse_label("2D_HNC'").unwrap(),
+        RdcBondType::HNCPrime
+    );
+    assert_eq!(RdcBondType::NH.physical_gamma_sign(), -1.0);
+    assert_eq!(RdcBondType::NCPrime.physical_gamma_sign(), -1.0);
+    assert_eq!(RdcBondType::CAHA.physical_gamma_sign(), 1.0);
+    assert_eq!(RdcBondType::CACO.physical_gamma_sign(), 1.0);
+    assert_eq!(RdcBondType::HNCPrime.physical_gamma_sign(), 1.0);
+
+    let (seq, seq_ids, chain) = build_diverse_test_chain();
+    let s_true = saupe_matrix_from_pas(14.2, 0.31, [33.0, 52.0, 128.0]);
+    let mut med_pos = synthesize_all5_rdc_medium(&chain, "bicelle_sign", &s_true);
+    partition_rdc_free_set(std::slice::from_mut(&mut med_pos), 0.20, 77);
+
+    // Build equivalent physical-gamma-sign dataset (`gamma_15N < 0` => negative `d_obs_hz` & negative `d_max_hz`
+    // on `1D_NH` and `1D_NC'`, using `"2D_HNC'"` label in TSV with `# sign_convention: physical_gamma`)
+    let mut tsv_phys = String::from(
+        "# sign_convention: physical_gamma\n\
+         medium_id\tseq_id_1\tres_name_1\tatom_name_1\tseq_id_2\tres_name_2\tatom_name_2\tbond_type\td_obs_hz\tsigma_hz\td_max_hz\tis_free\n",
+    );
+    for r in &med_pos.restraints {
+        let g_sgn = r.bond_type.physical_gamma_sign();
+        let d_obs_phys = r.d_obs_hz * g_sgn;
+        tsv_phys.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.15e}\t{:.6}\t.\t{}\n",
+            r.medium_id,
+            r.seq_id_1,
+            r.res_name_1,
+            r.atom_name_1,
+            r.seq_id_2,
+            r.res_name_2,
+            r.atom_name_2,
+            r.bond_type.iupac_coupling_label(),
+            d_obs_phys,
+            r.sigma_hz,
+            if r.is_free { 1 } else { 0 }
+        ));
+    }
+
+    let media_phys = parse_rdc_tsv_str(&tsv_phys).expect("parse physical_gamma RDC TSV");
+    assert_eq!(media_phys.len(), 1);
+    assert!(media_phys[0]
+        .restraints
+        .iter()
+        .filter(|r| matches!(r.bond_type, RdcBondType::NH | RdcBondType::NCPrime))
+        .all(|r| r.d_max_hz < 0.0));
+    assert!(media_phys[0]
+        .restraints
+        .iter()
+        .filter(|r| !matches!(r.bond_type, RdcBondType::NH | RdcBondType::NCPrime))
+        .all(|r| r.d_max_hz > 0.0));
+
+    // Also test explicit negative `d_max_hz` column without header directive
+    let mut med_explicit_neg = med_pos.clone();
+    for r in &mut med_explicit_neg.restraints {
+        if r.bond_type.physical_gamma_sign() < 0.0 {
+            r.d_obs_hz = -r.d_obs_hz;
+            r.d_max_hz = -r.d_max_hz;
+        }
+        r.validate()
+            .expect("negative d_max_hz must validate cleanly");
+    }
+    let parsed_explicit = parse_rdc_tsv_str_with_convention(
+        &format_rdc_tsv(std::slice::from_ref(&med_explicit_neg)),
+        RdcSignConvention::SignNormalized,
+    )
+    .unwrap();
+    assert!(parsed_explicit[0]
+        .restraints
+        .iter()
+        .any(|r| r.d_max_hz < 0.0));
+
+    // Zero `d_max_hz` must still fail validation
+    let mut bad_zero_dmax = med_pos.restraints[0].clone();
+    bad_zero_dmax.d_max_hz = 0.0;
+    assert!(bad_zero_dmax.validate().is_err());
+
+    // Machine-precision invariance of Saupe SVD fit (`S`, `Da`, `R`, `Euler`, `Q_work`, `Q_free`)
+    let fit_pos = fit_saupe_tensor_svd(&chain, &med_pos).unwrap();
+    let fit_phys = fit_saupe_tensor_svd(&chain, &media_phys[0]).unwrap();
+    assert!((fit_pos.da_nh_hz - fit_phys.da_nh_hz).abs() < 1e-9);
+    assert!((fit_pos.rhombicity - fit_phys.rhombicity).abs() < 1e-10);
+    assert!((fit_pos.q_work - fit_phys.q_work).abs() < 1e-12);
+    assert!((fit_pos.q_free - fit_phys.q_free).abs() < 1e-12);
+    for r in 0..3 {
+        for c in 0..3 {
+            assert!((fit_pos.s_matrix[r][c] - fit_phys.s_matrix[r][c]).abs() < 1e-12);
+        }
+    }
+
+    // Machine-precision invariance of analytical variable-projection torsion energy & gradients
+    let mut rng = Rng::new(909);
+    let l = seq.len();
+    let phi: Vec<f64> = (0..l).map(|_| rng.uniform(-2.2, 2.0)).collect();
+    let psi: Vec<f64> = (0..l).map(|_| rng.uniform(-2.4, 2.4)).collect();
+    let omega = vec![PI; l];
+    let weights = EnergyWeights::default();
+    let mut gp_pos = vec![0.0; l];
+    let mut gs_pos = vec![0.0; l];
+    let mut gp_phys = vec![0.0; l];
+    let mut gs_phys = vec![0.0; l];
+    let (_, eb_pos) = evaluate_energy_and_gradients_with_rdcs(
+        &seq,
+        &seq_ids,
+        &phi,
+        &psi,
+        &omega,
+        &[],
+        &[],
+        std::slice::from_ref(&med_pos),
+        0.5,
+        &weights,
+        &mut gp_pos,
+        &mut gs_pos,
+    );
+    let (_, eb_phys) = evaluate_energy_and_gradients_with_rdcs(
+        &seq,
+        &seq_ids,
+        &phi,
+        &psi,
+        &omega,
+        &[],
+        &[],
+        &media_phys,
+        0.5,
+        &weights,
+        &mut gp_phys,
+        &mut gs_phys,
+    );
+    assert!((eb_pos.total - eb_phys.total).abs() < 1e-9);
+    for i in 0..l {
+        assert!((gp_pos[i] - gp_phys[i]).abs() < 1e-9);
+        assert!((gs_pos[i] - gs_phys[i]).abs() < 1e-9);
+    }
+
+    // `normalize_rdc_sign_convention` converts `media_phys` back to positive `d_max_hz > 0`
+    let mut norm_media = media_phys;
+    normalize_rdc_sign_convention(&mut norm_media, RdcSignConvention::PhysicalGammaSign);
+    for (ra, rb) in norm_media[0]
+        .restraints
+        .iter()
+        .zip(med_pos.restraints.iter())
+    {
+        assert!(ra.d_max_hz > 0.0);
+        assert!((ra.d_obs_hz - rb.d_obs_hz).abs() < 1e-8);
+        assert!((ra.d_max_hz - rb.d_max_hz).abs() < 1e-8);
+    }
+}
+
+#[test]
+fn test_noncircular_ubiquitin_exp_noe_fold_rdc_refine_vs_1ubq_xray() {
+    let root = workspace_root();
+    // Independent 1987 1.8 A X-ray crystal reference structure (1UBQ; Vijay-Kumar et al., JMB 1987),
+    // solved 11 years BEFORE 1D3Z bicelle RDCs existed — strictly non-circular external reference!
+    let xray_1ubq = parse_pdb_first_model(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .expect("read 1UBQ");
+    assert_eq!(xray_1ubq.residues.len(), 76);
+
+    let seq: Vec<String> = xray_1ubq
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids: Vec<i32> = xray_1ubq.residues.iter().map(|r| r.seq_id).collect();
+
+    // Pure experimental proton-proton NOE distance bounds from wwPDB 1D3Z (`1d3z.mr`, zero simulated NOEs!)
+    let exp_adrs = read_exp_noe_tsv(
+        root.join("data/fixtures/ubiquitin_1d3z_exp_noe.tsv"),
+        &seq,
+        &seq_ids,
+    )
+    .expect("read experimental 1D3Z NOEs");
+    assert!(exp_adrs.len() >= 2500);
+
+    // Experimental bicelle RDCs partitioned with 20% ByPeptidePlane RdcFree holdout
+    let mut media =
+        read_rdc_tsv(root.join("data/fixtures/ubiquitin_1d3z_rdc.tsv")).expect("read 1D3Z RDCs");
+    partition_rdc_free_set_with_mode(
+        &mut media,
+        0.20,
+        199807,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+
+    // 1. Validate experimental 1D3Z bicelle RDCs directly on independent 1.8 A X-ray 1UBQ
+    let xray_rdc_val = evaluate_rdc_validation(&xray_1ubq, &media).unwrap();
+    println!(
+        "\n[NON-CIRCULAR UBIQUITIN -> 1UBQ 1.8A X-RAY] Direct 1D3Z RDC fit on unrefined 1UBQ crystal: Q_work = {:.4}, plane Q_free = {:.4}",
+        xray_rdc_val.overall_q_work, xray_rdc_val.overall_q_free
+    );
+
+    // 2. Fold de novo from extended/random coordinates using ONLY experimental NOEs (`dihedrals = &[]`, zero RDCs)
+    let cfg = StructureCalcConfig {
+        seed: 20260401,
+        ..StructureCalcConfig::default()
+    };
+    let (noe_only, none_rdc) =
+        fold_from_experimental_noes_and_rdcs(&seq, &seq_ids, &exp_adrs, &[], &[], 0.0, &cfg)
+            .expect("pure experimental NOE fold");
+    assert!(none_rdc.is_none());
+
+    let pre_rdc_val = evaluate_rdc_validation(&noe_only.conformers[0].chain, &media).unwrap();
+    let pre_rmsd_low = backbone_rmsd_seq_range(&noe_only.conformers[0].chain, &xray_1ubq, 1, 71);
+    let pre_rmsd_mean: f64 = noe_only
+        .conformers
+        .iter()
+        .map(|c| backbone_rmsd_seq_range(&c.chain, &xray_1ubq, 1, 71))
+        .sum::<f64>()
+        / (noe_only.conformers.len() as f64);
+
+    // 3. Multi-cycle pure-experimental-NOE + working (!is_free) bicelle RDC refinement from the same Cycle 0 pool
+    let (rdc_ens, post_rdc_opt) =
+        fold_from_experimental_noes_and_rdcs(&seq, &seq_ids, &exp_adrs, &[], &media, 0.75, &cfg)
+            .expect("RDC refinement on pure-NOE ubiquitin ensemble");
+    let post_rdc_val = post_rdc_opt.expect("RDC validation summary");
+    let refined_conformers = rdc_ens.conformers;
+
+    let post_rmsd_low = backbone_rmsd_seq_range(&refined_conformers[0].chain, &xray_1ubq, 1, 71);
+    let post_rmsd_mean: f64 = refined_conformers
+        .iter()
+        .map(|c| backbone_rmsd_seq_range(&c.chain, &xray_1ubq, 1, 71))
+        .sum::<f64>()
+        / (refined_conformers.len() as f64);
+
+    println!("=== P1-9 NON-CIRCULAR UBIQUITIN (EXP 1D3Z NOE -> RDC -> INDEPENDENT 1UBQ X-RAY) ===");
+    println!(
+        "  Exp NOE-only  : Q_work = {:.4}, plane Q_free = {:.4} | 1UBQ (1..71) BB RMSD lowE = {:.3} A, mean = {:.3} A",
+        pre_rdc_val.overall_q_work, pre_rdc_val.overall_q_free, pre_rmsd_low, pre_rmsd_mean
+    );
+    println!(
+        "  + Bicelle RDC : Q_work = {:.4}, plane Q_free = {:.4} | 1UBQ (1..71) BB RMSD lowE = {:.3} A, mean = {:.3} A",
+        post_rdc_val.overall_q_work, post_rdc_val.overall_q_free, post_rmsd_low, post_rmsd_mean
+    );
+
+    assert!(
+        post_rdc_val.overall_q_work < 0.22
+            && post_rdc_val.overall_q_work < pre_rdc_val.overall_q_work,
+        "working Q must improve ({:.4} -> {:.4})",
+        pre_rdc_val.overall_q_work,
+        post_rdc_val.overall_q_work
+    );
+    assert!(
+        post_rdc_val.overall_q_free < pre_rdc_val.overall_q_free,
+        "peptide-plane Q_free must improve ({:.4} -> {:.4})",
+        pre_rdc_val.overall_q_free,
+        post_rdc_val.overall_q_free
+    );
+    assert!(
+        post_rdc_val.overall_q_free < 0.65,
+        "non-circular pure-NOE ubiquitin peptide-plane Q_free {:.4} must be < 0.65",
+        post_rdc_val.overall_q_free
+    );
+    assert!(
+        post_rmsd_low < 1.80 && post_rmsd_mean < 2.35 && post_rmsd_low < pre_rmsd_low,
+        "non-circular 1UBQ (1..71) BB RMSD out of range: lowE={pre_rmsd_low:.3} -> {post_rmsd_low:.3} A, mean={pre_rmsd_mean:.3} -> {post_rmsd_mean:.3} A"
+    );
+    assert!(
+        post_rmsd_mean < pre_rmsd_mean,
+        "RDC refinement must improve independent 1UBQ (1..71) mean BB RMSD ({pre_rmsd_mean:.3} -> {post_rmsd_mean:.3} A)"
+    );
+}
+
+#[test]
+fn test_noncircular_gb1_3gb1_exp_noe_fold_rdc_refine_vs_1pga_xray() {
+    let root = workspace_root();
+    // Independent 1994 2.07 A X-ray crystal structure of Streptococcal Protein G B1 domain (1PGA;
+    // Gallagher et al., Biochemistry 1994) — solved 4 years BEFORE 3GB1 TMV/bicelle RDCs!
+    let xray_1pga = parse_pdb_first_model(root.join("data/pdb_refs/1pga.pdb")).expect("read 1PGA");
+    assert_eq!(xray_1pga.residues.len(), 56);
+
+    let seq: Vec<String> = xray_1pga
+        .residues
+        .iter()
+        .map(|r| r.res_name.clone())
+        .collect();
+    let seq_ids: Vec<i32> = xray_1pga.residues.iter().map(|r| r.seq_id).collect();
+
+    // Pure experimental proton-proton NOEs from wwPDB 3GB1 (`3gb1.mr` Section A, zero H-bonds, zero simulated NOEs!)
+    let exp_adrs = read_exp_noe_tsv(
+        root.join("data/fixtures/gb1_3gb1_exp_noe.tsv"),
+        &seq,
+        &seq_ids,
+    )
+    .expect("read experimental 3GB1 NOEs");
+    assert!(exp_adrs.len() >= 600);
+
+    // Experimental two-medium peptide-plane RDCs (`tmv_3gb1` + `bicelle_3gb1`, 300 couplings) with 20% ByPeptidePlane holdout
+    let mut media =
+        read_rdc_tsv(root.join("data/fixtures/gb1_3gb1_rdc.tsv")).expect("read 3GB1 RDCs");
+    assert_eq!(media.len(), 2);
+    partition_rdc_free_set_with_mode(
+        &mut media,
+        0.20,
+        2026,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+
+    // 1. Direct Saupe SVD validation of experimental 3GB1 RDCs on unrefined 1994 X-ray 1PGA
+    let xray_rdc_val = evaluate_rdc_validation(&xray_1pga, &media).expect("1PGA Saupe SVD");
+    let nh_only_media: Vec<RdcMediumSet> = media
+        .iter()
+        .map(|m| RdcMediumSet {
+            medium_id: m.medium_id.clone(),
+            restraints: m
+                .restraints
+                .iter()
+                .filter(|r| r.bond_type == RdcBondType::NH)
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    let xray_nh_val = evaluate_rdc_validation(&xray_1pga, &nh_only_media).expect("1PGA NH SVD");
+    println!(
+        "\n[NON-CIRCULAR GB1 -> 1PGA 2.07A X-RAY] Direct 3GB1 RDC fit on unrefined 1994 1PGA crystal: 1D_NH Q = {:.4}, multi-bond Q_work = {:.4}, plane Q_free = {:.4} | m0 ({}, Da={:+.2} Hz, R={:.3}, Q={:.4}) | m1 ({}, Da={:+.2} Hz, R={:.3}, Q={:.4})",
+        xray_nh_val.overall_q_work,
+        xray_rdc_val.overall_q_work,
+        xray_rdc_val.overall_q_free,
+        xray_rdc_val.media[0].medium_id,
+        xray_rdc_val.media[0].da_nh_hz,
+        xray_rdc_val.media[0].rhombicity,
+        xray_rdc_val.media[0].q_work,
+        xray_rdc_val.media[1].medium_id,
+        xray_rdc_val.media[1].da_nh_hz,
+        xray_rdc_val.media[1].rhombicity,
+        xray_rdc_val.media[1].q_work,
+    );
+    assert!(
+        xray_nh_val.overall_q_work < 0.20 && xray_rdc_val.overall_q_work < 0.36,
+        "experimental 3GB1 RDCs must agree with independent 1994 1PGA X-ray structure (got NH Q={:.4}, multi-bond Q_work={:.4})",
+        xray_nh_val.overall_q_work,
+        xray_rdc_val.overall_q_work
+    );
+
+    // 2. Predict non-homologous (phi, psi) torsion restraints from public CC0 solution-NMR BMRB 7280
+    //    chemical shifts under the 4-layer HomologFirewall (excluding all GB1 / CATH 3.10.20 beta-grasp
+    //    templates, with `query_ca_coords: None` so ZERO 1PGA/3GB1 coordinates ever enter folding!).
+    let shifts_gb1 = read_star_all_atoms(root.join("data/fixtures/gb1_bmr7280_shifts.str"), None)
+        .expect("read BMRB 7280 shifts");
+    let fw_gb1 = HomologFirewallQuery {
+        query_pdb_ids: vec![
+            "1PGA".to_string(),
+            "3GB1".to_string(),
+            "1GB1".to_string(),
+            "2GB1".to_string(),
+            "2QMT".to_string(),
+        ],
+        query_bmrb_ids: vec!["bmr7280".to_string(), "bmr15156".to_string()],
+        query_uniprot_id: Some("P06654".to_string()),
+        query_family_id: Some("3.10.20.10".to_string()),
+        query_topology_id: Some("3.10.20".to_string()),
+        query_ca_coords: None,
+    };
+    let gb1_pred = predict_torsions_with_firewall(&shifts_gb1, &fw_gb1);
+    assert!(gb1_pred.max_retained_seq_identity <= 0.25);
+    let fw_dihs_gb1 = gb1_pred.to_dihedral_restraints();
+
+    // 3. Fold GB1 de novo from extended coordinates using experimental 3GB1 NOEs + firewalled BMRB 7280 shifts (zero RDCs)
+    let cfg = StructureCalcConfig {
+        seed: 20260402,
+        ..StructureCalcConfig::default()
+    };
+    let (noe_only, none_rdc) = fold_from_experimental_noes_and_rdcs(
+        &seq,
+        &seq_ids,
+        &exp_adrs,
+        &fw_dihs_gb1,
+        &[],
+        0.0,
+        &cfg,
+    )
+    .expect("experimental GB1 NOE + firewall shift fold");
+    assert!(none_rdc.is_none());
+
+    let pre_rdc_val = evaluate_rdc_validation(&noe_only.conformers[0].chain, &media).unwrap();
+    let pre_rmsd_low = backbone_rmsd_seq_range(&noe_only.conformers[0].chain, &xray_1pga, 1, 56);
+    let pre_rmsd_mean: f64 = noe_only
+        .conformers
+        .iter()
+        .map(|c| backbone_rmsd_seq_range(&c.chain, &xray_1pga, 1, 56))
+        .sum::<f64>()
+        / (noe_only.conformers.len() as f64);
+
+    // 4. Multi-cycle experimental 3GB1 NOE + firewalled BMRB 7280 shifts + working (!is_free) 3GB1 TMV & bicelle RDC refinement
+    let (rdc_ens, post_rdc_opt) = fold_from_experimental_noes_and_rdcs(
+        &seq,
+        &seq_ids,
+        &exp_adrs,
+        &fw_dihs_gb1,
+        &media,
+        0.75,
+        &cfg,
+    )
+    .expect("RDC refinement on experimental GB1 ensemble");
+    let post_rdc_val = post_rdc_opt.expect("GB1 RDC validation summary");
+    let refined_conformers = rdc_ens.conformers;
+
+    let post_rmsd_low = backbone_rmsd_seq_range(&refined_conformers[0].chain, &xray_1pga, 1, 56);
+    let post_rmsd_mean: f64 = refined_conformers
+        .iter()
+        .map(|c| backbone_rmsd_seq_range(&c.chain, &xray_1pga, 1, 56))
+        .sum::<f64>()
+        / (refined_conformers.len() as f64);
+
+    let post_nh_val =
+        evaluate_rdc_validation(&refined_conformers[0].chain, &nh_only_media).expect("GB1 NH SVD");
+
+    println!("=== P1-9 NON-CIRCULAR GB1 (EXP 3GB1 NOE + BMRB 7280 FIREWALL -> RDC -> INDEPENDENT 1994 1PGA X-RAY) ===");
+    println!(
+        "  Exp NOE+Shift : Q_work = {:.4}, plane Q_free = {:.4} | 1PGA (1..56) BB RMSD lowE = {:.3} A, mean = {:.3} A",
+        pre_rdc_val.overall_q_work, pre_rdc_val.overall_q_free, pre_rmsd_low, pre_rmsd_mean
+    );
+    println!(
+        "  + TMV+Bicelle : Q_work = {:.4}, plane Q_free = {:.4} (1D_NH Q_work = {:.4}, 1D_NH plane Q_free = {:.4}) | 1PGA (1..56) BB RMSD lowE = {:.3} A, mean = {:.3} A",
+        post_rdc_val.overall_q_work,
+        post_rdc_val.overall_q_free,
+        post_nh_val.overall_q_work,
+        post_nh_val.overall_q_free,
+        post_rmsd_low,
+        post_rmsd_mean
+    );
+
+    assert!(
+        post_rdc_val.overall_q_work < 0.25
+            && post_rdc_val.overall_q_work < pre_rdc_val.overall_q_work,
+        "GB1 working Q must improve ({:.4} -> {:.4})",
+        pre_rdc_val.overall_q_work,
+        post_rdc_val.overall_q_work
+    );
+    assert!(
+        post_rdc_val.overall_q_free < pre_rdc_val.overall_q_free,
+        "GB1 peptide-plane Q_free must improve ({:.4} -> {:.4})",
+        pre_rdc_val.overall_q_free,
+        post_rdc_val.overall_q_free
+    );
+    assert!(
+        post_rdc_val.overall_q_free < 0.55 && post_nh_val.overall_q_free < 0.35,
+        "GB1 non-circular peptide-plane Q_free out of range: multi-bond={:.4} (<0.55), 1D_NH={:.4} (<0.35)",
+        post_rdc_val.overall_q_free,
+        post_nh_val.overall_q_free
+    );
+    assert!(
+        post_rmsd_low < 1.50 && post_rmsd_mean < 2.00 && post_rmsd_low < pre_rmsd_low,
+        "non-circular 1PGA (1..56) BB RMSD out of range: lowE={pre_rmsd_low:.3} -> {post_rmsd_low:.3} A, mean={pre_rmsd_mean:.3} -> {post_rmsd_mean:.3} A"
+    );
+    assert!(
+        post_rmsd_mean < pre_rmsd_mean,
+        "RDC refinement must improve independent 1PGA (1..56) mean BB RMSD ({pre_rmsd_mean:.3} -> {post_rmsd_mean:.3} A)"
     );
 }
