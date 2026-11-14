@@ -2341,10 +2341,9 @@ pub fn process_fid_2d_mut(
         && dim_y.p1_deg.is_none()
         && !matches!(dim_y.phase_source, PhaseSource::DefaultZero);
     if auto_solved_y {
-        if let Some(fc) = fid.axis_y.stored_proc.fcor {
-            dim_y.fcor = fc;
-            recipe.dims[1].fcor = fc;
-        }
+        // Solve blind indirect `(p0, p1)` without a `+0.5 * s(0)` DC bias; `fcor` is reconciled
+        // immediately after `auto_phase_indirect_nd` per Otting et al. (1986) (`1.0` iff `|p1| > 15°`).
+        dim_y.fcor = 0.5;
     }
 
     let (p0_y, p1_y) = match (dim_y.p0_deg, dim_y.p1_deg, dim_y.phase_source) {
@@ -2407,9 +2406,10 @@ pub fn process_fid_2d_mut(
     };
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);
-    if auto_solved_y && p1_y.abs() > 15.0 {
-        dim_y.fcor = 1.0;
-        recipe.dims[1].fcor = 1.0;
+    if auto_solved_y {
+        let fc = if p1_y.abs() > 15.0 { 1.0 } else { 0.5 };
+        dim_y.fcor = fc;
+        recipe.dims[1].fcor = fc;
     }
 
     // Process each `ix in 0..nx_out` column independently in parallel, storing transposed `[nx_out * ny_out]`
@@ -3130,16 +3130,10 @@ fn process_fid_3d_inner(
         && dim_z.p1_deg.is_none()
         && !matches!(dim_z.phase_source, PhaseSource::DefaultZero);
     if need_auto_y {
-        if let Some(fc) = fid.axis_y.stored_proc.fcor {
-            dim_y.fcor = fc;
-            recipe.dims[1].fcor = fc;
-        }
+        dim_y.fcor = 0.5;
     }
     if need_auto_z {
-        if let Some(fc) = fid.axis_z.stored_proc.fcor {
-            dim_z.fcor = fc;
-            recipe.dims[2].fcor = fc;
-        }
+        dim_z.fcor = 0.5;
     }
 
     let (mut p0_y, p1_y) = (dim_y.p0_deg.unwrap_or(0.0), dim_y.p1_deg.unwrap_or(0.0));
@@ -3278,9 +3272,10 @@ fn process_fid_3d_inner(
         } else {
             (p0_y, p1_y)
         };
-        if need_auto_y && sy1.abs() > 15.0 {
-            dim_y.fcor = 1.0;
-            recipe.dims[1].fcor = 1.0;
+        if need_auto_y {
+            let fc = if sy1.abs() > 15.0 { 1.0 } else { 0.5 };
+            dim_y.fcor = fc;
+            recipe.dims[1].fcor = fc;
         }
 
         let (sz0, sz1) = if need_auto_z {
@@ -3452,9 +3447,10 @@ fn process_fid_3d_inner(
     p0_z = p0_z_solved;
     let p1_y = p1_y_solved;
     let p1_z = p1_z_solved;
-    if need_auto_z && p1_z.abs() > 15.0 {
-        dim_z.fcor = 1.0;
-        recipe.dims[2].fcor = 1.0;
+    if need_auto_z {
+        let fc = if p1_z.abs() > 15.0 { 1.0 } else { 0.5 };
+        dim_z.fcor = fc;
+        recipe.dims[2].fcor = fc;
     }
     recipe.dims[1].p0_deg = Some(p0_y);
     recipe.dims[1].p1_deg = Some(p1_y);

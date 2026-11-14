@@ -1402,20 +1402,6 @@ pub fn decode_nuslist_str(
 // ============================================================================
 
 #[derive(Clone, Debug, Default)]
-struct PhaseTable {
-    radix: i32,
-    entries: Vec<i32>,
-}
-
-impl PhaseTable {
-    fn first_deg(&self) -> f64 {
-        let e0 = self.entries.first().copied().unwrap_or(0);
-        let r = if self.radix <= 0 { 4 } else { self.radix };
-        ((e0 as f64) * 360.0 / (r as f64)).rem_euclid(360.0)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
 struct RawLoopSpan {
     label: String,
     count_expr: String,
@@ -1477,33 +1463,6 @@ fn parse_bruker_time_literal_s(raw: &str) -> Option<f64> {
         _ => (t, 1.0),
     };
     num_s.trim().parse::<f64>().ok().map(|v| v * scale)
-}
-
-fn parse_phase_table_rhs(rhs: &str) -> PhaseTable {
-    let mut radix = 4i32;
-    let mut rest = rhs.trim();
-    if let Some(after_open) = rest.strip_prefix('(') {
-        if let Some(close) = after_open.find(')') {
-            if let Ok(r) = after_open[..close].trim().parse::<i32>() {
-                if r > 0 {
-                    radix = r;
-                }
-            }
-            rest = after_open[close + 1..].trim();
-        }
-    }
-    let mut entries = Vec::new();
-    for tok in rest.split(|c: char| c.is_whitespace() || c == ',' || c == '{' || c == '}') {
-        if tok.is_empty() {
-            continue;
-        }
-        // Handle repetition like `(0 2)^2` or plain integers
-        let clean = tok.trim_matches(|c: char| c == '(' || c == ')');
-        if let Ok(v) = clean.parse::<i32>() {
-            entries.push(v);
-        }
-    }
-    PhaseTable { radix, entries }
 }
 
 fn contains_word(haystack: &str, needle: &str) -> bool {
@@ -2009,7 +1968,6 @@ fn interpret_bruker_experiment_inner(
 
     // Symbolic analysis of preprocessed lines
     let mut pp_aqseq_override: Option<AcquisitionOrder> = None;
-    let mut phase_tables: HashMap<usize, PhaseTable> = HashMap::new();
     let mut label_lines: HashMap<String, usize> = HashMap::new();
     let mut exec_lines: Vec<(usize, String)> = Vec::new();
     let mut raw_loops: Vec<RawLoopSpan> = Vec::new();
@@ -2143,11 +2101,8 @@ fn interpret_bruker_experiment_inner(
                 let d_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
                 if d_len > 0 {
                     let after_d = rest[d_len..].trim_start();
-                    if let Some(rhs) = after_d.strip_prefix('=') {
+                    if after_d.starts_with('=') {
                         in_phase_section = true;
-                        if let Ok(reg) = rest[..d_len].parse::<usize>() {
-                            phase_tables.insert(reg, parse_phase_table_rhs(rhs));
-                        }
                         continue;
                     }
                 }
@@ -2159,10 +2114,15 @@ fn interpret_bruker_experiment_inner(
             // Leading label (`1 ze`, `2 d1`, `lbl: ...`)
             let mut stmt = code;
             let first_tok = stmt.split_whitespace().next().unwrap_or("");
+            let is_symbolic_lbl = (first_tok.ends_with(':') || first_tok.ends_with(','))
+                && first_tok.len() > 1
+                && first_tok[..first_tok.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_');
             if !first_tok.is_empty()
-                && (first_tok.bytes().all(|b| b.is_ascii_digit()) || first_tok.ends_with(':'))
+                && (first_tok.bytes().all(|b| b.is_ascii_digit()) || is_symbolic_lbl)
             {
-                let lbl = first_tok.trim_end_matches(':').to_string();
+                let lbl = first_tok.trim_end_matches([':', ',']).to_string();
                 label_lines.entry(lbl).or_insert(exec_lines.len());
                 stmt = stmt[first_tok.len()..].trim_start();
             }
@@ -2183,20 +2143,24 @@ fn interpret_bruker_experiment_inner(
                     .or_else(|| tail.strip_prefix("TO "))
                 {
                     let mut parts = after_to.split_whitespace();
-                    let target_lbl = parts.next().unwrap_or("").trim_end_matches(':').to_string();
+                    let target_lbl = parts
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches([':', ','])
+                        .to_string();
                     let times_kw = parts.next().unwrap_or("");
                     if times_kw.eq_ignore_ascii_case("times") {
                         let cnt_expr: String = parts.collect::<Vec<_>>().join("");
                         let start_exec = label_lines.get(&target_lbl).copied().unwrap_or(0);
                         let start_src_line = exec_lines.get(start_exec).map(|x| x.0).unwrap_or(1);
-                        // Collect ops strictly in the tail between the previous `lo to` (if same label)
-                        // or `start_exec` and `cur_exec_idx`!
+                        // Collect ops strictly in this loop's own increment tail (after any
+                        // already-closed inner `lo to` loop ending at or after `start_src_line`,
+                        // whether jumping to the same numeric label `2` or nested TopSpin `mc`
+                        // labels `LBLSTS2, LBLF2, LBLSTS1, LBLF1,`).
                         let prev_same_end = raw_loops
                             .iter()
                             .rev()
-                            .find(|prev_l| {
-                                prev_l.label == target_lbl && prev_l.start_line == start_src_line
-                            })
+                            .find(|prev_l| prev_l.end_line >= start_src_line)
                             .map(|prev_l| {
                                 exec_lines
                                     .iter()
@@ -2314,7 +2278,6 @@ fn interpret_bruker_experiment_inner(
                     &delays_s,
                     &increments_s,
                     &pulses_us,
-                    &phase_tables,
                     &exec_lines,
                     &dim_sym_f1,
                     &pulprog_name,
@@ -2370,7 +2333,6 @@ fn interpret_bruker_experiment_inner(
                     &delays_s,
                     &increments_s,
                     &pulses_us,
-                    &phase_tables,
                     &exec_lines,
                     sym_for_a2,
                     &pulprog_name,
@@ -2386,7 +2348,6 @@ fn interpret_bruker_experiment_inner(
                     &delays_s,
                     &increments_s,
                     &pulses_us,
-                    &phase_tables,
                     &exec_lines,
                     sym_for_a3,
                     &pulprog_name,
@@ -2405,7 +2366,6 @@ fn interpret_bruker_experiment_inner(
                     &delays_s,
                     &increments_s,
                     &pulses_us,
-                    &phase_tables,
                     &exec_lines,
                     &dummy_sym,
                     &pulprog_name,
@@ -2421,7 +2381,6 @@ fn interpret_bruker_experiment_inner(
                     &delays_s,
                     &increments_s,
                     &pulses_us,
-                    &phase_tables,
                     &exec_lines,
                     &dim_sym_f2,
                     &pulprog_name,
@@ -2437,7 +2396,6 @@ fn interpret_bruker_experiment_inner(
                     &delays_s,
                     &increments_s,
                     &pulses_us,
-                    &phase_tables,
                     &exec_lines,
                     &dim_sym_f1,
                     &pulprog_name,
@@ -2985,7 +2943,6 @@ fn build_bruker_indirect_dim_physics(
     delays_s: &[f64],
     _increments_s: &[f64],
     pulses_us: &[f64],
-    phase_tables: &HashMap<usize, PhaseTable>,
     exec_lines: &[(usize, String)],
     sym: &SymbolicDimLoopInfo,
     pulprog_name: &str,
@@ -3119,7 +3076,6 @@ fn build_bruker_indirect_dim_physics(
         f_dim,
         quad_mode,
         sym,
-        phase_tables,
         exec_lines,
         pulprog_name,
         rance_kay.as_ref().is_some_and(|rk| rk.ea_polarity_inverted),
@@ -3147,13 +3103,9 @@ fn build_bruker_indirect_dim_physics(
     let p90_s = if nucleus == "15N" {
         pulses_us.get(21).copied().unwrap_or(0.0) * 1e-6
     } else if nucleus == "13C" {
-        pulses_us
-            .get(13)
-            .copied()
-            .filter(|&v| v > 0.0)
-            .or_else(|| pulses_us.get(3).copied())
-            .unwrap_or(0.0)
-            * 1e-6
+        // Hard `13C` 90° pulse is `P[3]` (`p3`); `P[13]` (`p13`) in Bruker triple-resonance
+        // sequences (`hncacbgp3d`, `hncogp3d`) is a shaped pulse (`> 100 us`) compensated by `sp8`.
+        pulses_us.get(3).copied().unwrap_or(0.0) * 1e-6
     } else {
         pulses_us.get(1).copied().unwrap_or(0.0) * 1e-6
     };
@@ -3162,15 +3114,18 @@ fn build_bruker_indirect_dim_physics(
         // Constant-time where `d10 = T_CT / 2` and `d30 = T_CT / 2`: `t(0) = d10 - d30 = 0`!
         0.0
     } else if double_d0 {
-        // `d0 - 180 - d0` with `in0 = DW / 2`: total evolution at `k=0` is `2 * d0` (plus `4*p90/pi` if `d0 <= 10 us` vs explicit half-dwell `2*d0 ≈ DW/2`)
+        // `d0 - 180 - d0` with `in0 = DW / 2`: when `raw_d0_s <= 10 us` (`d0 = 3u` minimal
+        // switching delay), initial sampling is zero-delay (`PHC1 = 0°`, `FCOR = 0.5`).
+        // Only add `(4/pi) * p90` finite-pulse evolution when `raw_d0_s > 10 us` reflects an
+        // explicit pre-compensated half-dwell formula (`d0 = in0/2 - p1 - 2*p90/pi`).
         let base = 2.0 * raw_d0_s;
-        if base > 0.25 * dwell_s {
+        if raw_d0_s <= 10e-6 || base > 0.25 * dwell_s {
             base
         } else {
             base + (4.0 / PI) * p90_s.min(40e-6)
         }
     } else if raw_d0_s > 0.0 {
-        if raw_d0_s > 0.25 * dwell_s {
+        if raw_d0_s <= 10e-6 || raw_d0_s > 0.25 * dwell_s {
             raw_d0_s
         } else {
             raw_d0_s + (4.0 / PI) * p90_s.min(40e-6)
@@ -3230,7 +3185,6 @@ fn infer_symbolic_reverse(
     f_dim: usize,
     quad_mode: DecodedQuadMode,
     sym: &SymbolicDimLoopInfo,
-    phase_tables: &HashMap<usize, PhaseTable>,
     exec_lines: &[(usize, String)],
     pulprog_name: &str,
     ea_polarity_inverted: bool,
@@ -3253,8 +3207,7 @@ fn infer_symbolic_reverse(
         let evo_tok = if f_dim == 1 { "d0" } else { "d10" };
         let dec_tok = if f_dim == 1 { "d20" } else { "d30" };
         let mut evo_line = None;
-        let mut first_ph_before = None;
-        let mut ph_after = false;
+        let mut first_ph_line = None;
         for (idx, (_, stmt)) in exec_lines.iter().enumerate() {
             if stmt.contains("MCWRK")
                 || stmt.contains("caldel")
@@ -3262,50 +3215,34 @@ fn infer_symbolic_reverse(
             {
                 continue;
             }
-            if evo_line.is_none() && contains_word(stmt, evo_tok) {
+            if evo_line.is_none() && !stmt.starts_with("define ") && contains_word(stmt, evo_tok) {
                 evo_line = Some(idx);
             }
-        }
-        if let Some(el) = evo_line {
-            for (idx, (_, stmt)) in exec_lines.iter().enumerate() {
-                if stmt.contains("calph(")
-                    || stmt.contains("MCWRK")
-                    || stmt.trim_start().starts_with('"')
-                {
-                    continue;
-                }
-                if contains_word(stmt, &ph_tok) {
-                    if idx < el {
-                        first_ph_before.get_or_insert(idx);
-                    } else if idx > el {
-                        ph_after = true;
-                    }
-                }
+            if first_ph_line.is_none() && !stmt.contains("calph(") && contains_word(stmt, &ph_tok) {
+                first_ph_line = Some(idx);
             }
-            let init_deg = phase_tables
-                .get(&reg)
-                .map(PhaseTable::first_deg)
-                .unwrap_or(0.0);
-            let shifted_90 = (init_deg - 90.0).abs() < 1e-3 || (init_deg - 270.0).abs() < 1e-3;
-            if let Some(p_idx) = first_ph_before.filter(|_| !ph_after) {
+        }
+        if let (Some(p_idx), Some(el)) = (first_ph_line, evo_line) {
+            // Note: an initial phase-table offset such as `ph9 = 3 1` (`270°` / `90°`) multiplies
+            // the complex FID by a constant unit phasor `exp(+-i * phi_0)` (`PHC0` shift), never
+            // conjugating `exp(-i * omega * t)` <-> `exp(+i * omega * t)`. Only the quadrature
+            // increment sign (`ip` vs `dp`), readout-after-evolution (`p_idx > el`), and semi-CT
+            // decremented-delay refocusing (`has_dec_before_evo`) determine `REVERSE`.
+            let mut net_sign = step_sign;
+            if p_idx > el {
+                net_sign = -net_sign;
+            } else {
                 let has_dec_before_evo = exec_lines[p_idx + 1..el].iter().any(|(_, s)| {
                     !s.contains("MCWRK")
                         && !s.contains("caldel")
                         && !s.trim_start().starts_with('"')
                         && contains_word(s, dec_tok)
                 });
-                let net_sign = if has_dec_before_evo {
-                    -step_sign
-                } else {
-                    step_sign
-                };
-                let base_rev = net_sign < 0;
-                return if shifted_90 { !base_rev } else { base_rev };
+                if has_dec_before_evo {
+                    net_sign = -net_sign;
+                }
             }
-            if ph_after && first_ph_before.is_none() {
-                let base_rev = step_sign > 0;
-                return if shifted_90 { !base_rev } else { base_rev };
-            }
+            return net_sign < 0;
         }
     }
     let low = pulprog_name.to_ascii_lowercase();
@@ -3864,6 +3801,18 @@ fn build_bruker_transfer_graph(
     let has_explicit_ca_jump = carrier_jumps_ppm
         .iter()
         .any(|(_, ppm)| (35.0..=66.0).contains(ppm));
+    let n_short_cc_relays = used_delays_ms
+        .iter()
+        .filter(|(name, ms)| {
+            name != "d1"
+                && name != "d11"
+                && name != "d12"
+                && name != "d16"
+                && (3.0..=5.0).contains(ms)
+        })
+        .count();
+    let has_dual_cc_relays = n_short_cc_relays >= 2
+        || ((3.0e-3..=5.0e-3).contains(&delays_s[22]) && (3.0e-3..=5.0e-3).contains(&delays_s[28]));
 
     // Deduce `PulprogSequenceFamily` from first-principles transfer graph!
     let deduced_family = deduce_family_from_graph(
@@ -3886,6 +3835,7 @@ fn build_bruker_transfer_graph(
         visited_cacb,
         has_co_ca_transfer,
         has_ca_cb_transfer,
+        has_dual_cc_relays,
         has_1h_13c_inept,
         trosy_selected,
         sensitivity_enhanced,
@@ -3926,6 +3876,7 @@ fn deduce_family_from_graph(
     visited_cacb: bool,
     has_co_ca_transfer: bool,
     _has_ca_cb_transfer: bool,
+    has_dual_cc_relays: bool,
     has_1h_13c_inept: bool,
     trosy_selected: bool,
     sensitivity_enhanced: bool,
@@ -4068,6 +4019,7 @@ fn deduce_family_from_graph(
                         return if has_explicit_co_jump
                             || (visited_co && c_before_n)
                             || (has_1h_13c_inept && has_co_ca_transfer)
+                            || (visited_co && visited_ca && visited_cacb && has_dual_cc_relays)
                         {
                             PulprogSequenceFamily::Cbcaconh
                         } else {
@@ -4782,23 +4734,45 @@ fn deduce_varian_family(
         }
         return PulprogSequenceFamily::RelaxR1;
     }
-    if seq_low.contains("cbca") && seq_low.contains("co") {
-        return PulprogSequenceFamily::Cbcaconh;
+    if seq_low == "ghnha"
+        || seq_low == "hnha"
+        || seq_low.starts_with("hnhagp")
+        || seq_low.contains("caha")
+    {
+        return PulprogSequenceFamily::Unknown;
     }
-    if seq_low.contains("hncacb") || seq_low.contains("hncab") {
-        return PulprogSequenceFamily::Hncacb;
-    }
-    if seq_low.contains("hncaco") || seq_low.contains("hn_ca_co") {
-        return PulprogSequenceFamily::Hncaco;
-    }
-    if seq_low.contains("hncoca") || seq_low.contains("hn_co_ca") {
-        return PulprogSequenceFamily::Hncoca;
-    }
-    if seq_low.contains("hnca") {
-        return PulprogSequenceFamily::Hnca;
-    }
-    if seq_low.contains("hnco") {
-        return PulprogSequenceFamily::Hnco;
+    let has_ind_n = evolved_pools
+        .iter()
+        .any(|(_, p)| *p == SpinPoolNode::NAmide);
+    let has_ind_c = evolved_pools.iter().any(|(_, p)| {
+        matches!(
+            *p,
+            SpinPoolNode::CCarbonyl | SpinPoolNode::CAlpha | SpinPoolNode::CAliphatic
+        )
+    });
+    let triple_res_axes_ok = evolved_pools.len() < 2 || (has_ind_n && has_ind_c && tn == "1H");
+    if triple_res_axes_ok {
+        if (seq_low.contains("cbca") && seq_low.contains("co"))
+            || seq_low.contains("hncocacb")
+            || seq_low.contains("hn_co_cacb")
+        {
+            return PulprogSequenceFamily::Cbcaconh;
+        }
+        if seq_low.contains("hncacb") || seq_low.contains("hncab") {
+            return PulprogSequenceFamily::Hncacb;
+        }
+        if seq_low.contains("hncaco") || seq_low.contains("hn_ca_co") {
+            return PulprogSequenceFamily::Hncaco;
+        }
+        if seq_low.contains("hncoca") || seq_low.contains("hn_co_ca") {
+            return PulprogSequenceFamily::Hncoca;
+        }
+        if seq_low.contains("hnca") {
+            return PulprogSequenceFamily::Hnca;
+        }
+        if seq_low.contains("hnco") {
+            return PulprogSequenceFamily::Hnco;
+        }
     }
     if seq_low.contains("nhsqc")
         || (evolved_pools.len() == 1 && evolved_pools[0].1 == SpinPoolNode::NAmide && tn == "1H")
@@ -5851,11 +5825,12 @@ fn score_13c_axis_prior(
     let sw_ppm = (ax_z.step_ppm.abs() * (nz as f64)).max(1.0);
     let ln_uniform = -(sw_ppm.ln());
 
-    // Optimize small `13C` referencing offset `dc in [-1.0, +1.0] ppm` so DSS/TMS offset never biases `op_c`
+    // Optimize `13C` referencing offset `dc in [-2.8, +2.8] ppm` so TMS-vs-DSS (`~2.7 ppm`) or
+    // carrier offsets never bias `op_c` against `Canonical`:
     let dc_grid: &[f64] = if sw_ppm >= 11.0 {
-        &[-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0]
+        &[-2.8, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 2.8]
     } else {
-        &[-0.4, -0.2, 0.0, 0.2, 0.4]
+        &[-0.8, -0.4, 0.0, 0.4, 0.8]
     };
 
     let mut best_ll = f64::NEG_INFINITY;
@@ -5885,10 +5860,20 @@ fn score_13c_axis_prior(
 
             let ln_p = match regime {
                 C13Regime::Carbonyl => {
-                    // BMRB 13CO mixture (`175.8 +- 2.35 ppm` + Gly `173.4 +- 2.8 ppm`)
-                    let p1 = 0.88 * gauss_pdf(c, 175.8, 2.35);
-                    let p2 = 0.12 * gauss_pdf(c, 173.4, 2.80);
-                    (p1 + p2 + 1e-4).ln() - ln_uniform
+                    // BMRB 13CO mixture (`175.8 +- 2.35 ppm` + Gly `173.4 +- 2.8 ppm`), allowing
+                    // minor `+- SW` Nyquist folding in narrow (`< 16 ppm`) carbonyl windows so a
+                    // `10-15%` folded Gly/beta-sheet tail on a TMS-referenced sample never mimics `HalfSwShiftC`.
+                    let base = 0.88 * gauss_pdf(c, 175.8, 2.35) + 0.12 * gauss_pdf(c, 173.4, 2.80);
+                    let folded = if sw_ppm < 16.0 {
+                        let f_lo = 0.88 * gauss_pdf(c - sw_ppm, 175.8, 2.35)
+                            + 0.12 * gauss_pdf(c - sw_ppm, 173.4, 2.80);
+                        let f_hi = 0.88 * gauss_pdf(c + sw_ppm, 175.8, 2.35)
+                            + 0.12 * gauss_pdf(c + sw_ppm, 173.4, 2.80);
+                        0.30 * f_lo.max(f_hi)
+                    } else {
+                        0.0
+                    };
+                    (base.max(folded) + 1e-4).ln() - ln_uniform
                 }
                 C13Regime::CAlphaOnly => {
                     if !(41.5..=68.0).contains(&c) {
@@ -5967,11 +5952,14 @@ fn score_13c_axis_prior(
 struct C13BandDiag {
     oob_frac: f64,
     edge_frac: f64,
+    lo_edge_frac: f64,
+    hi_edge_frac: f64,
     center_frac: f64,
     low_aliph_frac: f64,
     ca_core_frac: f64,
     ser_thr_frac: f64,
     biphasic_sep: f64,
+    signed_biphasic_sep: f64,
 }
 
 fn compute_c13_band_diag(
@@ -5992,6 +5980,8 @@ fn compute_c13_band_diag(
     let mut tot_w = 0.0_f64;
     let mut oob_w = 0.0_f64;
     let mut edge_w = 0.0_f64;
+    let mut lo_edge_w = 0.0_f64;
+    let mut hi_edge_w = 0.0_f64;
     let mut center_w = 0.0_f64;
     let mut low_aliph_w = 0.0_f64;
     let mut ca_core_w = 0.0_f64;
@@ -6015,8 +6005,12 @@ fn compute_c13_band_diag(
         if is_oob {
             oob_w += pk.weight;
         }
-        if c_raw <= lo_edge || c_raw >= hi_edge {
+        if c_raw <= lo_edge {
             edge_w += pk.weight;
+            lo_edge_w += pk.weight;
+        } else if c_raw >= hi_edge {
+            edge_w += pk.weight;
+            hi_edge_w += pk.weight;
         }
         if (c_raw - mid_ppm).abs() <= 0.22 * sw_ppm {
             center_w += pk.weight;
@@ -6037,19 +6031,23 @@ fn compute_c13_band_diag(
     if tot_w <= 0.0 {
         return C13BandDiag::default();
     }
-    let biphasic_sep = if ca_abs > 0.0 && cb_abs > 0.0 {
-        (ca_signed / ca_abs - cb_signed / cb_abs).abs()
+    let signed_biphasic_sep = if ca_abs > 0.0 && cb_abs > 0.0 {
+        ca_signed / ca_abs - cb_signed / cb_abs
     } else {
         0.0
     };
+    let biphasic_sep = signed_biphasic_sep.abs();
     C13BandDiag {
         oob_frac: oob_w / tot_w,
         edge_frac: edge_w / tot_w,
+        lo_edge_frac: lo_edge_w / tot_w,
+        hi_edge_frac: hi_edge_w / tot_w,
         center_frac: center_w / tot_w,
         low_aliph_frac: low_aliph_w / tot_w,
         ca_core_frac: ca_core_w / tot_w,
         ser_thr_frac: ser_thr_w / tot_w,
         biphasic_sep,
+        signed_biphasic_sep,
     }
 }
 
@@ -6064,41 +6062,55 @@ fn is_13c_axis_rescue_physically_justified(
         C13Regime::Carbonyl | C13Regime::CAlphaOnly => {
             // For unimodal `13CO` (`166.5..184.5 ppm`) and `13CA` (`41.0..68.5 ppm`), `SignFlip` or
             // `MirrorFold` is forbidden when `Canonical` already places peaks inside the physical
-            // envelope (preventing false mirroring of e.g. `<13CO> ≈ 172 ppm` β-sheet/PCS `HNCO`!).
+            // envelope (preventing false mirroring of e.g. `<13CO> ≈ 172 ppm` β-sheet/PCS/TMS `HNCO`!).
             let oob_rescue =
                 canon_d.oob_frac >= 0.25 && (canon_d.oob_frac - best_d.oob_frac) >= 0.20;
-            let nyquist_split_rescue = canon_d.edge_frac >= 0.35
-                && (canon_d.edge_frac - best_d.edge_frac) >= 0.20
-                && (best_d.center_frac - canon_d.center_frac) >= 0.20
+            let nyquist_split_rescue = canon_d.edge_frac >= 0.45
+                && canon_d.lo_edge_frac >= 0.18
+                && canon_d.hi_edge_frac >= 0.18
+                && canon_d.center_frac <= 0.16
+                && best_d.center_frac >= 0.50
+                && (canon_d.edge_frac - best_d.edge_frac) >= 0.25
+                && (best_d.center_frac - canon_d.center_frac) >= 0.30
                 && best_d.oob_frac <= canon_d.oob_frac + 0.05;
             match op_c {
                 AxisTransformOp::Canonical => true,
-                AxisTransformOp::SignFlip => oob_rescue,
-                AxisTransformOp::HalfSwShift | AxisTransformOp::MirrorFold => {
-                    oob_rescue || nyquist_split_rescue
-                }
+                AxisTransformOp::SignFlip | AxisTransformOp::MirrorFold => oob_rescue,
+                AxisTransformOp::HalfSwShift => oob_rescue || nyquist_split_rescue,
             }
         }
         C13Regime::AliphaticCaCb { biphasic } => {
             let oob_rescue =
                 canon_d.oob_frac >= 0.20 && (canon_d.oob_frac - best_d.oob_frac) >= 0.15;
             let nyquist_split_rescue = canon_d.edge_frac >= 0.28
+                && canon_d.lo_edge_frac >= 0.06
+                && canon_d.hi_edge_frac >= 0.06
                 && (canon_d.edge_frac - best_d.edge_frac) >= 0.15
                 && best_d.oob_frac <= canon_d.oob_frac + 0.05;
             // Two-band swap requires BOTH `CB` (`15.5..43.5`) and `CA`/`high-aliphatic` to be
             // substantively populated under `Canonical` AND under `best` (with `CA` core `50..60.5`
             // populated under `Canonical` for `SignFlip` so `CA`-bleached paramagnetic `CB`-only
-            // cubes with or without Ser/Thr `CB` are never reflected into `CA`!).
+            // cubes with or without Ser/Thr `CB` are never reflected into `CA`!), never increasing
+            // OOB peaks, and either recovering a depleted `CA` core (`>= 1.35x` and `+0.10`,
+            // matching `is_mirrored_aliphatic_cacb_3d`) or fixing inverted biphasic `CA`/`CB` signs.
             let canon_upper_ok = if op_c == AxisTransformOp::SignFlip {
                 canon_d.ca_core_frac >= 0.15
             } else {
                 (canon_d.ca_core_frac + canon_d.ser_thr_frac) >= 0.18
             };
+            let ca_core_gain = best_d.ca_core_frac >= canon_d.ca_core_frac * 1.35
+                && (best_d.ca_core_frac - canon_d.ca_core_frac) >= 0.10;
+            let swap_justified = if biphasic {
+                best_d.biphasic_sep >= 1.30 && (canon_d.signed_biphasic_sep < 0.60 || ca_core_gain)
+            } else {
+                ca_core_gain
+            };
             let two_band_swap_rescue = canon_d.low_aliph_frac >= 0.18
                 && canon_upper_ok
                 && best_d.low_aliph_frac >= 0.18
                 && best_d.ca_core_frac >= 0.20
-                && (!biphasic || best_d.biphasic_sep >= 1.30);
+                && best_d.oob_frac <= canon_d.oob_frac + 0.03
+                && swap_justified;
             oob_rescue || nyquist_split_rescue || two_band_swap_rescue
         }
     }

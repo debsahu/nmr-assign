@@ -1578,6 +1578,7 @@ pub struct RealBenchmarkSummary {
 pub struct RealBenchmarkConfig {
     pub manifest_path: PathBuf,
     pub split: BenchmarkSplitFilter,
+    pub cohort_opt: Option<String>,
     pub solver: SolverKind,
     pub engine_opt: Option<EngineKind>,
     pub seeds: usize,
@@ -1594,7 +1595,8 @@ pub struct RealBenchmarkConfig {
     pub verbose: bool,
 }
 
-/// Execute `process -> pick -> assign -> score` across all manifest entries matching `cfg.split`.
+/// Execute `process -> pick -> assign -> score` across all manifest entries matching `cfg.split`
+/// (and optional `cfg.cohort_opt`).
 pub fn run_real_benchmark_with_loaders(
     cfg: &RealBenchmarkConfig,
     load_fid_2d: &dyn Fn(&Path) -> Result<Spectrum2D, String>,
@@ -1607,14 +1609,26 @@ pub fn run_real_benchmark_with_loaders(
     let entries: Vec<RealManifestEntry> = all_entries
         .into_iter()
         .filter(|e| cfg.split.matches(&e.split))
+        .filter(|e| {
+            cfg.cohort_opt
+                .as_deref()
+                .is_none_or(|c| e.cohort.trim().eq_ignore_ascii_case(c.trim()))
+        })
         .collect();
 
     if entries.is_empty() {
-        return Err(format!(
-            "no entries matching --split {} in {}",
-            cfg.split.as_str(),
-            cfg.manifest_path.display()
-        ));
+        return Err(match cfg.cohort_opt.as_deref() {
+            Some(c) => format!(
+                "no entries matching --split {} --cohort {c} in {}",
+                cfg.split.as_str(),
+                cfg.manifest_path.display()
+            ),
+            None => format!(
+                "no entries matching --split {} in {}",
+                cfg.split.as_str(),
+                cfg.manifest_path.display()
+            ),
+        });
     }
 
     let priors = load_priors(cfg.priors_path.as_deref())?;
@@ -2944,6 +2958,7 @@ pub fn render_summary_json(summary: &RealBenchmarkSummary) -> String {
 pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig, String> {
     let mut manifest_path = PathBuf::from("data/benchmark/real_manifest.tsv");
     let mut split_opt: Option<BenchmarkSplitFilter> = None;
+    let mut cohort_opt: Option<String> = None;
     let mut solver = SolverKind::EvoGraph;
     let mut engine_opt: Option<EngineKind> = None;
     let mut seeds = 5usize;
@@ -2970,6 +2985,14 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
                 split_opt = Some(BenchmarkSplitFilter::parse(
                     args.get(i).ok_or("missing value for --split")?,
                 )?);
+            }
+            "--cohort" => {
+                i += 1;
+                let raw_coh = args.get(i).ok_or("missing value for --cohort")?.trim();
+                if raw_coh.is_empty() {
+                    return Err("--cohort must be non-empty".to_string());
+                }
+                cohort_opt = Some(raw_coh.to_string());
             }
             "--solver" => {
                 i += 1;
@@ -3049,6 +3072,7 @@ pub fn parse_real_benchmark_args(args: &[String]) -> Result<RealBenchmarkConfig,
     Ok(RealBenchmarkConfig {
         manifest_path,
         split,
+        cohort_opt,
         solver,
         engine_opt,
         seeds,
@@ -3282,6 +3306,7 @@ mod tests {
         let cfg = RealBenchmarkConfig {
             manifest_path: manifest,
             split: BenchmarkSplitFilter::Dev,
+            cohort_opt: None,
             solver: SolverKind::Standard,
             engine_opt: Some(EngineKind::Cpu),
             seeds: 2,
@@ -3433,6 +3458,10 @@ mod tests {
             .filter(|e| e.split == "heldout" && e.cohort == "seen_p12")
             .count();
         let n_cold_p12 = entries.iter().filter(|e| e.cohort == "cold_p12").count();
+        let n_cold_p13 = entries
+            .iter()
+            .filter(|e| e.split == "heldout" && e.cohort == "cold_p13")
+            .count();
         assert_eq!(n_seen, 6);
         assert_eq!(
             n_cold_p12, 0,
@@ -3442,7 +3471,11 @@ mod tests {
             (6..=8).contains(&n_seen_p12),
             "expected 6..=8 seen_p12 entries, got {n_seen_p12}"
         );
-        assert_eq!(n_held, n_seen + n_seen_p12);
+        assert!(
+            n_cold_p13 == 0 || (6..=10).contains(&n_cold_p13),
+            "expected 0 (pre-registration pending) or 6..=10 cold_p13 entries, got {n_cold_p13}"
+        );
+        assert_eq!(n_held, n_seen + n_seen_p12 + n_cold_p13);
         for seen_id in ["5845", "17030", "18145", "51351", "16099", "18489"] {
             let e = entries
                 .iter()
@@ -3453,17 +3486,18 @@ mod tests {
         }
         for e in entries
             .iter()
-            .filter(|e| e.split == "heldout" && e.cohort == "seen_p12")
+            .filter(|e| e.split == "heldout" && (e.cohort == "seen_p12" || e.cohort == "cold_p13"))
         {
-            let seen_p12_id = e.bmrb_id.as_str();
-            assert!((50..=160).contains(&e.residues));
+            let entry_id = e.bmrb_id.as_str();
+            let coh = e.cohort.as_str();
+            assert!((40..=200).contains(&e.residues));
             // Header-only verification (strictly zero FID FFT, peak picking, or solver runs!)
             if let Ok(loc) =
-                resolve_local_entry_paths(seen_p12_id, Path::new("data/private/bmrb"), true)
+                resolve_local_entry_paths(entry_id, Path::new("data/private/bmrb"), true)
             {
                 assert!(
                     loc.truth_path.as_ref().is_some_and(|p| p.is_file()),
-                    "seen_p12 entry {seen_p12_id} must have NMR-STAR file present"
+                    "{coh} entry {entry_id} must have NMR-STAR file present"
                 );
                 let ws = nmr_core::classify::classify_nmr_workspace(&loc.entry_dir).unwrap();
                 assert!(
@@ -3471,18 +3505,18 @@ mod tests {
                         || ws
                             .secondary_regimes
                             .contains(&nmr_core::classify::ProblemRegime::GlobularBackbone),
-                    "seen_p12 entry {seen_p12_id} must support GlobularBackbone (got primary {:?}, secondary {:?})",
+                    "{coh} entry {entry_id} must support GlobularBackbone (got primary {:?}, secondary {:?})",
                     ws.problem_regime,
                     ws.secondary_regimes
                 );
                 let (disc, _) =
                     discover_entry_experiments(&loc.entry_dir, Some(e.field_mhz)).unwrap();
                 let disc_exps: BTreeSet<&str> = disc.iter().map(|d| d.exp_type.as_str()).collect();
-                println!("  [seen_p12 header-only] {seen_p12_id} -> discovered={disc_exps:?}");
+                println!("  [{coh} header-only] {entry_id} -> discovered={disc_exps:?}");
                 for req_exp in &e.experiments {
                     assert!(
                         disc_exps.contains(req_exp.as_str()),
-                        "seen_p12 entry {seen_p12_id} missing manifest experiment {req_exp}; discovered {disc_exps:?}"
+                        "{coh} entry {entry_id} missing manifest experiment {req_exp}; discovered {disc_exps:?}"
                     );
                 }
             }

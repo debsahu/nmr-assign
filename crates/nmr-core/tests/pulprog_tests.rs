@@ -2738,7 +2738,232 @@ ph31=0 2
         }),
     });
 
+    // 31. Bruker `hncacbgp3d` with readout `ph9 = 3 1` (`270°` initial phase offset) after `d0`:
+    //     Constant phase offset `exp(+-i*phi_0)` MUST NOT invert `reverse_frequency` (`true` for readout `ip9` after `d0`).
+    bruker_cases.push(BrukerFixtureCase {
+        name: "31_bruker_hncacbgp3d_readout_ph9_3_1_reverse",
+        acqus: make_bruker_acqus(
+            "hncacbgp3d",
+            2,
+            Some(0),
+            "",
+            600.1328,
+            150.9092,
+            60.8179,
+            "13C",
+            "15N",
+            174.0,
+            43.0,
+            3.0e-6,
+            0.0,
+            0.0,
+            0.0036,
+            80.0,
+            8.1,
+            0.0,
+            67.984,
+            20,
+            2000,
+        ),
+        acqu2s: Some(make_bruker_acqu_ind(
+            "15N", 60.8179, 60.8106, 32.0, 64, 6, 0, None,
+        )),
+        acqu3s: Some(make_bruker_acqu_ind(
+            "13C", 150.9092, 150.9028, 70.0, 128, 5, 0, None,
+        )),
+        pulseprogram: "\
+;hncacbgp3d - readout ph9=3 1 after d0 evolution
+define list<gradient> EA=<EA>
+\"d0=3u\"
+\"d26=2.3m\"
+\"d28=3.6m\"
+\"d23=12.4m\"
+\"d10=d23/2\"
+\"d30=d23/2\"
+1 ze
+2 MCWRK do:f3
+LBLSTS2, MCWRK * 3
+LBLF2, MCWRK * 5
+LBLSTS1, MCWRK * 2
+LBLF1, MCREST
+3 d1 do:f3
+  (p1 ph1)
+  d26
+  (p21 ph3):f3
+  d23
+  (p13:sp2 ph4):f2
+  d28
+  (p14:sp3 ph1):f2
+  d28
+  (p13:sp8 ph2):f2
+  d0
+  (center (p14:sp5 ph1):f2 (p22 ph8):f3)
+  d0
+  (p13:sp2 ph9):f2
+  d28
+  (p14:sp3 ph1):f2
+  d28
+  (p13:sp8 ph10):f2
+  (p21 ph1):f3
+  d30
+  (p22 ph8):f3
+  d10
+  p16:gp1*EA
+  p16:gp2
+  go=2 ph31 cpd3:f3
+  MCWRK wr #0 if #0 zd igrad EA ip6*2
+  lo to LBLSTS2 times 2
+  MCWRK id10 dd30
+  lo to LBLF2 times 32
+  MCWRK rd10 rd30 ip9 ip10
+  lo to LBLSTS1 times 2
+  MCWRK id0 dp9*2
+  lo to LBLF1 times 64
+exit
+ph1=0
+ph2=1
+ph3=0
+ph4=0
+ph6=3 3 1 1
+ph8=0 2
+ph9=3 1
+ph10=0 2
+ph31=0 2
+"
+        .to_string(),
+        nuslist: None,
+        vdlist: None,
+        vclist: None,
+        fqlist: None,
+        difflist: None,
+        local_includes: HashMap::new(),
+        expected_family: PulprogSequenceFamily::Hncacb,
+        expected_aqseq: AcquisitionOrder::Aqseq321,
+        expected_pseudo: Pseudo3DStorageOrder::NotPseudo3D,
+        check: Box::new(|pi| {
+            // `acqu3s` (`F1`, `13C`) uses readout `ip9` after `d0` with `ph9 = 3 1`: MUST have `reverse_frequency == true`!
+            assert_eq!(pi.indirect_dims[1].quad_mode, DecodedQuadMode::StatesTppi);
+            assert!(
+                pi.indirect_dims[1].reverse_frequency,
+                "readout ip9 after d0 must set reverse_frequency=true even when ph9=3 1 starts at 270 deg"
+            );
+        }),
+    });
+
+    // 32. Out-and-back `hncocacbgp3d` (`HN(CO)CACB` = `CBCACONH`):
+    //     Must classify as `Cbcaconh` (never hijacked by `"hncoca"` substring or single-relay `Hncacb`).
+    bruker_cases.push(BrukerFixtureCase {
+        name: "32_bruker_hncocacbgp3d_out_and_back_cbcaconh",
+        acqus: make_bruker_acqus(
+            "hncocacbgp3d",
+            2,
+            Some(0),
+            "",
+            600.1328,
+            150.9092,
+            60.8179,
+            "13C",
+            "15N",
+            176.0,
+            54.0,
+            3.0e-6,
+            0.0,
+            0.0,
+            0.0036,
+            80.0,
+            8.1,
+            0.0,
+            67.984,
+            20,
+            2000,
+        ),
+        acqu2s: Some(make_bruker_acqu_ind(
+            "15N", 60.8179, 60.8106, 32.0, 64, 6, 0, None,
+        )),
+        acqu3s: Some(make_bruker_acqu_ind(
+            "13C", 150.9092, 150.9028, 70.0, 128, 5, 0, None,
+        )),
+        pulseprogram: "\
+;hncocacbgp3d - out-and-back HN(CO)CACB
+define list<gradient> EA=<EA>
+\"d0=3u\"
+\"d22=4m\"
+\"d23=12m\"
+\"d26=2.3m\"
+\"d28=3.6m\"
+\"d10=d23/2\"
+\"d30=d23/2\"
+1 ze
+2 d1 fq=cnst20(bf ppm):f2
+  (p1 ph1)
+  d26
+  (p21 ph1):f3
+  d23
+  (p13:sp2 ph3):f2
+  d22
+  (p13:sp8 ph2):f2
+  30u fq=cnst21(bf ppm):f2
+  (p13:sp2 ph4):f2
+  d28
+  (p13:sp8 ph2):f2
+  d0
+  (center (p14:sp7 ph1):f2 (p22 ph8):f3)
+  d0
+  (p13:sp2 ph9):f2
+  d28
+  (p13:sp8 ph10):f2
+  30u fq=cnst20(bf ppm):f2
+  (p13:sp2 ph2):f2
+  d22
+  (p13:sp8 ph1):f2
+  (p21 ph1):f3
+  d30
+  (p22 ph8):f3
+  d10
+  p16:gp1*EA
+  p16:gp2
+  go=2 ph31 cpd3:f3
+  MCWRK wr #0 if #0 zd igrad EA ip6*2
+  lo to 2 times 2
+  MCWRK id10 dd30
+  lo to 2 times 32
+  MCWRK rd10 rd30 ip9 ip10
+  lo to 2 times 2
+  MCWRK id0 dp9*2
+  lo to 2 times 64
+exit
+ph1=0
+ph2=1
+ph3=0
+ph4=0
+ph6=3 3 1 1
+ph8=0 2
+ph9=3 1
+ph10=0 2
+ph31=0 2
+"
+        .to_string(),
+        nuslist: None,
+        vdlist: None,
+        vclist: None,
+        fqlist: None,
+        difflist: None,
+        local_includes: HashMap::new(),
+        expected_family: PulprogSequenceFamily::Cbcaconh,
+        expected_aqseq: AcquisitionOrder::Aqseq321,
+        expected_pseudo: Pseudo3DStorageOrder::NotPseudo3D,
+        check: Box::new(|pi| {
+            assert_eq!(
+                pi.transfer_graph.deduced_family.to_pulse_sequence_class(),
+                PulseSequenceClass::Cbcaconh
+            );
+            assert!(pi.indirect_dims[1].reverse_frequency);
+        }),
+    });
+
     // Execute all Bruker fixtures and assert 100% accuracy + `< 10 ms` latency per fixture!
+    let mut bruker_max_ms = 0.0_f64;
+    let mut bruker_sum_ms = 0.0_f64;
     for case in &bruker_cases {
         let inp = BrukerExperimentInputs {
             acqus_text: &case.acqus,
@@ -2757,6 +2982,8 @@ ph31=0 2
         let pi = interpret_bruker_experiment(&inp)
             .unwrap_or_else(|e| panic!("fixture {} failed: {e}", case.name));
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        bruker_max_ms = bruker_max_ms.max(elapsed_ms);
+        bruker_sum_ms += elapsed_ms;
 
         assert_eq!(pi.vendor, PulprogVendor::Bruker, "{}", case.name);
         assert_eq!(
@@ -3012,6 +3239,18 @@ gzlvl1 1 1 32767 -32767 0 2 1 11 1 64\n\
         bruker_cases.len() + 6 >= 35,
         "verified {} total fixtures (>= 28 required)",
         bruker_cases.len() + 6
+    );
+    // Count 30 Bruker + 8 Varian assertions (31..34 + 35a/35b/35c + 36)
+    let n_bruker = bruker_cases.len();
+    let n_varian = 8usize;
+    println!(
+        "PULPROG_METRIC_JSON: {{\"kind\":\"fixture_suite\",\"bruker_fixtures\":{},\"varian_fixtures\":{},\"total_fixtures\":{},\"passed\":{},\"bruker_mean_ms\":{:.4},\"bruker_max_ms\":{:.4}}}",
+        n_bruker,
+        n_varian,
+        n_bruker + n_varian,
+        n_bruker + n_varian,
+        bruker_sum_ms / (n_bruker as f64),
+        bruker_max_ms
     );
 }
 
@@ -4201,6 +4440,16 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
             "{label}: expected 100% strip recovery after rescue, got {:.1}%",
             post_rec * 100.0
         );
+        println!(
+            "PULPROG_METRIC_JSON: {{\"kind\":\"q1_rescue\",\"case\":{:?},\"selected\":\"{:?}\",\"applied\":{},\"polarity_flipped\":{},\"ln_bf\":{:.2},\"pre_recovery_pct\":{:.2},\"post_recovery_pct\":{:.2}}}",
+            label,
+            ver.selected,
+            ver.applied,
+            ver.polarity_flipped,
+            ver.ln_bayes_factor_vs_canonical,
+            pre_rec * 100.0,
+            post_rec * 100.0
+        );
     }
 
     // 3. Corrupt `HNCO` (`SignFlipN`, `HalfSwShiftN`, `MirrorFoldN`, `HalfSwShiftC`) + test `register_3d_hn_to_hsqc_2d` integration!
@@ -4236,11 +4485,20 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
         );
 
         // Run through `register_3d_hn_to_hsqc_2d` directly to prove seamless pipeline integration!
+        let ver_eval = evaluate_3d_axis_hypotheses_against_hsqc(&corrupted, &hsqc, None);
         let _shift = register_3d_hn_to_hsqc_2d(&mut corrupted, &hsqc, 0.15, 0.80);
         let post_rec = measure_hnco_strip_recovery(&corrupted, &systems);
         assert!(
             (post_rec - 1.0).abs() < 1e-9,
             "{label}: expected 100% strip recovery via register_3d_hn_to_hsqc_2d, got {:.1}%",
+            post_rec * 100.0
+        );
+        println!(
+            "PULPROG_METRIC_JSON: {{\"kind\":\"q1_rescue\",\"case\":{:?},\"selected\":\"{:?}\",\"applied\":true,\"polarity_flipped\":false,\"ln_bf\":{:.2},\"pre_recovery_pct\":{:.2},\"post_recovery_pct\":{:.2}}}",
+            label,
+            ver_eval.selected,
+            ver_eval.ln_bayes_factor_vs_canonical,
+            pre_rec * 100.0,
             post_rec * 100.0
         );
     }
@@ -4288,6 +4546,10 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
         assert!(!ver_para.applied);
         assert!(!ver_para.polarity_flipped);
         assert_eq!(para_cube.data, orig_para);
+        println!(
+            "PULPROG_METRIC_JSON: {{\"kind\":\"q1_guard\",\"case\":\"CA-less paramagnetic {}\",\"selected\":\"{:?}\",\"applied\":{},\"polarity_flipped\":{},\"ln_bf\":{:.2}}}",
+            exp_name, ver_para.selected, ver_para.applied, ver_para.polarity_flipped, ver_para.ln_bayes_factor_vs_canonical
+        );
 
         // And if `15N` is `SignFlip`ped on a `CA`-less paramagnetic `HNCACB`, rescuing `SignFlipN`
         // must keep `op_c == Canonical` AND preserve negative `CB` polarity (`!polarity_flipped`)!
@@ -4308,6 +4570,10 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
                 "rescuing SignFlipN on CA-less HNCACB must not negate negative CB peaks!"
             );
             assert_eq!(para_n_flip.data, orig_para);
+            println!(
+                "PULPROG_METRIC_JSON: {{\"kind\":\"q1_guard\",\"case\":\"CA-less paramagnetic HNCACB + SignFlipN\",\"selected\":\"{:?}\",\"applied\":{},\"polarity_flipped\":{},\"ln_bf\":{:.2}}}",
+                ver_n.selected, ver_n.applied, ver_n.polarity_flipped, ver_n.ln_bayes_factor_vs_canonical
+            );
         }
     }
 
@@ -4355,6 +4621,105 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
     );
     assert!(!ver_beta.applied);
     assert_eq!(hnco_beta.data, orig_beta);
+    println!(
+        "PULPROG_METRIC_JSON: {{\"kind\":\"q1_guard\",\"case\":\"48-root beta-sheet/PCS HNCO (<13CO>~172 ppm)\",\"selected\":\"{:?}\",\"applied\":{},\"polarity_flipped\":{},\"ln_bf\":{:.2}}}",
+        ver_beta.selected, ver_beta.applied, ver_beta.polarity_flipped, ver_beta.ln_bayes_factor_vs_canonical
+    );
+
+    //    (c) TMS-referenced narrow-SW `HNCO` (`O2P = 177.0 ppm, SW = 11.7 ppm`, `Z: 182.85..171.15 ppm`)
+    //        where `-2.75 ppm` TMS referencing shifts `<13CO>` to `~173.5 ppm` with ~15% minor fold-in
+    //        at `182.2 ppm` while `>40%` of roots remain in the central corridor: must NEVER false-`MirrorFoldC`!
+    let ax_co_tms = AxisPpm {
+        label: "13C".to_string(),
+        size: 64,
+        first_ppm: 182.85,
+        step_ppm: -11.70 / 64.0,
+        obs_mhz: 213.76,
+    };
+    let mut hnco_tms = Spectrum3D {
+        name: "tms_narrow_hnco".to_string(),
+        exp: "HNCO".to_string(),
+        axis_x: hsqc.axis_x.clone(),
+        axis_y: hsqc.axis_y.clone(),
+        axis_z: ax_co_tms,
+        data: (0..96 * 64 * 64)
+            .map(|i| deterministic_noise(93, i) * 1.3)
+            .collect(),
+    };
+    for k in 0..48 {
+        let h_k = 6.95 + ((k % 12) as f64) * 0.23 + ((k / 12) as f64) * 0.04;
+        let n_k = 106.5 + ((k / 12) as f64) * 5.8 + ((k % 12) as f64) * 0.55;
+        // Beta-rich TMS-shifted `<13CO> ~ 172.8 ppm`: `2/16` (`12.5%`) alias `< 171.15` to `182.1..182.7 ppm`,
+        // `7/16` (`43.8%`) sit near the lower edge `171.3..172.7 ppm`, and only `3/16` (`18.8%`) reach `174.5..176.2 ppm`.
+        let bin = k % 16;
+        let raw_co = 170.35 + (bin as f64) * 0.38;
+        let co_k = if raw_co < 171.15 {
+            raw_co + 11.70
+        } else {
+            raw_co
+        };
+        add_gaussian_3d(&mut hnco_tms, h_k, n_k, co_k, 115.0, 0.030, 0.30, 0.20);
+    }
+    let orig_tms = hnco_tms.data.clone();
+    let ver_tms = verify_3d_axis_hypotheses_against_hsqc(&mut hnco_tms, &hsqc_48, None);
+    assert_eq!(
+        ver_tms.selected,
+        NamedAxisHypothesis::Canonical,
+        "TMS-referenced narrow-SW HNCO (<13CO> ~ 172.8 ppm) must NEVER false-MirrorFoldC or false-HalfSwShiftC!"
+    );
+    assert!(!ver_tms.applied);
+    assert_eq!(hnco_tms.data, orig_tms);
+    println!(
+        "PULPROG_METRIC_JSON: {{\"kind\":\"q1_guard\",\"case\":\"48-root TMS narrow-SW HNCO (<13CO>~173.5 ppm)\",\"selected\":\"{:?}\",\"applied\":{},\"polarity_flipped\":{},\"ln_bf\":{:.2}}}",
+        ver_tms.selected, ver_tms.applied, ver_tms.polarity_flipped, ver_tms.ln_bayes_factor_vs_canonical
+    );
+
+    //    (d) Canonical all-positive `CBCACONH` (`O2P = 39.0 ppm, SW = 75.0 ppm`, `Z: 76.5..1.5 ppm`)
+    //        where `CH2`/`CH3` `CB` INEPT cross-peaks (`20..25 ppm`, amplitude `135.0`) are brighter
+    //        than `CH` `CA` (`53..59 ppm`, amplitude `75.0`): reflecting around `39.0 ppm` (`78 - c`)
+    //        would swap `CB (22 ppm) <-> CA (56 ppm)` and must NEVER false-`SignFlipC`!
+    let ax_cbca_39 = AxisPpm {
+        label: "13C".to_string(),
+        size: 96,
+        first_ppm: 76.5,
+        step_ppm: -75.0 / 96.0,
+        obs_mhz: 125.71,
+    };
+    let mut cbca_39 = Spectrum3D {
+        name: "canon_cbca_39ppm".to_string(),
+        exp: "CBCACONH".to_string(),
+        axis_x: hsqc.axis_x.clone(),
+        axis_y: hsqc.axis_y.clone(),
+        axis_z: ax_cbca_39,
+        data: (0..96 * 64 * 96)
+            .map(|i| deterministic_noise(94, i) * 1.3)
+            .collect(),
+    };
+    for k in 0..48 {
+        let h_k = 6.95 + ((k % 12) as f64) * 0.23 + ((k / 12) as f64) * 0.04;
+        let n_k = 106.5 + ((k / 12) as f64) * 5.8 + ((k % 12) as f64) * 0.55;
+        let ca_k = 53.5 + ((k % 7) as f64) * 0.85;
+        let cb_k = if k % 9 == 0 {
+            65.5 // Ser/Thr CB
+        } else {
+            20.5 + ((k % 6) as f64) * 0.85 // bright CH3/CH2 CB at 20.5..24.75 ppm (`78 - cb = 53.25..57.5 ppm`!)
+        };
+        add_gaussian_3d(&mut cbca_39, h_k, n_k, ca_k, 75.0, 0.030, 0.30, 0.55);
+        add_gaussian_3d(&mut cbca_39, h_k, n_k, cb_k, 135.0, 0.030, 0.30, 0.55);
+    }
+    let orig_cbca_39 = cbca_39.data.clone();
+    let ver_cbca_39 = verify_3d_axis_hypotheses_against_hsqc(&mut cbca_39, &hsqc_48, None);
+    assert_eq!(
+        ver_cbca_39.selected,
+        NamedAxisHypothesis::Canonical,
+        "Canonical CBCACONH (O2P=39 ppm, bright CH3/CH2 CB) must NEVER false-SignFlipC!"
+    );
+    assert!(!ver_cbca_39.applied);
+    assert_eq!(cbca_39.data, orig_cbca_39);
+    println!(
+        "PULPROG_METRIC_JSON: {{\"kind\":\"q1_guard\",\"case\":\"48-root canonical CBCACONH (O2P=39 ppm, bright CB)\",\"selected\":\"{:?}\",\"applied\":{},\"polarity_flipped\":{},\"ln_bf\":{:.2}}}",
+        ver_cbca_39.selected, ver_cbca_39.applied, ver_cbca_39.polarity_flipped, ver_cbca_39.ln_bayes_factor_vs_canonical
+    );
 }
 
 // ============================================================================
@@ -4372,7 +4737,12 @@ fn test_conditional_real_dev_cisd3_pulprog_and_canonical_non_corruption() {
         return;
     }
 
-    let hsqc_dir = cisd3_dir.join("CISD3_N15HSQC");
+    let hsqc_cand = cisd3_dir.join("CISD3_15N_HSQC_diamagnetic");
+    let hsqc_dir = if hsqc_cand.is_dir() {
+        hsqc_cand
+    } else {
+        cisd3_dir.join("CISD3_N15HSQC")
+    };
     let hnco_dir = cisd3_dir.join("CISD3_HNCO");
     let cbca_dir = cisd3_dir.join("CISD3_CBCACONH");
     if !hsqc_dir.is_dir() || !hnco_dir.is_dir() || !cbca_dir.is_dir() {
@@ -4416,4 +4786,14 @@ fn test_conditional_real_dev_cisd3_pulprog_and_canonical_non_corruption() {
     assert_eq!(ver_rescued.selected, NamedAxisHypothesis::HalfSwShiftN);
     assert!(ver_rescued.applied);
     assert_eq!(hnco_shifted.data, hnco_spec.data);
+    println!(
+        "PULPROG_METRIC_JSON: {{\"kind\":\"real_cisd3\",\"canonical_selected\":\"{:?}\",\"canonical_applied\":{},\"corrupted_selected\":\"{:?}\",\"corrupted_applied\":{},\"corrupted_ln_bf\":{:.2},\"canonical_match_frac\":{:.4},\"rescued_match_frac\":{:.4}}}",
+        eval_clean.selected,
+        eval_clean.applied,
+        ver_rescued.selected,
+        ver_rescued.applied,
+        ver_rescued.ln_bayes_factor_vs_canonical,
+        ver_rescued.canonical_matched_fraction,
+        ver_rescued.selected_matched_fraction
+    );
 }

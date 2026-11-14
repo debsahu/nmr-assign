@@ -2542,7 +2542,9 @@ fn classify_pulse_token(
     ) {
         if compact.contains("cbcaconh")
             || compact.contains("cbcaconnh")
+            || compact.contains("cbcacocanh")
             || compact.contains("cbcacogp")
+            || compact.contains("hncocacb")
         {
             return Some(PulseSequenceClass::Cbcaconh);
         }
@@ -3826,7 +3828,14 @@ fn build_varian_experiment(
         .or_else(|| sfrq.and_then(|sf| infer_proton_base_mhz(&axes[0].nucleus, sf)));
 
     let disp = display_name_from_rel(rel_root, root_name);
-    let mut pulse_class = if is_varian_dosy {
+    let is_known_specialized_j = seqfil.as_deref().is_some_and(|s| {
+        let sl = s.to_ascii_lowercase();
+        sl == "ghnha" || sl == "hnha" || sl.starts_with("hnhagp")
+    });
+    if is_known_specialized_j {
+        notes.push("3D HNHA scalar-coupling experiment".to_string());
+    }
+    let mut pulse_class = if is_varian_dosy || is_known_specialized_j {
         PulseSequenceClass::Unknown
     } else {
         seqfil
@@ -3834,14 +3843,14 @@ fn build_varian_experiment(
             .and_then(|s| classify_pulse_token(s, dimensionality, &axes))
             .unwrap_or(PulseSequenceClass::Unknown)
     };
-    if !is_varian_dosy && pulse_class == PulseSequenceClass::Unknown {
+    if !is_varian_dosy && !is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown {
         if let Some(ps) = pslabel.as_deref() {
             if let Some(c) = classify_pulse_token(ps, dimensionality, &axes) {
                 pulse_class = c;
             }
         }
     }
-    if !is_varian_dosy && pulse_class == PulseSequenceClass::Unknown {
+    if !is_varian_dosy && !is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown {
         let pp_txt = String::from_utf8_lossy(procpar_bytes);
         let sch_txt = grp
             .sampling_sch
@@ -3857,19 +3866,13 @@ fn build_varian_experiment(
         }
     }
     if !is_varian_dosy
+        && !is_known_specialized_j
         && pulse_class == PulseSequenceClass::Unknown
         && dimensionality != ExperimentDimensionality::Dim1D
     {
         if let Some(c) = classify_pulse_token(&disp, dimensionality, &axes) {
             pulse_class = c;
         }
-    }
-    let is_known_specialized_j = seqfil.as_deref().is_some_and(|s| {
-        let sl = s.to_ascii_lowercase();
-        sl == "ghnha" || sl == "hnha" || sl.starts_with("hnhagp")
-    });
-    if is_known_specialized_j {
-        notes.push("3D HNHA scalar-coupling experiment".to_string());
     }
     if !is_varian_dosy
         && ((!is_known_specialized_j && pulse_class == PulseSequenceClass::Unknown)
