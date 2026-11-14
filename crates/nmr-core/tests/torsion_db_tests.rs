@@ -953,6 +953,85 @@ fn test_build_torsion_corpus_script_verify_and_spot_check() {
         ),
         "expected VERIFY_OK with exact corpus SHA-256, got: {stdout}"
     );
+
+    // 2. Standalone `--spot-check-pdb` (without `--spot-check-star`) must still recompute and
+    //    verify `(phi, psi, chi1)` and `CA` coordinates (`verified_shifts=0`).
+    let pdb_only = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--verify")
+        .arg(root.join("data/torsion_db/torsion_corpus.tsv"))
+        .arg("--spot-check-pdb")
+        .arg(root.join("data/fixtures/ubiquitin_1ubq_xray.pdb"))
+        .arg("--chain")
+        .arg("1UBQ_A")
+        .output()
+        .expect("invoke python3 scripts/build_torsion_corpus.py --spot-check-pdb only");
+    let pdb_stdout = String::from_utf8_lossy(&pdb_only.stdout);
+    assert!(
+        pdb_only.status.success(),
+        "PDB-only spot-check failed: stderr={}",
+        String::from_utf8_lossy(&pdb_only.stderr)
+    );
+    assert!(
+        pdb_stdout.contains("SPOT_CHECK_OK chain=1UBQ_A residues=76 verified_shifts=0"),
+        "expected PDB-only SPOT_CHECK_OK, got: {pdb_stdout}"
+    );
+
+    // 3. Invalid `--spot-check-pdb` path and lone `--spot-check-star` without `--spot-check-pdb`
+    //    must fail with non-zero exit codes rather than silently passing.
+    let bad_pdb = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--verify")
+        .arg(root.join("data/torsion_db/torsion_corpus.tsv"))
+        .arg("--spot-check-pdb")
+        .arg(root.join("data/fixtures/nonexistent_spot_check_p13.pdb"))
+        .arg("--chain")
+        .arg("1UBQ_A")
+        .output()
+        .expect("invoke python3 with missing spot-check PDB");
+    assert!(
+        !bad_pdb.status.success(),
+        "missing --spot-check-pdb path must fail, got stdout={}",
+        String::from_utf8_lossy(&bad_pdb.stdout)
+    );
+
+    let star_without_pdb = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--verify")
+        .arg(root.join("data/torsion_db/torsion_corpus.tsv"))
+        .arg("--spot-check-star")
+        .arg(root.join("data/benchmark/bmr5387.str"))
+        .output()
+        .expect("invoke python3 with --spot-check-star without --spot-check-pdb");
+    assert!(
+        !star_without_pdb.status.success(),
+        "--spot-check-star without --spot-check-pdb must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&star_without_pdb.stderr)
+            .contains("--spot-check-star requires --spot-check-pdb"),
+        "stderr={}",
+        String::from_utf8_lossy(&star_without_pdb.stderr)
+    );
+
+    // 4. Verify documented `--build` cache flags (`--manifest`, `--pdb-dir`, `--bmrb-dir`,
+    //    `--download-missing`) are accepted by `argparse` (`--help` + missing-cache dry fail).
+    let help_out = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--help")
+        .output()
+        .expect("invoke python3 scripts/build_torsion_corpus.py --help");
+    assert!(help_out.status.success());
+    let help_txt = String::from_utf8_lossy(&help_out.stdout);
+    for flag in [
+        "--manifest",
+        "--provenance",
+        "--pdb-dir",
+        "--bmrb-dir",
+        "--download-missing",
+    ] {
+        assert!(help_txt.contains(flag), "missing CLI flag {flag} in --help");
+    }
 }
 
 #[test]

@@ -17,7 +17,7 @@
 
 ## Reproducible Extraction & Verification Protocol (`scripts/build_torsion_corpus.py`)
 
-`data/torsion_db/torsion_corpus.tsv` is generated and verified strictly from public CC0 `wwPDB` coordinate files (`https://files.rcsb.org/download/<pdb_id>.pdb`) and public CC0 `BMRB` NMR-STAR files (`https://bmrb.io/ftp/pub/bmrb/entry_directories/bmr<bmrb_id>/bmr<bmrb_id>_3.str`) via the Python 3 standard-library script `scripts/build_torsion_corpus.py` (zero third-party Python packages; zero external structural-biology binaries):
+`data/torsion_db/torsion_corpus.tsv` is generated and verified strictly from public CC0 `wwPDB` coordinate files (`https://files.rcsb.org/download/<pdb_id>.pdb.gz`) and public CC0 `BMRB` NMR-STAR v3 files (`https://api.bmrb.io/v2/entry/<bmrb_id>?format=rawnmrstar`) via the Python 3 standard-library script `scripts/build_torsion_corpus.py` (zero third-party Python packages; zero external structural-biology binaries):
 
 1. **Coordinate Selection & IUPAC Dihedrals**:
    - Reads **Model 1** only (stops at the first `ENDMDL` record for multi-conformer NMR ensembles), `ATOM  ` records on `chain_id`, `altLoc in (' ', 'A')` (retaining the first conformer atom encountered), `iCode == ' '`, and standard 20 amino-acid residues with complete backbone `(N, CA, C)` coordinates.
@@ -27,19 +27,20 @@
 2. **Secondary Chemical Shifts & Coil-Origin Referencing**:
    - Reads the primary `_Atom_chem_shift` loop (`Assigned_chem_shift_list_ID == 1`, first `Entity_ID`), mapping `HN -> H`, `CO -> C`, and `GLY` `HA = 0.5 * (HA2 + HA3)` when `HA` is absent, then aligns the BMRB sequence to the PDB `ATOM` sequence via Gotoh global alignment (exact gapless substring match preferred).
    - Subtracts Wishart et al. (*J. Biomol. NMR* 1995, 5, 67–81) sequence-corrected random-coil chemical shifts matching `nmr_core::dihedrals::random_coil_shifts`: oxidized `CYS` (`CB_obs > 35.0 ppm` -> `CA = 55.6, CB = 41.1, HA = 4.71 ppm`), pre-Proline corrections (`CA -= 1.95, C' -= 2.00, CB += 0.25 ppm` for non-Gly; `CA -= 1.00, C' -= 1.50 ppm` for Gly), `PRO` `(dH, dN) = None`, and `GLY` `dCB = None`.
-   - Applies the self-contained Wang & Wishart (*J. Biomol. NMR* 2005, 31, 143–148) coil-origin median offset correction per chain: over residues with `|dCA - dCB| <= 1.5 ppm` (when `>= 5` coil-like residues exist), if `>= 5` observations exist for nucleus `k in (H, N, CA, CB, C', HA)` and `|median_k| > (0.20, 1.20, 1.00, 1.00, 1.00, 0.20)[k] ppm`, subtracts `median_k` from nucleus `k` across the chain and formats secondary shifts to `0.001 ppm` (`%.3f`).
+   - Applies the self-contained Wang & Wishart (*J. Biomol. NMR* 2005, 31, 143–148) coil-origin median offset correction per chain: over residues with `|dCA - dCB| <= 1.5 ppm` (when `>= 5` coil-like residues exist), if `>= 5` observations exist for nucleus `k in (H, N, CA, CB, C', HA)` and `|median_k| > (0.20, 1.20, 1.00, 1.00, 1.00, 0.20)[k] ppm`, subtracts `median_k` from nucleus `k` across the chain and formats `1H` secondary shifts (`H`, `HA`) to `0.001 ppm` (`%.3f`) and heavy-atom `15N`/`13C` secondary shifts (`N`, `CA`, `CB`, `C'`) to `0.01 ppm` (`%.2f`).
 3. **Offline Verification & Spot-Check Commands**:
    ```bash
-   # Verify schema, 129 chains / 13,647 residues, and exact SHA-256 + offline spot-check on 1UBQ_A:
+   # Verify schema, 129 chains / 13,647 residues, and exact SHA-256 + offline spot-check on 1UBQ_A
+   # (--spot-check-pdb also runs standalone without --spot-check-star for geometry-only checks):
    python3 scripts/build_torsion_corpus.py \
      --verify data/torsion_db/torsion_corpus.tsv \
      --spot-check-pdb data/fixtures/ubiquitin_1ubq_xray.pdb \
      --spot-check-star data/benchmark/bmr5387.str \
      --chain 1UBQ_A
 
-   # Rebuild all 129 chains from local or downloaded public wwPDB + BMRB caches:
+   # Rebuild all 129 chains from local caches and/or public CC0 wwPDB + BMRB archives:
    python3 scripts/build_torsion_corpus.py \
-     --build --manifest data/torsion_db/PROVENANCE.md \
+     --build --provenance data/torsion_db/PROVENANCE.md \
      --pdb-dir /path/to/wwpdb_cache --bmrb-dir /path/to/bmrb_cache \
      --download-missing --out data/torsion_db/torsion_corpus.tsv
    ```

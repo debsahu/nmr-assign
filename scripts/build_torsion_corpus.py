@@ -533,12 +533,83 @@ def http_get_text(url: str) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def load_cached_or_fetch_pdb(
+    pdb_id: str,
+    pdb_dir: Optional[pathlib.Path],
+    download_missing: bool,
+    rate_limit_sec: float,
+    need_delay: bool,
+) -> Tuple[str, bool]:
+    """Load a wwPDB entry from local `pdb_dir` cache or fetch CC0 gzip PDB from RCSB."""
+    if pdb_dir is not None:
+        for cand_name in (
+            f"{pdb_id.lower()}.pdb",
+            f"{pdb_id.upper()}.pdb",
+            f"pdb{pdb_id.lower()}.ent",
+            f"{pdb_id.lower()}.pdb.gz",
+        ):
+            cand = pdb_dir / cand_name
+            if cand.is_file():
+                raw = cand.read_bytes()
+                if cand_name.endswith(".gz"):
+                    raw = gzip.decompress(raw)
+                return raw.decode("utf-8", errors="replace"), False
+        if not download_missing:
+            raise FileNotFoundError(
+                f"PDB {pdb_id} not found in {pdb_dir} (pass --download-missing to fetch)"
+            )
+
+    if need_delay and rate_limit_sec > 0.0:
+        time.sleep(rate_limit_sec)
+    pdb_url = f"https://files.rcsb.org/download/{pdb_id.lower()}.pdb.gz"
+    pdb_text = http_get_text(pdb_url)
+    if pdb_dir is not None:
+        pdb_dir.mkdir(parents=True, exist_ok=True)
+        (pdb_dir / f"{pdb_id.lower()}.pdb").write_text(pdb_text, encoding="utf-8")
+    return pdb_text, True
+
+
+def load_cached_or_fetch_bmrb(
+    bmrb_id: str,
+    bmrb_dir: Optional[pathlib.Path],
+    download_missing: bool,
+    rate_limit_sec: float,
+    need_delay: bool,
+) -> Tuple[str, bool]:
+    """Load a BMRB NMR-STAR v3 entry from `bmrb_dir` cache or fetch CC0 STAR from BMRB API."""
+    if bmrb_dir is not None:
+        for cand_name in (
+            f"bmr{bmrb_id}.str",
+            f"bmr{bmrb_id}_3.str",
+            f"{bmrb_id}.str",
+        ):
+            cand = bmrb_dir / cand_name
+            if cand.is_file():
+                return cand.read_text(encoding="utf-8", errors="replace"), False
+        if not download_missing:
+            raise FileNotFoundError(
+                f"BMRB {bmrb_id} not found in {bmrb_dir} (pass --download-missing to fetch)"
+            )
+
+    if need_delay and rate_limit_sec > 0.0:
+        time.sleep(rate_limit_sec)
+    bmrb_url = f"https://api.bmrb.io/v2/entry/{bmrb_id}?format=rawnmrstar"
+    star_text = http_get_text(bmrb_url)
+    if bmrb_dir is not None:
+        bmrb_dir.mkdir(parents=True, exist_ok=True)
+        (bmrb_dir / f"bmr{bmrb_id}_3.str").write_text(star_text, encoding="utf-8")
+    return star_text, True
+
+
 def build_corpus_from_public_archives(
     provenance_path: pathlib.Path,
     out_path: pathlib.Path,
+    pdb_dir: Optional[pathlib.Path] = None,
+    bmrb_dir: Optional[pathlib.Path] = None,
+    download_missing: bool = False,
     rate_limit_sec: float = 1.0,
 ) -> None:
-    """Rebuild `torsion_corpus.tsv` from public CC0 wwPDB + BMRB sources."""
+    """Rebuild `torsion_corpus.tsv` from local caches and/or public CC0 wwPDB + BMRB sources."""
     inventory = parse_provenance_inventory(provenance_path)
     if len(inventory) != EXPECTED_CHAIN_COUNT:
         raise ValueError(
@@ -546,17 +617,26 @@ def build_corpus_from_public_archives(
         )
 
     lines: List[str] = list(CORPUS_HEADER_LINES)
-    for idx, (ck, pdb_id, chain_id, bmrb_id, unp, fam, top, exp_len) in enumerate(
+    did_http = False
+    for _idx, (ck, pdb_id, chain_id, bmrb_id, unp, fam, top, exp_len) in enumerate(
         inventory
     ):
-        if idx > 0 and rate_limit_sec > 0.0:
-            time.sleep(rate_limit_sec)
-        pdb_url = f"https://files.rcsb.org/download/{pdb_id.lower()}.pdb.gz"
-        pdb_text = http_get_text(pdb_url)
-        if rate_limit_sec > 0.0:
-            time.sleep(rate_limit_sec)
-        bmrb_url = f"https://api.bmrb.io/v2/entry/{bmrb_id}?format=rawnmrstar"
-        star_text = http_get_text(bmrb_url)
+        pdb_text, fetched_pdb = load_cached_or_fetch_pdb(
+            pdb_id,
+            pdb_dir,
+            download_missing or (pdb_dir is None),
+            rate_limit_sec,
+            did_http,
+        )
+        did_http = did_http or fetched_pdb
+        star_text, fetched_star = load_cached_or_fetch_bmrb(
+            bmrb_id,
+            bmrb_dir,
+            download_missing or (bmrb_dir is None),
+            rate_limit_sec,
+            did_http,
+        )
+        did_http = did_http or fetched_star
 
         pdb_res = parse_pdb_chain_model1(pdb_text, chain_id)
         if len(pdb_res) != exp_len:
@@ -679,15 +759,20 @@ def verify_corpus(
                 f"Chain {ck}: header length {decl_len} != RES count {len(chain_rows[ck])}"
             )
 
-    if spot_pdb is not None and spot_star is not None:
+    if spot_star is not None and spot_pdb is None:
+        raise ValueError("--spot-check-star requires --spot-check-pdb")
+
+    if spot_pdb is not None:
         if spot_chain not in chain_headers:
             raise ValueError(f"Spot-check chain {spot_chain} not in corpus")
         target_chain_id = chain_headers[spot_chain][3]
         pdb_res = parse_pdb_chain_model1(
             spot_pdb.read_text(encoding="utf-8"), target_chain_id
         )
-        bmrb_res = parse_bmrb_star_primary_shifts(
-            spot_star.read_text(encoding="utf-8")
+        bmrb_res = (
+            parse_bmrb_star_primary_shifts(spot_star.read_text(encoding="utf-8"))
+            if spot_star is not None
+            else []
         )
         recomputed = [
             r.split("\t")
@@ -705,15 +790,16 @@ def verify_corpus(
                 raise ValueError(
                     f"Spot-check geometry mismatch on {spot_chain} seq {r_exp[2]}: got {r_got[10:16]} vs {r_exp[10:16]}"
                 )
-            # Exact match on every shift column present in the local STAR fixture
-            for col_i in range(4, 10):
-                if r_got[col_i] != ".":
-                    checked_shifts += 1
-                    if r_got[col_i] != r_exp[col_i]:
-                        raise ValueError(
-                            f"Spot-check shift mismatch on {spot_chain} seq {r_exp[2]} col {col_i}: got {r_got[col_i]} vs {r_exp[col_i]}"
-                        )
-        if checked_shifts == 0:
+            if spot_star is not None:
+                # Exact match on every shift column present in the local STAR fixture
+                for col_i in range(4, 10):
+                    if r_got[col_i] != ".":
+                        checked_shifts += 1
+                        if r_got[col_i] != r_exp[col_i]:
+                            raise ValueError(
+                                f"Spot-check shift mismatch on {spot_chain} seq {r_exp[2]} col {col_i}: got {r_got[col_i]} vs {r_exp[col_i]}"
+                            )
+        if spot_star is not None and checked_shifts == 0:
             raise ValueError(f"Spot-check {spot_chain} matched zero assigned shifts")
         print(
             f"SPOT_CHECK_OK chain={spot_chain} residues={len(recomputed)} verified_shifts={checked_shifts}"
@@ -757,9 +843,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--provenance",
+        "--manifest",
+        dest="provenance",
         type=pathlib.Path,
         default=pathlib.Path("data/torsion_db/PROVENANCE.md"),
         help="Path to PROVENANCE.md containing the 129-chain inventory table.",
+    )
+    parser.add_argument(
+        "--pdb-dir",
+        type=pathlib.Path,
+        default=None,
+        help="Optional local cache directory for wwPDB .pdb/.pdb.gz files during --build.",
+    )
+    parser.add_argument(
+        "--bmrb-dir",
+        type=pathlib.Path,
+        default=None,
+        help="Optional local cache directory for BMRB NMR-STAR .str files during --build.",
+    )
+    parser.add_argument(
+        "--download-missing",
+        action="store_true",
+        help="When --pdb-dir or --bmrb-dir is given, fetch missing entries from public archives into the cache.",
     )
     parser.add_argument(
         "--out",
@@ -781,7 +886,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.build:
             build_corpus_from_public_archives(
-                args.provenance, args.out, rate_limit_sec=args.rate_limit_sec
+                args.provenance,
+                args.out,
+                pdb_dir=args.pdb_dir,
+                bmrb_dir=args.bmrb_dir,
+                download_missing=args.download_missing,
+                rate_limit_sec=args.rate_limit_sec,
             )
             verify_corpus(args.out)
         if args.verify:
