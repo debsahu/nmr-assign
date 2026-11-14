@@ -7,7 +7,7 @@
 # were added with `cohort=cold_p10` (10 `dev` + 9 `heldout` = 19 total).
 # Phase 11 -> Phase 12 update (external review Q1): `16072`, `16782`, and `17092` (`cold_p10`) were promoted to `split=dev` (`cohort=dev_from_p10`, 13 `dev` entries total),
 # and fresh pre-screened disjoint monomeric cold entries are added under `split=heldout`, `cohort=cold_p12` with pre-registered manifest SHA-256 in `data/benchmark/PROVENANCE.md`.
-# Phase 12 -> Phase 13 update (external review P1-7 / W1 F4): `cold_p12` (`5691,6585,15491,16096,16376,18337,18561`) was evaluated once at `v0.8.0` (`cohort=seen_p12`), `cold_p13` (`6209,6340,7175,15603,15819,15822,17192`) was evaluated once in Phase 13 Wave 1 and is relabelled `cohort=seen_p13` (`split=heldout`, non-cold from Wave 2 onward), and 7 fresh disjoint monomeric entries (`5844,15089,15167,16238,16298,16313,18662`) are pre-registered after Phase 13 Wave 2 code freeze (`4b8ae5b`) under `split=heldout`, `cohort=cold_p13_w2` (13 `dev` + 27 `heldout` = 40 total).
+# Phase 12 -> Phase 13 update (external review P1-7 / W1 F4 / W2 P1-2): `cold_p12` (`5691,6585,15491,16096,16376,18337,18561`) was evaluated once at `v0.8.0` (`cohort=seen_p12`), `cold_p13` (`6209,6340,7175,15603,15819,15822,17192`) was evaluated once in Phase 13 Wave 1 (`cohort=seen_p13`, non-cold from Wave 2 onward), and `cold_p13_w2` (`5844,15089,15167,16238,16298,16313,18662`, pre-registered after Phase 13 Wave 2 code freeze `4b8ae5b` at `57a2244`) was evaluated once in Phase 13 Wave 2 and is relabelled `cohort=seen_p13_w2` (`split=heldout`, spent/non-cold per `13.1:P1-2`; 13 `dev` + 27 `heldout` = 40 total).
 bmrb_id	protein	residues	field_mhz	vendor	experiments	split	cohort
 ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 51439	CISD3	93	900	Bruker	HSQC,HNCO,HNCA,HNCOCA,CBCACONH	dev	dev
@@ -42,10 +42,10 @@ ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 15819	TR91A	110	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	seen_p13
 15822	CmR9	76	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p13
 17192	HR4495E	126	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p13
-5844	ZR18	91	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p13_w2
-15089	StR65	115	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	cold_p13_w2
-15167	YehR	139	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p13_w2
-16238	VC_A0919	108	850	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p13_w2
-16298	SH1003	111	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p13_w2
-16313	AR3436A	97	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH	heldout	cold_p13_w2
-18662	SH3_domain_of_GAS7	60	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p13_w2
+5844	ZR18	91	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	seen_p13_w2
+15089	StR65	115	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	seen_p13_w2
+15167	YehR	139	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	seen_p13_w2
+16238	VC_A0919	108	850	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	seen_p13_w2
+16298	SH1003	111	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	seen_p13_w2
+16313	AR3436A	97	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH	heldout	seen_p13_w2
+18662	SH3_domain_of_GAS7	60	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	seen_p13_w2

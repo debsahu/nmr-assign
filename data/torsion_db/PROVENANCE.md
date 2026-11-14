@@ -44,6 +44,8 @@
      --pdb-dir /path/to/wwpdb_cache --bmrb-dir /path/to/bmrb_cache \
      --download-missing --out data/torsion_db/torsion_corpus.tsv
    ```
+4. **Sequence-Identity Firewall Sensitivity (`<= 25%` vs `<= 20%`, `13.2:P1-10`)**:
+   - Tightening the sequence-identity homolog firewall from `<= 25%` (`TM < 0.50`) to `<= 20%` (`TM < 0.50`) slightly improves backbone `phi`/`psi` circular MAE (`13.79° -> 13.59°`, `Good = 541/773 [70.0%] -> 542/773 [70.1%]`), **but worsens sidechain `chi1` MAE from `33.63°` (`n = 81`) to `38.57°` (`n = 71`)**, reinforcing the canonical default of omitting `CHI1` restraints unless explicitly opted in via `--include-chi1`.
 
 ## Corpus Chain Inventory
 

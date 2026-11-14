@@ -368,8 +368,10 @@ def render_slice_13_1(root: Path) -> str:
             f"`{100.0 * float(f2_opt['accuracy']):.2f}%` | `{f2_opt['hc_status']}` | Zero-filled `9,942 -> 10,240` traces (`CBCACONH`) |"
         )
 
-    # Disjoint cold_p13_w2 single-shot validation
-    cold_rows = parse_manifest_cohort(manifest, "cold_p13_w2")
+    # Disjoint cold_p13_w2 single-shot validation (relabeled seen_p13_w2 post-W2 per 13.1:P1-2)
+    cold_rows = parse_manifest_cohort(manifest, "cold_p13_w2") or parse_manifest_cohort(
+        manifest, "seen_p13_w2"
+    )
     if cold_rows:
         lines.append("")
         lines.append("### Pre-Registered Disjoint `cold_p13_w2` Cohort (`split=heldout`, `cohort=cold_p13_w2`)")
@@ -712,6 +714,322 @@ def render_slice_13_4(root: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def summarize_cold_cohort_entries(
+    json_path: Path,
+    cohort_filter: str | None = None,
+    exclude_ids: set[str] | None = None,
+) -> tuple[int, int, int, float | None]:
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    entries = [e for e in data.get("entries", []) if e.get("status") == "OK"]
+    if cohort_filter is not None:
+        entries = [e for e in entries if e.get("cohort") == cohort_filter]
+    if exclude_ids:
+        entries = [e for e in entries if str(e.get("bmrb_id")) not in exclude_ids]
+    hc_ok = sum(int(e["reliability_curve"]["hc_correct"]) for e in entries)
+    hc_tot = sum(int(e["reliability_curve"]["hc_assigned"]) for e in entries)
+    pct = (100.0 * hc_ok / hc_tot) if hc_tot > 0 else None
+    return len(entries), hc_ok, hc_tot, pct
+
+
+def parse_provenance_gate_spec(prov_path: Path) -> list[tuple[str, str, str, str]]:
+    txt = prov_path.read_text(encoding="utf-8")
+    b_tag = "<!-- CALIBRATION-GATE-SPEC-BEGIN -->"
+    e_tag = "<!-- CALIBRATION-GATE-SPEC-END -->"
+    s = txt.index(b_tag) + len(b_tag)
+    e = txt.index(e_tag, s)
+    rows: list[tuple[str, str, str, str]] = []
+    for raw in txt[s:e].splitlines():
+        line = raw.strip()
+        if (
+            not line.startswith("|")
+            or "Gate ID" in line
+            or ":---" in line
+            or line.startswith("|---")
+        ):
+            continue
+        cols = [c.strip().strip("`") for c in line.strip("|").split("|")]
+        if len(cols) >= 4:
+            rows.append((cols[0], cols[1], cols[2], cols[3]))
+    return rows
+
+
+def parse_rust_gate_constants(
+    rs_path: Path,
+) -> tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str, str]]]:
+    txt = rs_path.read_text(encoding="utf-8")
+
+    def extract_const(name: str) -> list[tuple[str, str, str, str]]:
+        m = re.search(
+            rf"const\s+{name}\s*:[^=]+=\s*&\[(.*?)\];",
+            txt,
+            flags=re.DOTALL,
+        )
+        if not m:
+            return []
+        return re.findall(
+            r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)',
+            m.group(1),
+        )
+
+    return (
+        extract_const("ACTIVE_26_FOLD_CALIBRATION_GATES"),
+        extract_const("RETIRED_W1_13_FOLD_CALIBRATION_GATES"),
+    )
+
+
+def render_remediation(root: Path, extra_files: list[Path]) -> str:
+    w2 = root / "data/private/w2_results"
+    p_priv = root / "data/private"
+    prov_path = root / "data/benchmark/PROVENANCE.md"
+    rs_path = root / "crates/nmr-cli/src/real_benchmark.rs"
+    manifest_path = root / "data/benchmark/real_manifest.tsv"
+    lopo_data = json.loads((w2 / "w2_non_cold_26_lopo.json").read_text(encoding="utf-8"))
+
+    lines: list[str] = []
+
+    # 1. Digest table of updated & cited remediation artifacts
+    rem_files = [
+        manifest_path,
+        prov_path,
+        root / "data/torsion_db/PROVENANCE.md",
+        root / "TODO.md",
+        root / "docs/specs/14-regime-solvers.md",
+        p_priv / "phase12_heldout_evo_graph.json",
+        p_priv / "phase12_heldout_standard_cpu.json",
+        p_priv / "phase12_heldout_standard_gpu.json",
+        p_priv / "phase13_w1_cold_p13_evograph.json",
+        p_priv / "phase13_w1_cold_p13_standard_cpu.json",
+        p_priv / "phase13_w1_cold_p13_standard_gpu.json",
+        w2 / "w2_non_cold_26_lopo.json",
+        w2 / "w2_cold_p13_w2_evograph.json",
+        w2 / "w2_cold_p13_w2_standard_cpu.json",
+        w2 / "w2_cold_p13_w2_standard_gpu.json",
+        w2 / "w2_cold_p13_w2_bayes_cpu.json",
+        w2 / "w2_cold_p13_w2_bayes_gpu.json",
+        w2 / "w2_remediation_workspace_tests.log",
+        *extra_files,
+    ]
+    lines.append("### Pre-Tag Remediation Artifact & Raw JSON FIPS 180-4 SHA-256 Digests")
+    lines.append("")
+    lines.append(
+        "Generated mechanically by `python3 scripts/render_phase13_w2_tables.py --section remediation`:"
+    )
+    lines.append("")
+    lines.append("| Artifact Path | Bytes | SHA-256 |")
+    lines.append("|---|---:|---|")
+    seen_paths: set[Path] = set()
+    for fp in rem_files:
+        if fp.exists() and fp not in seen_paths:
+            seen_paths.add(fp)
+            digest, nbytes = sha256_file(fp)
+            rel = fp.relative_to(root) if fp.is_relative_to(root) else fp
+            lines.append(f"| `{rel}` | {nbytes:,} | `{digest}` |")
+
+    # 2. Manifest seen_p13_w2 verification
+    seen_w2_rows = parse_manifest_cohort(manifest_path, "seen_p13_w2")
+    cold_w2_rows = parse_manifest_cohort(manifest_path, "cold_p13_w2")
+    lines.append("")
+    lines.append(
+        f"- **Manifest Cohort Relabel Check (`data/benchmark/real_manifest.tsv`)**: "
+        f"`cold_p13_w2` rows = **`{len(cold_w2_rows)}`**, "
+        f"`seen_p13_w2` rows = **`{len(seen_w2_rows)}`** "
+        f"(`{','.join(r['bmrb_id'] for r in seen_w2_rows)}`)."
+    )
+
+    # 3. 13.1:P1-1 Gate-set parity table
+    doc_gates = parse_provenance_gate_spec(prov_path)
+    rs_active, rs_retired = parse_rust_gate_constants(rs_path)
+    rs_combined = rs_active + rs_retired
+    if doc_gates != rs_combined:
+        raise RuntimeError(
+            f"Gate parity mismatch: PROVENANCE.md={doc_gates} vs real_benchmark.rs={rs_combined}"
+        )
+    lines.append("")
+    lines.append(
+        "### `13.1:P1-1` — Canonical Active vs Retired Calibration Gate Parity (`PROVENANCE.md` <-> `real_benchmark.rs`)"
+    )
+    lines.append("")
+    lines.append(
+        "| Gate ID | Operator | Threshold | `PROVENANCE.md` Status | `real_benchmark.rs` Constant | Parity |"
+    )
+    lines.append("|---|---|---|---|---|---|")
+    for (dg, dop, dthr, dst), (rg, rop, rthr, rst) in zip(doc_gates, rs_combined):
+        cname = (
+            "`ACTIVE_26_FOLD_CALIBRATION_GATES`"
+            if rst == "ACTIVE"
+            else "`RETIRED_W1_13_FOLD_CALIBRATION_GATES`"
+        )
+        ok = (dg, dop, dthr, dst) == (rg, rop, rthr, rst)
+        lines.append(
+            f"| `{dg}` | `{dop}` | `{dthr}` | `{dst}` | {cname} | **`{'MATCH' if ok else 'MISMATCH'}`** |"
+        )
+
+    # 4. 13.1:P1-1 5-engine 26-fold OOF table on retired vs active gates
+    macro_thr = float(next(t for g, _, t, _ in rs_retired if g == "macro_HCP"))
+    deb_thr = float(next(t for g, _, t, _ in rs_retired if g == "mean_debiased_ECE_10"))
+    ece10_thr = float(next(t for g, _, t, _ in rs_active if g == "pooled_ECE_10"))
+    micro_thr = float(next(t for g, _, t, _ in rs_active if g == "micro_HCP"))
+
+    lines.append("")
+    lines.append(
+        "### `13.1:P1-1` — 5-Engine 26-Fold Non-Cold OOF Evaluation on Retired `13.W1` Gates vs Active `13.W2` Gates (`w2_non_cold_26_lopo.json`)"
+    )
+    lines.append("")
+    lines.append(
+        f"| Engine (`26`-Fold OOF) | Retired `macro_HCP` (`>={100.0 * macro_thr:.1f}%`) | "
+        f"Retired `mean_debiased_ECE_10` (`<={deb_thr:.3f}`) | Active `pooled_ECE_10` (`<={ece10_thr:.3f}`) | "
+        f"Active `micro_HCP` (`>={100.0 * micro_thr:.1f}%`) | `clean_dev_capped == 0` | `5691 & 18561` OOF Capped |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---|---|")
+    for eng in lopo_data["engines"]:
+        macro_v = float(eng["oof_macro_hc_precision"])
+        deb_v = float(eng["oof_mean_debiased_ece_10"])
+        ece_v = float(eng["oof_pooled_ece_10"])
+        micro_v = float(eng["oof_micro_hc_precision"])
+        hc_ok = sum(int(p["oof_hc_correct"]) for p in eng["per_protein"])
+        hc_tot = sum(int(p["oof_hc_assigned"]) for p in eng["per_protein"])
+        dev_ok = len(eng["dev_clean_proteins_capped"]) == 0
+        cat_ok = bool(eng["oof_5691_capped_or_warned"]) and bool(
+            eng["oof_18561_capped_or_warned"]
+        )
+        macro_cell = (
+            f"`{100.0 * macro_v:.2f}%` (`PASS`)"
+            if macro_v >= macro_thr
+            else f"**`{100.0 * macro_v:.2f}%` (`FAIL`)**"
+        )
+        deb_cell = (
+            f"`{deb_v:.4f}` (`PASS`)"
+            if deb_v <= deb_thr
+            else f"**`{deb_v:.4f}` (`FAIL`)**"
+        )
+        ece_cell = (
+            f"`{ece_v:.4f}` (`PASS`)"
+            if ece_v <= ece10_thr
+            else f"**`{ece_v:.4f}` (`FAIL`)**"
+        )
+        micro_cell = (
+            f"`{100.0 * micro_v:.2f}%` (`{hc_ok}/{hc_tot}`, `PASS`)"
+            if micro_v >= micro_thr
+            else f"**`{100.0 * micro_v:.2f}%` (`{hc_ok}/{hc_tot}`, `FAIL`)**"
+        )
+        lines.append(
+            f"| `{eng['engine']}` | {macro_cell} | {deb_cell} | {ece_cell} | {micro_cell} | "
+            f"`{str(dev_ok).lower()}` (`{'PASS' if dev_ok else 'FAIL'}`) | "
+            f"`{str(cat_ok).lower()}` (`{'PASS' if cat_ok else 'FAIL'}`) |"
+        )
+
+    # 5. 13.1:P1-2 Cold micro-HCP table across cold_p12, cold_p13, cold_p13_w2
+    cold_matrix = [
+        (
+            "evo-graph",
+            p_priv / "phase12_heldout_evo_graph.json",
+            p_priv / "phase13_w1_cold_p13_evograph.json",
+            w2 / "w2_cold_p13_w2_evograph.json",
+        ),
+        (
+            "standard (cpu)",
+            p_priv / "phase12_heldout_standard_cpu.json",
+            p_priv / "phase13_w1_cold_p13_standard_cpu.json",
+            w2 / "w2_cold_p13_w2_standard_cpu.json",
+        ),
+        (
+            "standard (gpu)",
+            p_priv / "phase12_heldout_standard_gpu.json",
+            p_priv / "phase13_w1_cold_p13_standard_gpu.json",
+            w2 / "w2_cold_p13_w2_standard_gpu.json",
+        ),
+        (
+            "bayes-sa (cpu) [opt-in]",
+            None,
+            None,
+            w2 / "w2_cold_p13_w2_bayes_cpu.json",
+        ),
+        (
+            "bayes-sa (gpu) [opt-in]",
+            None,
+            None,
+            w2 / "w2_cold_p13_w2_bayes_gpu.json",
+        ),
+    ]
+    lines.append("")
+    lines.append(
+        "### `13.1:P1-2` — Per-Engine Unseen Single-Shot Cold Micro-HCP (`>= 0.80`) Across `cold_p12`, `cold_p13` & `cold_p13_w2`"
+    )
+    lines.append("")
+    lines.append(
+        "| Engine | `cold_p12` (`v0.8.0`, `7/7`) | `cold_p13` (`13.W1`, `5/7`) | `cold_p13_w2` (`13.W2`, `5/7`) | `cold_p13_w2` Ex-`16238` (`4` entries) | Unseen Cold-Observed Micro-HCP Range |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for label, p12_p, p13_p, w2_p in cold_matrix:
+        observed_pcts: list[float] = []
+
+        def fmt_cold_cell(
+            jpath: Path | None,
+            cohort_filter: str | None = None,
+            exclude_ids: set[str] | None = None,
+            record_range: bool = True,
+            with_gate: bool = True,
+        ) -> str:
+            if jpath is None or not jpath.exists():
+                return "`n/a`"
+            _, ok, tot, pct = summarize_cold_cohort_entries(
+                jpath, cohort_filter=cohort_filter, exclude_ids=exclude_ids
+            )
+            if pct is None:
+                return "`ABSTAIN (0/0)`"
+            if record_range:
+                observed_pcts.append(pct)
+            if not with_gate:
+                return f"`{pct:.2f}%` (`{ok}/{tot}`)"
+            if pct >= 100.0 * micro_thr:
+                return f"`{pct:.2f}%` (`{ok}/{tot}`, `PASS`)"
+            return f"**`{pct:.2f}%` (`{ok}/{tot}`, `FAIL`)**"
+
+        c12 = fmt_cold_cell(p12_p, cohort_filter="cold_p12")
+        c13 = fmt_cold_cell(p13_p)
+        cw2 = fmt_cold_cell(w2_p)
+        cw2_ex = fmt_cold_cell(
+            w2_p, exclude_ids={"16238"}, record_range=False, with_gate=False
+        )
+        if len(observed_pcts) == 1:
+            rng = f"**`{observed_pcts[0]:.2f}%`** (`1` cohort)"
+        else:
+            rng = f"**`{min(observed_pcts):.2f}%–{max(observed_pcts):.2f}%`** (`{len(observed_pcts)}` cohorts)"
+        lines.append(f"| `{label}` | {c12} | {c13} | {cw2} | {cw2_ex} | {rng} |")
+
+    # 6. Post-remediation workspace test log verification
+    rem_log = w2 / "w2_remediation_workspace_tests.log"
+    if rem_log.exists():
+        tot_p, tot_f, suites = parse_test_pass_counts(rem_log)
+        raw_log = rem_log.read_text(encoding="utf-8")
+        gate_test_ok = (
+            "test_documented_calibration_gate_set_matches_asserted_gate_set ... ok"
+            in raw_log
+        )
+        manifest_test_ok = (
+            "test_committed_real_manifest_tsv_schema_splits_and_disjointness ... ok"
+            in raw_log
+        )
+        lines.append("")
+        lines.append(
+            "### Post-Remediation Workspace Test Verification (`data/private/w2_results/w2_remediation_workspace_tests.log`)"
+        )
+        lines.append("")
+        lines.append("| Verification Check | Result |")
+        lines.append("|---|---|")
+        lines.append(
+            f"| `cargo test --release --workspace` (`{len(suites)}` test result lines) | **`{tot_p} passed; {tot_f} failed`** |"
+        )
+        lines.append(
+            f"| `test_documented_calibration_gate_set_matches_asserted_gate_set` | **`{'ok' if gate_test_ok else 'MISSING/FAILED'}`** |"
+        )
+        lines.append(
+            f"| `test_committed_real_manifest_tsv_schema_splits_and_disjointness` (`seen_p13_w2`) | **`{'ok' if manifest_test_ok else 'MISSING/FAILED'}`** |"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -719,7 +1037,7 @@ def main() -> None:
     ap.add_argument("--extra-file", action="append", default=[])
     ap.add_argument(
         "--section",
-        choices=["all", "digests", "13.1", "13.2", "13.4"],
+        choices=["all", "digests", "13.1", "13.2", "13.4", "remediation"],
         default="all",
     )
     args = ap.parse_args()
@@ -735,6 +1053,8 @@ def main() -> None:
         parts.append(render_slice_13_2(root))
     if args.section in ("all", "13.4"):
         parts.append(render_slice_13_4(root))
+    if args.section == "remediation":
+        parts.append(render_remediation(root, extras))
 
     md = "\n".join(parts)
     if args.out is not None:

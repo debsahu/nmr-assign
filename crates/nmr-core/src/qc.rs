@@ -2930,8 +2930,15 @@ pub fn select_gpu_shrinkage_weight_nested_lopo(
     )
 }
 
-/// Canonical empirical-Bayes shrinkage weight (`w = 0.00`, `P1-8` / `13.1:P1-7b`) selected by
-/// nested LOPO across the 26-entry non-cold pool when fitting WebGPU `standard` (`f32`) knots.
+/// Canonical empirical-Bayes shrinkage weight (`w = 0.00`, `P1-8` / `13.1:P1-7b` / `F7`) selected
+/// by nested 26x25 LOPO across the 26-entry non-cold pool (`dev` + `seen_p12` + `seen_p13`;
+/// outer-fold range `[0.00, 0.50]`, moved from `w = 0.50` on the 13-protein `dev` split in `13.W1`)
+/// when fitting WebGPU `standard` (`f32`, `runs = 64`) knots. In
+/// [`fit_isotonic_monotone_knots_shrunk_toward_beta`], `samples` (`WebGPU f32`) carries unit weight
+/// `1.0` and `anchor_samples` (`CPU f64`, `runs = 16`) carries weight `anchor_weight = w` (returning
+/// `fit_isotonic_monotone_knots_beta(samples, ...)` immediately when `w <= 0.0`), so `w = 0.00`
+/// assigns zero weight to CPU anchor bin counts and selects **pure WebGPU (`f32`, `Beta(0.35, 0.65)`
+/// isotonic PAV) knots**.
 pub const CANONICAL_GPU_CPU_SHRINKAGE_WEIGHT: f64 = 0.00;
 
 /// Canonical empirical-Bayes shrinkage weight (`w = 0.20`, `13.4`) pooling CPU `bayes-sa` (`f64`)

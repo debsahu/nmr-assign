@@ -247,6 +247,9 @@ $$\Delta\delta^{\text{PCS}}(\mathbf{r}) = \frac{10^{4}}{4\pi r^5}\Big[(x^2 - z^2
 
      * *Candid physical interpretation*: On the outer-sphere subset (`N = 47`, excluding inner-shell EF-hand `seq_ids [25, 51, 67, 68]`), fitting $\delta_{\text{off}}$ captures the `+0.071` to `+0.098 ppm` inter-laboratory/2-K temperature referencing offset between `BMRB 15594` (`298 K`) and `BMRB 6699` (`300 K`), lowering fixed-metal `SVD@LA105` $Q$ from `0.2015` to **`0.1886`** and bounded `VarPro(r <= 1.5 Å)` $Q$ from `0.1579` to **`0.1397`** (`RMSD = 0.0983 ppm`), whereas on unfiltered `N = 51` inner-shell contact/structural residuals dominate ($Q = 0.2729\text{–}0.2988$), and unconstrained `r <= 5.0 Å` `VarPro` still drifts $> 3.0\text{ Å}$ outside the coordination sphere (flipping UTS axis ordering under `fit_offset = true`). Note also that `1KSM` was refined with lanthanide restraints in its original structure determination.
 
+> [!WARNING]
+> **Degeneracy of wide trust radius (`VarPro <= 5.0 Å`) combined with `fit_offset = true`:** In row `VarPro (r <= 5.0 Å, 2·NLL) + fit_offset = true` above, joint relaxation of the metal-position trust radius to `5.0 Å` and free $\delta_{\text{off}}$ converges to a physically **degenerate** solution that flips the sign of $\Delta\chi_{\text{ax}}$ (`+12.416 -> -10.277`, i.e. `+12.4 -> -10.3`) and shifts the metal by `3.189 Å` (`~3.2 Å`) outside the coordination sphere despite achieving a lower apparent Cornilescu $Q = 0.1137$. Do **not** promote `r <= 5.0 Å` + `fit_offset = true` on the basis of its lower $Q$: the canonical defaults (`fit_offset = false`, trust radius `<= 1.5 Å`) avoid this metal-position/offset/$\Delta\chi$ sign-flip degeneracy across Calbindin $D_{9k}$, `CISD3` (`BMRB 51439`), and general metalloproteins and **must remain canonical**.
+
 ---
 
 ## 5. CLI & Interactive Workbench Contracts (`crates/nmr-cli`, `crates/nmr-gui`)
