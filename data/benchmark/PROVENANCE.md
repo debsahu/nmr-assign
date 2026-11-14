@@ -7,10 +7,10 @@
 
 ## Frozen Manifest Pre-Registration Digest (`Q1`)
 - **Manifest path**: `data/benchmark/real_manifest.tsv`
-- **Manifest FIPS 180-4 SHA-256**: `17dcf215c2f8ed7a4126066ec70028ee2a54cd36e7910a530d7a89c00ad7ec90`
+- **Manifest FIPS 180-4 SHA-256**: `31ca3a3ecf66ab1c3c80808a6549f9afdd59d339d69ca1a3f33f68e8f8e73557`
 - **Programmatic enforcement**: `real_benchmark::tests::test_committed_real_manifest_tsv_schema_splits_and_disjointness` computes the streaming SHA-256 digest of `data/benchmark/real_manifest.tsv` and asserts that this exact hex digest is recorded in `data/benchmark/PROVENANCE.md`, alongside 100% disjointness against `data/priors/PROVENANCE.md` (21 entries) and `data/benchmark/manifest.tsv` (12 entries).
 
-## Cohort Structure & Rotation History (`33` Entries Total)
+## Cohort Structure & Rotation History (`40` Entries Total)
 1. **`split=dev`, `cohort=dev` (`10` entries)**:
    - `ubiquitin_local` (`Ubiquitin`, 76 aa, Bruker 500 MHz), `51439` (`CISD3`, 93 aa, Bruker 900 MHz), `53371` (`hDVL2_PDZ`, 102 aa, Bruker 600 MHz), `18465` (`OR135`, 110 aa, Varian 600 MHz), `15386` (`StR82`, 77 aa, Bruker 800 MHz), `5329` (`WR41`, 94 aa, Varian 600 MHz), `6318` (`At3g51030`, 124 aa, Bruker 600 MHz), `15476` (`SR384`, 54 aa, Bruker 800 MHz), `16385` (`PfR193A`, 114 aa, Bruker 600 MHz), `53280` (`Ap3`, 60 aa, Bruker 850 MHz).
 2. **`split=dev`, `cohort=dev_from_p10` (`3` entries promoted from `cold_p10` in Phase 12)**:
@@ -30,7 +30,7 @@
 | `18337` | `OR136` | 134 | 800 | Bruker | `HSQC,HNCO,HNCACB,CBCACONH` | `94.0% / 95.5% / 92.5% / 92.5%` | *De novo* P-loop NTPase fold protein (NESG OR136) |
 | `18561` | `OR250` | 112 | 800 | Bruker | `HSQC,HNCO,HNCACB,CBCACONH` | `88.1% / 94.6% / 89.3% / 84.8%` | *De novo* PFK-fold protein (NESG OR250) |
 
-5. **`split=heldout`, `cohort=cold_p13` (`7` fresh non-homologous `C1`-monomeric entries pre-registered after Phase 13 Wave 1 code freeze `67a51d7`)**:
+5. **`split=heldout`, `cohort=seen_p13` (`7` former `cold_p13` entries evaluated once in Phase 13 Wave 1 after `67a51d7` and relabeled `seen_p13` as spent per `13.W1 F4`)**:
 
 | BMRB ID | Protein | Residues | Field (MHz) | Vendor | Raw Time-Domain Backbone Experiments | Deposited Shift Coverage (`HN` / `CA` / `CB` / `C`) | PDB (`C1` Monomer) & Description |
 |---|---|---:|---:|---|---|---|---|
@@ -41,6 +41,18 @@
 | `15819` | `TR91A` | 110 | 600 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO` | `92.4% / 96.4% / 88.2% / 92.7%` | `2K50` — *Methanobacterium thermoautotrophicum* RFA-related protein (NESG TR91A) |
 | `15822` | `CmR9` | 76 | 600 | Varian | `HSQC,HNCO,HNCACB,CBCACONH` | `93.2% / 94.7% / 86.8% / 84.2%` | `2K53` — *Clostridium thermocellum* A3DK08 protein (NESG CmR9) |
 | `17192` | `HR4495E` | 126 | 600 | Varian | `HSQC,HNCO,HNCACB,CBCACONH` | `91.7% / 93.7% / 86.5% / 88.1%` | `2L3G` — *Homo sapiens* RhoGEF7 CH domain (NESG HR4495E) |
+
+6. **`split=heldout`, `cohort=cold_p13_w2` (`7` fresh non-homologous `C1`-monomeric entries pre-registered after Phase 13 Wave 2 code freeze `4b8ae5b` for joint `13.1:P1-7b` + `13.4` `bayes-sa` single-shot cold validation)**:
+
+| BMRB ID | Protein | Residues | Field (MHz) | Vendor | Raw Time-Domain Backbone Experiments | Deposited Shift Coverage (`HN` / `CA` / `CB` / `C`) | PDB (`C1` Monomer) & Description |
+|---|---|---:|---:|---|---|---|---|
+| `5844` | `ZR18` | 91 | 600 | Varian | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA` | `93.2% / 95.6% / 93.4% / 90.1%` | `1PQX` — NESG monomeric target ZR18 |
+| `15089` | `StR65` | 115 | 600 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO` | `88.1% / 93.0% / 86.1% / 90.4%` | `2ES9` — *Salmonella typhimurium* Q8ZRJ2 (NESG StR65) |
+| `15167` | `YehR` | 139 | 600 | Varian | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA` | `99.3% / 99.3% / 92.8% / 93.5%` | `2JOE` — *Escherichia coli* YehR lipoprotein (NESG ER538) |
+| `16238` | `VC_A0919` | 108 | 850 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA` | `90.7% / 94.4% / 88.9% / 88.0%` | `2KHD` — *Vibrio cholerae* VC_A0919 (NESG VcR52) |
+| `16298` | `SH1003` | 111 | 600 | Varian | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA` | `95.4% / 97.3% / 96.4% / 91.0%` | `2KIW` — *Staphylococcus haemolyticus* SH1003 N-terminal domain (NESG ShR105F) |
+| `16313` | `AR3436A` | 97 | 600 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH` | `88.2% / 88.7% / 83.5% / 83.5%` | `2KJ6` — *Arabidopsis thaliana* tubulin-folding cofactor B (NESG AR3436A) |
+| `18662` | `SH3_domain_of_GAS7` | 60 | 600 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA` | `96.5% / 100.0% / 83.3% / 90.0%` | `2LX7` — *Homo sapiens* GAS7 SH3 domain (NESG HR8574A) |
 
 ## Pre-Screening & Zero-Solver Firewall Protocol (`Q1`, `P1-7`)
 1. **Disjointness & Homology Screen**: All public BMRB entries with `timedomain_data/` archives were filtered to remove every BMRB accession referenced anywhere in the repository (`21` empirical-prior entries in `data/priors/PROVENANCE.md`, `12` Phase-1 peak-list entries in `data/benchmark/manifest.tsv`, all `26` prior `real_manifest.tsv` entries, all torsion/RDC/IDP/PCS corpus entries, and all unit/integration test fixtures), plus entries with `>= 0.15` 4-mer sequence Jaccard similarity to any prior manifest entry (`bmr18161`, `bmr18372`, `bmr18380`), ubiquitin/β-grasp modifiers (`bmr6128`, `bmr6176`, `bmr17263`), or marked perdeuterated (`2H`).
@@ -53,6 +65,7 @@
    - **Phase 12 (`cold_p12`, now `seen_p12`)**: Committed at **`be631d1` (`be631d1c863379c0b360e05ea8522ed05da89fb4`)** (`2026-11-13T15:26:24Z`) before running the single-shot cold evaluation (`2026-11-13T15:27:05Z`–`2026-11-13T15:30:57Z`).
    - **Phase 13 Wave 1 (`cold_p13`)**: All Wave 1 (`13.1` + `13.3`) solver, QC, calibration, and pulseprogram-interpreter code was frozen and committed first at **`67a51d7` (`67a51d78156c68c06bf0f65beadc91c59767f257`)** with commit timestamp **`2026-11-14T01:31:38-05:00` (`2026-11-14T06:31:38Z`)** before fetching or pre-registering `cold_p13`. Subsequently, `data/benchmark/real_manifest.tsv` (`SHA-256: 17dcf215c2f8ed7a4126066ec70028ee2a54cd36e7910a530d7a89c00ad7ec90`) and this pre-registration section were committed on `main` at **`b0bd223` (`b0bd223c80020eeaeda8ca8568eaedf7f277f27e`)** with commit timestamp **`2026-11-14T03:07:31-05:00` (`2026-11-14T08:07:31Z`)** **before** executing any picker or solver run on `cold_p13`.
    - The single-shot 3-engine `cohort=cold_p13` (`seeds = 0..4`) evaluation ran from **`2026-11-14T08:08:09Z`** (start, **`+38 s`** post-commit gap after `b0bd223`) to **`2026-11-14T08:10:26Z`** (end). Zero `crates/` solver, FID, QC, threshold, or calibration knot edits were made after `67a51d7` (`b0bd223`); `5/7` `cold_p13` entries completed end-to-end (`6340`, `7175`, `15603`, `15819`, `17192`) and `2/7` failed cold at the raw FID `process` stage (`6209`: XWIN-NMR `acqu2s` omitting `##$FnMODE`; `15822`: prematurely halted Varian 3D `CBCACONH` with `9,942 / 10,240` traces), reported verbatim without post-hoc re-running.
+   - **Phase 13 Wave 2 (`cold_p13_w2`, joint `13.1:P1-7b` + `13.4` `bayes-sa` cold cohort)**: All Wave 2 (`13.1:P1-7b`, `13.2`, `13.4`) solver, FID/pulprog (`F1`–`F3`), 26-fold non-cold LOPO protein-HC gate, and 5-engine calibration knot code was frozen and committed first at **`4b8ae5b` (`4b8ae5b0f4eeaec62be34c57e023f7f1701701d6`)** with commit timestamp **`2026-11-14T09:02:05-05:00` (`2026-11-14T14:02:05Z`)** before fetching or pre-registering `cold_p13_w2`. During post-freeze header-only screening (`249` prior repository/screened BMRB IDs and `31` sequences excluded upfront), `bmr5307` (`PDB 1B0C`) and `bmr5843` (`PDB 1Q53`) were excluded as non-monomeric RCSB assemblies, `bmr5596` and `bmr6173` exceeded the `1.2 GB` archive cap, and `bmr16251`, `bmr16267`, and `bmr15203` (`mapped=['HSQC']`) were discarded at header-only `nmrassign inspect --json` without ever invoking FFT processing, peak picking, or assignment. `data/benchmark/real_manifest.tsv` (`SHA-256: 31ca3a3ecf66ab1c3c80808a6549f9afdd59d339d69ca1a3f33f68e8f8e73557`) is committed on `main` **before** executing any picker or solver run on `cold_p13_w2`.
    - Raw stdout and JSON benchmark artifacts archived locally in git-ignored `data/private/` carry the following verified FIPS PUB 180-4 SHA-256 digests:
 
 | Local Post-Freeze Artifact (`git-ignored`) | FIPS 180-4 SHA-256 Digest |
