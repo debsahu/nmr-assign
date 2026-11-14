@@ -7,7 +7,7 @@
 # were added with `cohort=cold_p10` (10 `dev` + 9 `heldout` = 19 total).
 # Phase 11 -> Phase 12 update (external review Q1): `16072`, `16782`, and `17092` (`cold_p10`) were promoted to `split=dev` (`cohort=dev_from_p10`, 13 `dev` entries total),
 # and fresh pre-screened disjoint monomeric cold entries are added under `split=heldout`, `cohort=cold_p12` with pre-registered manifest SHA-256 in `data/benchmark/PROVENANCE.md`.
-# Phase 12 -> Phase 13 update (external review P1-7): `cold_p12` (`5691,6585,15491,16096,16376,18337,18561`) was evaluated once at `v0.8.0` and is now spent for cold validation (`cohort=seen_p12`, remaining in `split=heldout`); fresh `cold_p13` entries will be fetched and pre-registered only after full Phase 13 code freeze.
+# Phase 12 -> Phase 13 update (external review P1-7): `cold_p12` (`5691,6585,15491,16096,16376,18337,18561`) was evaluated once at `v0.8.0` and is now spent for cold validation (`cohort=seen_p12`, remaining in `split=heldout`); 7 fresh header/STAR/PDB-monomer-screened disjoint entries (`6209,6340,7175,15603,15819,15822,17192`) were pre-registered at `cohort=cold_p13` (`split=heldout`, 33 entries total) after Wave 1 code freeze (`67a51d7`).
 bmrb_id	protein	residues	field_mhz	vendor	experiments	split	cohort
 ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 51439	CISD3	93	900	Bruker	HSQC,HNCO,HNCA,HNCOCA,CBCACONH	dev	dev
@@ -35,3 +35,10 @@ ubiquitin_local	Ubiquitin	76	500	Bruker	HSQC,HNCO,HNCACB,CBCACONH,HNCACO	dev	dev
 16376	OR8w187r	140	800	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	seen_p12
 18337	OR136	134	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p12
 18561	OR250	112	800	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	seen_p12
+6209	At3g03410.1	67	600	Bruker	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p13
+6340	At3g03773	150	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p13
+7175	YorP	84	600	Varian	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA	heldout	cold_p13
+15603	ER541	136	800	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCACO	heldout	cold_p13
+15819	TR91A	110	600	Bruker	HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO	heldout	cold_p13
+15822	CmR9	76	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p13
+17192	HR4495E	126	600	Varian	HSQC,HNCO,HNCACB,CBCACONH	heldout	cold_p13

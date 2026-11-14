@@ -7,10 +7,10 @@
 
 ## Frozen Manifest Pre-Registration Digest (`Q1`)
 - **Manifest path**: `data/benchmark/real_manifest.tsv`
-- **Manifest FIPS 180-4 SHA-256**: `735e2f57e5e71ec6c45400b693bf8e9b42e50f44a8431d6f3a18ae8209d2dabc`
+- **Manifest FIPS 180-4 SHA-256**: `17dcf215c2f8ed7a4126066ec70028ee2a54cd36e7910a530d7a89c00ad7ec90`
 - **Programmatic enforcement**: `real_benchmark::tests::test_committed_real_manifest_tsv_schema_splits_and_disjointness` computes the streaming SHA-256 digest of `data/benchmark/real_manifest.tsv` and asserts that this exact hex digest is recorded in `data/benchmark/PROVENANCE.md`, alongside 100% disjointness against `data/priors/PROVENANCE.md` (21 entries) and `data/benchmark/manifest.tsv` (12 entries).
 
-## Cohort Structure & Rotation History (`26` Entries Total)
+## Cohort Structure & Rotation History (`33` Entries Total)
 1. **`split=dev`, `cohort=dev` (`10` entries)**:
    - `ubiquitin_local` (`Ubiquitin`, 76 aa, Bruker 500 MHz), `51439` (`CISD3`, 93 aa, Bruker 900 MHz), `53371` (`hDVL2_PDZ`, 102 aa, Bruker 600 MHz), `18465` (`OR135`, 110 aa, Varian 600 MHz), `15386` (`StR82`, 77 aa, Bruker 800 MHz), `5329` (`WR41`, 94 aa, Varian 600 MHz), `6318` (`At3g51030`, 124 aa, Bruker 600 MHz), `15476` (`SR384`, 54 aa, Bruker 800 MHz), `16385` (`PfR193A`, 114 aa, Bruker 600 MHz), `53280` (`Ap3`, 60 aa, Bruker 850 MHz).
 2. **`split=dev`, `cohort=dev_from_p10` (`3` entries promoted from `cold_p10` in Phase 12)**:
@@ -18,7 +18,7 @@
    - Combined `dev` split = **`13` proteins** (`10` Bruker, `3` Varian; `54–124` aa).
 3. **`split=heldout`, `cohort=seen_p8_p9` (`6` previously-evaluated heldout entries, retained for longitudinal tracking)**:
    - `5845` (`ZR31`, 102 aa, Varian 600 MHz), `17030` (`HR4694F`, 95 aa, Bruker 600 MHz), `18145` (`OR126`, 83 aa, Bruker 800 MHz), `51351` (`TSR3`, 75 aa, Varian 600 MHz), `16099` (`Kazal-1`, 74 aa, Bruker 800 MHz), `18489` (`NFU1`, 107 aa, Bruker 800 MHz).
-4. **`split=heldout`, `cohort=seen_p12` (`7` former `cold_p12` entries evaluated once at `v0.8.0` and relabeled `seen_p12` as spent per `P1-7`; fresh `cold_p13` will be fetched and pre-registered after full Phase 13 code freeze)**:
+4. **`split=heldout`, `cohort=seen_p12` (`7` former `cold_p12` entries evaluated once at `v0.8.0` and relabeled `seen_p12` as spent per `P1-7`)**:
 
 | BMRB ID | Protein | Residues | Field (MHz) | Vendor | Raw Time-Domain Backbone Experiments | Deposited Shift Coverage (`HN` / `CA` / `CB` / `C`) | Description |
 |---|---|---:|---:|---|---|---|---|
@@ -30,16 +30,28 @@
 | `18337` | `OR136` | 134 | 800 | Bruker | `HSQC,HNCO,HNCACB,CBCACONH` | `94.0% / 95.5% / 92.5% / 92.5%` | *De novo* P-loop NTPase fold protein (NESG OR136) |
 | `18561` | `OR250` | 112 | 800 | Bruker | `HSQC,HNCO,HNCACB,CBCACONH` | `88.1% / 94.6% / 89.3% / 84.8%` | *De novo* PFK-fold protein (NESG OR250) |
 
-## Pre-Screening & Zero-Solver Firewall Protocol (`Q1`)
-1. **Disjointness & Homology Screen**: All public BMRB entries with `timedomain_data/` archives were filtered to remove every BMRB accession referenced anywhere in the repository (`21` empirical-prior entries in `data/priors/PROVENANCE.md`, `12` Phase-1 peak-list entries in `data/benchmark/manifest.tsv`, all `19` prior `real_manifest.tsv` entries, and all unit/integration test fixtures), plus entries homologous to Ubiquitin/GB1/NifU-NFU1/CISD families or marked perdeuterated (`2H`).
-2. **NMR-STAR Metadata Screen**: Candidate `.str` headers were checked strictly for:
-   - Single monomeric polypeptide chain (`50 <= L <= 160` canonical amino acids; oligomers, complexes, membrane/micelle samples, IDPs, and paramagnetic metalloproteins excluded),
-   - `>= 80%` non-Proline `1H`/`15N` and `>= 80%` `13CA` deposited backbone chemical shifts in the primary `_Atom_chem_shift` loop (`>= 70%` `13CB` or `13C`).
+5. **`split=heldout`, `cohort=cold_p13` (`7` fresh non-homologous `C1`-monomeric entries pre-registered after Phase 13 Wave 1 code freeze `67a51d7`)**:
+
+| BMRB ID | Protein | Residues | Field (MHz) | Vendor | Raw Time-Domain Backbone Experiments | Deposited Shift Coverage (`HN` / `CA` / `CB` / `C`) | PDB (`C1` Monomer) & Description |
+|---|---|---:|---:|---|---|---|---|
+| `6209` | `At3g03410.1` | 67 | 600 | Bruker | `HSQC,HNCO,HNCACB,CBCACONH` | `97.0% / 98.5% / 94.0% / 95.5%` | `1TIZ` — *Arabidopsis thaliana* calmodulin-like Ca2+-binding domain |
+| `6340` | `At3g03773` | 150 | 600 | Varian | `HSQC,HNCO,HNCACB,CBCACONH` | `97.9% / 99.3% / 95.3% / 93.3%` | `2KMW` — *Arabidopsis thaliana* protein AT3g03773 |
+| `7175` | `YorP` | 84 | 600 | Varian | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA` | `94.9% / 97.6% / 88.1% / 89.3%` | `2HEQ` — *Bacillus subtilis* protein YorP |
+| `15603` | `ER541` | 136 | 800 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCACO` | `89.6% / 94.9% / 85.3% / 92.6%` | `2K1G` — *Escherichia coli* K12 lipoprotein Spr (NESG ER541-37-162) |
+| `15819` | `TR91A` | 110 | 600 | Bruker | `HSQC,HNCO,HNCA,HNCACB,CBCACONH,HNCOCA,HNCACO` | `92.4% / 96.4% / 88.2% / 92.7%` | `2K50` — *Methanobacterium thermoautotrophicum* RFA-related protein (NESG TR91A) |
+| `15822` | `CmR9` | 76 | 600 | Varian | `HSQC,HNCO,HNCACB,CBCACONH` | `93.2% / 94.7% / 86.8% / 84.2%` | `2K53` — *Clostridium thermocellum* A3DK08 protein (NESG CmR9) |
+| `17192` | `HR4495E` | 126 | 600 | Varian | `HSQC,HNCO,HNCACB,CBCACONH` | `91.7% / 93.7% / 86.5% / 88.1%` | `2L3G` — *Homo sapiens* RhoGEF7 CH domain (NESG HR4495E) |
+
+## Pre-Screening & Zero-Solver Firewall Protocol (`Q1`, `P1-7`)
+1. **Disjointness & Homology Screen**: All public BMRB entries with `timedomain_data/` archives were filtered to remove every BMRB accession referenced anywhere in the repository (`21` empirical-prior entries in `data/priors/PROVENANCE.md`, `12` Phase-1 peak-list entries in `data/benchmark/manifest.tsv`, all `26` prior `real_manifest.tsv` entries, all torsion/RDC/IDP/PCS corpus entries, and all unit/integration test fixtures), plus entries with `>= 0.15` 4-mer sequence Jaccard similarity to any prior manifest entry (`bmr18161`, `bmr18372`, `bmr18380`), ubiquitin/β-grasp modifiers (`bmr6128`, `bmr6176`, `bmr17263`), or marked perdeuterated (`2H`).
+2. **NMR-STAR & RCSB Biological Assembly Metadata Screen**: Candidate `.str` headers and linked RCSB PDB assembly records were checked strictly for:
+   - Single monomeric polypeptide chain (`55 <= L <= 150` canonical amino acids, RCSB biological assembly `polymer_entity_instance_count == 1` / `C1`; `bmr6396` `PDB 1Y4O` and `bmr6860` `PDB 2GW6` excluded as non-monomeric assemblies),
+   - `>= 82%` non-Proline `1H`/`15N`, `>= 82%` `13CA`, and `>= 78%` `13CB` & `13C` deposited backbone chemical shifts in the primary `_Atom_chem_shift` loop.
 3. **Header-Only Archive Verification (`ZERO` FFT / Peak-Picker / Solver Runs)**:
-   - Candidate archives (`<= 650 MB`) were fetched via `nmrassign fetch-bmrb` and inspected **solely** via `nmrassign inspect --json` and `discover_entry_experiments` (`acqus` / `procpar` text headers only) to confirm the presence of a raw time-domain `2D 15N-HSQC` plus `>= 3` raw time-domain 3D triple-resonance backbone experiments (`HNCO`, `HNCA`, `HNCACB`, `CBCACONH`, `HNCOCA`, `HNCACO`). Archives containing only NOESY or 2D FIDs (`bmr25061`, `bmr16100`, `bmr16272`, `bmr25067`, `bmr17965`, `bmr18511`) or lacking discoverable 3D `HNCO` headers (`bmr5589`) were discarded at header inspection without ever invoking FFT processing, peak picking, or assignment.
-4. **Pre-Registration Commit & Post-Freeze Raw Output Digests (`P1-1`)**:
-   - All solver/QC/CLI code, the 13-protein `dev` isotonic calibration knot tables (`EVO_GRAPH_CALIBRATION_KNOTS`, `STANDARD_CALIBRATION_KNOTS`, and CPU-shrunk `STANDARD_GPU_CALIBRATION_KNOTS`), `data/benchmark/real_manifest.tsv`, and this `PROVENANCE.md` manifest digest were committed at **`be631d1` (`be631d1c863379c0b360e05ea8522ed05da89fb4`)** with commit timestamp **`2026-11-13T10:26:24-05:00` (`2026-11-13T15:26:24Z`)** **before** executing the single-shot cold evaluation on `split=heldout`.
-   - The single-shot 3-engine `split=heldout` (`seen_p8_p9` + `cold_p12`, `seeds = 0..4`) evaluation ran from **`2026-11-13T15:27:05Z`** (start, **`+41 s`** post-commit gap after `be631d1`) to **`2026-11-13T15:30:57Z`** (end). Zero solver, QC, threshold, or calibration knot edits were made after `be631d1`.
+   - Candidate archives were fetched via `nmrassign fetch-bmrb` and inspected **solely** via `nmrassign inspect --json` and `discover_entry_experiments` (`acqus` / `procpar` text headers only) to confirm the presence of a raw time-domain `2D 15N-HSQC` plus `>= 3` raw time-domain 3D triple-resonance backbone experiments (`HNCO`, `HNCA`, `HNCACB`, `CBCACONH`, `HNCOCA`, `HNCACO`). In Phase 12, NOESY/2D-only or non-`HNCO` archives (`bmr25061`, `bmr16100`, `bmr16272`, `bmr25067`, `bmr17965`, `bmr18511`, `bmr5589`) were discarded at header inspection; in Phase 13 (`cold_p13`), NOESY-only archives (`bmr18563`, `bmr15265`, `bmr17359`, `bmr16686`, `bmr16942`), 2-cube-only `bmr15482` (`HSQC+HNCO+HNCACB`), non-standard `origfid`-named archives (`bmr5335`, `bmr6052`) lacking standard `fid` files, and FTP stream/size-cap/missing-archive exclusions (`bmr17207`, `bmr15652`, `bmr15750`, `bmr6464`, `bmr15821`) were discarded at header inspection without ever invoking FFT processing, peak picking, or assignment.
+4. **Pre-Registration Commits & Post-Freeze Raw Output Digests (`P1-1`, `P1-7`)**:
+   - **Phase 12 (`cold_p12`, now `seen_p12`)**: Committed at **`be631d1` (`be631d1c863379c0b360e05ea8522ed05da89fb4`)** (`2026-11-13T15:26:24Z`) before running the single-shot cold evaluation (`2026-11-13T15:27:05Z`–`2026-11-13T15:30:57Z`).
+   - **Phase 13 Wave 1 (`cold_p13`)**: All Wave 1 (`13.1` + `13.3`) solver, QC, calibration, and pulseprogram-interpreter code was frozen and committed first at **`67a51d7` (`67a51d78156c68c06bf0f65beadc91c59767f257`)** with commit timestamp **`2026-11-14T01:31:38-05:00` (`2026-11-14T06:31:38Z`)** before fetching or pre-registering `cold_p13`. Subsequently, `data/benchmark/real_manifest.tsv` (`SHA-256: 17dcf215c2f8ed7a4126066ec70028ee2a54cd36e7910a530d7a89c00ad7ec90`) and this pre-registration section were committed on `main` **before** executing any picker or solver run on `cold_p13`.
    - Raw stdout and JSON benchmark artifacts archived locally in git-ignored `data/private/` carry the following verified FIPS PUB 180-4 SHA-256 digests:
 
 | Local Post-Freeze Artifact (`git-ignored`) | FIPS 180-4 SHA-256 Digest |
