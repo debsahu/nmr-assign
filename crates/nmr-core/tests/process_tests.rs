@@ -321,6 +321,7 @@ fn states_tppi_reverse_and_milp_2d_tests() {
         axis_x: ax_x.clone(),
         axis_y: ax_y.clone(),
         nus_mask: None,
+        truncated_traces: None,
         data,
     };
 
@@ -352,6 +353,7 @@ fn states_tppi_reverse_and_milp_2d_tests() {
         axis_x: ax_x,
         axis_y: ax_y_ea,
         nus_mask: None,
+        truncated_traces: None,
         data: fid.data.clone(),
     };
     let spec_ea =
@@ -423,6 +425,7 @@ fn synthetic_2d_and_3d_nus_ist_recovery_and_3d_writers_roundtrip() {
         axis_x: ax_x.clone(),
         axis_y: ax_y.clone(),
         nus_mask: None,
+        truncated_traces: None,
         data: full_2d_data.clone(),
     };
     let spec2_ref =
@@ -453,6 +456,7 @@ fn synthetic_2d_and_3d_nus_ist_recovery_and_3d_writers_roundtrip() {
         axis_x: ax_x.clone(),
         axis_y: ax_y,
         nus_mask: Some(mask_2d),
+        truncated_traces: None,
         data: nus_2d_data,
     };
     let mut rec2_nus = ProcessingRecipe::from_fid_2d(&fid2_nus);
@@ -516,6 +520,7 @@ fn synthetic_2d_and_3d_nus_ist_recovery_and_3d_writers_roundtrip() {
         axis_y: ax_y3.clone(),
         axis_z: ax_z3.clone(),
         nus_mask: None,
+        truncated_traces: None,
         data: full_3d_data.clone(),
     };
     let spec3_ref = process_fid_3d(
@@ -557,6 +562,7 @@ fn synthetic_2d_and_3d_nus_ist_recovery_and_3d_writers_roundtrip() {
         axis_y: ax_y3,
         axis_z: ax_z3,
         nus_mask: Some(mask_3d),
+        truncated_traces: None,
         data: nus_3d_data,
     };
     let mut rec3_nus = ProcessingRecipe::from_fid_3d(&fid3_nus);
@@ -1465,6 +1471,7 @@ fn blind_3d_hncacb_autophasing_locks_ca_positive_and_cb_negative() {
         axis_y: ax_y,
         axis_z: ax_z,
         nus_mask: None,
+        truncated_traces: None,
         data,
     };
     let recipe = ProcessingRecipe::from_fid_3d(&fid3);
@@ -1523,6 +1530,7 @@ fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unr
         axis_y: ax_y_bad,
         data: vec![[0.0, 0.0]; ny * 2 * nx],
         nus_mask: Some(mask_2d.clone()),
+        truncated_traces: None,
     };
     let rec_bad2 = ProcessingRecipe::from_fid_2d(&bad_fid2);
     let err2 =
@@ -1571,6 +1579,7 @@ fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unr
         axis_y: ax_y_ok.clone(),
         data: data2,
         nus_mask: Some(mask_2d),
+        truncated_traces: None,
     };
     let rec2 = ProcessingRecipe::from_fid_2d(&fid2);
     let spec2 = process_fid_2d(&fid2, &rec2).expect("process 2D NUS 100:1");
@@ -1618,6 +1627,7 @@ fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unr
         axis_z: bad_z3,
         data: vec![[0.0, 0.0]; n2 * 2 * n1 * 2 * nx],
         nus_mask: Some(mask_3d.clone()),
+        truncated_traces: None,
     };
     let rec_bad3 = ProcessingRecipe::from_fid_3d(&bad_fid3);
     assert!(process_fid_3d(&bad_fid3, "HNCO", &rec_bad3).is_err());
@@ -1667,6 +1677,7 @@ fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unr
         axis_z: ax_z3,
         data: data3,
         nus_mask: Some(mask_3d),
+        truncated_traces: None,
     };
     let rec3 = ProcessingRecipe::from_fid_3d(&fid3);
     let spec3 = process_fid_3d(&fid3, "HNCO", &rec3).expect("process 3D NUS 100:1");
@@ -1705,7 +1716,7 @@ fn nus_2d_and_3d_hypercomplex_recover_100_to_1_adjacent_weak_peak_and_reject_unr
 
 #[test]
 fn low_snr_3d_focused_autophase_mirrored_cacb_recovery_and_rigid_hn_registration() {
-    use nmr_core::process::register_3d_hn_to_hsqc_2d;
+    use nmr_core::process::register_3d_hn_to_hsqc_2d_with_audit;
 
     // Synthesize a 16-spin-system Varian-layout 3D `CBCACONH` (`axis_y = 13C`, `axis_z = 15N`)
     // where:
@@ -1797,6 +1808,7 @@ fn low_snr_3d_focused_autophase_mirrored_cacb_recovery_and_rigid_hn_registration
         axis_z: ax_n.clone(),
         data: data3,
         nus_mask: None,
+        truncated_traces: None,
     };
     let mut rec3 = ProcessingRecipe::from_fid_3d(&fid3);
     let initial_conj_c = rec3.dims[1].conjugate_for_fft;
@@ -1867,7 +1879,9 @@ fn low_snr_3d_focused_autophase_mirrored_cacb_recovery_and_rigid_hn_registration
         axis_y: hsqc_ax_y,
         data: hsqc_data,
     };
-    let (applied_dh, applied_dn) = register_3d_hn_to_hsqc_2d(&mut spec3, &hsqc_2d, 0.08, 0.8);
+    let (applied_dh, applied_dn, reg_audit) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut spec3, &hsqc_2d, 0.08, 0.8, true);
+    assert!(reg_audit.is_some());
     assert!(
         (applied_dh - dh_shift).abs() < 0.008 && (applied_dn - dn_shift).abs() < 0.06,
         "Expected rigid shift ({dh_shift:+.4}, {dn_shift:+.3}), got ({applied_dh:+.4}, {applied_dn:+.3})"

@@ -15,10 +15,15 @@ use nmr_core::classify::{
     classify_nmr_entries, classify_nmr_workspace, ExperimentDimensionality, PulseSequenceClass,
     QuadratureKind, VirtualEntry,
 };
-use nmr_core::fid::{read_bruker_pseudo3d_planes_2d, read_fid_2d, read_fid_3d, QuadMode};
+use nmr_core::fid::{
+    read_bruker_pseudo3d_planes_2d, read_fid_2d, read_fid_3d, read_fid_3d_opts, read_fid_auto,
+    QuadMode,
+};
+use nmr_core::picker::{pick_hsqc_2d, pick_triple_3d, PickerConfig};
 use nmr_core::process::{
-    process_fid_2d, process_fid_3d, register_3d_hn_to_hsqc_2d,
-    register_3d_hn_to_hsqc_2d_with_audit, AxisRescueAuditRecord, ProcessingRecipe,
+    process_fid_2d, process_fid_3d, process_fid_dir_2d, process_fid_dir_3d,
+    process_fid_dir_3d_opts, register_3d_hn_to_hsqc_2d_with_audit, AxisRescueAuditRecord,
+    ProcessingRecipe,
 };
 use nmr_core::pulprog::{
     apply_indirect_axis_transform_3d, decode_nuslist_str, evaluate_3d_axis_hypotheses_against_hsqc,
@@ -2800,6 +2805,9 @@ LBLF1, MCREST
   d0
   (center (p14:sp5 ph1):f2 (p22 ph8):f3)
   d0
+  4u
+  (p14:sp3 ph1):f2
+  (p14:sp5 ph1):f2
   (p13:sp2 ph9):f2
   d28
   (p14:sp3 ph1):f2
@@ -4485,13 +4493,15 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
             pre_rec * 100.0
         );
 
-        // Run through `register_3d_hn_to_hsqc_2d` directly to prove seamless pipeline integration!
+        // Run through `register_3d_hn_to_hsqc_2d_with_audit` directly to prove seamless pipeline integration!
         let ver_eval = evaluate_3d_axis_hypotheses_against_hsqc(&corrupted, &hsqc, None);
-        let _shift = register_3d_hn_to_hsqc_2d(&mut corrupted, &hsqc, 0.15, 0.80);
+        let (_dh, _dn, rescue_audit) =
+            register_3d_hn_to_hsqc_2d_with_audit(&mut corrupted, &hsqc, 0.15, 0.80, true);
+        assert!(rescue_audit.as_ref().is_some_and(|a| a.applied));
         let post_rec = measure_hnco_strip_recovery(&corrupted, &systems);
         assert!(
             (post_rec - 1.0).abs() < 1e-9,
-            "{label}: expected 100% strip recovery via register_3d_hn_to_hsqc_2d, got {:.1}%",
+            "{label}: expected 100% strip recovery via register_3d_hn_to_hsqc_2d_with_audit, got {:.1}%",
             post_rec * 100.0
         );
         println!(
@@ -4923,6 +4933,9 @@ fn test_p1_1_axis_rescue_audit_record_recipe_nef_report_and_opt_out() {
         nus: None,
         enable_axis_rescue: true,
         axis_rescue_audit: Some(audit_on.clone()),
+        allow_truncated_fid: false,
+        truncated_fid_zero_filled: false,
+        truncated_fid_warning: None,
     };
     let recipe_json = recipe.to_json_pretty().expect("serialize recipe JSON");
     assert!(recipe_json.contains("\"axis_rescue_audit\""));
@@ -4961,4 +4974,461 @@ fn test_p1_1_axis_rescue_audit_record_recipe_nef_report_and_opt_out() {
     assert!(html.contains("id=\"axis-rescue-provenance\""));
     assert!(html.contains("HalfSwShiftN"));
     assert!(html.contains("[Non-canonical transform applied]"));
+}
+
+// ============================================================================
+// Phase 13 Wave 2 Hardening Tests (`F1`, `F2`, `F3`, and Binding Condition 3)
+// ============================================================================
+
+fn discover_private_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("NMR_ASSIGN_PRIVATE_DATA_DIR") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    if let Some(p) = std::env::var_os("NMR_REAL_DATA_DIR") {
+        let base = std::path::PathBuf::from(p);
+        let cand_priv = base.join("private");
+        if cand_priv.is_dir() {
+            return Some(cand_priv);
+        }
+        if base.is_dir() {
+            return Some(base);
+        }
+    }
+    let rel = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/private");
+    rel.is_dir().then_some(rel)
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_deprecated_register_3d_hn_to_hsqc_2d_wrapper_delegates_cleanly() {
+    use nmr_core::process::register_3d_hn_to_hsqc_2d;
+    let ax_h = AxisPpm::from_bounds("1H", 16, 10.0, 6.0, 600.0);
+    let ax_n = AxisPpm::from_bounds("15N", 16, 130.0, 105.0, 60.8);
+    let ax_c = AxisPpm::from_bounds("13C", 16, 182.0, 168.0, 150.9);
+    let hsqc = Spectrum2D {
+        name: "dep_hsqc".into(),
+        axis_x: ax_h.clone(),
+        axis_y: ax_n.clone(),
+        data: vec![0.0; 16 * 16],
+    };
+    let mut cube = Spectrum3D {
+        name: "dep_hnco".into(),
+        exp: "HNCO".into(),
+        axis_x: ax_h,
+        axis_y: ax_n,
+        axis_z: ax_c,
+        data: vec![0.0; 16 * 16 * 16],
+    };
+    let (dh, dn) = register_3d_hn_to_hsqc_2d(&mut cube, &hsqc, 0.05, 0.50);
+    assert_eq!((dh, dn), (0.0, 0.0));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_f3_unix_symlink_containment_for_pulseprogram_and_includes() {
+    use std::os::unix::fs::symlink;
+
+    let root =
+        std::env::temp_dir().join(format!("nmrassign_f3_symlink_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let exp_dir = root.join("exp_1");
+    let outside_dir = root.join("outside_sandbox");
+    fs::create_dir_all(&exp_dir).unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+
+    let outside_secret = outside_dir.join("outside_secret.txt");
+    let outside_pp = outside_dir.join("outside_pp.txt");
+    fs::write(&outside_secret, "SECRET_SENTINEL_DO_NOT_READ\n").unwrap();
+    fs::write(
+        &outside_pp,
+        "1 ze\n2 d1\n  go=2 ph31\nexit\nph31=0 2\n; OUTSIDE_PP_SENTINEL\n",
+    )
+    .unwrap();
+
+    // Minimal Bruker 2D headers + ser so `read_fid_2d` / `read_fid_auto` exercise full containment!
+    let acqus = make_bruker_acqus(
+        "hsqcetf3gpsi",
+        1,
+        Some(0),
+        "",
+        600.1328,
+        150.9108,
+        60.8179,
+        "13C",
+        "15N",
+        174.0,
+        54.0,
+        3.0e-6,
+        0.0,
+        0.0,
+        0.0,
+        80.0,
+        8.1,
+        0.0,
+        67.984,
+        20,
+        2000,
+    );
+    let acqu2s = make_bruker_acqu_ind("15N", 60.8179, 60.8106, 32.0, 4, 6, 0, None);
+    fs::write(exp_dir.join("acqus"), &acqus).unwrap();
+    fs::write(exp_dir.join("acqu2s"), &acqu2s).unwrap();
+    fs::write(exp_dir.join("ser"), vec![0u8; 4 * 2048]).unwrap();
+
+    // ------------------------------------------------------------------------
+    // Case A: `#include "escaped.incl"` where `exp_dir/escaped.incl -> outside_secret.txt`
+    // ------------------------------------------------------------------------
+    symlink(&outside_secret, exp_dir.join("escaped.incl")).expect("create include symlink");
+    let pp_with_escaped_include = "\
+; pulseprogram referencing an escaping symlink
+#include \"escaped.incl\"
+1 ze
+2 d1
+  go=2 ph31
+exit
+ph31=0 2
+";
+    fs::write(exp_dir.join("pulseprogram"), pp_with_escaped_include).unwrap();
+
+    let err_a_pre = preprocess_bruker_pulseprogram_in_dir(pp_with_escaped_include, "", &exp_dir)
+        .expect_err("escaping #include symlink must fail closed in preprocessor");
+    assert!(
+        matches!(err_a_pre, PulprogError::UnsafeIncludePath(_)),
+        "expected PulprogError::UnsafeIncludePath, got: {err_a_pre:?}"
+    );
+    assert!(
+        !err_a_pre
+            .to_string()
+            .contains("SECRET_SENTINEL_DO_NOT_READ"),
+        "outside file contents must never be read or echoed"
+    );
+
+    let err_a_interp = interpret_experiment_dir(&exp_dir)
+        .expect_err("escaping #include symlink must fail closed in interpret_experiment_dir");
+    assert!(
+        matches!(err_a_interp, PulprogError::UnsafeIncludePath(_)),
+        "expected PulprogError::UnsafeIncludePath, got: {err_a_interp:?}"
+    );
+
+    let err_a_fid = read_fid_2d(&exp_dir)
+        .expect_err("escaping #include symlink must fail closed in read_fid_2d");
+    assert!(
+        err_a_fid.contains("escapes") || err_a_fid.contains("unsafe pulseprogram"),
+        "unexpected fid error for escaping #include: {err_a_fid}"
+    );
+
+    // Also verify inactive `#ifdef` branch still rejects escaping `#include` symlink!
+    let pp_inactive_branch = "\
+#ifdef NEVER_DEFINED_FLAG
+#include \"escaped.incl\"
+#endif
+1 ze
+exit
+";
+    let err_a_inactive = preprocess_bruker_pulseprogram_in_dir(pp_inactive_branch, "", &exp_dir)
+        .expect_err("inactive #ifdef escaping #include symlink must also fail closed");
+    assert!(matches!(err_a_inactive, PulprogError::UnsafeIncludePath(_)));
+
+    fs::remove_file(exp_dir.join("pulseprogram")).unwrap();
+    fs::remove_file(exp_dir.join("escaped.incl")).unwrap();
+
+    // ------------------------------------------------------------------------
+    // Case B: `exp_dir/pulseprogram -> outside_pp.txt` (and `pulseprogram.precomp -> outside_pp.txt`)
+    // ------------------------------------------------------------------------
+    symlink(&outside_pp, exp_dir.join("pulseprogram")).expect("create pulseprogram symlink");
+
+    let err_b_interp = interpret_experiment_dir(&exp_dir)
+        .expect_err("escaping pulseprogram symlink must fail closed in interpret_experiment_dir");
+    assert!(
+        matches!(err_b_interp, PulprogError::UnsafeIncludePath(_)),
+        "expected PulprogError::UnsafeIncludePath for pulseprogram symlink, got: {err_b_interp:?}"
+    );
+    assert!(
+        !err_b_interp.to_string().contains("OUTSIDE_PP_SENTINEL"),
+        "outside_pp.txt contents must never be read"
+    );
+
+    let err_b_fid = read_fid_2d(&exp_dir)
+        .expect_err("escaping pulseprogram symlink must fail closed in read_fid_2d");
+    assert!(
+        err_b_fid.contains("escapes") || err_b_fid.contains("unsafe pulseprogram"),
+        "unexpected fid error for pulseprogram symlink: {err_b_fid}"
+    );
+    assert!(read_fid_auto(&exp_dir).is_err());
+
+    fs::remove_file(exp_dir.join("pulseprogram")).unwrap();
+    symlink(&outside_pp, exp_dir.join("pulseprogram.precomp"))
+        .expect("create pulseprogram.precomp symlink");
+    let err_b_precomp = interpret_experiment_dir(&exp_dir)
+        .expect_err("escaping pulseprogram.precomp symlink must fail closed");
+    assert!(matches!(err_b_precomp, PulprogError::UnsafeIncludePath(_)));
+    assert!(read_fid_2d(&exp_dir).is_err());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_f1_real_bmrb_6209_xwinnmr2_backbone_shifts() {
+    let Some(priv_root) = discover_private_data_dir() else {
+        return;
+    };
+    let d6209 = priv_root.join("bmrb/6209");
+    let hsqc_dir = d6209.join("1");
+    let hncacb_dir = d6209.join("2");
+    let cbcaconh_dir = d6209.join("3");
+    let hnco_dir = d6209.join("5");
+    if !hsqc_dir.is_dir() || !hncacb_dir.is_dir() || !cbcaconh_dir.is_dir() || !hnco_dir.is_dir() {
+        return;
+    }
+
+    // 1. Verify `pulprog.rs` sequence classification & `SynthesizedManualLoop` on all 4 experiments
+    let pi_1 = interpret_experiment_dir(&hsqc_dir).expect("interpret 6209/1 fhsqc.s");
+    let pi_2 = interpret_experiment_dir(&hncacb_dir).expect("interpret 6209/2 hncacbf.s");
+    let pi_3 = interpret_experiment_dir(&cbcaconh_dir).expect("interpret 6209/3 hncocacbf.s");
+    let pi_5 = interpret_experiment_dir(&hnco_dir).expect("interpret 6209/5 hncof.s");
+    assert_eq!(
+        pi_1.transfer_graph.deduced_family,
+        PulprogSequenceFamily::N15Hsqc
+    );
+    assert_eq!(
+        pi_2.transfer_graph.deduced_family,
+        PulprogSequenceFamily::Hncacb
+    );
+    assert_eq!(
+        pi_3.transfer_graph.deduced_family,
+        PulprogSequenceFamily::Cbcaconh
+    );
+    assert_eq!(
+        pi_5.transfer_graph.deduced_family,
+        PulprogSequenceFamily::Hnco
+    );
+
+    // 2. Verify `6209/1` `proc2s` template `SF=600.13` / `OFFSET=-898657.9` guard and `States` quadrature!
+    let fid_hsqc = read_fid_2d(&hsqc_dir).expect("read 6209/1 HSQC");
+    assert_eq!(fid_hsqc.axis_y.quad_mode, QuadMode::States);
+    assert!(
+        (fid_hsqc.axis_y.obs_mhz - 60.810663).abs() < 0.05,
+        "6209/1 15N obs_mhz must use BF1 (~60.81 MHz), not proc2s template 600.13 MHz: got {}",
+        fid_hsqc.axis_y.obs_mhz
+    );
+
+    let (hsqc_spec, _) = process_fid_dir_2d(&hsqc_dir, false, false).expect("process 6209/1 HSQC");
+    let hsqc_roots = pick_hsqc_2d(&hsqc_spec, &PickerConfig::default());
+
+    let (mut hncacb_spec, _rec2) =
+        process_fid_dir_3d(&hncacb_dir, "HNCACB", false, false).expect("process 6209/2 HNCACB");
+    let (dh2, dn2, aud_hncacb) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut hncacb_spec, &hsqc_spec, 0.12, 0.80, true);
+
+    let (mut cbcaconh_spec, _rec3) = process_fid_dir_3d(&cbcaconh_dir, "CBCACONH", false, false)
+        .expect("process 6209/3 CBCACONH");
+    let (dh3, dn3, aud_cbcaconh) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut cbcaconh_spec, &hsqc_spec, 0.12, 0.80, true);
+
+    let (mut hnco_spec, _rec5) =
+        process_fid_dir_3d(&hnco_dir, "HNCO", false, false).expect("process 6209/5 HNCO");
+    let (dh5, dn5, aud_hnco) =
+        register_3d_hn_to_hsqc_2d_with_audit(&mut hnco_spec, &hsqc_spec, 0.12, 0.80, true);
+
+    for (lbl, dh, dn, aud) in [
+        ("HNCACB", dh2, dn2, &aud_hncacb),
+        ("CBCACONH", dh3, dn3, &aud_cbcaconh),
+        ("HNCO", dh5, dn5, &aud_hnco),
+    ] {
+        assert!(
+            dh.abs() < 0.05 && dn.abs() < 0.15,
+            "6209 {lbl} registration drift too large: dh={dh}, dn={dn}"
+        );
+        let a = aud.as_ref().expect("audit record emitted");
+        assert_eq!(a.selected, NamedAxisHypothesis::Canonical);
+        assert!(!a.applied);
+        assert!(!a.polarity_flipped);
+    }
+
+    let hncacb_peaks = pick_triple_3d(&hncacb_spec, &hsqc_roots, &PickerConfig::default());
+    let cbcaconh_peaks = pick_triple_3d(&cbcaconh_spec, &hsqc_roots, &PickerConfig::default());
+    let hnco_peaks = pick_triple_3d(&hnco_spec, &hsqc_roots, &PickerConfig::default());
+
+    // ALA 3 (`bmr6209_3.str` DSS-shifted ~ +0.126 H / +1.83 N / +2.36 C from raw TMS-referenced FID):
+    // raw root at `(8.871, 124.41)` must carry `CA(+)` at `~53.1 ppm` and `CB(-)` at `~17.0 ppm` in HNCACB,
+    // and LYS 4 at `(8.116, 117.74)` must carry `CA(i-1) ~ 53.2`, `CB(i-1) ~ 17.5` in CBCACONH and `C'(i-1) ~ 176.6` in HNCO!
+    assert!(
+        hncacb_peaks.iter().any(|p| (p.h - 8.87).abs() < 0.06
+            && (p.n - 124.45).abs() < 0.35
+            && (p.c.unwrap_or(0.0) - 53.08).abs() < 0.6
+            && p.sign > 0),
+        "expected ALA3 CA(+) peak near 53.1 ppm in 6209 HNCACB"
+    );
+    assert!(
+        hncacb_peaks.iter().any(|p| (p.h - 8.87).abs() < 0.06
+            && (p.n - 124.45).abs() < 0.35
+            && (p.c.unwrap_or(0.0) - 17.00).abs() < 0.6
+            && p.sign < 0),
+        "expected ALA3 CB(-) peak near 17.0 ppm in 6209 HNCACB"
+    );
+    assert!(
+        cbcaconh_peaks.iter().any(|p| (p.h - 8.115).abs() < 0.06
+            && (p.n - 117.75).abs() < 0.35
+            && (p.c.unwrap_or(0.0) - 53.24).abs() < 0.6
+            && p.sign > 0),
+        "expected LYS4->ALA3 CA(i-1) peak near 53.2 ppm in 6209 CBCACONH"
+    );
+    assert!(
+        hnco_peaks.iter().any(|p| (p.h - 8.115).abs() < 0.06
+            && (p.n - 117.75).abs() < 0.35
+            && (p.c.unwrap_or(0.0) - 176.62).abs() < 0.6
+            && p.sign > 0),
+        "expected LYS4->ALA3 C'(i-1) peak near 176.6 ppm in 6209 HNCO"
+    );
+}
+
+#[test]
+fn test_f2_real_bmrb_15822_truncated_varian_cbcaconh() {
+    let Some(priv_root) = discover_private_data_dir() else {
+        return;
+    };
+    let d15822 = priv_root.join("bmrb/15822");
+    if !d15822.is_dir() {
+        return;
+    }
+    // Locate `CmR9.003_3D_V600_CBCAcoNH.fid` recursively (1–2 levels deep)
+    let mut cbca_dir: Option<std::path::PathBuf> = None;
+    let direct = d15822.join("CmR9.003_3D_V600_CBCAcoNH.fid");
+    if direct.is_dir() {
+        cbca_dir = Some(direct);
+    } else if let Ok(entries) = fs::read_dir(&d15822) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.contains("CBCAcoNH.fid"))
+                && p.is_dir()
+            {
+                cbca_dir = Some(p);
+                break;
+            }
+            let sub = p.join("CmR9.003_3D_V600_CBCAcoNH.fid");
+            if sub.is_dir() {
+                cbca_dir = Some(sub);
+                break;
+            }
+        }
+    }
+    let Some(cbca_path) = cbca_dir else {
+        return;
+    };
+
+    // 1. Default `allow_truncated_fid = false` MUST strictly reject the halted 9942/10240 FID!
+    let default_err =
+        read_fid_3d(&cbca_path).expect_err("default read_fid_3d must reject truncated 15822 FID");
+    assert!(
+        default_err.contains("9942") && default_err.contains("10240"),
+        "expected 9942 / 10240 mismatch in error message, got: {default_err}"
+    );
+    assert!(process_fid_dir_3d(&cbca_path, "CBCACONH", false, false).is_err());
+
+    // 2. Opt-in `allow_truncated_fid = true` zero-fills missing indirect traces & records provenance!
+    let fid3 =
+        read_fid_3d_opts(&cbca_path, true).expect("opt-in read_fid_3d_opts on 15822 CBCAcoNH");
+    assert_eq!(fid3.truncated_traces, Some((9942, 10240)));
+
+    let (spec3, recipe) = process_fid_dir_3d_opts(&cbca_path, "CBCACONH", false, false, true)
+        .expect("opt-in process_fid_dir_3d_opts on 15822 CBCAcoNH");
+    assert!(recipe.allow_truncated_fid);
+    assert!(recipe.truncated_fid_zero_filled);
+    let warn = recipe
+        .truncated_fid_warning
+        .as_deref()
+        .expect("recipe.truncated_fid_warning populated");
+    assert!(warn.contains("9942/10240") && warn.contains("97.1%"));
+    assert!(spec3.data.iter().any(|&v| v > 0.0));
+    println!(
+        "BMRB_15822_SUMMARY: truncated_traces={:?} dims=({}, {}, {}) warning={:?}",
+        fid3.truncated_traces, spec3.axis_x.size, spec3.axis_y.size, spec3.axis_z.size, warn
+    );
+}
+
+#[test]
+fn test_condition3_real_3_cubes_raw_ln_bf_miscalibration_vs_plausibility_gates() {
+    let Some(priv_root) = discover_private_data_dir() else {
+        return;
+    };
+    let bmrb_root = priv_root.join("bmrb");
+    // Ubiquitin may reside either in `<priv_root>/../ubiquitin` (`data/ubiquitin`) or `<priv_root>/ubiquitin`
+    let ubi_cand_parent = priv_root
+        .parent()
+        .map(|p| p.join("ubiquitin"))
+        .filter(|p| p.is_dir());
+    let ubi_root = ubi_cand_parent.unwrap_or_else(|| priv_root.join("ubiquitin"));
+
+    let cases = [
+        (
+            "16072_HNCO",
+            bmrb_root.join("16072/nesgSyR6_bmrb16072_fids/syr6_Nhsqc_12_7_07.850mhz"),
+            bmrb_root.join("16072/nesgSyR6_bmrb16072_fids/syr6_hnco_12_20_07.850mhz"),
+            "HNCO",
+        ),
+        (
+            "53280_HNCACO",
+            bmrb_root.join("53280/618"),
+            bmrb_root.join("53280/620"),
+            "HNCACO",
+        ),
+        (
+            "Ubiquitin_HNCACO",
+            ubi_root.join("Ubiquitin_090309/2"),
+            ubi_root.join("Ubiquitin_111909/11"),
+            "HNCACO",
+        ),
+    ];
+
+    for (label, hsqc_dir, cube_dir, exp_name) in cases {
+        if !hsqc_dir.is_dir() || !cube_dir.is_dir() {
+            continue;
+        }
+        let (hsqc_2d, _) = process_fid_dir_2d(&hsqc_dir, false, false)
+            .unwrap_or_else(|e| panic!("{label}: process HSQC failed: {e}"));
+        let (mut spec_3d, _) = process_fid_dir_3d(&cube_dir, exp_name, false, false)
+            .unwrap_or_else(|e| panic!("{label}: process 3D {exp_name} failed: {e}"));
+
+        let eval = evaluate_3d_axis_hypotheses_against_hsqc(&spec_3d, &hsqc_2d, Some(exp_name));
+        let canon_post = eval
+            .candidates
+            .iter()
+            .find(|s| s.hypothesis == NamedAxisHypothesis::Canonical)
+            .map(|s| s.ln_posterior)
+            .expect("Canonical score present");
+        let (best_non_canon_hyp, max_raw_delta_ln_bf) = eval
+            .candidates
+            .iter()
+            .filter(|s| s.hypothesis != NamedAxisHypothesis::Canonical)
+            .map(|s| (s.hypothesis, s.ln_posterior - canon_post))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("non-canonical scores present");
+
+        assert!(
+            max_raw_delta_ln_bf >= MIN_AXIS_RESCUE_LN_BF,
+            "{label}: expected raw non-canonical delta ln_posterior >= {MIN_AXIS_RESCUE_LN_BF} (miscalibrated raw BF), got {max_raw_delta_ln_bf:.2} ({best_non_canon_hyp:?})"
+        );
+
+        let (_dh, _dn, audit_opt) =
+            register_3d_hn_to_hsqc_2d_with_audit(&mut spec_3d, &hsqc_2d, 0.08, 0.60, true);
+        let audit = audit_opt.expect("audit record returned");
+        assert_eq!(
+            audit.selected,
+            NamedAxisHypothesis::Canonical,
+            "{label}: physical-plausibility gates must select Canonical despite raw ln_BF={max_raw_delta_ln_bf:+.2} ({best_non_canon_hyp:?})"
+        );
+        assert!(!audit.applied, "{label}: audit.applied must be false");
+        assert!(
+            !audit.polarity_flipped,
+            "{label}: audit.polarity_flipped must be false"
+        );
+        println!(
+            "COND3_CUBE_SUMMARY: case={label} top_raw_non_canon={best_non_canon_hyp:?} raw_delta_ln_bf={max_raw_delta_ln_bf:+.2} selected={:?} applied={}",
+            audit.selected, audit.applied
+        );
+    }
 }
