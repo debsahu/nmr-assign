@@ -56,6 +56,8 @@ pub enum PulprogError {
     IncludeCycle(String),
     /// Local `#include` nesting exceeded the safety bound.
     IncludeDepthExceeded(usize),
+    /// Total `#include` count, preprocessed line count, file byte size, or `procpar` array length exceeded safety cap.
+    ResourceLimitExceeded(String),
     /// Malformed `#ifdef`/`#ifndef`/`#else`/`#endif` conditional structure.
     PreprocessorSyntax(String),
     /// Required spectrometer acquisition header (`acqus` or `procpar`) is missing or invalid.
@@ -79,6 +81,9 @@ impl fmt::Display for PulprogError {
             }
             Self::IncludeDepthExceeded(d) => {
                 write!(f, "pulseprogram local #include depth exceeded limit ({d})")
+            }
+            Self::ResourceLimitExceeded(s) => {
+                write!(f, "pulprog resource safety limit exceeded: {s}")
             }
             Self::PreprocessorSyntax(s) => write!(f, "pulseprogram preprocessor syntax error: {s}"),
             Self::MissingParameters(s) => write!(f, "missing acquisition parameters: {s}"),
@@ -195,11 +200,12 @@ pub enum AcquisitionOrder {
 pub enum Pseudo3DStorageOrder {
     /// Pure frequency-evolved 1D/2D/3D/4D dataset (no pseudo-dimension list loop).
     NotPseudo3D,
-    /// Complete 2D planes acquired sequentially: relaxation/exchange variable (`vd`/`vc`/`fq`/`difflist`)
-    /// advances in the OUTER loop outside $t_1$ (`[plane_0(all t_1), plane_1(all t_1), ...]`).
+    /// Complete 2D planes acquired sequentially: relaxation/exchange variable (`vd`/`vc`/`fq`/`difflist`
+    /// or Varian `array = "relaxT,phase"` / `"relaxT,d2,phase"`) advances in the OUTER loop outside $t_1$
+    /// (`[plane_0(all t_1), plane_1(all t_1), ...]`).
     PlaneQueued,
     /// Interleaved at every $t_1$ increment: relaxation/exchange/reference toggle (`vd`/`vc`/`fq`/`l*` or
-    /// Varian `array = "relaxT,phase"`) advances INSIDE the $t_1$ loop (`[t_1(0) all delays, t_1(1) all delays, ...]`).
+    /// Varian `array = "d2,relaxT,phase"`) advances INSIDE the $t_1$ loop (`[t_1(0) all delays, t_1(1) all delays, ...]`).
     T1Interleaved,
 }
 
@@ -403,6 +409,11 @@ pub struct PulprogInterpretation {
     pub aqseq: AcquisitionOrder,
     pub pseudo_3d_order: Pseudo3DStorageOrder,
     pub pseudo_3d_list_kind: Option<String>,
+    /// When `pseudo_3d_order == T1Interleaved` and explicit loops / array nesting exist,
+    /// `Some(true)` if the `vd`/`vc`/`fq` plane list advances *inner* to the `times 2` quadrature loop
+    /// (`((k1 * 2 + q) * n_planes) + p`), and `Some(false)` if the `times 2` quadrature loop is innermost
+    /// (`((k1 * n_planes + p) * 2) + q`). `None` when `mc` macros determine nesting from `acqu2s`/`acqu3s`.
+    pub pseudo_3d_list_inner_to_quad: Option<bool>,
     pub varian_array_nesting: Vec<String>,
     pub direct_nucleus: String,
     pub direct_group_delay_pts: f64,
@@ -425,6 +436,10 @@ pub struct PulprogInterpretation {
 // ============================================================================
 
 const MAX_INCLUDE_DEPTH: usize = 8;
+const MAX_TOTAL_INCLUDES: usize = 64;
+const MAX_PREPROCESSED_LINES: usize = 65_536;
+const MAX_TEXT_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PROCPAR_VALUES: usize = 1_000_000;
 
 /// Parse Bruker `##$ZGOPTNS` (e.g. `"-DTROSY -DLABEL_CN -DMODE=2 -UNOE"`) into a macro map.
 pub fn parse_zgoptns(zgoptns: &str) -> BTreeMap<String, String> {
@@ -658,36 +673,79 @@ pub fn preprocess_bruker_pulseprogram(
     })
 }
 
+///Canonicalize `exp_dir` fail-closed so symlink containment checks can never be bypassed.
+fn canonicalize_exp_dir(exp_dir: &Path) -> Result<PathBuf, PulprogError> {
+    fs::canonicalize(exp_dir).map_err(|e| {
+        PulprogError::Io(format!(
+            "failed to canonicalize experiment directory {}: {e}",
+            exp_dir.display()
+        ))
+    })
+}
+
+/// Read an experiment-local text file fail-closed:
+/// 1. `fs::canonicalize(path)` must succeed and reside strictly inside `canon_root` (rejects any escaping symlink!).
+/// 2. Enforces `MAX_TEXT_FILE_BYTES` (`4 MiB`) before and during reading.
+/// 3. Decodes ISO-8859-1 / Latin-1 vendor header comments cleanly via `String::from_utf8_lossy`.
+fn read_sandboxed_text_lossy(
+    canon_root: &Path,
+    path: &Path,
+    display_rel: &str,
+) -> Result<String, PulprogError> {
+    let target_c = fs::canonicalize(path)
+        .map_err(|_| PulprogError::UnsafeIncludePath(display_rel.to_string()))?;
+    if !target_c.starts_with(canon_root) {
+        return Err(PulprogError::UnsafeIncludePath(display_rel.to_string()));
+    }
+    let meta = fs::metadata(&target_c)
+        .map_err(|e| PulprogError::Io(format!("{}: {e}", path.display())))?;
+    if meta.len() > MAX_TEXT_FILE_BYTES {
+        return Err(PulprogError::ResourceLimitExceeded(format!(
+            "file '{}' ({} bytes) exceeds {} byte safety cap",
+            display_rel,
+            meta.len(),
+            MAX_TEXT_FILE_BYTES
+        )));
+    }
+    use std::io::Read;
+    let f = fs::File::open(&target_c)
+        .map_err(|e| PulprogError::Io(format!("{}: {e}", path.display())))?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(65_536));
+    f.take(MAX_TEXT_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| PulprogError::Io(format!("{}: {e}", path.display())))?;
+    if (buf.len() as u64) > MAX_TEXT_FILE_BYTES {
+        return Err(PulprogError::ResourceLimitExceeded(format!(
+            "file '{}' exceeds {} byte safety cap",
+            display_rel, MAX_TEXT_FILE_BYTES
+        )));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Preprocess Bruker `pulseprogram` inside `exp_dir`, resolving local `#include` files strictly
 /// inside `exp_dir` (never accessing external TopSpin/system include directories and rejecting
-/// symlinks or paths that escape `exp_dir`).
+/// symlinks or paths that escape `exp_dir` fail-closed).
 pub fn preprocess_bruker_pulseprogram_in_dir(
     source: &str,
     zgoptns: &str,
     exp_dir: &Path,
 ) -> Result<PreprocessedPulprog, PulprogError> {
-    let canon_root = fs::canonicalize(exp_dir).ok();
+    let canon_root = canonicalize_exp_dir(exp_dir)?;
     preprocess_with_resolver(source, zgoptns, &|inc_rel| {
-        let candidate = find_relative_child_ci(exp_dir, inc_rel);
-        let Some(found_path) = candidate else {
+        let Some(found_path) = find_relative_child_ci(exp_dir, inc_rel) else {
             return Ok(None);
         };
-        if let Some(ref root_c) = canon_root {
-            let target_c = fs::canonicalize(&found_path)
-                .map_err(|_| PulprogError::UnsafeIncludePath(inc_rel.to_string()))?;
-            if !target_c.starts_with(root_c) {
-                return Err(PulprogError::UnsafeIncludePath(inc_rel.to_string()));
-            }
-        }
-        let txt = fs::read_to_string(&found_path)
-            .map_err(|e| PulprogError::Io(format!("{}: {e}", found_path.display())))?;
+        let txt = read_sandboxed_text_lossy(&canon_root, &found_path, inc_rel)?;
         Ok(Some(txt))
     })
 }
 
 fn find_relative_child_ci(base: &Path, rel: &str) -> Option<PathBuf> {
+    let is_file_or_symlink =
+        |p: &Path| p.is_file() || fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
     let direct = base.join(rel);
-    if direct.is_file() {
+    if is_file_or_symlink(&direct) {
         return Some(direct);
     }
     let mut cur = base.to_path_buf();
@@ -702,7 +760,7 @@ fn find_relative_child_ci(base: &Path, rel: &str) -> Option<PathBuf> {
         }
         cur = matched?;
     }
-    cur.is_file().then_some(cur)
+    is_file_or_symlink(&cur).then_some(cur)
 }
 
 fn preprocess_with_resolver<F>(
@@ -713,6 +771,13 @@ fn preprocess_with_resolver<F>(
 where
     F: Fn(&str) -> Result<Option<String>, PulprogError>,
 {
+    if (source.len() as u64) > MAX_TEXT_FILE_BYTES {
+        return Err(PulprogError::ResourceLimitExceeded(format!(
+            "pulseprogram source ({} bytes) exceeds {} byte safety cap",
+            source.len(),
+            MAX_TEXT_FILE_BYTES
+        )));
+    }
     let mut out = PreprocessedPulprog {
         lines: Vec::new(),
         defines: parse_zgoptns(zgoptns),
@@ -721,6 +786,7 @@ where
     };
     let mut stack: Vec<CondFrame> = Vec::new();
     let mut include_chain: Vec<String> = Vec::new();
+    let mut total_includes: usize = 0;
 
     preprocess_recursive(
         source,
@@ -728,6 +794,7 @@ where
         &mut out,
         &mut stack,
         &mut include_chain,
+        &mut total_includes,
     )?;
 
     if !stack.is_empty() {
@@ -744,10 +811,18 @@ fn preprocess_recursive<F>(
     out: &mut PreprocessedPulprog,
     stack: &mut Vec<CondFrame>,
     include_chain: &mut Vec<String>,
+    total_includes: &mut usize,
 ) -> Result<(), PulprogError>
 where
     F: Fn(&str) -> Result<Option<String>, PulprogError>,
 {
+    if (source.len() as u64) > MAX_TEXT_FILE_BYTES {
+        return Err(PulprogError::ResourceLimitExceeded(format!(
+            "pulseprogram include ({} bytes) exceeds {} byte safety cap",
+            source.len(),
+            MAX_TEXT_FILE_BYTES
+        )));
+    }
     let cleaned = strip_c_block_comments_preserving_lines(source);
 
     for raw_line in cleaned.lines() {
@@ -870,6 +945,12 @@ where
                         }
                         match resolve_local(&safe_rel)? {
                             Some(inc_src) => {
+                                if *total_includes >= MAX_TOTAL_INCLUDES {
+                                    return Err(PulprogError::ResourceLimitExceeded(format!(
+                                        "total local #include expansions exceeded limit ({MAX_TOTAL_INCLUDES})"
+                                    )));
+                                }
+                                *total_includes += 1;
                                 out.resolved_includes.push(safe_rel.clone());
                                 include_chain.push(safe_rel);
                                 preprocess_recursive(
@@ -878,6 +959,7 @@ where
                                     out,
                                     stack,
                                     include_chain,
+                                    total_includes,
                                 )?;
                                 include_chain.pop();
                             }
@@ -896,6 +978,11 @@ where
 
         let active = stack.last().map(|f| f.currently_active).unwrap_or(true);
         if active {
+            if out.lines.len() >= MAX_PREPROCESSED_LINES {
+                return Err(PulprogError::ResourceLimitExceeded(format!(
+                    "preprocessed line count exceeded limit ({MAX_PREPROCESSED_LINES})"
+                )));
+            }
             out.lines.push(raw_line.to_string());
         }
     }
@@ -1581,43 +1668,49 @@ pub fn interpret_bruker_experiment(
 }
 
 /// Interpret a Bruker experiment directory on disk, reading ONLY experiment-local `acqus`/`acqu*s`,
-/// `pulseprogram`/`pulseprogram.precomp`, `nuslist`, and variable schedule files.
+/// `pulseprogram`/`pulseprogram.precomp`, `nuslist`, and variable schedule files (fail-closed
+/// against escaping symlinks and oversized files, with ISO-8859-1 / Latin-1 lossy decoding).
 pub fn interpret_bruker_dir(dir: impl AsRef<Path>) -> Result<PulprogInterpretation, PulprogError> {
     let dir = dir.as_ref();
-    let acqus_text = read_merged_jcamp_pair_in_dir(dir, "acqus", "acqu").ok_or_else(|| {
-        PulprogError::MissingParameters(format!("missing acqus/acqu in {}", dir.display()))
-    })?;
-    let acqu2s_text = read_merged_jcamp_pair_in_dir(dir, "acqu2s", "acqu2");
-    let acqu3s_text = read_merged_jcamp_pair_in_dir(dir, "acqu3s", "acqu3");
-    let acqu4s_text = read_merged_jcamp_pair_in_dir(dir, "acqu4s", "acqu4");
+    let canon_root = canonicalize_exp_dir(dir)?;
+    let acqus_text =
+        read_merged_jcamp_pair_in_dir(dir, &canon_root, "acqus", "acqu")?.ok_or_else(|| {
+            PulprogError::MissingParameters(format!("missing acqus/acqu in {}", dir.display()))
+        })?;
+    let acqu2s_text = read_merged_jcamp_pair_in_dir(dir, &canon_root, "acqu2s", "acqu2")?;
+    let acqu3s_text = read_merged_jcamp_pair_in_dir(dir, &canon_root, "acqu3s", "acqu3")?;
+    let acqu4s_text = read_merged_jcamp_pair_in_dir(dir, &canon_root, "acqu4s", "acqu4")?;
 
     let pp_path = find_relative_child_ci(dir, "pulseprogram")
         .or_else(|| find_relative_child_ci(dir, "pulseprogram.precomp"));
     let pulseprogram_text = match pp_path {
-        Some(p) => Some(
-            fs::read_to_string(&p)
-                .map_err(|e| PulprogError::Io(format!("{}: {e}", p.display())))?,
-        ),
+        Some(p) => {
+            let rel_name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "pulseprogram".to_string());
+            Some(read_sandboxed_text_lossy(&canon_root, &p, &rel_name)?)
+        }
         None => None,
     };
 
-    let nuslist_text = find_relative_child_ci(dir, "nuslist")
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|s| !s.trim().is_empty());
-    let vdlist_text = find_relative_child_ci(dir, "vdlist")
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|s| !s.trim().is_empty());
-    let vclist_text = find_relative_child_ci(dir, "vclist")
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|s| !s.trim().is_empty());
-    let fqlist_text = find_relative_child_ci(dir, "fqlist")
-        .or_else(|| find_relative_child_ci(dir, "fq1list"))
-        .or_else(|| find_relative_child_ci(dir, "fq2list"))
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|s| !s.trim().is_empty());
-    let difflist_text = find_relative_child_ci(dir, "difflist")
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|s| !s.trim().is_empty());
+    let read_opt_list = |names: &[&str]| -> Result<Option<String>, PulprogError> {
+        for &nm in names {
+            if let Some(p) = find_relative_child_ci(dir, nm) {
+                let s = read_sandboxed_text_lossy(&canon_root, &p, nm)?;
+                if !s.trim().is_empty() {
+                    return Ok(Some(s));
+                }
+            }
+        }
+        Ok(None)
+    };
+
+    let nuslist_text = read_opt_list(&["nuslist"])?;
+    let vdlist_text = read_opt_list(&["vdlist"])?;
+    let vclist_text = read_opt_list(&["vclist"])?;
+    let fqlist_text = read_opt_list(&["fqlist", "fq1list", "fq2list"])?;
+    let difflist_text = read_opt_list(&["difflist"])?;
 
     let inputs = BrukerExperimentInputs {
         acqus_text: &acqus_text,
@@ -1635,19 +1728,28 @@ pub fn interpret_bruker_dir(dir: impl AsRef<Path>) -> Result<PulprogInterpretati
     interpret_bruker_experiment_inner(&inputs, Some(dir))
 }
 
-fn read_merged_jcamp_pair_in_dir(dir: &Path, status_name: &str, base_name: &str) -> Option<String> {
+fn read_merged_jcamp_pair_in_dir(
+    dir: &Path,
+    canon_root: &Path,
+    status_name: &str,
+    base_name: &str,
+) -> Result<Option<String>, PulprogError> {
     let p_status = find_relative_child_ci(dir, status_name);
     let p_base = find_relative_child_ci(dir, base_name);
     match (p_base, p_status) {
         (Some(b), Some(s)) => {
-            let mut txt = fs::read_to_string(b).unwrap_or_default();
+            let mut txt = read_sandboxed_text_lossy(canon_root, &b, base_name)?;
             txt.push('\n');
-            txt.push_str(&fs::read_to_string(s).unwrap_or_default());
-            Some(txt)
+            txt.push_str(&read_sandboxed_text_lossy(canon_root, &s, status_name)?);
+            Ok(Some(txt))
         }
-        (None, Some(s)) => fs::read_to_string(s).ok(),
-        (Some(b), None) => fs::read_to_string(b).ok(),
-        (None, None) => None,
+        (None, Some(s)) => Ok(Some(read_sandboxed_text_lossy(
+            canon_root,
+            &s,
+            status_name,
+        )?)),
+        (Some(b), None) => Ok(Some(read_sandboxed_text_lossy(canon_root, &b, base_name)?)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -2139,9 +2241,11 @@ fn interpret_bruker_experiment_inner(
     let loops = nest_loop_spans(raw_loops.clone());
 
     // Resolve `AQSEQ` (`321` vs `312`):
-    // 1. Header `##$AQSEQ` (`1` = `312`, `0` = `321`)
-    // 2. Pulseprogram `aqseq 312` / `aqseq 321` when header `AQSEQ` is absent
-    // 3. Symbolic loop nesting (`id0` inner to `id10` -> `Aqseq312`!) when header `AQSEQ` is absent
+    // 1. Explicit `##$AQSEQ= 1` -> `Aqseq312`.
+    // 2. Manual `lo to` loops (`mc_lines.is_empty()`) execute hard-coded hardware loop order
+    //    regardless of template default `##$AQSEQ= 0` in `acqus`: when `id0` (F1) is nested
+    //    inside `id10` (F2), resolve `Aqseq312` even if `##$AQSEQ= 0`!
+    // 3. When `##$AQSEQ` is omitted, fall back to `aqseq 312`/`aqseq 321` directive or loop order.
     let header_aqseq = a1.get("AQSEQ").and_then(|s| s.parse::<i32>().ok());
     let symbolic_loop_aqseq = detect_symbolic_loop_aqseq(&raw_loops);
     let aqseq = match dimensionality {
@@ -2150,15 +2254,19 @@ fn interpret_bruker_experiment_inner(
         3 => match header_aqseq {
             Some(1) => AcquisitionOrder::Aqseq312,
             Some(0) => {
-                // Note: if `acqus` has template default `AQSEQ= 0` AND explicit `aqseq 312` OR
-                // manual loop (`mc` absent) with `id0` strictly inside `id10`, report warning & honor `AQSEQ`
-                // unless `AQSEQ` was omitted. When `AQSEQ= 1`, always `Aqseq312`.
-                if pp_aqseq_override == Some(AcquisitionOrder::Aqseq312) {
+                if mc_lines.is_empty() && symbolic_loop_aqseq == Some(AcquisitionOrder::Aqseq312) {
                     warnings.push(
-                        "pulseprogram specifies `aqseq 312` while acqus ##$AQSEQ=0".to_string(),
+                        "manual `lo to` loops advance `d0` (F1) inner to `d10` (F2) while acqus has default ##$AQSEQ=0; honoring loop order `Aqseq312`".to_string(),
                     );
+                    AcquisitionOrder::Aqseq312
+                } else {
+                    if pp_aqseq_override == Some(AcquisitionOrder::Aqseq312) {
+                        warnings.push(
+                            "pulseprogram specifies `aqseq 312` while acqus ##$AQSEQ=0".to_string(),
+                        );
+                    }
+                    AcquisitionOrder::Aqseq321
                 }
-                AcquisitionOrder::Aqseq321
             }
             _ => pp_aqseq_override
                 .or(symbolic_loop_aqseq)
@@ -2339,7 +2447,7 @@ fn interpret_bruker_experiment_inner(
         _ => {}
     }
 
-    // Detect Pseudo-3D storage order (`PlaneQueued` vs `T1Interleaved`)
+    // Detect Pseudo-3D storage order (`PlaneQueued` vs `T1Interleaved`) and inner loop nesting
     let (pseudo_3d_order, pseudo_3d_list_kind) = detect_bruker_pseudo3d_order(
         &raw_loops,
         &exec_lines,
@@ -2348,6 +2456,22 @@ fn interpret_bruker_experiment_inner(
         inp,
         &pulprog_name,
     );
+    let pseudo_3d_list_inner_to_quad = if pseudo_3d_order == Pseudo3DStorageOrder::T1Interleaved {
+        let list_lp = raw_loops.iter().find(|l| {
+            l.list_ops
+                .iter()
+                .any(|o| matches!(o.as_str(), "ivd" | "ivc") || o.starts_with("ifq"))
+        });
+        let quad_lp = raw_loops.iter().find(|l| {
+            l.resolved_count == Some(2) && (!l.phase_ops.is_empty() || !l.grad_ops.is_empty())
+        });
+        match (list_lp, quad_lp) {
+            (Some(ll), Some(ql)) => Some(ll.end_line < ql.end_line),
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // Decode `nuslist` if present
     let nus_schedule = if let Some(nus_txt) = inp.nuslist_text {
@@ -2411,6 +2535,7 @@ fn interpret_bruker_experiment_inner(
         aqseq,
         pseudo_3d_order,
         pseudo_3d_list_kind,
+        pseudo_3d_list_inner_to_quad,
         varian_array_nesting: Vec::new(),
         direct_nucleus,
         direct_group_delay_pts,
@@ -3979,7 +4104,14 @@ impl VarianParam {
     }
 }
 
-fn parse_varian_procpar_text(text: &str) -> HashMap<String, VarianParam> {
+fn parse_varian_procpar_text(text: &str) -> Result<HashMap<String, VarianParam>, PulprogError> {
+    if (text.len() as u64) > MAX_TEXT_FILE_BYTES {
+        return Err(PulprogError::ResourceLimitExceeded(format!(
+            "Varian procpar ({} bytes) exceeds {} byte safety cap",
+            text.len(),
+            MAX_TEXT_FILE_BYTES
+        )));
+    }
     let mut map = HashMap::new();
     let mut lines = text.lines().peekable();
 
@@ -4008,16 +4140,24 @@ fn parse_varian_procpar_text(text: &str) -> HashMap<String, VarianParam> {
         let Ok(n_vals) = count_str.parse::<usize>() else {
             continue;
         };
+        if n_vals > MAX_PROCPAR_VALUES {
+            return Err(PulprogError::ResourceLimitExceeded(format!(
+                "Varian procpar parameter '{name}' value count ({n_vals}) exceeds limit ({MAX_PROCPAR_VALUES})"
+            )));
+        }
         vt = vt[count_str.len()..].trim_start();
 
-        let mut values = Vec::with_capacity(n_vals);
+        let mut values = Vec::with_capacity(n_vals.min(1024));
         if basic_type == 2 {
             // Quoted string values (first on `val_line`, subsequent `n_vals - 1` on following lines)
-            values.push(unquote_procpar(vt));
+            if n_vals > 0 {
+                values.push(unquote_procpar(vt));
+            }
             for _ in 1..n_vals {
-                if let Some(nl) = lines.next() {
-                    values.push(unquote_procpar(nl.trim()));
-                }
+                let Some(nl) = lines.next() else {
+                    break;
+                };
+                values.push(unquote_procpar(nl.trim()));
             }
         } else {
             for tok in vt.split_whitespace() {
@@ -4040,7 +4180,7 @@ fn parse_varian_procpar_text(text: &str) -> HashMap<String, VarianParam> {
         let _ = lines.next();
         map.insert(name, VarianParam { values });
     }
-    map
+    Ok(map)
 }
 
 fn unquote_procpar(s: &str) -> String {
@@ -4059,7 +4199,7 @@ pub fn interpret_varian_procpar(
     procpar_text: &str,
     sampling_sch_text: Option<&str>,
 ) -> Result<PulprogInterpretation, PulprogError> {
-    let pp = parse_varian_procpar_text(procpar_text);
+    let pp = parse_varian_procpar_text(procpar_text)?;
     if pp.is_empty() {
         return Err(PulprogError::MissingParameters(
             "empty or invalid Varian procpar".to_string(),
@@ -4387,7 +4527,11 @@ pub fn interpret_varian_procpar(
     let non_phase_vars: Vec<&str> = varian_array_nesting
         .iter()
         .map(String::as_str)
-        .filter(|s| !s.starts_with("phase") && !s.eq_ignore_ascii_case("izar"))
+        .filter(|s| {
+            !s.starts_with("phase")
+                && !s.eq_ignore_ascii_case("izar")
+                && !matches!(*s, "d2" | "d3" | "d4")
+        })
         .collect();
 
     let dimensionality = if is_dosy && indirect_dims.is_empty() {
@@ -4411,27 +4555,40 @@ pub fn interpret_varian_procpar(
         _ => AcquisitionOrder::Dim4D,
     };
 
-    let (pseudo_3d_order, pseudo_3d_list_kind) = if is_dosy {
+    let (pseudo_3d_order, pseudo_3d_list_kind, pseudo_3d_list_inner_to_quad) = if is_dosy {
         (
             Pseudo3DStorageOrder::PlaneQueued,
             Some("gzlvl1".to_string()),
+            None,
         )
     } else if let Some(&var) = non_phase_vars.first() {
-        // In Varian VnmrJ, explicit `array` variables vary inside each `d2` (`ni`) increment (`T1Interleaved`),
-        // UNLESS `d2` itself is explicitly listed before `var` or `ni <= 1`!
+        // In Varian VnmrJ `psg`, implicit `d2` (`ni`) runs *inside* explicit non-phase array variables
+        // (`array = "relaxT,phase"` or `"relaxT,d2,phase"` acquires plane-by-plane -> `PlaneQueued`);
+        // interleaving `var` inside `t1` requires explicit `array = "d2,relaxT,phase"` (`dp < var_pos` -> `T1Interleaved`).
         let d2_pos = varian_array_nesting.iter().position(|v| v == "d2");
         let var_pos = varian_array_nesting
             .iter()
             .position(|v| v == var)
             .unwrap_or(0);
-        let order = if d2_pos.is_some_and(|dp| var_pos < dp) {
-            Pseudo3DStorageOrder::PlaneQueued
+        let phase_pos = varian_array_nesting
+            .iter()
+            .position(|v| v.starts_with("phase"));
+        if d2_pos.is_some_and(|dp| dp < var_pos) {
+            let inner_to_quad = phase_pos.map(|pp_idx| pp_idx < var_pos);
+            (
+                Pseudo3DStorageOrder::T1Interleaved,
+                Some(var.to_string()),
+                inner_to_quad,
+            )
         } else {
-            Pseudo3DStorageOrder::T1Interleaved
-        };
-        (order, Some(var.to_string()))
+            (
+                Pseudo3DStorageOrder::PlaneQueued,
+                Some(var.to_string()),
+                None,
+            )
+        }
     } else {
-        (Pseudo3DStorageOrder::NotPseudo3D, None)
+        (Pseudo3DStorageOrder::NotPseudo3D, None, None)
     };
 
     let nus_schedule = if let Some(sch_txt) = sampling_sch_text {
@@ -4502,6 +4659,7 @@ pub fn interpret_varian_procpar(
         aqseq,
         pseudo_3d_order,
         pseudo_3d_list_kind,
+        pseudo_3d_list_inner_to_quad,
         varian_array_nesting,
         direct_nucleus: tn,
         direct_group_delay_pts: 0.0,
@@ -4696,18 +4854,25 @@ fn deduce_varian_family(
     PulprogSequenceFamily::Unknown
 }
 
-/// Interpret a Varian/Agilent `.fid` directory on disk (`procpar` + optional `sampling.sch` / `nuslist`).
+/// Interpret a Varian/Agilent `.fid` directory on disk (`procpar` + optional `sampling.sch` / `nuslist`),
+/// enforcing sandbox containment, file size caps, and ISO-8859-1 / Latin-1 lossy decoding.
 pub fn interpret_varian_dir(dir: impl AsRef<Path>) -> Result<PulprogInterpretation, PulprogError> {
     let dir = dir.as_ref();
+    let canon_root = canonicalize_exp_dir(dir)?;
     let procpar_path = find_relative_child_ci(dir, "procpar").ok_or_else(|| {
         PulprogError::MissingParameters(format!("missing Varian procpar in {}", dir.display()))
     })?;
-    let procpar_text = fs::read_to_string(&procpar_path)
-        .map_err(|e| PulprogError::Io(format!("{}: {e}", procpar_path.display())))?;
-    let sch_text = find_relative_child_ci(dir, "sampling.sch")
-        .or_else(|| find_relative_child_ci(dir, "nuslist"))
-        .and_then(|p| fs::read_to_string(p).ok())
-        .filter(|s| !s.trim().is_empty());
+    let procpar_text = read_sandboxed_text_lossy(&canon_root, &procpar_path, "procpar")?;
+    let sch_text = match find_relative_child_ci(dir, "sampling.sch")
+        .map(|p| (p, "sampling.sch"))
+        .or_else(|| find_relative_child_ci(dir, "nuslist").map(|p| (p, "nuslist")))
+    {
+        Some((p, nm)) => {
+            let s = read_sandboxed_text_lossy(&canon_root, &p, nm)?;
+            (!s.trim().is_empty()).then_some(s)
+        }
+        None => None,
+    };
     interpret_varian_procpar(&procpar_text, sch_text.as_deref())
 }
 
@@ -4927,9 +5092,13 @@ fn reconcile_3d_polarity_in_place(spec_3d: &mut Spectrum3D, exp: &str) -> bool {
     }
 
     if norm == "HNCACB" {
-        // Ensure `CA` core band (`50..60 ppm`, excluding Ser/Thr CB) has positive net strong energy!
-        let mut pos_e = 0.0_f64;
-        let mut neg_e = 0.0_f64;
+        // Ensure `CA` core band (`50.5..=58.0 ppm`, excluding Ser/Thr CB `>= 58.5 ppm`) has positive
+        // net strong energy, while guarding `CA`-bleached paramagnetic `HNCACB` (where `CA` is empty
+        // and `CB` in `15.5..=43.0 ppm` is already negative) against false negation!
+        let mut ca_pos_e = 0.0_f64;
+        let mut ca_neg_e = 0.0_f64;
+        let mut cb_pos_e = 0.0_f64;
+        let mut cb_neg_e = 0.0_f64;
         let mut max_abs = 0.0_f32;
         for &v in &spec_3d.data {
             let a = v.abs();
@@ -4943,20 +5112,32 @@ fn reconcile_3d_polarity_in_place(spec_3d: &mut Spectrum3D, exp: &str) -> bool {
         }
         for iz in 0..nz {
             let c_ppm = spec_3d.axis_z.index_to_ppm(iz as f64);
-            if !(50.5..=60.0).contains(&c_ppm) {
+            let in_ca = (50.5..=58.0).contains(&c_ppm);
+            let in_cb = (15.5..=43.0).contains(&c_ppm);
+            if !in_ca && !in_cb {
                 continue;
             }
             let plane = &spec_3d.data[iz * ny * nx..(iz + 1) * ny * nx];
             for &v in plane {
                 let vf = v as f64;
                 if vf > thr {
-                    pos_e += vf * vf;
+                    if in_ca {
+                        ca_pos_e += vf * vf;
+                    } else {
+                        cb_pos_e += vf * vf;
+                    }
                 } else if vf < -thr {
-                    neg_e += vf * vf;
+                    if in_ca {
+                        ca_neg_e += vf * vf;
+                    } else {
+                        cb_neg_e += vf * vf;
+                    }
                 }
             }
         }
-        if neg_e > pos_e * 1.25 {
+        let cb_already_canonical =
+            cb_neg_e > cb_pos_e * 2.0 && (ca_pos_e + ca_neg_e) < 0.20 * cb_neg_e;
+        if !cb_already_canonical && ca_neg_e > ca_pos_e * 1.25 {
             for v in &mut spec_3d.data {
                 *v = -*v;
             }
@@ -5327,7 +5508,9 @@ fn evaluate_3d_axis_hypotheses_with_weighted_roots(
 
     // 3. For each `op_n`, extract `13C` strip extrema at `matched_raw_coords` and score all 4 `op_c` hypotheses!
     let exp_str = exp_override.unwrap_or(&spec_3d.exp);
+    let c13_regime = classify_c13_regime(exp_str, &spec_3d.axis_z);
     let mut candidates: Vec<AxisHypothesisScore> = Vec::with_capacity(16);
+    let mut strip_peaks_by_n: Vec<(AxisTransformOp, Vec<StripPeak13C>)> = Vec::with_capacity(4);
 
     for (op_n, ref n_res) in &n_results {
         let strip_peaks =
@@ -5363,6 +5546,7 @@ fn evaluate_3d_axis_hypotheses_with_weighted_roots(
                 best_dn_ppm: n_res.dn,
             });
         }
+        strip_peaks_by_n.push((*op_n, strip_peaks));
     }
 
     let canon_score = candidates
@@ -5371,55 +5555,82 @@ fn evaluate_3d_axis_hypotheses_with_weighted_roots(
         .cloned()
         .unwrap();
 
-    // Sort candidates descending by `ln_posterior`
+    // Sort candidates descending by `ln_posterior` and select the highest-posterior
+    // non-canonical candidate that passes BOTH the Bayes-factor threshold and physical
+    // plausibility gates (`accept_n` and `accept_c`). Evaluating across `sorted` ensures
+    // that if `(SignFlipN, SignFlipC)` fails `accept_c` on a `CA`-bleached paramagnetic
+    // `HNCACB`, `(SignFlipN, CanonicalC)` is cleanly selected instead of aborting `SignFlipN`!
     let mut sorted = candidates.clone();
     sorted.sort_by(|a, b| b.ln_posterior.total_cmp(&a.ln_posterior));
-    let best = &sorted[0];
 
-    let bf_gain = best.ln_posterior - canon_score.ln_posterior;
+    let accepted_cand = sorted.iter().find(|cand| {
+        if cand.hypothesis == NamedAxisHypothesis::Canonical {
+            return false;
+        }
+        let bf_gain = cand.ln_posterior - canon_score.ln_posterior;
+        if bf_gain < MIN_AXIS_RESCUE_LN_BF {
+            return false;
+        }
+        let accept_n = if cand.op_n != AxisTransformOp::Canonical {
+            cand.matched_roots >= 5
+                && cand.matched_root_fraction >= 0.40
+                && cand.matched_root_fraction >= canon_score.matched_root_fraction + 0.20
+        } else {
+            true
+        };
+        if !accept_n {
+            return false;
+        }
+        if cand.op_c != AxisTransformOp::Canonical {
+            let same_n_canon_c = candidates
+                .iter()
+                .find(|c| c.op_n == cand.op_n && c.op_c == AxisTransformOp::Canonical)
+                .unwrap_or(&canon_score);
+            let cand_n_peaks = strip_peaks_by_n
+                .iter()
+                .find(|(op, _)| *op == cand.op_n)
+                .map(|(_, pks)| pks.as_slice())
+                .unwrap_or(&[]);
+            let canon_c_diag = compute_c13_band_diag(
+                cand_n_peaks,
+                &spec_3d.axis_z,
+                AxisTransformOp::Canonical,
+                c13_regime,
+            );
+            let cand_c_diag =
+                compute_c13_band_diag(cand_n_peaks, &spec_3d.axis_z, cand.op_c, c13_regime);
+            cand.matched_roots >= 5
+                && (cand.ln_likelihood_c - same_n_canon_c.ln_likelihood_c) >= 18.0
+                && is_13c_axis_rescue_physically_justified(
+                    c13_regime,
+                    cand.op_c,
+                    &canon_c_diag,
+                    &cand_c_diag,
+                )
+        } else {
+            true
+        }
+    });
 
-    // Strict Bayes-factor + physical plausibility acceptance gate:
-    let accept_n = if best.op_n != AxisTransformOp::Canonical {
-        best.matched_roots >= 5
-            && best.matched_root_fraction >= 0.40
-            && best.matched_root_fraction >= canon_score.matched_root_fraction + 0.20
+    let (selected, selected_frac, ln_bf) = if let Some(win) = accepted_cand {
+        (
+            win.hypothesis,
+            win.matched_root_fraction,
+            win.ln_posterior - canon_score.ln_posterior,
+        )
     } else {
-        true
+        (
+            NamedAxisHypothesis::Canonical,
+            canon_score.matched_root_fraction,
+            0.0,
+        )
     };
-
-    // Compare `best.op_c` against `op_c == Canonical` at the SAME `best.op_n`!
-    let same_n_canon_c = candidates
-        .iter()
-        .find(|c| c.op_n == best.op_n && c.op_c == AxisTransformOp::Canonical)
-        .unwrap_or(&canon_score);
-    let accept_c = if best.op_c != AxisTransformOp::Canonical {
-        best.matched_roots >= 5 && (best.ln_likelihood_c - same_n_canon_c.ln_likelihood_c) >= 18.0
-    } else {
-        true
-    };
-
-    let accepted = best.hypothesis != NamedAxisHypothesis::Canonical
-        && bf_gain >= MIN_AXIS_RESCUE_LN_BF
-        && accept_n
-        && accept_c;
-
-    let selected = if accepted {
-        best.hypothesis
-    } else {
-        NamedAxisHypothesis::Canonical
-    };
-    let selected_frac = if accepted {
-        best.matched_root_fraction
-    } else {
-        canon_score.matched_root_fraction
-    };
-    let reported_bf = if accepted { bf_gain } else { bf_gain.max(0.0) };
 
     AxisHypothesisVerification {
         selected,
         applied: false,
         polarity_flipped: false,
-        ln_bayes_factor_vs_canonical: if accepted { bf_gain } else { 0.0 * reported_bf },
+        ln_bayes_factor_vs_canonical: ln_bf,
         canonical_matched_fraction: canon_score.matched_root_fraction,
         selected_matched_fraction: selected_frac,
         candidates,
@@ -5725,16 +5936,23 @@ fn score_13c_axis_prior(
             }
         }
 
-        // Biphasic `CA` vs `CB` opposite-sign coherence reward for `HNCACB` (invariant to global +-1 flip!):
-        if matches!(regime, C13Regime::AliphaticCaCb { biphasic: true })
-            && ca_abs_sum > 0.0
-            && cb_abs_sum > 0.0
-        {
-            let mean_ca_sign = ca_signed_sum / ca_abs_sum;
-            let mean_cb_sign = cb_signed_sum / cb_abs_sum;
-            // Under true `HNCACB` C-axis: `mean_ca_sign ~ +1, mean_cb_sign ~ -1` (or `-1` and `+1`) -> `sep ~ 2.0`!
-            let sep = (mean_ca_sign - mean_cb_sign).abs();
-            ll += 0.35 * tot_weight * (sep - 1.0);
+        // Biphasic `CA` vs `CB` opposite-sign coherence reward for `HNCACB` (invariant to global +-1 flip!),
+        // plus single-band negative-only `CA` penalty so `CA`-bleached paramagnetic `CB`-only cubes
+        // never gain likelihood by reflecting negative `CB` (`~30 ppm`) into the positive `CA` (`~56 ppm`) band!
+        if matches!(regime, C13Regime::AliphaticCaCb { biphasic: true }) {
+            if ca_abs_sum > 0.0 && cb_abs_sum > 0.08 * ca_abs_sum && ca_abs_sum > 0.08 * cb_abs_sum
+            {
+                let mean_ca_sign = ca_signed_sum / ca_abs_sum;
+                let mean_cb_sign = cb_signed_sum / cb_abs_sum;
+                // Under true `HNCACB` C-axis: `mean_ca_sign ~ +1, mean_cb_sign ~ -1` (or `-1` and `+1`) -> `sep ~ 2.0`!
+                let sep = (mean_ca_sign - mean_cb_sign).abs();
+                ll += 0.35 * tot_weight * (sep - 1.0);
+            } else if ca_abs_sum > 0.0 && cb_abs_sum <= 0.08 * ca_abs_sum {
+                let mean_ca_sign = ca_signed_sum / ca_abs_sum;
+                if mean_ca_sign < -0.35 {
+                    ll -= 0.90 * tot_weight;
+                }
+            }
         }
 
         if ll > best_ll {
@@ -5743,6 +5961,147 @@ fn score_13c_axis_prior(
     }
 
     best_ll
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct C13BandDiag {
+    oob_frac: f64,
+    edge_frac: f64,
+    center_frac: f64,
+    low_aliph_frac: f64,
+    ca_core_frac: f64,
+    ser_thr_frac: f64,
+    biphasic_sep: f64,
+}
+
+fn compute_c13_band_diag(
+    peaks: &[StripPeak13C],
+    ax_z: &AxisPpm,
+    op_c: AxisTransformOp,
+    regime: C13Regime,
+) -> C13BandDiag {
+    let nz = ax_z.size;
+    if peaks.is_empty() || nz < 4 {
+        return C13BandDiag::default();
+    }
+    let sw_ppm = (ax_z.step_ppm.abs() * (nz as f64)).max(1.0);
+    let mid_ppm = 0.5 * (ax_z.min_ppm() + ax_z.max_ppm());
+    let lo_edge = ax_z.min_ppm() + 0.14 * sw_ppm;
+    let hi_edge = ax_z.max_ppm() - 0.14 * sw_ppm;
+
+    let mut tot_w = 0.0_f64;
+    let mut oob_w = 0.0_f64;
+    let mut edge_w = 0.0_f64;
+    let mut center_w = 0.0_f64;
+    let mut low_aliph_w = 0.0_f64;
+    let mut ca_core_w = 0.0_f64;
+    let mut ser_thr_w = 0.0_f64;
+    let mut ca_signed = 0.0_f64;
+    let mut ca_abs = 0.0_f64;
+    let mut cb_signed = 0.0_f64;
+    let mut cb_abs = 0.0_f64;
+
+    for pk in peaks {
+        let dst_iz = op_c.dst_for_src(nz, pk.raw_iz);
+        let c_raw = ax_z.index_to_ppm(dst_iz as f64);
+        tot_w += pk.weight;
+
+        let is_oob = match regime {
+            C13Regime::Carbonyl => !(166.5..=184.5).contains(&c_raw),
+            C13Regime::CAlphaOnly => !(41.0..=68.5).contains(&c_raw),
+            C13Regime::AliphaticCaCb { .. } => !(13.5..=72.2).contains(&c_raw),
+            C13Regime::Uninformative => false,
+        };
+        if is_oob {
+            oob_w += pk.weight;
+        }
+        if c_raw <= lo_edge || c_raw >= hi_edge {
+            edge_w += pk.weight;
+        }
+        if (c_raw - mid_ppm).abs() <= 0.22 * sw_ppm {
+            center_w += pk.weight;
+        }
+        if (15.5..=43.5).contains(&c_raw) {
+            low_aliph_w += pk.weight;
+            cb_signed += pk.signed_val;
+            cb_abs += pk.signed_val.abs();
+        } else if (50.0..=60.5).contains(&c_raw) {
+            ca_core_w += pk.weight;
+            ca_signed += pk.signed_val;
+            ca_abs += pk.signed_val.abs();
+        } else if (60.5..=72.2).contains(&c_raw) {
+            ser_thr_w += pk.weight;
+        }
+    }
+
+    if tot_w <= 0.0 {
+        return C13BandDiag::default();
+    }
+    let biphasic_sep = if ca_abs > 0.0 && cb_abs > 0.0 {
+        (ca_signed / ca_abs - cb_signed / cb_abs).abs()
+    } else {
+        0.0
+    };
+    C13BandDiag {
+        oob_frac: oob_w / tot_w,
+        edge_frac: edge_w / tot_w,
+        center_frac: center_w / tot_w,
+        low_aliph_frac: low_aliph_w / tot_w,
+        ca_core_frac: ca_core_w / tot_w,
+        ser_thr_frac: ser_thr_w / tot_w,
+        biphasic_sep,
+    }
+}
+
+fn is_13c_axis_rescue_physically_justified(
+    regime: C13Regime,
+    op_c: AxisTransformOp,
+    canon_d: &C13BandDiag,
+    best_d: &C13BandDiag,
+) -> bool {
+    match regime {
+        C13Regime::Uninformative => false,
+        C13Regime::Carbonyl | C13Regime::CAlphaOnly => {
+            // For unimodal `13CO` (`166.5..184.5 ppm`) and `13CA` (`41.0..68.5 ppm`), `SignFlip` or
+            // `MirrorFold` is forbidden when `Canonical` already places peaks inside the physical
+            // envelope (preventing false mirroring of e.g. `<13CO> ≈ 172 ppm` β-sheet/PCS `HNCO`!).
+            let oob_rescue =
+                canon_d.oob_frac >= 0.25 && (canon_d.oob_frac - best_d.oob_frac) >= 0.20;
+            let nyquist_split_rescue = canon_d.edge_frac >= 0.35
+                && (canon_d.edge_frac - best_d.edge_frac) >= 0.20
+                && (best_d.center_frac - canon_d.center_frac) >= 0.20
+                && best_d.oob_frac <= canon_d.oob_frac + 0.05;
+            match op_c {
+                AxisTransformOp::Canonical => true,
+                AxisTransformOp::SignFlip => oob_rescue,
+                AxisTransformOp::HalfSwShift | AxisTransformOp::MirrorFold => {
+                    oob_rescue || nyquist_split_rescue
+                }
+            }
+        }
+        C13Regime::AliphaticCaCb { biphasic } => {
+            let oob_rescue =
+                canon_d.oob_frac >= 0.20 && (canon_d.oob_frac - best_d.oob_frac) >= 0.15;
+            let nyquist_split_rescue = canon_d.edge_frac >= 0.28
+                && (canon_d.edge_frac - best_d.edge_frac) >= 0.15
+                && best_d.oob_frac <= canon_d.oob_frac + 0.05;
+            // Two-band swap requires BOTH `CB` (`15.5..43.5`) and `CA`/`high-aliphatic` to be
+            // substantively populated under `Canonical` AND under `best` (with `CA` core `50..60.5`
+            // populated under `Canonical` for `SignFlip` so `CA`-bleached paramagnetic `CB`-only
+            // cubes with or without Ser/Thr `CB` are never reflected into `CA`!).
+            let canon_upper_ok = if op_c == AxisTransformOp::SignFlip {
+                canon_d.ca_core_frac >= 0.15
+            } else {
+                (canon_d.ca_core_frac + canon_d.ser_thr_frac) >= 0.18
+            };
+            let two_band_swap_rescue = canon_d.low_aliph_frac >= 0.18
+                && canon_upper_ok
+                && best_d.low_aliph_frac >= 0.18
+                && best_d.ca_core_frac >= 0.20
+                && (!biphasic || best_d.biphasic_sep >= 1.30);
+            oob_rescue || nyquist_split_rescue || two_band_swap_rescue
+        }
+    }
 }
 
 #[inline]

@@ -389,8 +389,39 @@ fn resolve_fid_dir(path: &Path) -> Result<PathBuf, String> {
 // NUS Schedule File Helpers (Bruker `nuslist` & Varian `sampling.sch`)
 // ============================================================================
 
+const MAX_FID_TEXT_HEADER_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FID_PROCPAR_VALUES: usize = 1_000_000;
+
+/// Read a spectrometer text parameter/schedule/pulseprogram file up to `MAX_FID_TEXT_HEADER_BYTES`,
+/// decoding ISO-8859-1 / Latin-1 header comments cleanly via `String::from_utf8_lossy`.
+fn read_text_lossy_capped(path: &Path) -> Result<String, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if meta.len() > MAX_FID_TEXT_HEADER_BYTES {
+        return Err(format!(
+            "text header {} ({} bytes) exceeds {} byte safety cap",
+            path.display(),
+            meta.len(),
+            MAX_FID_TEXT_HEADER_BYTES
+        ));
+    }
+    use std::io::Read;
+    let f = fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(65_536));
+    f.take(MAX_FID_TEXT_HEADER_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    if (buf.len() as u64) > MAX_FID_TEXT_HEADER_BYTES {
+        return Err(format!(
+            "text header {} exceeds {} byte safety cap",
+            path.display(),
+            MAX_FID_TEXT_HEADER_BYTES
+        ));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 fn parse_nus_schedule_1d(path: &Path, n1_cplx: usize) -> Result<Vec<usize>, String> {
-    let text = fs::read_to_string(path)
+    let text = read_text_lossy_capped(path)
         .map_err(|e| format!("failed to read NUS schedule {}: {e}", path.display()))?;
     let decoded = crate::pulprog::decode_nuslist_str(
         &text,
@@ -411,7 +442,7 @@ fn parse_nus_schedule_2d(
     n2_cplx: usize,
     col0_is_y: bool,
 ) -> Result<Vec<(usize, usize)>, String> {
-    let text = fs::read_to_string(path)
+    let text = read_text_lossy_capped(path)
         .map_err(|e| format!("failed to read 3D NUS schedule {}: {e}", path.display()))?;
     let aqseq = if col0_is_y {
         crate::pulprog::AcquisitionOrder::Aqseq321
@@ -471,8 +502,7 @@ fn find_varian_schedule_file(dir: &Path, pp: &HashMap<String, ProcparVal>) -> Op
 // ============================================================================
 
 fn parse_jcamp_file(path: &Path) -> Result<HashMap<String, String>, String> {
-    let text =
-        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let text = read_text_lossy_capped(path)?;
     Ok(parse_jcamp_str(&text))
 }
 
@@ -1273,7 +1303,7 @@ pub fn read_bruker_fid_1d(dir: impl AsRef<Path>) -> Result<Fid1D, String> {
 fn read_optional_bruker_pulseprogram(dir: &Path) -> Option<String> {
     find_file_ci(dir, "pulseprogram")
         .or_else(|| find_file_ci(dir, "pulseprogram.precomp"))
-        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|p| read_text_lossy_capped(&p).ok())
 }
 
 fn contains_word_token(line: &str, word: &str) -> bool {
@@ -1852,12 +1882,16 @@ pub fn read_bruker_fid_3d(dir: impl AsRef<Path>) -> Result<Fid3D, String> {
     let (axis_x, bytorda, dtypa) = parse_bruker_direct_axis(&acqus, procs.as_ref())?;
 
     let pulprog_interp = crate::pulprog::interpret_bruker_dir(&dir).ok();
+    let interp_aqseq_312 = matches!(
+        pulprog_interp.as_ref().map(|pi| pi.aqseq),
+        Some(crate::pulprog::AcquisitionOrder::Aqseq312)
+    );
     let aqseq: i32 = match acqus.get("AQSEQ") {
-        Some(v) => v.parse().unwrap_or(-1),
-        None => match pulprog_interp.as_ref().map(|pi| pi.aqseq) {
-            Some(crate::pulprog::AcquisitionOrder::Aqseq312) => 1,
-            _ => 0,
+        Some(v) => match v.trim().parse::<i32>().unwrap_or(-1) {
+            0 if interp_aqseq_312 => 1,
+            parsed => parsed,
         },
+        None => i32::from(interp_aqseq_312),
     };
     if !matches!(aqseq, 0 | 1) {
         return Err(format!(
@@ -2228,16 +2262,15 @@ pub fn read_bruker_pseudo3d_planes_2d(
         .unwrap_or("pseudo3d")
         .to_string();
 
+    let list_inner_to_quad = pulprog_interp
+        .pseudo_3d_list_inner_to_quad
+        .unwrap_or(inner_is_qf);
     let mut planes = Vec::with_capacity(n_planes);
     for p in 0..n_planes {
         let mut plane_data = vec![[0.0, 0.0]; n_t1 * 2 * n0];
         for k1 in 0..n_t1 {
-            let (t0_idx, t1_idx) = match (storage_order, inner_is_qf) {
-                (crate::pulprog::Pseudo3DStorageOrder::PlaneQueued, false) => {
-                    ((p * n_t1 + k1) * q_mult, (p * n_t1 + k1) * q_mult + 1)
-                }
-                (crate::pulprog::Pseudo3DStorageOrder::T1Interleaved, true)
-                | (crate::pulprog::Pseudo3DStorageOrder::PlaneQueued, true) => (
+            let (t0_idx, t1_idx) = match (storage_order, list_inner_to_quad) {
+                (crate::pulprog::Pseudo3DStorageOrder::T1Interleaved, true) => (
                     (k1 * q_mult) * n_planes + p,
                     (k1 * q_mult + 1) * n_planes + p,
                 ),
@@ -2344,8 +2377,13 @@ fn parse_procpar_str(text: &str) -> Result<HashMap<String, ProcparVal>, String> 
                 .split_once(char::is_whitespace)
                 .unwrap_or((first_val_line, ""));
             let count: usize = count_str.parse().unwrap_or(1);
-            let mut strs = Vec::with_capacity(count);
-            if !rem.trim().is_empty() {
+            if count > MAX_FID_PROCPAR_VALUES {
+                return Err(format!(
+                    "Varian procpar parameter '{name}' value count ({count}) exceeds limit ({MAX_FID_PROCPAR_VALUES})"
+                ));
+            }
+            let mut strs = Vec::with_capacity(count.min(1024));
+            if !rem.trim().is_empty() && count > 0 {
                 strs.push(unquote_procpar(rem.trim()));
             }
             while strs.len() < count && idx < lines.len() {
@@ -2356,12 +2394,21 @@ fn parse_procpar_str(text: &str) -> Result<HashMap<String, ProcparVal>, String> 
             map.insert(name, ProcparVal::Strings(strs));
         } else {
             // Real/integer array (`basictype == 1` or `0`): `<count> v1 v2 ...` possibly wrapping lines
-            let mut nums_raw = Vec::new();
             let first_tokens: Vec<&str> = lines[idx].split_whitespace().collect();
             idx += 1;
+            let mut nums_raw = Vec::new();
             if let Some(cnt_tok) = first_tokens.first() {
                 let count: usize = cnt_tok.parse().unwrap_or(0);
+                if count > MAX_FID_PROCPAR_VALUES {
+                    return Err(format!(
+                        "Varian procpar parameter '{name}' value count ({count}) exceeds limit ({MAX_FID_PROCPAR_VALUES})"
+                    ));
+                }
+                nums_raw.reserve(count.min(1024));
                 for &t in &first_tokens[1..] {
+                    if nums_raw.len() >= count {
+                        break;
+                    }
                     if let Ok(v) = t.parse::<f64>() {
                         nums_raw.push(v);
                     }
@@ -2373,6 +2420,9 @@ fn parse_procpar_str(text: &str) -> Result<HashMap<String, ProcparVal>, String> 
                         break;
                     }
                     for &t in &more {
+                        if nums_raw.len() >= count {
+                            break;
+                        }
                         if let Ok(v) = t.parse::<f64>() {
                             nums_raw.push(v);
                         }
@@ -2770,8 +2820,7 @@ fn varian_fcoef_conjugate_for_fft(fcoef: Option<[f64; 8]>) -> bool {
 fn read_varian_fid_auto(dir: &Path) -> Result<RawFid, String> {
     let procpar_path = find_file_ci(dir, "procpar")
         .ok_or_else(|| format!("missing Varian procpar in {}", dir.display()))?;
-    let procpar_txt = fs::read_to_string(&procpar_path)
-        .map_err(|e| format!("failed to read {}: {e}", procpar_path.display()))?;
+    let procpar_txt = read_text_lossy_capped(&procpar_path)?;
     let pp = parse_procpar_str(&procpar_txt)?;
 
     // When a Varian/Kay post-acquisition preprocessor (`mungefid` / `r2s` / `se_sort`) recombines

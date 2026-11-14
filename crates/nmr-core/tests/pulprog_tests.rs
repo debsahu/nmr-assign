@@ -387,7 +387,42 @@ fn test_preprocessor_zgoptns_ifdef_and_strict_include_sandbox() {
         preprocess_bruker_pulseprogram("#include \"a.incl\"\n", "", &cyc_inc).unwrap_err();
     assert!(matches!(cyc_err, PulprogError::IncludeCycle(_)));
 
-    // Reject symlink escaping `exp_dir` on disk!
+    // Reject non-cyclic diamond `#include` DAG bombs (`10 x 10 = 100 > MAX_TOTAL_INCLUDES = 64`) in `< 5 ms`!
+    let mut dag_inc = HashMap::new();
+    dag_inc.insert(
+        "lvl1.incl".to_string(),
+        "#include \"lvl2.incl\"\n".repeat(10),
+    );
+    dag_inc.insert("lvl2.incl".to_string(), "\"d0=3u\"\n".to_string());
+    let dag_root = "#include \"lvl1.incl\"\n".repeat(10);
+    let t_dag = Instant::now();
+    let dag_err = preprocess_bruker_pulseprogram(&dag_root, "", &dag_inc).unwrap_err();
+    assert!(
+        matches!(dag_err, PulprogError::ResourceLimitExceeded(_)),
+        "expected ResourceLimitExceeded on diamond #include DAG, got {dag_err:?}"
+    );
+    assert!(t_dag.elapsed().as_secs_f64() * 1000.0 < 10.0);
+
+    // Reject corrupt `procpar` with huge `n_vals` (`999_999_999_999`) + truncated EOF in `< 5 ms` without OOM or spin!
+    let corrupt_procpar = "seqfil 2 2 8192 0 0 2 1 0 1 64\n999999999999 \"ghsqc\"\n";
+    let t_pp = Instant::now();
+    let pp_err = interpret_varian_procpar(corrupt_procpar, None).unwrap_err();
+    assert!(
+        matches!(pp_err, PulprogError::ResourceLimitExceeded(_)),
+        "expected ResourceLimitExceeded on huge procpar n_vals, got {pp_err:?}"
+    );
+    assert!(t_pp.elapsed().as_secs_f64() * 1000.0 < 5.0);
+
+    // Fail closed when `exp_dir` does not exist!
+    let missing_dir = std::env::temp_dir().join("nmr_nonexistent_pulprog_dir_999888777");
+    let _ = fs::remove_dir_all(&missing_dir);
+    assert!(matches!(
+        preprocess_bruker_pulseprogram_in_dir("1 ze\n", "", &missing_dir),
+        Err(PulprogError::Io(_))
+    ));
+
+    // Reject symlink escaping `exp_dir` on disk (both `#include` AND top-level `pulseprogram`),
+    // AND verify ISO-8859-1 / Latin-1 vendor header comments (`Wüthrich` `0xfc`, `90°` `0xb0`) parse cleanly!
     #[cfg(unix)]
     {
         let tmp = std::env::temp_dir().join(format!(
@@ -407,6 +442,92 @@ fn test_preprocessor_zgoptns_ifdef_and_strict_include_sandbox() {
         let res =
             preprocess_bruker_pulseprogram_in_dir("#include \"escape_link.incl\"\n", "", &exp_dir);
         assert!(matches!(res, Err(PulprogError::UnsafeIncludePath(_))));
+
+        // Top-level `pulseprogram` symlink escaping `exp_dir` MUST also fail closed!
+        let exp_top = tmp.join("exp_top_symlink");
+        fs::create_dir_all(&exp_top).unwrap();
+        fs::write(
+            exp_top.join("acqus"),
+            make_bruker_acqus(
+                "hsqcetf3gpsi",
+                1,
+                Some(0),
+                "",
+                600.13,
+                150.91,
+                60.81,
+                "13C",
+                "15N",
+                174.0,
+                54.0,
+                3e-6,
+                0.0,
+                0.0,
+                0.0,
+                80.0,
+                8.1,
+                0.0,
+                0.0,
+                0,
+                1,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            exp_top.join("acqu2s"),
+            make_bruker_acqu_ind("15N", 60.8179, 60.8106, 32.0, 64, 6, 0, None),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&secret, exp_top.join("pulseprogram")).unwrap();
+        assert!(matches!(
+            interpret_experiment_dir(&exp_top),
+            Err(PulprogError::UnsafeIncludePath(_))
+        ));
+
+        // Raw ISO-8859-1 / Latin-1 bytes (`0xfc` = `ü`, `0xb0` = `°`) in `acqus` and `pulseprogram`!
+        let exp_latin1 = tmp.join("exp_latin1");
+        fs::create_dir_all(&exp_latin1).unwrap();
+        let mut acqus_latin1 = b"$$ Author: Kurt W\xfcthrich, Z\xfcrich 25\xb0C\n".to_vec();
+        acqus_latin1.extend_from_slice(
+            make_bruker_acqus(
+                "hsqcetf3gpsi",
+                1,
+                Some(0),
+                "",
+                600.1328,
+                150.9108,
+                60.8179,
+                "13C",
+                "15N",
+                174.0,
+                54.0,
+                3e-6,
+                0.0,
+                0.0,
+                0.0,
+                80.0,
+                8.1,
+                0.0,
+                0.0,
+                0,
+                1,
+            )
+            .as_bytes(),
+        );
+        fs::write(exp_latin1.join("acqus"), &acqus_latin1).unwrap();
+        fs::write(
+            exp_latin1.join("acqu2s"),
+            make_bruker_acqu_ind("15N", 60.8179, 60.8106, 32.0, 16, 6, 0, None),
+        )
+        .unwrap();
+        let pp_latin1 = b"; Marion & W\xfcthrich 90\xb0 phase-sensitive HSQC\ndefine list<gradient> EA=<EA>\n1 ze\n2 d1\n  (p1 ph1)\n  (p21 ph3):f3\n  d0\n  p16:gp1*EA\n  (p22 ph4):f3\n  d0\n  p16:gp2\n  go=2 ph31 cpd3:f3\n  d1 mc #0 to 2 F1EA(calgrad(EA), caldel(d0, +in0))\nexit\nph1=0\nph3=0\nph4=0\nph31=0 2\n";
+        fs::write(exp_latin1.join("pulseprogram"), pp_latin1).unwrap();
+        let pi_lat = interpret_experiment_dir(&exp_latin1).expect("Latin-1 acqus + pulseprogram");
+        assert_eq!(
+            pi_lat.transfer_graph.deduced_family,
+            PulprogSequenceFamily::N15Hsqc
+        );
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }
@@ -2800,35 +2921,42 @@ ph31=0 2
         NusIndexBase::OneBased
     );
 
-    // 35 & 36. Varian arrayed `gNhsqc` (`relaxT,d2,phase` `PlaneQueued` vs `d2,relaxT,phase` / `relaxT,phase` `T1Interleaved`) & `Dbppste` DOSY
+    // 35 & 36. Varian arrayed `gNhsqc` (`"relaxT,phase"` & `"relaxT,d2,phase"` -> `PlaneQueued`;
+    // `"d2,relaxT,phase"` -> `T1Interleaved` per VnmrJ `psg` physics!) & `Dbppste` DOSY
     let relax_extra = "\
 relaxT 1 1 10 0 0 2 1 11 1 64\n\
 6 0.01 0.05 0.1 0.2 0.5 1.0\n\
 0\n";
-    let v35_pq = make_varian_procpar(
-        "gNhsqc",
-        "gNhsqc_T1",
-        "C13",
-        "N15",
-        150.9028,
-        60.8106,
-        0.0,
-        0.0,
-        64,
-        1946.0,
-        &[1, 2],
-        "1 0 -1 0 0 1 0 1",
-        "n",
-        None,
-        "relaxT,d2,phase",
-        relax_extra,
-    );
-    let pi35_pq = interpret_varian_procpar(&v35_pq, None).unwrap();
-    assert_eq!(pi35_pq.pseudo_3d_order, Pseudo3DStorageOrder::PlaneQueued);
-    assert_eq!(
-        pi35_pq.transfer_graph.deduced_family,
-        PulprogSequenceFamily::RelaxR1
-    );
+    for pq_arr in ["relaxT,phase", "relaxT,d2,phase"] {
+        let v35_pq = make_varian_procpar(
+            "gNhsqc",
+            "gNhsqc_T1",
+            "C13",
+            "N15",
+            150.9028,
+            60.8106,
+            0.0,
+            0.0,
+            64,
+            1946.0,
+            &[1, 2],
+            "1 0 -1 0 0 1 0 1",
+            "n",
+            None,
+            pq_arr,
+            relax_extra,
+        );
+        let pi35_pq = interpret_varian_procpar(&v35_pq, None).unwrap();
+        assert_eq!(
+            pi35_pq.pseudo_3d_order,
+            Pseudo3DStorageOrder::PlaneQueued,
+            "expected PlaneQueued for Varian array='{pq_arr}'"
+        );
+        assert_eq!(
+            pi35_pq.transfer_graph.deduced_family,
+            PulprogSequenceFamily::RelaxR1
+        );
+    }
 
     let v35_il = make_varian_procpar(
         "gNhsqc",
@@ -2850,6 +2978,7 @@ relaxT 1 1 10 0 0 2 1 11 1 64\n\
     );
     let pi35_il = interpret_varian_procpar(&v35_il, None).unwrap();
     assert_eq!(pi35_il.pseudo_3d_order, Pseudo3DStorageOrder::T1Interleaved);
+    assert_eq!(pi35_il.pseudo_3d_list_kind.as_deref(), Some("relaxT"));
 
     let dosy_extra = "\
 gzlvl1 1 1 32767 -32767 0 2 1 11 1 64\n\
@@ -3308,9 +3437,224 @@ ph31=0 2
         }
     }
 
+    // Also verify `03c` `(PlaneQueued, inner_is_qf=true)` AND `03d` `(T1Interleaved, list_inner_to_quad=true, inner_is_qf=false)`!
+    for (sub_name, a2_fnmode, a3_fnmode, is_pq) in [
+        ("03c_pseudo3d_pq_inner_qf", 1, 4, true),
+        ("03d_pseudo3d_il_list_inside_quad", 4, 1, false),
+    ] {
+        let pdir = tmp.join(sub_name);
+        fs::create_dir_all(&pdir).unwrap();
+        let acqus_p = make_bruker_acqus(
+            "hsqct1etf3gpsi3d",
+            2,
+            Some(0),
+            "",
+            sfo_h,
+            150.9108,
+            sfo_n,
+            "13C",
+            "15N",
+            174.0,
+            54.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            80.0,
+            8.1,
+            0.0,
+            0.0,
+            0,
+            1,
+        );
+        let td2 = if a2_fnmode == 1 { n_planes } else { n1_p3d * 2 };
+        let td3 = if a3_fnmode == 1 { n_planes } else { n1_p3d * 2 };
+        let a2_p = make_bruker_acqu_ind("15N", sfo_n, bf_n, sw_n_ppm, td2, a2_fnmode, 0, None);
+        let a3_p = make_bruker_acqu_ind("15N", sfo_n, bf_n, sw_n_ppm, td3, a3_fnmode, 0, None);
+        let pp_p = if is_pq {
+            // Explicit outer `ivd` loop, even though `acqu2s` has `FnMODE=1`!
+            "1 ze\n2 d1\n3 d1\n4 (p1 ph1)\n  vd\n  (p21 ph3):f3\n  d0\n  (p21 ph4):f3\n  go=4 ph31\n  d1 wr #0 if #0 zd ip3\n  lo to 4 times 2\n  d1 id0\n  lo to 3 times 16\n  d1 rd0 ivd\n  lo to 2 times 4\nexit\nph1=0\nph3=0\nph4=0\nph31=0 2\n"
+        } else {
+            // Explicit `ivd` INNERMOST (`lo to 4 times 4` inside `lo to 3 times 2` `ip3` inside `lo to 2 times 16` `id0`),
+            // even though `acqu2s = States (4)` and `acqu3s = QF (1)`!
+            "1 ze\n2 d1\n3 d1\n4 (p1 ph1)\n  vd\n  (p21 ph3):f3\n  d0\n  (p21 ph4):f3\n  go=4 ph31\n  d1 wr #0 if #0 zd ivd\n  lo to 4 times 4\n  d1 ip3\n  lo to 3 times 2\n  d1 id0\n  lo to 2 times 16\nexit\nph1=0\nph3=0\nph4=0\nph31=0 2\n"
+        };
+        fs::write(pdir.join("acqus"), &acqus_p).unwrap();
+        fs::write(pdir.join("acqu2s"), &a2_p).unwrap();
+        fs::write(pdir.join("acqu3s"), &a3_p).unwrap();
+        fs::write(pdir.join("pulseprogram"), pp_p).unwrap();
+        fs::write(pdir.join("vdlist"), "0.01\n0.25\n0.65\n1.25\n").unwrap();
+
+        let make_trace2 = |amp: f64, k1: usize, is_sin: bool| -> Vec<[f64; 2]> {
+            let t1 = (k1 as f64) / sw_n_hz;
+            let m = amp
+                * (-t1 / 0.04).exp()
+                * if !is_sin {
+                    (-2.0 * PI * nu_n * t1).cos()
+                } else {
+                    (-2.0 * PI * nu_n * t1).sin()
+                };
+            (0..n0_p3d)
+                .map(|k0| {
+                    let t0 = (k0 as f64) / sw_h_hz;
+                    let e0 = (-t0 / 0.04).exp();
+                    let w0 = 2.0 * PI * nu_h * t0;
+                    [m * e0 * w0.cos(), m * e0 * w0.sin()]
+                })
+                .collect()
+        };
+
+        let mut ser_traces = Vec::with_capacity(n_planes * n1_p3d * 2);
+        if is_pq {
+            for &amp in &decay_amps {
+                for k1 in 0..n1_p3d {
+                    ser_traces.push(make_trace2(amp, k1, false));
+                    ser_traces.push(make_trace2(amp, k1, true));
+                }
+            }
+        } else {
+            // `k1` outermost, `q in [cos, sin]` middle, `p` (`amp`) innermost!
+            for k1 in 0..n1_p3d {
+                for is_sin in [false, true] {
+                    for &amp in &decay_amps {
+                        ser_traces.push(make_trace2(amp, k1, is_sin));
+                    }
+                }
+            }
+        }
+        write_bruker_ser_traces(&pdir.join("ser"), n0_p3d * 2, &ser_traces);
+
+        let (planes, detected_order) = read_bruker_pseudo3d_planes_2d(&pdir).unwrap();
+        assert_eq!(
+            detected_order,
+            if is_pq {
+                Pseudo3DStorageOrder::PlaneQueued
+            } else {
+                Pseudo3DStorageOrder::T1Interleaved
+            }
+        );
+        let norm0 = planes[0].data[0][0];
+        for (pi_idx, plane) in planes.iter().enumerate() {
+            let ratio = plane.data[0][0] / norm0;
+            assert!(
+                (ratio - decay_amps[pi_idx]).abs() < 1e-3,
+                "plane {pi_idx} in {sub_name}: expected {:.3}, got {:.3}",
+                decay_amps[pi_idx],
+                ratio
+            );
+        }
+    }
+
     // ------------------------------------------------------------------------
-    // Case D: `AQSEQ = 312` deduced from `pulseprogram` + 1-based `nuslist` in `read_fid_3d`!
+    // Case D: `AQSEQ = 312` deduced from `pulseprogram` + 1-based `nuslist` in `read_fid_3d`
+    // (including manual `lo to` `id0`-inside-`id10` when `acqus` has default `##$AQSEQ= 0`!),
+    // AND half-dwell `FCOR = 1.0` preserved across `ProcessingRecipe::from_fid_2d`!
     // ------------------------------------------------------------------------
+    let dir_hd = tmp.join("04a_half_dwell_fcor_preserved");
+    fs::create_dir_all(&dir_hd).unwrap();
+    let dw_n = 1.0 / sw_n_hz;
+    let acqus_hd = make_bruker_acqus(
+        "hsqcetf3gpsi",
+        1,
+        Some(0),
+        "",
+        sfo_h,
+        150.9108,
+        sfo_n,
+        "13C",
+        "15N",
+        174.0,
+        54.0,
+        0.25 * dw_n, // `2 * d0 = 0.5 * DW_N` -> half-dwell sampling!
+        0.0,
+        0.0,
+        0.0,
+        80.0,
+        8.1,
+        0.0,
+        0.0,
+        0,
+        1,
+    );
+    fs::write(dir_hd.join("acqus"), &acqus_hd).unwrap();
+    fs::write(
+        dir_hd.join("acqu2s"),
+        make_bruker_acqu_ind("15N", sfo_n, bf_n, sw_n_ppm, n1 * 2, 6, 0, None),
+    )
+    .unwrap();
+    fs::write(
+        dir_hd.join("pulseprogram"),
+        "define list<gradient> EA=<EA>\n1 ze\n2 d1\n  (p1 ph1)\n  (p21 ph3):f3\n  d0\n  (p2 ph2)\n  d0\n  p16:gp1*EA\n  (p22 ph4):f3\n  p16:gp2\n  go=2 ph31\n  d1 mc #0 to 2 F1EA(calgrad(EA), caldel(d0, +in0))\nexit\nph1=0\nph2=0\nph3=0\nph4=0\nph31=0 2\n",
+    )
+    .unwrap();
+    write_bruker_ser_traces(&dir_hd.join("ser"), n0 * 2, &traces_manual);
+    let fid_hd = read_fid_2d(&dir_hd).unwrap();
+    assert_eq!(fid_hd.axis_y.stored_proc.fcor, Some(1.0));
+    let rec_hd = ProcessingRecipe::from_fid_2d(&fid_hd);
+    assert!(
+        (rec_hd.dims[1].fcor - 1.0).abs() < 1e-9,
+        "ProcessingRecipe::from_fid_2d must preserve half-dwell FCOR=1.0 during Auto phase, got {}",
+        rec_hd.dims[1].fcor
+    );
+    assert!(
+        (rec_man.dims[1].fcor - 0.5).abs() < 1e-9,
+        "Zero-delay FID must keep FCOR=0.5, got {}",
+        rec_man.dims[1].fcor
+    );
+
+    // Manual `lo to` `AQSEQ = 312` (`id0` nested inside `id10`) WITH explicit `##$AQSEQ= 0` in `acqus`!
+    let dir_312_man = tmp.join("04b_manual_loop_aqseq312_with_header_zero");
+    fs::create_dir_all(&dir_312_man).unwrap();
+    let acqus_312_man = make_bruker_acqus(
+        "hncagp3d",
+        2,
+        Some(0), // Default `##$AQSEQ= 0` in `acqus` while manual `lo to` executes `id0` inside `id10`!
+        "",
+        sfo_h,
+        150.9290,
+        sfo_n,
+        "13C",
+        "15N",
+        174.0,
+        54.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        80.0,
+        8.1,
+        0.0,
+        0.0,
+        0,
+        1,
+    );
+    let a2_312_m = make_bruker_acqu_ind("15N", sfo_n, bf_n, sw_n_ppm, 8 * 4, 4, 2, Some(16)); // n1 = 8
+    let a3_312_m = make_bruker_acqu_ind("13C", 150.9290, 150.9028, 28.0, 1, 4, 2, Some(32)); // n2 = 16
+    fs::write(dir_312_man.join("acqus"), &acqus_312_man).unwrap();
+    fs::write(dir_312_man.join("acqu2s"), &a2_312_m).unwrap();
+    fs::write(dir_312_man.join("acqu3s"), &a3_312_m).unwrap();
+    fs::write(
+        dir_312_man.join("pulseprogram"),
+        "; manual lo-to 3D with inner F1 (d0/id0) and outer F2 (d10/id10)\n1 ze\n2 d1\n3 d1\n4 (p1 ph1)\n  (p21 ph5):f3\n  d10\n  (p3 ph3):f2\n  d0\n  go=4 ph31\n  d1 wr #0 if #0 zd ip3\n  lo to 4 times 2\n  d1 id0\n  lo to 3 times l0\n  d1 rd0 ip5\n  lo to 2 times 2\n  d1 id10\n  lo to 2 times l10\nexit\nph1=0\nph3=0\nph5=0\nph31=0 2\n",
+    )
+    .unwrap();
+    fs::write(
+        dir_312_man.join("nuslist"),
+        "1 1\n2 3\n5 4\n7 2\n10 6\n12 5\n15 7\n16 8\n",
+    )
+    .unwrap();
+    let dummy_traces_m: Vec<Vec<[f64; 2]>> = (0..8 * 4).map(|_| vec![[1.0, 0.0]; 256]).collect();
+    write_bruker_ser_traces(&dir_312_man.join("ser"), 512, &dummy_traces_m);
+    let pi_312_man = interpret_experiment_dir(&dir_312_man).unwrap();
+    assert_eq!(pi_312_man.aqseq, AcquisitionOrder::Aqseq312);
+    let fid_312_man = read_fid_3d(&dir_312_man).expect("read_fid_3d manual lo-to AQSEQ=312");
+    let mask_312_man = fid_312_man.nus_mask.expect("nus_mask");
+    assert!(mask_312_man[15 * 8 + 7]);
+    let inv_312_man = classify_nmr_workspace(&dir_312_man).unwrap();
+    assert!(inv_312_man.experiments[0]
+        .notes
+        .iter()
+        .any(|n| n.contains("AQSEQ=312")));
     let dir_312 = tmp.join("04_aqseq312_1based_nus_3d");
     fs::create_dir_all(&dir_312).unwrap();
     let acqus_312 = make_bruker_acqus(
@@ -3900,6 +4244,117 @@ fn test_volumetric_empirical_sign_fold_hsqc_verifier_rescues_hncacb_and_hnco() {
             post_rec * 100.0
         );
     }
+
+    // 4. Regression guards against false `SignFlipC` on physically valid edge regimes (Verifier P1 #1):
+    //    (a) `CA`-bleached paramagnetic `HNCACB` and `CBCACONH` (carrier `43.0 ppm`, `Z: 77.0..9.0 ppm`,
+    //        where `CA ~ 56 ppm` is completely bleached and ONLY `CB ~ 28..36 ppm` survives — reflecting
+    //        `30 -> 56 ppm` would map `CB` into the narrower `CA` Gaussian and flip negative `CB` to fake `+CA`!).
+    let ax_c_para = AxisPpm {
+        label: "13C".to_string(),
+        size: 96,
+        first_ppm: 77.0,
+        step_ppm: -68.0 / 96.0,
+        obs_mhz: 150.90,
+    };
+    for (exp_name, cb_amp) in [("HNCACB", -85.0_f64), ("CBCACONH", 85.0_f64)] {
+        let mut para_cube = Spectrum3D {
+            name: format!("para_{exp_name}"),
+            exp: exp_name.to_string(),
+            axis_x: hsqc.axis_x.clone(),
+            axis_y: hsqc.axis_y.clone(),
+            axis_z: ax_c_para.clone(),
+            data: (0..96 * 64 * 96)
+                .map(|i| deterministic_noise(77, i) * 1.4)
+                .collect(),
+        };
+        for (idx, s) in systems.iter().enumerate() {
+            // Paramagnetic bleaching of `CA`: ONLY `CB` (`28..35 ppm` cluster + occasional Ser/Thr) survives!
+            if s.cb > 10.0 {
+                let cb_para = if s.cb > 60.0 {
+                    s.cb
+                } else {
+                    28.0 + ((idx % 7) as f64) * 0.95
+                };
+                add_gaussian_3d(&mut para_cube, s.h, s.n, cb_para, cb_amp, 0.032, 0.32, 0.55);
+            }
+        }
+        let orig_para = para_cube.data.clone();
+        let ver_para = verify_3d_axis_hypotheses_against_hsqc(&mut para_cube, &hsqc, None);
+        assert_eq!(
+            ver_para.selected,
+            NamedAxisHypothesis::Canonical,
+            "CA-less paramagnetic {exp_name} must NEVER false-SignFlip CB -> CA!"
+        );
+        assert!(!ver_para.applied);
+        assert!(!ver_para.polarity_flipped);
+        assert_eq!(para_cube.data, orig_para);
+
+        // And if `15N` is `SignFlip`ped on a `CA`-less paramagnetic `HNCACB`, rescuing `SignFlipN`
+        // must keep `op_c == Canonical` AND preserve negative `CB` polarity (`!polarity_flipped`)!
+        if exp_name == "HNCACB" {
+            let mut para_n_flip = para_cube.clone();
+            apply_indirect_axis_transform_3d(
+                &mut para_n_flip,
+                AxisTransformOp::SignFlip,
+                AxisTransformOp::Canonical,
+                None,
+                false,
+            );
+            let ver_n = verify_3d_axis_hypotheses_against_hsqc(&mut para_n_flip, &hsqc, None);
+            assert_eq!(ver_n.selected, NamedAxisHypothesis::SignFlipN);
+            assert!(ver_n.applied);
+            assert!(
+                !ver_n.polarity_flipped,
+                "rescuing SignFlipN on CA-less HNCACB must not negate negative CB peaks!"
+            );
+            assert_eq!(para_n_flip.data, orig_para);
+        }
+    }
+
+    //    (b) β-sheet / Pro-rich / PCS `HNCO` (`O2P = 174.0 ppm, SW = 16.0 ppm`, `Z: 182.0..166.0 ppm`)
+    //        with `48` clean roots whose `<13CO> ≈ 172.0 ppm` (`170.4..173.5 ppm`, 100% inside `166.5..184.5 ppm`):
+    //        must NEVER falsely `SignFlip` `172 -> 176 ppm`!
+    let mut hsqc_48 = Spectrum2D {
+        name: "syn_hsqc_48".to_string(),
+        axis_x: hsqc.axis_x.clone(),
+        axis_y: hsqc.axis_y.clone(),
+        data: (0..96 * 64)
+            .map(|i| deterministic_noise(91, i) * 1.1)
+            .collect(),
+    };
+    let ax_co_174 = AxisPpm {
+        label: "13C".to_string(),
+        size: 64,
+        first_ppm: 182.0,
+        step_ppm: -16.0 / 64.0,
+        obs_mhz: 150.93,
+    };
+    let mut hnco_beta = Spectrum3D {
+        name: "beta_pcs_hnco".to_string(),
+        exp: "HNCO".to_string(),
+        axis_x: hsqc.axis_x.clone(),
+        axis_y: hsqc.axis_y.clone(),
+        axis_z: ax_co_174,
+        data: (0..96 * 64 * 64)
+            .map(|i| deterministic_noise(92, i) * 1.3)
+            .collect(),
+    };
+    for k in 0..48 {
+        let h_k = 6.95 + ((k % 12) as f64) * 0.23 + ((k / 12) as f64) * 0.04;
+        let n_k = 106.5 + ((k / 12) as f64) * 5.8 + ((k % 12) as f64) * 0.55;
+        let co_k = 170.5 + ((k % 9) as f64) * 0.36; // mean `~171.94 ppm`!
+        add_gaussian_2d(&mut hsqc_48, h_k, n_k, 125.0, 0.030, 0.30);
+        add_gaussian_3d(&mut hnco_beta, h_k, n_k, co_k, 115.0, 0.030, 0.30, 0.22);
+    }
+    let orig_beta = hnco_beta.data.clone();
+    let ver_beta = verify_3d_axis_hypotheses_against_hsqc(&mut hnco_beta, &hsqc_48, None);
+    assert_eq!(
+        ver_beta.selected,
+        NamedAxisHypothesis::Canonical,
+        "Clean beta-sheet/PCS HNCO (<13CO> ~ 172 ppm) must NEVER false-SignFlip!"
+    );
+    assert!(!ver_beta.applied);
+    assert_eq!(hnco_beta.data, orig_beta);
 }
 
 // ============================================================================

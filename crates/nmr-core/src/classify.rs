@@ -3160,7 +3160,7 @@ fn build_bruker_experiment(
                     || vc_len > 0
                     || fq_len > 0
                     || jcamp_usize(&a1, "AQSEQ") == Some(1)
-                    || (ndim_raw >= 3 && jcamp_usize(&a1, "AQSEQ").is_none()))));
+                    || ndim_raw >= 3)));
 
     let pulprog_interp = if needs_pulprog_interp {
         let a1_s = grp
