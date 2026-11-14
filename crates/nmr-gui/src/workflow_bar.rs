@@ -117,11 +117,12 @@ pub enum WorkbenchAction {
     TogglePeakLabels,
     FilterArtifactAndFoldedPeaks,
 
-    // --- 5. Spin-System, Backbone Assignment & Session Undo/Redo (14) ---
+    // --- 5. Spin-System, Backbone Assignment & Session Undo/Redo (15) ---
     BuildSpinSystems,
     RunBackboneAssignment,
     SelectSolverEvoGraph,
     SelectSolverStandardSa,
+    SelectSolverBayesSa,
     ToggleGpuComputeEngine,
     TileSequentialStrips,
     OpenResidueAssignmentPopover,
@@ -177,7 +178,7 @@ pub struct ActionMetadata {
 }
 
 impl WorkbenchAction {
-    /// Complete deterministic registry of all 75 workbench commands (`>= 55` required).
+    /// Complete deterministic registry of all 76 workbench commands (`>= 55` required).
     pub const ALL: &'static [Self] = &[
         // File (12)
         Self::OpenIngestMatrix,
@@ -224,11 +225,12 @@ impl WorkbenchAction {
         Self::SnapPeakParabolicCenter,
         Self::TogglePeakLabels,
         Self::FilterArtifactAndFoldedPeaks,
-        // Assignment & Undo/Redo (14)
+        // Assignment & Undo/Redo (15)
         Self::BuildSpinSystems,
         Self::RunBackboneAssignment,
         Self::SelectSolverEvoGraph,
         Self::SelectSolverStandardSa,
+        Self::SelectSolverBayesSa,
         Self::ToggleGpuComputeEngine,
         Self::TileSequentialStrips,
         Self::OpenResidueAssignmentPopover,
@@ -773,6 +775,16 @@ impl WorkbenchAction {
                 category: "Backbone Assignment",
                 title: "Select Standard Simulated Annealing Solver",
                 description: "Use multi-replica CPU/WebGPU Metropolis simulated annealing over U(s,k) and P(s,t)",
+                modifier_shortcut: None,
+                chord_badge: None,
+                menu_separator_after: false,
+            },
+            Self::SelectSolverBayesSa => ActionMetadata {
+                action: self,
+                menu: TopMenu::Assignment,
+                category: "Backbone Assignment",
+                title: "Select Bayesian SA (Cv Adaptive) Solver",
+                description: "Use Bayesian shift/overlap pseudo-energy with specific-heat Cv(T) adaptive CPU/WebGPU annealing",
                 modifier_shortcut: None,
                 chord_badge: None,
                 menu_separator_after: false,

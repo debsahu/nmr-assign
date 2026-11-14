@@ -19,6 +19,9 @@ use nmr_core::aromatic::{
     merge_aromatic_assignments_preserving_existing, AromaticRingCluster, AromaticSolverConfig,
     AROMATIC_EXPERIMENTS,
 };
+use nmr_core::bayes_sa::{
+    solve_bayes_sa, solve_bayes_sa_from_peaks, BayesSaConfig, BayesSaReport, LockedAssignment,
+};
 use nmr_core::c13_detected::{
     pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
     C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
@@ -99,6 +102,8 @@ use nmr_core::stereospec::{
     assign_stereospecific_dataset, StereospecConfig, StereospecDatasetInput,
 };
 use nmr_core::topology::SidechainPriors;
+#[cfg(not(target_arch = "wasm32"))]
+use nmr_gpu::bayes_sa_gpu::BayesSaGpuSolver;
 #[cfg(not(target_arch = "wasm32"))]
 use nmr_gpu::GpuEngine;
 #[cfg(not(target_arch = "wasm32"))]
@@ -281,6 +286,7 @@ enum GuiSolverKind {
     #[default]
     EvoGraph,
     Standard,
+    BayesSa,
 }
 
 impl GuiSolverKind {
@@ -288,6 +294,7 @@ impl GuiSolverKind {
         match self {
             Self::EvoGraph => "Evo-Graph",
             Self::Standard => "Standard",
+            Self::BayesSa => "Bayesian SA (Cv Adaptive)",
         }
     }
 }
@@ -1585,6 +1592,8 @@ struct NmrWorkbenchApp {
     octet_app: OctetDrawPanel,
     #[cfg(not(target_arch = "wasm32"))]
     gpu_engine: Option<GpuEngine>,
+    #[cfg(not(target_arch = "wasm32"))]
+    bayes_gpu_solver: Option<BayesSaGpuSolver>,
     adapter_label: Option<String>,
     solver_kind: GuiSolverKind,
     regime_kind: GuiRegimeKind,
@@ -1602,6 +1611,7 @@ struct NmrWorkbenchApp {
     axis_rescue_audits: Vec<AxisRescueAuditRecord>,
     status_msg: String,
     last_solve_ms: Option<f64>,
+    last_bayes_sa_telemetry: Option<(f64, f64, f64)>,
 
     // Active dataset
     priors: Priors,
@@ -1703,6 +1713,8 @@ impl NmrWorkbenchApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut gpu_engine = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut bayes_gpu_solver = None;
         let mut adapter_label = None;
 
         if let Some(rs) = &cc.wgpu_render_state {
@@ -1724,11 +1736,21 @@ impl NmrWorkbenchApp {
 
             #[cfg(not(target_arch = "wasm32"))]
             {
+                let backend_str = format!("{:?}", info.backend);
                 gpu_engine = Some(GpuEngine::from_device(
                     rs.device.clone(),
                     rs.queue.clone(),
                     info.name.clone(),
-                    format!("{:?}", info.backend),
+                    backend_str.clone(),
+                ));
+                bayes_gpu_solver = Some(BayesSaGpuSolver::with_device_type(
+                    GpuEngine::from_device(
+                        rs.device.clone(),
+                        rs.queue.clone(),
+                        info.name.clone(),
+                        backend_str,
+                    ),
+                    info.device_type,
                 ));
             }
         }
@@ -1761,6 +1783,8 @@ impl NmrWorkbenchApp {
             use_gpu: gpu_engine.is_some(),
             #[cfg(not(target_arch = "wasm32"))]
             gpu_engine,
+            #[cfg(not(target_arch = "wasm32"))]
+            bayes_gpu_solver,
             use_neural_picker: true,
             enable_axis_rescue: true,
             axis_rescue_notices: Vec::new(),
@@ -1768,6 +1792,7 @@ impl NmrWorkbenchApp {
             adapter_label,
             status_msg: String::new(),
             last_solve_ms: None,
+            last_bayes_sa_telemetry: None,
             priors: Priors::provisional(),
             sidechain_priors: SidechainPriors::empirical_bmrb(),
             reference: None,
@@ -2437,7 +2462,11 @@ impl NmrWorkbenchApp {
     fn run_paramagnetic_assignment(&mut self) {
         if self.sequence.is_empty()
             || (self.solver_kind == GuiSolverKind::EvoGraph && self.peaks.is_empty())
-            || (self.solver_kind == GuiSolverKind::Standard && self.systems.is_empty())
+            || (matches!(
+                self.solver_kind,
+                GuiSolverKind::Standard | GuiSolverKind::BayesSa
+            ) && self.systems.is_empty()
+                && self.peaks.is_empty())
         {
             self.status_msg =
                 "Need peaks/spin systems and sequence to run paramagnetic assignment".to_string();
@@ -2472,7 +2501,7 @@ impl NmrWorkbenchApp {
             ..AnnealConfig::default()
         };
         let mode = match self.solver_kind {
-            GuiSolverKind::Standard => ParamagneticSolverMode::Standard,
+            GuiSolverKind::Standard | GuiSolverKind::BayesSa => ParamagneticSolverMode::Standard,
             GuiSolverKind::EvoGraph => ParamagneticSolverMode::EvoGraph,
         };
         let para_cfg = ParamagneticAssignConfig {
@@ -2486,7 +2515,7 @@ impl NmrWorkbenchApp {
         };
 
         let (res, para_rep, eff_priors, tag) = match self.solver_kind {
-            GuiSolverKind::Standard => {
+            GuiSolverKind::Standard | GuiSolverKind::BayesSa => {
                 if let Ok(sys) = build_spin_systems(&self.peaks, &Tolerances::default(), 3, false) {
                     if !sys.is_empty() {
                         self.systems = sys;
@@ -2585,10 +2614,14 @@ impl NmrWorkbenchApp {
         if self.sequence.is_empty()
             || (self.solver_kind == GuiSolverKind::EvoGraph && self.peaks.is_empty())
             || (self.solver_kind == GuiSolverKind::Standard && self.systems.is_empty())
+            || (self.solver_kind == GuiSolverKind::BayesSa
+                && self.peaks.is_empty()
+                && self.systems.is_empty())
         {
             self.status_msg = "Need peaks/spin systems and sequence to run assignment".to_string();
             return;
         }
+        self.last_bayes_sa_telemetry = None;
         // Snapshot coordinates of user-locked spin systems so locks remap across filtered/rebuilt SpinSystems
         let locked_coords: Vec<(f64, f64, usize)> = self
             .session
@@ -2753,6 +2786,143 @@ impl NmrWorkbenchApp {
                 self.qc_report = Some(qc);
                 (r, tag, self.priors.clone(), None)
             }
+            GuiSolverKind::BayesSa => {
+                let raw_locks: Vec<LockedAssignment> = if !self.peaks.is_empty() {
+                    self.raw_hsqc_locks_for_peaks()
+                        .into_iter()
+                        .map(LockedAssignment::from)
+                        .collect()
+                } else {
+                    self.session
+                        .state
+                        .locked_assignments_vec()
+                        .into_iter()
+                        .map(LockedAssignment::from)
+                        .collect()
+                };
+                let mu_override = (self.assign_cost != 0.0).then_some(self.assign_cost);
+
+                #[allow(unused_mut)]
+                let mut bayes_out: Option<(
+                    Vec<SpinSystem>,
+                    AssignResult,
+                    BayesSaReport,
+                    &'static str,
+                )> = None;
+
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.use_gpu {
+                    if let Some(ref bgpu) = self.bayes_gpu_solver {
+                        let mut gcfg = BayesSaConfig {
+                            replicas: self.replicas.max(8),
+                            seed: self.sim_seed,
+                            locked_assignments: raw_locks.clone(),
+                            mu_null_override: mu_override,
+                            ..BayesSaConfig::default_gpu()
+                        };
+                        if gcfg.replicas == 64 {
+                            // Preserve BayesSaConfig::default_gpu() R=128 unless user adjusted slider away from GUI startup default
+                            gcfg.replicas = BayesSaConfig::default_gpu().replicas;
+                        }
+                        let gpu_res = if !self.peaks.is_empty() {
+                            bgpu.solve_from_peaks(&self.peaks, &self.sequence, &self.priors, &gcfg)
+                        } else {
+                            bgpu.solve(&self.systems, &self.sequence, &self.priors, &gcfg)
+                                .map(|(r, rep)| (self.systems.clone(), r, rep))
+                        };
+                        match gpu_res {
+                            Ok((sys, r, rep)) => {
+                                bayes_out = Some((sys, r, rep, "WebGPU Bayes-SA"));
+                            }
+                            Err(e) => {
+                                self.status_msg = format!(
+                                    "WebGPU Bayes-SA error ({e}), falling back to CPU Bayes-SA"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let cpu_tag = if cfg!(target_arch = "wasm32") {
+                    "WASM Bayes-SA"
+                } else {
+                    "CPU Bayes-SA"
+                };
+                let (bayes_systems, r, rep, tag) = match bayes_out {
+                    Some(v) => v,
+                    None => {
+                        #[allow(unused_mut)]
+                        let mut ccfg = BayesSaConfig {
+                            replicas: if self.replicas == 64 {
+                                BayesSaConfig::default().replicas
+                            } else {
+                                self.replicas.max(4)
+                            },
+                            seed: self.sim_seed,
+                            locked_assignments: raw_locks,
+                            mu_null_override: mu_override,
+                            ..BayesSaConfig::default()
+                        };
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            ccfg.replicas = ccfg.replicas.min(16);
+                            ccfg.max_stages = ccfg.max_stages.min(24);
+                        }
+                        if !self.peaks.is_empty() {
+                            match solve_bayes_sa_from_peaks(
+                                &self.peaks,
+                                &self.sequence,
+                                &self.priors,
+                                &ccfg,
+                            ) {
+                                Ok((sys, r, rep)) => (sys, r, rep, cpu_tag),
+                                Err(e) => {
+                                    self.status_msg = format!("Bayes-SA error: {e}");
+                                    return;
+                                }
+                            }
+                        } else {
+                            let (r, rep) =
+                                solve_bayes_sa(&self.systems, &self.sequence, &self.priors, &ccfg);
+                            (self.systems.clone(), r, rep, cpu_tag)
+                        }
+                    }
+                };
+
+                let mut remapped_locks: BTreeMap<usize, usize> = BTreeMap::new();
+                for &(lh, ln, lres) in &locked_coords {
+                    if let Some((new_ss, _)) = bayes_systems
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, s)| (s.h - lh).abs() <= 0.045 && (s.n - ln).abs() <= 0.45)
+                    {
+                        remapped_locks.insert(new_ss, lres);
+                    }
+                }
+                self.session.state.locked_residues = remapped_locks;
+
+                let scfg_u = ScoreConfig {
+                    assign_cost: self.assign_cost,
+                    locked_assignments: self.session.state.locked_assignments_vec(),
+                    ..ScoreConfig::default()
+                };
+                let shifted_pri = self.priors.with_offsets(&rep.applied_offsets);
+                self.u_mat = Some(unary_matrix(
+                    &bayes_systems,
+                    &self.sequence,
+                    &shifted_pri,
+                    &scfg_u,
+                ));
+                self.p_mat = Some(pair_matrix(&bayes_systems, &scfg_u));
+                self.qc_report = Some(rep.qc_report.clone());
+                self.last_bayes_sa_telemetry = Some((rep.t_crit, rep.max_cv, rep.mu_null));
+                self.systems = bayes_systems;
+                self.selected_ss = match self.selected_ss {
+                    Some(s) if s < self.systems.len() => Some(s),
+                    _ => (!self.systems.is_empty()).then_some(0),
+                };
+                (r, tag, shifted_pri, None)
+            }
         };
 
         let dt_ms = timer.elapsed_ms();
@@ -2793,8 +2963,13 @@ impl NmrWorkbenchApp {
         } else {
             String::new()
         };
+        let bayes_note = if let Some((t_crit, max_cv, mu_null)) = self.last_bayes_sa_telemetry {
+            format!(", T_crit={t_crit:.2}, max_Cv={max_cv:.1}, mu_null={mu_null:.2}")
+        } else {
+            String::new()
+        };
         self.status_msg = format!(
-            "[{engine_tag}] Assigned {}/{} residues ({} high-conf >=0.8{lock_note}) in {:.0} ms",
+            "[{engine_tag}] Assigned {}/{} residues ({} high-conf >=0.8{lock_note}{bayes_note}) in {:.0} ms",
             conf.len(),
             self.sequence.len(),
             n_hc,
@@ -3623,19 +3798,27 @@ impl NmrWorkbenchApp {
                             GuiSolverKind::Standard,
                             "Standard SA (GPU / CPU)",
                         );
+                        ui.selectable_value(
+                            &mut self.solver_kind,
+                            GuiSolverKind::BayesSa,
+                            "Bayesian SA (Cv Adaptive)",
+                        );
                     });
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let gpu_supported = (self.regime_kind == GuiRegimeKind::Globular
-                    && self.solver_kind == GuiSolverKind::Standard)
+                    && matches!(
+                        self.solver_kind,
+                        GuiSolverKind::Standard | GuiSolverKind::BayesSa
+                    ))
                     || self.regime_kind == GuiRegimeKind::Idp13C;
                 ui.add_enabled(
                     gpu_supported,
                     egui::Checkbox::new(&mut self.use_gpu, "WebGPU Compute"),
                 )
                 .on_disabled_hover_text(
-                    "WebGPU Compute accelerates Standard SA and 13C-IDP multi-replica annealing; Evo-Graph and Paramagnetic run in f64 on CPU",
+                    "WebGPU Compute accelerates Standard SA, Bayesian SA (Cv Adaptive), and 13C-IDP multi-replica annealing; Evo-Graph and Paramagnetic run in f64 on CPU",
                 );
             }
             ui.add(egui::Slider::new(&mut self.replicas, 8..=256).text("Replicas"));
@@ -5756,6 +5939,14 @@ impl NmrWorkbenchApp {
                         inp.solver_score = Some(res.score);
                         inp.systems_and_assignment = Some((self.systems.clone(), res.clone()));
                     }
+                    if let Some((t_crit, max_cv, mu_null)) = self.last_bayes_sa_telemetry {
+                        inp.engine_label = Some(format!(
+                            "{} [T_crit={t_crit:.4} | max_Cv={max_cv:.3} | mu_null={mu_null:.4}]",
+                            self.solver_kind.label()
+                        ));
+                    } else {
+                        inp.engine_label = Some(self.solver_kind.label().to_string());
+                    }
                     if self.regime_kind == GuiRegimeKind::Idp13C || self.show_propensity_panel {
                         inp.propensity_report = self.propensity_report.clone();
                     }
@@ -5795,6 +5986,7 @@ impl NmrWorkbenchApp {
                 self.propensity_report = None;
                 self.metrics = None;
                 self.qc_report = None;
+                self.last_bayes_sa_telemetry = None;
                 self.overlay_layers.clear();
                 self.hsqc_spec = None;
                 self.hncacb_3d = None;
@@ -6070,10 +6262,14 @@ impl NmrWorkbenchApp {
             WorkbenchAction::SelectSolverStandardSa => {
                 self.solver_kind = GuiSolverKind::Standard;
             }
+            WorkbenchAction::SelectSolverBayesSa => {
+                self.solver_kind = GuiSolverKind::BayesSa;
+            }
             WorkbenchAction::ToggleGpuComputeEngine => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    self.use_gpu = !self.use_gpu && self.gpu_engine.is_some();
+                    self.use_gpu = !self.use_gpu
+                        && (self.gpu_engine.is_some() || self.bayes_gpu_solver.is_some());
                 }
             }
             WorkbenchAction::TileSequentialStrips => {
@@ -7327,5 +7523,50 @@ CBCACON\t175.41\t122.09\t30.40\t1\t520.0
         state.sync_inferred_variants_from_reference(&solved);
         assert_eq!(state.sample_ph, Some(6.8));
         assert_eq!(state.variant_for(1), ResidueVariant::HisNe2H);
+    }
+
+    #[test]
+    fn test_gui_solver_kind_bayes_sa_selector_and_solve() {
+        use super::*;
+
+        assert_eq!(GuiSolverKind::default(), GuiSolverKind::EvoGraph);
+        assert_eq!(GuiSolverKind::BayesSa.label(), "Bayesian SA (Cv Adaptive)");
+
+        let ref_data =
+            read_star_str(SYNTHETIC_UBIQUITIN_STR, None).expect("parse ubiquitin fixture");
+        let priors = Priors::provisional();
+        let (peaks, truth) = simulate(
+            &ref_data,
+            &SimConfig {
+                p_missing_peak: 0.0,
+                spurious_rate: 0.0,
+                seed: 42,
+                ..SimConfig::default()
+            },
+        );
+        let locked_idx = truth
+            .iter()
+            .enumerate()
+            .find_map(|(ss, &k)| (k > 0).then_some((ss, k as usize)))
+            .expect("at least one assignable root");
+        let cfg = BayesSaConfig {
+            replicas: 8,
+            max_stages: 18,
+            seed: 42,
+            locked_assignments: vec![LockedAssignment::from(locked_idx)],
+            ..BayesSaConfig::default()
+        };
+        let (sys, res, rep) = solve_bayes_sa_from_peaks(&peaks, &ref_data.sequence, &priors, &cfg)
+            .expect("GUI Bayes-SA from peaks");
+        assert!(!sys.is_empty());
+        assert_eq!(res.position[locked_idx.0], locked_idx.1 as i32);
+        assert!(rep.t_crit.is_finite() && rep.t_crit > 0.0);
+        assert!(rep.max_cv.is_finite() && rep.max_cv >= 0.0);
+        let m = score(&res, &truth, 0.8);
+        assert!(
+            m.accuracy() >= 0.90,
+            "expected >=90% GUI Bayes-SA accuracy on synthetic ubiquitin, got {:.3}",
+            m.accuracy()
+        );
     }
 }

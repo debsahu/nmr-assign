@@ -18,6 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use nmr_core::bayes_sa::{condition_peaks_preserving_hsqc_roots, solve_bayes_sa_with_peaks};
 use nmr_core::evaluate::to_reference;
 use nmr_core::peaks::Peak;
 use nmr_core::picker::{
@@ -29,12 +30,14 @@ use nmr_core::qc::{DatasetQcReport, ProteinReliabilityCurve, STANDARD_CPU_CALIBR
 use nmr_core::solver::ScoreConfig;
 use nmr_core::spectrum::{Spectrum2D, Spectrum3D};
 use nmr_core::spinsystems::{build_spin_systems, Tolerances};
+use nmr_gpu::bayes_sa_gpu::BayesSaGpuSolver;
+use nmr_gpu::GpuEngine;
 
 use crate::{
-    evaluate_prediction_against_truth, execute_assignment_workflow, load_priors,
-    parse_bounded_runs, parse_bounded_steps, parse_engine, parse_solver, parse_truth_auto,
-    register_3d_hn_to_hsqc_adaptive_with_audit, resolve_solver_engine, version_string, EngineKind,
-    SolverKind,
+    build_bayes_sa_config_cli, evaluate_prediction_against_truth,
+    execute_assignment_workflow_with_options, load_priors, parse_bounded_runs, parse_bounded_steps,
+    parse_engine, parse_solver, parse_truth_auto, register_3d_hn_to_hsqc_adaptive_with_audit,
+    resolve_solver_engine, version_string, EngineKind, SolverKind, ToleranceOverrides,
 };
 
 // ============================================================================
@@ -1605,7 +1608,7 @@ pub fn run_real_benchmark_with_loaders(
     load_fid_2d: &dyn Fn(&Path) -> Result<Spectrum2D, String>,
     load_fid_3d: &dyn Fn(&Path, &str) -> Result<Spectrum3D, String>,
 ) -> Result<RealBenchmarkSummary, String> {
-    let _validated_engine = resolve_solver_engine(cfg.solver, cfg.engine_opt)?;
+    let resolved_engine = resolve_solver_engine(cfg.solver, cfg.engine_opt)?;
     let manifest_txt = fs::read_to_string(&cfg.manifest_path)
         .map_err(|e| format!("failed to read {}: {e}", cfg.manifest_path.display()))?;
     let all_entries = parse_real_manifest_str(&manifest_txt)?;
@@ -1638,10 +1641,42 @@ pub fn run_real_benchmark_with_loaders(
     let score_cfg = ScoreConfig::default();
     let picker_cfg = PickerConfig::default();
 
+    let shared_gpu = if cfg.solver == SolverKind::Standard && resolved_engine == EngineKind::Gpu {
+        match GpuEngine::new_headless() {
+            Ok(g) => Some(g),
+            Err(err) if cfg.engine_opt.is_none() => {
+                eprintln!(
+                    "Warning: WebGPU unavailable for --solver standard ({err}); falling back to CPU (f64)."
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+    let shared_bayes_gpu = if cfg.solver == SolverKind::BayesSa
+        && resolved_engine == EngineKind::Gpu
+    {
+        match BayesSaGpuSolver::new_headless() {
+            Ok(bgpu) => Some(bgpu),
+            Err(err) if cfg.engine_opt.is_none() => {
+                eprintln!(
+                        "Warning: WebGPU unavailable for --solver bayes-sa ({err}); falling back to CPU (f64, bayes-sa)."
+                    );
+                None
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+
     let mut records: Vec<EntryBenchmarkRecord> = Vec::with_capacity(entries.len());
     let mut solver_label = match cfg.solver {
         SolverKind::Standard => "standard".to_string(),
         SolverKind::EvoGraph => "evo-graph".to_string(),
+        SolverKind::BayesSa => "bayes-sa".to_string(),
     };
 
     for entry in entries {
@@ -1928,35 +1963,156 @@ pub fn run_real_benchmark_with_loaders(
         let mut entry_predictions: Vec<(f64, bool)> = Vec::new();
         let mut assign_err: Option<String> = None;
 
-        for s_idx in 0..num_seeds {
-            let cur_seed = cfg.base_seed + (s_idx as u64);
-            let wf = match execute_assignment_workflow(
-                cfg.solver,
-                cfg.engine_opt,
-                &all_peaks,
+        let bayes_prebuilt = if cfg.solver == SolverKind::BayesSa {
+            let use_gpu = shared_bayes_gpu.is_some();
+            let base_bcfg = build_bayes_sa_config_cli(
+                use_gpu,
                 &truth_ref.sequence,
-                &priors,
                 &score_cfg,
+                ToleranceOverrides::default(),
                 cfg.runs_opt,
                 cfg.steps_opt,
-                STANDARD_CPU_CALIBRATED_RUNS,
-                cur_seed,
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    assign_err = Some(e);
-                    break;
-                }
+                cfg.base_seed,
+            );
+            let conditioned = if base_bcfg.enable_weak_root_penalty {
+                condition_peaks_preserving_hsqc_roots(&all_peaks, &base_bcfg.tolerances)
+            } else {
+                all_peaks.clone()
             };
-            solver_label = wf.engine_label.clone();
+            match build_spin_systems(
+                &conditioned,
+                &base_bcfg.tolerances,
+                base_bcfg.max_cands,
+                false,
+            ) {
+                Ok(bsys) => Some((bsys, use_gpu)),
+                Err(reason) => {
+                    records.push(EntryBenchmarkRecord {
+                        outcome: EntryBenchmarkOutcome::Failed(EntryFailureDiagnostic {
+                            stage: "pick".to_string(),
+                            experiment: None,
+                            vendor: hsqc_exp.vendor.clone(),
+                            quad_mode: hsqc_exp.quad_mode_summary.clone(),
+                            nus_status: hsqc_exp.nus_summary.clone(),
+                            reason,
+                        }),
+                        manifest_entry: entry,
+                    });
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        for s_idx in 0..num_seeds {
+            let cur_seed = cfg.base_seed + (s_idx as u64);
+            let (systems_for_seed, res_for_seed, eff_priors, det_off, qcr, elbl) = if let Some((
+                ref bsys,
+                use_gpu,
+            )) =
+                bayes_prebuilt
+            {
+                let bcfg = build_bayes_sa_config_cli(
+                    use_gpu,
+                    &truth_ref.sequence,
+                    &score_cfg,
+                    ToleranceOverrides::default(),
+                    cfg.runs_opt,
+                    cfg.steps_opt,
+                    cur_seed,
+                );
+                let (res, rep, lbl) = if let Some(ref bgpu) = shared_bayes_gpu {
+                    let lbl = format!(
+                        "WebGPU ({}, {}, bayes-sa)",
+                        bgpu.engine.adapter_name, bgpu.engine.backend_name
+                    );
+                    match bgpu.solve_with_peaks(
+                        Some(&all_peaks),
+                        bsys,
+                        &truth_ref.sequence,
+                        &priors,
+                        &bcfg,
+                    ) {
+                        Ok((res, rep)) => (res, rep, lbl),
+                        Err(e) => {
+                            assign_err = Some(e);
+                            break;
+                        }
+                    }
+                } else {
+                    let lbl = if resolved_engine == EngineKind::Gpu {
+                        "CPU (f64, bayes-sa, auto-fallback)".to_string()
+                    } else {
+                        "CPU (f64, bayes-sa)".to_string()
+                    };
+                    let (res, rep) = solve_bayes_sa_with_peaks(
+                        Some(&all_peaks),
+                        bsys,
+                        &truth_ref.sequence,
+                        &priors,
+                        &bcfg,
+                    );
+                    (res, rep, lbl)
+                };
+                if s_idx == 0 && cfg.verbose {
+                    eprintln!(
+                            "[bayes-sa] {}: T_crit={:.4}, max_Cv={:.4}, mu_null={:+.4}, best_energy={:+.3}",
+                            entry.bmrb_id, rep.t_crit, rep.max_cv, rep.mu_null, rep.best_energy
+                        );
+                }
+                let eff = priors.with_offsets(&rep.applied_offsets);
+                let det = rep.detailed_offsets;
+                let qc = rep.qc_report;
+                (bsys.clone(), res, eff, det, qc, lbl)
+            } else {
+                let eff_engine_opt = if cfg.solver == SolverKind::Standard
+                    && resolved_engine == EngineKind::Gpu
+                    && shared_gpu.is_none()
+                {
+                    Some(EngineKind::Cpu)
+                } else {
+                    cfg.engine_opt
+                };
+                let wf = match execute_assignment_workflow_with_options(
+                    cfg.solver,
+                    eff_engine_opt,
+                    &all_peaks,
+                    &truth_ref.sequence,
+                    &priors,
+                    &score_cfg,
+                    ToleranceOverrides::default(),
+                    cfg.runs_opt,
+                    cfg.steps_opt,
+                    STANDARD_CPU_CALIBRATED_RUNS,
+                    cur_seed,
+                    shared_gpu.as_ref(),
+                    shared_bayes_gpu.as_ref(),
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        assign_err = Some(e);
+                        break;
+                    }
+                };
+                (
+                    wf.systems,
+                    wf.result,
+                    wf.effective_priors,
+                    wf.detailed_offsets,
+                    wf.qc_report,
+                    wf.engine_label,
+                )
+            };
+            solver_label = elbl;
 
             let (pred_ref, conf_by_k) = to_reference(
-                &wf.result,
-                &wf.systems,
+                &res_for_seed,
+                &systems_for_seed,
                 &truth_ref.sequence,
                 &truth_ref.seq_ids,
                 0.0,
-                Some(&wf.effective_priors),
+                Some(&eff_priors),
             );
             let mut conf_by_seq_id = BTreeMap::new();
             for (k, c) in conf_by_k {
@@ -1975,8 +2131,8 @@ pub fn run_real_benchmark_with_loaders(
                 assignable_per_seed = eval.assignable;
                 reported_offsets = eval.global_offsets;
                 reported_detailed_offsets = eval.detailed_offsets;
-                reported_prior_detailed_offsets = wf.detailed_offsets;
-                reported_qc_report = wf.qc_report;
+                reported_prior_detailed_offsets = det_off;
+                reported_qc_report = qcr;
             }
             entry_predictions.extend_from_slice(&eval.placed_predictions);
             tot_assignable += eval.assignable;
@@ -2546,7 +2702,7 @@ fn truncate_col(s: &str, width: usize) -> String {
     }
 }
 
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for ch in s.chars() {
         match ch {
@@ -3492,25 +3648,38 @@ mod tests {
             .iter()
             .filter(|e| e.split == "heldout" && e.cohort == "seen_p12")
             .count();
-        let n_cold_p12 = entries.iter().filter(|e| e.cohort == "cold_p12").count();
-        let n_cold_p13 = entries
+        let n_seen_p13 = entries
             .iter()
-            .filter(|e| e.split == "heldout" && e.cohort == "cold_p13")
+            .filter(|e| e.split == "heldout" && e.cohort == "seen_p13")
+            .count();
+        let n_cold_p12 = entries.iter().filter(|e| e.cohort == "cold_p12").count();
+        let n_cold_p13 = entries.iter().filter(|e| e.cohort == "cold_p13").count();
+        let n_cold_p13_w2 = entries
+            .iter()
+            .filter(|e| e.split == "heldout" && e.cohort == "cold_p13_w2")
             .count();
         assert_eq!(n_seen, 6);
         assert_eq!(
             n_cold_p12, 0,
             "cold_p12 was evaluated at v0.8.0 and must be relabeled seen_p12 per P1-7"
         );
+        assert_eq!(
+            n_cold_p13, 0,
+            "cold_p13 was evaluated and must be relabeled seen_p13 per W1 F4"
+        );
         assert!(
             (6..=8).contains(&n_seen_p12),
             "expected 6..=8 seen_p12 entries, got {n_seen_p12}"
         );
         assert!(
-            n_cold_p13 == 0 || (6..=10).contains(&n_cold_p13),
-            "expected 0 (pre-registration pending) or 6..=10 cold_p13 entries, got {n_cold_p13}"
+            (6..=8).contains(&n_seen_p13),
+            "expected 6..=8 seen_p13 entries, got {n_seen_p13}"
         );
-        assert_eq!(n_held, n_seen + n_seen_p12 + n_cold_p13);
+        assert!(
+            n_cold_p13_w2 == 0 || (6..=10).contains(&n_cold_p13_w2),
+            "expected 0 (pre-registration pending) or 6..=10 cold_p13_w2 entries, got {n_cold_p13_w2}"
+        );
+        assert_eq!(n_held, n_seen + n_seen_p12 + n_seen_p13 + n_cold_p13_w2);
         for seen_id in ["5845", "17030", "18145", "51351", "16099", "18489"] {
             let e = entries
                 .iter()
@@ -3519,10 +3688,10 @@ mod tests {
             assert_eq!(e.split, "heldout");
             assert_eq!(e.cohort, "seen_p8_p9");
         }
-        for e in entries
-            .iter()
-            .filter(|e| e.split == "heldout" && (e.cohort == "seen_p12" || e.cohort == "cold_p13"))
-        {
+        for e in entries.iter().filter(|e| {
+            e.split == "heldout"
+                && matches!(e.cohort.as_str(), "seen_p12" | "seen_p13" | "cold_p13_w2")
+        }) {
             let entry_id = e.bmrb_id.as_str();
             let coh = e.cohort.as_str();
             assert!((40..=200).contains(&e.residues));
@@ -3591,14 +3760,20 @@ mod tests {
         }
 
         // Verify `data/benchmark/PROVENANCE.md` pre-registration record embeds the exact
-        // FIPS 180-4 SHA-256 digest of `data/benchmark/real_manifest.tsv` (Q1 governance).
+        // FIPS 180-4 SHA-256 digest of `data/benchmark/real_manifest.tsv` (Q1 governance;
+        // when `n_cold_p13_w2 == 0` prior to Wave 2 cold pre-registration, also accept the exact
+        // `c0dfc76` W1-F4 `cold_p13 -> seen_p13` relabelled digest alongside the W1 `PROVENANCE.md` record).
+        const W1_F4_SEEN_P13_MANIFEST_SHA256: &str =
+            "0ab592d8fecc1e5374da0dbac5ecc84f0068bcdb256152dbfa4fce8477ef7dec";
         let (manifest_sha256, _) = crate::fetch_bmrb::sha256_file_and_size(&manifest_path).unwrap();
         let bench_prov_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/benchmark/PROVENANCE.md");
         let bench_prov_raw = fs::read_to_string(&bench_prov_path)
             .expect("data/benchmark/PROVENANCE.md must exist with pre-registered manifest SHA-256");
+        let digest_ok = bench_prov_raw.contains(&manifest_sha256)
+            || (n_cold_p13_w2 == 0 && manifest_sha256 == W1_F4_SEEN_P13_MANIFEST_SHA256);
         assert!(
-            bench_prov_raw.contains(&manifest_sha256),
+            digest_ok,
             "data/benchmark/PROVENANCE.md does not contain current real_manifest.tsv SHA-256 ({manifest_sha256})"
         );
 
@@ -3614,6 +3789,22 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cfg_std.solver, SolverKind::Standard);
+        let cfg_bayes = parse_real_benchmark_args(&[
+            "--split".to_string(),
+            "dev".to_string(),
+            "--solver".to_string(),
+            "bayes-sa".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(cfg_bayes.solver, SolverKind::BayesSa);
+        let cfg_bayes_alias = parse_real_benchmark_args(&[
+            "--split".to_string(),
+            "dev".to_string(),
+            "--solver".to_string(),
+            "bayes_sa".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(cfg_bayes_alias.solver, SolverKind::BayesSa);
     }
 
     #[test]
@@ -5036,7 +5227,7 @@ mod tests {
         let entries: Vec<RealManifestEntry> = parse_real_manifest_str(&manifest_txt)
             .expect("parse real_manifest.tsv")
             .into_iter()
-            .filter(|e| e.split == "dev" || e.cohort == "cold_p13")
+            .filter(|e| e.split == "dev" || e.cohort == "seen_p13" || e.cohort == "cold_p13")
             .collect();
         let data_root = env::var("NMR_REAL_DATA_DIR")
             .map(|p| PathBuf::from(p).join("private/bmrb"))

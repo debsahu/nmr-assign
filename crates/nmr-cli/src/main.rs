@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
+use nmr_core::bayes_sa::{
+    solve_bayes_sa_from_peaks, BayesSaConfig, BayesSaReport, LockedAssignment,
+};
 use nmr_core::c13_detected::{
     pick_caco_2d, pick_con_2d, pick_con_anchored_3d, simulate_idp_13c_cubes, C13DetectedExp,
     C13PickedDataset, C13PickerConfig, C13Strip3DPeak, Caco2DPeak, CacoPeakKind, Con2DPeak,
@@ -33,7 +36,7 @@ use nmr_core::idp_solver::{
     assign_idp_13c_cpu, idp_to_reference, register_and_build_con_dipeptide_systems,
     ConDipeptideSystem, IdpAssignResult, IdpSolverConfig,
 };
-use nmr_core::nef::{read_nef_file, write_nef_file, NefDocument};
+use nmr_core::nef::{read_nef_file, write_nef_file, write_nef_str, NefDocument};
 use nmr_core::neural_picker::{
     run_e2e_blind_benchmark, E2eBenchmarkConfig, NeuralPicker, NeuralPickerConfig,
 };
@@ -114,6 +117,7 @@ use nmr_core::torsion_db::{
     write_torsions_tsv_with_options, HomologFirewallQuery, TorsionExportOptions,
     TorsionPredictionClass,
 };
+use nmr_gpu::bayes_sa_gpu::BayesSaGpuSolver;
 use nmr_gpu::neural_gpu::{GpuNeuralPicker, GpuNeuralPickerConfig, PRETRAINED_WEIGHTS_3D_GPU};
 use nmr_gpu::rdc_gpu::refine_ensemble_with_rdcs_gpu;
 use nmr_gpu::GpuEngine;
@@ -139,6 +143,17 @@ pub enum EngineRequest {
 pub enum SolverKind {
     Standard,
     EvoGraph,
+    BayesSa,
+}
+
+impl SolverKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::EvoGraph => "evo-graph",
+            Self::BayesSa => "bayes-sa",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,13 +195,13 @@ fn usage() -> String {
      Usage:\n\
        nmrassign --version | -V | version\n\
        nmrassign inspect         <path> [--json]\n\
-       nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
-       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
-       nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--cohort <name>] [--solver evo-graph|standard] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
+       nmrassign benchmark       --star <ref.str> [--realistic] [--seeds 1] [--solver standard|evo-graph|bayes-sa] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--missing 0.06] [--spurious 0.04] [--experiments HSQC,HNCACB,...] [--priors priors.json] [--seed 0] [-v]\n\
+       nmrassign benchmark-suite [--manifest data/benchmark/manifest.tsv] [--solver standard|evo-graph|bayes-sa] [--engine gpu|cpu] [--runs 16] [--steps 1500] [--missing 0.06] [--spurious 0.04] [--seed 0]\n\
+       nmrassign real-benchmark  [--manifest data/benchmark/real_manifest.tsv] --split dev|heldout [--cohort <name>] [--solver evo-graph|standard|bayes-sa] [--engine gpu|cpu] [--seeds 5] [--data-root data/private/bmrb] [--no-crop] [--lp] [--json-out <path>]\n\
        nmrassign fetch-bmrb      --id <bmrb_id> [--dest <dir>] [--dry-run] [--all-archives] [--max-bytes <bytes>]\n\
        nmrassign process         --in <fid_dir> --out <path_or_dir> [--exp <EXP>] [--recipe <json>] [--crop-h 5.5:11.5] [--no-crop] [--lp] [--auto-phase] [--phase-x P0:P1] [--phase-y P0:P1] [--phase-z P0:P1] [--hilbert] [--nus-method fista|ist]\n\
        nmrassign e2e-benchmark   [--star data/fixtures/synthetic_ubiquitin.str] [--noise 1.0] [--seed 42]\n\
-       nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--priors priors.json] [-v]\n\
+       nmrassign assign          [--peaks <peaks.tsv>] (--seq <SEQ|fasta> | --star <ref.str>) --out <prefix> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--r-bleach 11.0] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--con <path>] [--caco <path>] [--canco <path>] [--cbcacon <path>] [--cccon <path>] [--ncaco <path>] [--solver evo-graph|standard|bayes-sa] [--engine auto|gpu|cpu] [--runs 16] [--steps 1500] [--assign-cost 0.0] [--no-auto-ref] [--locks <SPEC>] [--json-out <path>] [--nef-out <path>] [--report-out <path>] [--priors priors.json] [-v]\n\
        nmrassign propensity      --shifts <assigned.str|assigned.nef> [--temp-k 298.15] [--ph <f64>] [--format tsv|json] [-o <out_path>]\n\
        nmrassign torsions        --shifts <assigned.str|assigned.nef> -o <out.tsv|out.nef|out.json> [--include-chi1] [--exclude-pdb <ids>] [--exclude-bmrb <ids>] [--exclude-topology <id>]\n\
        nmrassign score           --pred <pred.str> --truth <truth.str|table.txt> [--peaks <peaks.tsv>] [--assign-tsv <pred.tsv>] [--hc 0.8] [--no-auto-offset] [-v]\n\
@@ -199,15 +214,16 @@ fn usage() -> String {
        nmrassign nef-import      --in <project.nef> [--out-star <shifts.str>] [--out-peaks <peaks.tsv>]\n\
        nmrassign nef-export      --star <shifts.str> [--peaks <peaks.tsv>] --out <project.nef> [--name <entry>]\n\
        nmrassign report          --star|--shifts <shifts.str|shifts.nef> [--peaks <peaks.tsv>] [--pdb <ensemble.pdb>] [--rdc <rdcs.tsv|rdcs.nef>] [--idp-propensity] [--temp-k 298.15] [--ph <f64>] --out <report.html> [--title <name>]\n\
-       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
+       nmrassign pipeline        (--seq <SEQ|fasta> (--hsqc <path> [--triple EXP=path ...] | --fid-hsqc <dir> [--fid-triple EXP=dir ...] | --fid <dir> | --peaks <peaks.tsv>) | --star <entry.str> | --nef <project.nef>) --out-dir <dir> [--regime globular|idp-13c|paramagnetic] [--metal-ligands <SPEC>] [--pdb <model.pdb>] [--pcs <pcs.tsv>] [--temp-k 298.15] [--ph <f64>] [--idp-propensity] [--recipe <json>] [--no-crop] [--lp] [--auto-phase] [--solver evo-graph|standard|bayes-sa] [--no-auto-ref] [--locks <SPEC>] [--method classical|neural] [--engine auto|gpu|cpu] [--fold] [--pdb-ref <ref.pdb>]\n\
        nmrassign serve           [--bind 127.0.0.1:8080] [--storage ./jobs]\n\
        nmrassign chem [info]     (--smiles <smi> | --name <name> | --inchi <inchi> | --peptide <seq> | --input <file>) [--out <file.{{cdxml,cdx,oct,mol,sdf,smi,svg,pdf,png,jdx}}>] [--solvent CDCl3] [--mhz 400]\n",
         version_string()
     )
 }
 
-fn run_solver(
+fn run_solver_with_shared_gpu(
     engine: EngineKind,
+    shared_gpu: Option<&GpuEngine>,
     systems: &[SpinSystem],
     sequence: &[String],
     priors: &Priors,
@@ -216,10 +232,16 @@ fn run_solver(
 ) -> Result<(AssignResult, String), String> {
     match engine {
         EngineKind::Gpu => {
-            let gpu = GpuEngine::new_headless()?;
-            let label = format!("WebGPU ({}, {})", gpu.adapter_name, gpu.backend_name);
-            let res = gpu.assign_gpu(systems, sequence, priors, score_cfg, cfg)?;
-            Ok((res, label))
+            if let Some(gpu) = shared_gpu {
+                let label = format!("WebGPU ({}, {})", gpu.adapter_name, gpu.backend_name);
+                let res = gpu.assign_gpu(systems, sequence, priors, score_cfg, cfg)?;
+                Ok((res, label))
+            } else {
+                let gpu = GpuEngine::new_headless()?;
+                let label = format!("WebGPU ({}, {})", gpu.adapter_name, gpu.backend_name);
+                let res = gpu.assign_gpu(systems, sequence, priors, score_cfg, cfg)?;
+                Ok((res, label))
+            }
         }
         EngineKind::Cpu => {
             let res = assign(systems, sequence, priors, score_cfg, cfg);
@@ -262,8 +284,9 @@ pub(crate) fn parse_solver(val: &str) -> Result<SolverKind, String> {
     match val.to_ascii_lowercase().as_str() {
         "standard" => Ok(SolverKind::Standard),
         "evo-graph" | "evograph" | "evo_graph" => Ok(SolverKind::EvoGraph),
+        "bayes-sa" | "bayessa" | "bayes_sa" => Ok(SolverKind::BayesSa),
         other => Err(format!(
-            "unknown --solver {other:?}; expected standard or evo-graph"
+            "unknown --solver {other:?}; expected standard, evo-graph, or bayes-sa"
         )),
     }
 }
@@ -273,10 +296,10 @@ pub(crate) fn resolve_solver_engine(
     engine_opt: Option<EngineKind>,
 ) -> Result<EngineKind, String> {
     match (solver, engine_opt) {
-        (SolverKind::Standard, Some(e)) => Ok(e),
-        (SolverKind::Standard, None) => Ok(EngineKind::Gpu),
+        (SolverKind::Standard | SolverKind::BayesSa, Some(e)) => Ok(e),
+        (SolverKind::Standard | SolverKind::BayesSa, None) => Ok(EngineKind::Gpu),
         (SolverKind::EvoGraph, Some(EngineKind::Gpu)) => Err(
-            "--engine gpu is not supported with --solver evo-graph (CPU-only); use --engine cpu (or omit --engine) or --solver standard"
+            "--engine gpu is not supported with --solver evo-graph (CPU-only); use --engine cpu (or omit --engine) or --solver standard|bayes-sa"
                 .to_string(),
         ),
         (SolverKind::EvoGraph, _) => Ok(EngineKind::Cpu),
@@ -284,6 +307,7 @@ pub(crate) fn resolve_solver_engine(
 }
 
 pub(crate) struct SolverWorkflowOutput {
+    pub(crate) solver: SolverKind,
     pub(crate) systems: Vec<SpinSystem>,
     pub(crate) kept_hsqc_indices: Option<Vec<usize>>,
     pub(crate) result: AssignResult,
@@ -294,6 +318,7 @@ pub(crate) struct SolverWorkflowOutput {
     pub(crate) engine_label: String,
     pub(crate) replicas: usize,
     pub(crate) steps_per_system: usize,
+    pub(crate) bayes_report: Option<BayesSaReport>,
 }
 
 /// Minimum allowed `--runs` replica / population count across CLI subcommands (`P2`).
@@ -365,7 +390,166 @@ pub(crate) fn register_3d_hn_to_hsqc_adaptive_with_audit(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ToleranceOverrides {
+    pub(crate) h: Option<f64>,
+    pub(crate) n: Option<f64>,
+    pub(crate) ca: Option<f64>,
+    pub(crate) cb: Option<f64>,
+    pub(crate) c: Option<f64>,
+}
+
+impl ToleranceOverrides {
+    pub(crate) fn apply_to(&self, tol: &mut Tolerances) {
+        if let Some(v) = self.h {
+            tol.h = v;
+        }
+        if let Some(v) = self.n {
+            tol.n = v;
+        }
+        if let Some(v) = self.ca {
+            tol.match_ca = v;
+        }
+        if let Some(v) = self.cb {
+            tol.match_cb = v;
+        }
+        if let Some(v) = self.c {
+            tol.match_c = v;
+        }
+    }
+
+    pub(crate) fn is_any(&self) -> bool {
+        self.h.is_some()
+            || self.n.is_some()
+            || self.ca.is_some()
+            || self.cb.is_some()
+            || self.c.is_some()
+    }
+}
+
+pub(crate) fn parse_bounded_tolerance(raw: &str, flag: &str) -> Result<f64, String> {
+    let val: f64 = raw
+        .parse()
+        .map_err(|e| format!("invalid {flag} value {raw:?}: {e} (expected finite ppm > 0)"))?;
+    if !val.is_finite() || !(1e-4..=20.0).contains(&val) {
+        return Err(format!(
+            "{flag} {val} out of allowed bounds (expected finite ppm in 0.0001..=20.0)"
+        ));
+    }
+    Ok(val)
+}
+
+/// Parse CLI `--locks <SPEC>` (e.g. `0:2,5:GLN12,8:#15`) into `(spin_system_idx, residue_idx)` pairs.
+///
+/// Each comma/semicolon/whitespace-separated entry is formatted `SS:RES` or `SS=RES`, where:
+/// - `SS` is a 0-based spin-system (HSQC root) index, and
+/// - `RES` is a residue token (`seq_id` like `2`, residue+`seq_id` like `GLN2` or `Q2`, or `#k` for 0-based residue index `k`).
+pub(crate) fn parse_cli_locks_spec(
+    spec: &str,
+    sequence: &[String],
+    seq_ids: &[i32],
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for raw_tok in spec
+        .split([',', ';', ' ', '\t'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let (ss_raw, res_raw) = raw_tok.split_once([':', '=']).ok_or_else(|| {
+            format!("invalid --locks token {raw_tok:?}; expected SS:RES (e.g. 0:2 or 3:GLN10)")
+        })?;
+        let s_idx: usize = ss_raw
+            .trim()
+            .parse()
+            .map_err(|e| format!("invalid spin-system index in --locks token {raw_tok:?}: {e}"))?;
+        let res_indices = parse_metal_ligands(res_raw.trim(), sequence, seq_ids)
+            .map_err(|e| format!("invalid residue target in --locks token {raw_tok:?}: {e}"))?;
+        if res_indices.len() != 1 {
+            return Err(format!(
+                "invalid residue target in --locks token {raw_tok:?}: expected exactly 1 residue"
+            ));
+        }
+        let k_idx = res_indices[0];
+        if sequence.get(k_idx).is_some_and(|aa| aa == "PRO") {
+            return Err(format!(
+                "cannot lock spin system {s_idx} onto proline residue {} ({raw_tok:?})",
+                seq_ids.get(k_idx).copied().unwrap_or((k_idx + 1) as i32)
+            ));
+        }
+        if out.iter().any(|&(s, _)| s == s_idx) {
+            return Err(format!(
+                "duplicate spin-system index {s_idx} in --locks ({raw_tok:?})"
+            ));
+        }
+        if out.iter().any(|&(_, k)| k == k_idx) {
+            return Err(format!(
+                "duplicate residue target {} in --locks ({raw_tok:?})",
+                seq_ids.get(k_idx).copied().unwrap_or((k_idx + 1) as i32)
+            ));
+        }
+        out.push((s_idx, k_idx));
+    }
+    Ok(out)
+}
+
+pub(crate) fn build_bayes_sa_config_cli(
+    use_gpu_defaults: bool,
+    sequence: &[String],
+    score_cfg: &ScoreConfig,
+    tol_overrides: ToleranceOverrides,
+    runs_opt: Option<usize>,
+    steps_opt: Option<usize>,
+    seed: u64,
+) -> BayesSaConfig {
+    let base = if use_gpu_defaults {
+        BayesSaConfig::default_gpu()
+    } else {
+        BayesSaConfig::default()
+    };
+    let mut cfg = BayesSaConfig {
+        seed,
+        auto_reference: score_cfg.auto_reference,
+        use_hn: score_cfg.use_hn,
+        forbid_zero_carbons: score_cfg.forbid_zero_carbons,
+        forbid_ca_less_excess_roots: score_cfg.forbid_ca_less_excess_roots,
+        sigma_ca: score_cfg.sigma_ca,
+        sigma_cb: score_cfg.sigma_cb,
+        sigma_c: score_cfg.sigma_c,
+        mu_null_override: if score_cfg.assign_cost != 0.0 {
+            Some(score_cfg.assign_cost)
+        } else {
+            None
+        },
+        locked_assignments: score_cfg
+            .locked_assignments
+            .iter()
+            .map(|&(spin_system_idx, residue_idx)| LockedAssignment {
+                spin_system: spin_system_idx,
+                seq_index: residue_idx,
+            })
+            .collect(),
+        ..base
+    };
+    tol_overrides.apply_to(&mut cfg.tolerances);
+    if let Some(v) = tol_overrides.ca {
+        cfg.sigma_ca = v;
+    }
+    if let Some(v) = tol_overrides.cb {
+        cfg.sigma_cb = v;
+    }
+    if let Some(v) = tol_overrides.c {
+        cfg.sigma_c = v;
+    }
+    if let Some(r) = runs_opt {
+        cfg.replicas = r.max(1);
+    }
+    if let Some(st) = steps_opt {
+        cfg.fixed_total_steps = Some(st.saturating_mul(sequence.len().max(1)).max(512));
+    }
+    cfg
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn execute_assignment_workflow(
     solver: SolverKind,
     engine_opt: Option<EngineKind>,
@@ -378,11 +562,46 @@ pub(crate) fn execute_assignment_workflow(
     default_cpu_runs: usize,
     seed: u64,
 ) -> Result<SolverWorkflowOutput, String> {
+    execute_assignment_workflow_with_options(
+        solver,
+        engine_opt,
+        peaks,
+        sequence,
+        priors,
+        score_cfg,
+        ToleranceOverrides::default(),
+        runs_opt,
+        steps_opt,
+        default_cpu_runs,
+        seed,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_assignment_workflow_with_options(
+    solver: SolverKind,
+    engine_opt: Option<EngineKind>,
+    peaks: &[Peak],
+    sequence: &[String],
+    priors: &Priors,
+    score_cfg: &ScoreConfig,
+    tol_overrides: ToleranceOverrides,
+    runs_opt: Option<usize>,
+    steps_opt: Option<usize>,
+    default_cpu_runs: usize,
+    seed: u64,
+    shared_gpu: Option<&GpuEngine>,
+    shared_bayes_gpu: Option<&BayesSaGpuSolver>,
+) -> Result<SolverWorkflowOutput, String> {
     let engine = resolve_solver_engine(solver, engine_opt)?;
 
     match solver {
         SolverKind::Standard => {
-            let systems = build_spin_systems(peaks, &Tolerances::default(), 3, false)?;
+            let mut tol = Tolerances::default();
+            tol_overrides.apply_to(&mut tol);
+            let systems = build_spin_systems(peaks, &tol, 3, false)?;
             let base_detailed = estimate_reference_offsets_detailed(&systems, sequence, priors);
             let (effective_priors, offsets) =
                 prepare_scoring_priors(&systems, sequence, priors, score_cfg);
@@ -403,8 +622,15 @@ pub(crate) fn execute_assignment_workflow(
                 seed,
                 ..AnnealConfig::default()
             };
-            let (mut result, engine_label) =
-                run_solver(engine, &systems, sequence, priors, score_cfg, &anneal_cfg)?;
+            let (mut result, engine_label) = run_solver_with_shared_gpu(
+                engine,
+                shared_gpu,
+                &systems,
+                sequence,
+                priors,
+                score_cfg,
+                &anneal_cfg,
+            )?;
             let mut qc_report = evaluate_dataset_qc(
                 Some(peaks),
                 &systems,
@@ -423,6 +649,7 @@ pub(crate) fn execute_assignment_workflow(
             apply_dataset_qc_to_assignments(&mut result, &qc_report);
             qc_report.already_applied = true;
             Ok(SolverWorkflowOutput {
+                solver,
                 systems,
                 kept_hsqc_indices: None,
                 result,
@@ -433,16 +660,19 @@ pub(crate) fn execute_assignment_workflow(
                 engine_label,
                 replicas: anneal_cfg.runs,
                 steps_per_system: anneal_cfg.steps_per_system,
+                bayes_report: None,
             })
         }
         SolverKind::EvoGraph => {
             let mut evo_cfg = EvoGraphConfig {
                 score_cfg: score_cfg.clone(),
                 auto_reference: score_cfg.auto_reference,
+                locked_assignments: score_cfg.locked_assignments.clone(),
                 structure_torsions: None,
                 seed,
                 ..EvoGraphConfig::default()
             };
+            tol_overrides.apply_to(&mut evo_cfg.tolerances);
             if let Some(r) = runs_opt {
                 evo_cfg.population_size = r.max(4);
                 evo_cfg.num_islands = evo_cfg.num_islands.min(evo_cfg.population_size).max(1);
@@ -475,6 +705,7 @@ pub(crate) fn execute_assignment_workflow(
             };
             let effective_priors = rep.shifted_priors(priors);
             Ok(SolverWorkflowOutput {
+                solver,
                 systems,
                 kept_hsqc_indices: Some(rep.kept_hsqc_indices),
                 result,
@@ -485,6 +716,112 @@ pub(crate) fn execute_assignment_workflow(
                 engine_label,
                 replicas: evo_cfg.population_size,
                 steps_per_system: evo_cfg.generations * evo_cfg.steps_per_system_per_gen,
+                bayes_report: None,
+            })
+        }
+        SolverKind::BayesSa => {
+            let (systems, result, rep, engine_label) = match engine {
+                EngineKind::Cpu => {
+                    let bayes_cfg = build_bayes_sa_config_cli(
+                        false,
+                        sequence,
+                        score_cfg,
+                        tol_overrides,
+                        runs_opt,
+                        steps_opt,
+                        seed,
+                    );
+                    let (sys, res, rep) =
+                        solve_bayes_sa_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
+                    (sys, res, rep, "CPU (f64, bayes-sa)".to_string())
+                }
+                EngineKind::Gpu => {
+                    if let Some(bgpu) = shared_bayes_gpu {
+                        let bayes_cfg = build_bayes_sa_config_cli(
+                            true,
+                            sequence,
+                            score_cfg,
+                            tol_overrides,
+                            runs_opt,
+                            steps_opt,
+                            seed,
+                        );
+                        let lbl = format!(
+                            "WebGPU ({}, {}, bayes-sa)",
+                            bgpu.engine.adapter_name, bgpu.engine.backend_name
+                        );
+                        let (sys, res, rep) =
+                            bgpu.solve_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
+                        (sys, res, rep, lbl)
+                    } else {
+                        match BayesSaGpuSolver::new_headless() {
+                            Ok(bgpu) => {
+                                let bayes_cfg = build_bayes_sa_config_cli(
+                                    true,
+                                    sequence,
+                                    score_cfg,
+                                    tol_overrides,
+                                    runs_opt,
+                                    steps_opt,
+                                    seed,
+                                );
+                                let lbl = format!(
+                                    "WebGPU ({}, {}, bayes-sa)",
+                                    bgpu.engine.adapter_name, bgpu.engine.backend_name
+                                );
+                                let (sys, res, rep) =
+                                    bgpu.solve_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
+                                (sys, res, rep, lbl)
+                            }
+                            Err(err) if engine_opt.is_none() => {
+                                eprintln!(
+                                    "Warning: WebGPU unavailable for --solver bayes-sa ({err}); falling back to CPU (f64, bayes-sa)."
+                                );
+                                let bayes_cfg = build_bayes_sa_config_cli(
+                                    false,
+                                    sequence,
+                                    score_cfg,
+                                    tol_overrides,
+                                    runs_opt,
+                                    steps_opt,
+                                    seed,
+                                );
+                                let (sys, res, rep) =
+                                    solve_bayes_sa_from_peaks(peaks, sequence, priors, &bayes_cfg)?;
+                                (
+                                    sys,
+                                    res,
+                                    rep,
+                                    "CPU (f64, bayes-sa, auto-fallback)".to_string(),
+                                )
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+            };
+            if let Some(ref w) = rep.qc_report.calibration_warning {
+                eprintln!("Warning: [{engine_label}] confidence_calibrated=false — {w}");
+            }
+            let offsets = rep.applied_offsets;
+            let detailed_offsets = rep.detailed_offsets;
+            let qc_report = rep.qc_report.clone();
+            let effective_priors = priors.with_offsets(&offsets);
+            let replicas = rep.replica_best_energies.len();
+            let steps_per_system = rep.total_steps_per_replica / systems.len().max(1);
+            Ok(SolverWorkflowOutput {
+                solver,
+                systems,
+                kept_hsqc_indices: None,
+                result,
+                effective_priors,
+                offsets,
+                detailed_offsets,
+                qc_report,
+                engine_label,
+                replicas,
+                steps_per_system,
+                bayes_report: Some(rep),
             })
         }
     }
@@ -495,8 +832,10 @@ fn format_star_offset_header(
     offsets: &ShiftOffsets,
     detailed_offsets: &DetailedReferenceOffsets,
     qc_report: &DatasetQcReport,
+    bayes_report: Option<&BayesSaReport>,
 ) -> Option<String> {
-    if offsets.is_zero()
+    if bayes_report.is_none()
+        && offsets.is_zero()
         && qc_report.verdict == DatasetQcVerdict::Pass
         && qc_report.confidence_calibrated
     {
@@ -508,6 +847,17 @@ fn format_star_offset_header(
         format!("qc_verdict={}", qc_report.verdict),
         format!("confidence_calibrated={}", qc_report.confidence_calibrated),
     ];
+    if let Some(br) = bayes_report {
+        parts.push(format!(
+            "bayes_sa(t_crit={:.4}, max_cv={:.4}, mu_null={:+.4}, best_energy={:+.3}, stages={}, steps_per_replica={})",
+            br.t_crit,
+            br.max_cv,
+            br.mu_null,
+            br.best_energy,
+            br.total_stages,
+            br.total_steps_per_replica,
+        ));
+    }
     if let Some(ref cw) = qc_report.calibration_warning {
         parts.push(format!("calibration_warning={cw}"));
     }
@@ -529,13 +879,158 @@ fn format_star_offset_header(
     Some(parts.join(" | "))
 }
 
+fn format_report_engine_label(engine_label: &str, bayes_report: Option<&BayesSaReport>) -> String {
+    if let Some(br) = bayes_report {
+        format!(
+            "{engine_label} [T_crit={:.3}, max_Cv={:.2}, mu_null={:+.2}]",
+            br.t_crit, br.max_cv, br.mu_null
+        )
+    } else {
+        engine_label.to_string()
+    }
+}
+
+fn write_nef_with_optional_header(
+    path: &Path,
+    doc: &NefDocument,
+    header_opt: Option<&str>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+        }
+    }
+    let body = write_nef_str(doc);
+    let full = if let Some(hdr) = header_opt {
+        let mut prefix = String::new();
+        for line in hdr.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                prefix.push_str(trimmed);
+            } else {
+                prefix.push_str("# ");
+                prefix.push_str(trimmed);
+            }
+            prefix.push('\n');
+        }
+        format!("{prefix}{body}")
+    } else {
+        body
+    };
+    fs::write(path, full).map_err(|e| format!("failed to write NEF {}: {e}", path.display()))
+}
+
+fn render_assign_workflow_json(
+    wf: &SolverWorkflowOutput,
+    n_assigned_residues: usize,
+    n_high_confidence: usize,
+) -> Result<String, String> {
+    let qc_json = real_benchmark::render_qc_report_json(&wf.qc_report, 2);
+    let detailed_json = real_benchmark::render_detailed_offsets_json(&wf.detailed_offsets, 2);
+    let bayes_json = match wf.bayes_report {
+        Some(ref br) => {
+            let traj = br
+                .cooling_trajectory
+                .iter()
+                .map(|s| {
+                    format!(
+                        "      {{ \"stage\": {}, \"temperature\": {:.6}, \"steps_per_replica\": {}, \"mean_energy\": {:.6}, \"energy_variance\": {:.6}, \"specific_heat_cv\": {:.6}, \"acceptance_rate\": {:.6}, \"min_replica_energy\": {:.6} }}",
+                        s.stage,
+                        s.temperature,
+                        s.steps_per_replica,
+                        s.mean_energy,
+                        s.energy_variance,
+                        s.specific_heat_cv,
+                        s.acceptance_rate,
+                        s.min_replica_energy,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let traj_block = if traj.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("[\n{traj}\n    ]")
+            };
+            format!(
+                "{{\n\
+                 \x20   \"t_crit\": {:.6},\n\
+                 \x20   \"max_cv\": {:.6},\n\
+                 \x20   \"mu_null\": {:.6},\n\
+                 \x20   \"best_energy\": {:.6},\n\
+                 \x20   \"final_mean_energy\": {:.6},\n\
+                 \x20   \"final_energy_variance\": {:.6},\n\
+                 \x20   \"replicas\": {},\n\
+                 \x20   \"total_stages\": {},\n\
+                 \x20   \"total_steps_per_replica\": {},\n\
+                 \x20   \"converged_early\": {},\n\
+                 \x20   \"cooling_trajectory\": {traj_block}\n\
+                 \x20 }}",
+                br.t_crit,
+                br.max_cv,
+                br.mu_null,
+                br.best_energy,
+                br.final_mean_energy,
+                br.final_energy_variance,
+                br.replica_best_energies.len(),
+                br.total_stages,
+                br.total_steps_per_replica,
+                br.converged_early,
+            )
+        }
+        None => "null".to_string(),
+    };
+
+    Ok(format!(
+        "{{\n\
+         \x20 \"version\": \"{}\",\n\
+         \x20 \"solver\": \"{}\",\n\
+         \x20 \"engine_label\": \"{}\",\n\
+         \x20 \"replicas\": {},\n\
+         \x20 \"steps_per_system\": {},\n\
+         \x20 \"n_spin_systems\": {},\n\
+         \x20 \"n_assigned_residues\": {},\n\
+         \x20 \"n_high_confidence\": {},\n\
+         \x20 \"applied_offsets\": {{ \"h\": {:.6}, \"n\": {:.6}, \"ca\": {:.6}, \"cb\": {:.6}, \"c\": {:.6} }},\n\
+         \x20 \"detailed_offsets\": {detailed_json},\n\
+         \x20 \"qc_report\": {qc_json},\n\
+         \x20 \"bayes_sa\": {bayes_json}\n\
+         }}",
+        real_benchmark::json_escape(&version_string()),
+        wf.solver.as_str(),
+        real_benchmark::json_escape(&wf.engine_label),
+        wf.replicas,
+        wf.steps_per_system,
+        wf.systems.len(),
+        n_assigned_residues,
+        n_high_confidence,
+        wf.offsets.h,
+        wf.offsets.n,
+        wf.offsets.ca,
+        wf.offsets.cb,
+        wf.offsets.c,
+    ))
+}
+
 fn log_workflow_diagnostics(
     solver_label: &str,
     offsets: &ShiftOffsets,
     detailed_offsets: &DetailedReferenceOffsets,
     qc_report: &DatasetQcReport,
+    bayes_report: Option<&BayesSaReport>,
     verbose: bool,
 ) {
+    if let Some(br) = bayes_report {
+        eprintln!(
+            "[{solver_label}] Bayesian SA thermodynamics: T_crit={:.4}, max_Cv={:.4}, mu_null={:+.4}, best_energy={:+.3} ({} stages, {} steps/replica)",
+            br.t_crit,
+            br.max_cv,
+            br.mu_null,
+            br.best_energy,
+            br.total_stages,
+            br.total_steps_per_replica,
+        );
+    }
     if !offsets.is_zero() || verbose {
         eprintln!(
             "[{solver_label}] prior reference offsets (experimental - DSS prior; output kept in experimental ppm): {} (applied: {offsets})",
@@ -578,6 +1073,9 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     let mut runs: Option<usize> = None;
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
+    let mut auto_reference = true;
+    let mut locks_spec: Option<String> = None;
+    let mut tol_overrides = ToleranceOverrides::default();
     let mut seed = 0u64;
     let mut num_seeds = 1usize;
     let mut verbose = false;
@@ -648,6 +1146,48 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("{e}"))?;
             }
+            "--no-auto-ref" => {
+                auto_reference = false;
+            }
+            "--locks" => {
+                i += 1;
+                locks_spec = Some(args.get(i).ok_or("missing value for --locks")?.clone());
+            }
+            "--tol-h" => {
+                i += 1;
+                tol_overrides.h = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing value for --tol-h")?,
+                    "--tol-h",
+                )?);
+            }
+            "--tol-n" => {
+                i += 1;
+                tol_overrides.n = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing value for --tol-n")?,
+                    "--tol-n",
+                )?);
+            }
+            "--tol-ca" => {
+                i += 1;
+                tol_overrides.ca = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing value for --tol-ca")?,
+                    "--tol-ca",
+                )?);
+            }
+            "--tol-cb" => {
+                i += 1;
+                tol_overrides.cb = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing value for --tol-cb")?,
+                    "--tol-cb",
+                )?);
+            }
+            "--tol-c" => {
+                i += 1;
+                tol_overrides.c = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing value for --tol-c")?,
+                    "--tol-c",
+                )?);
+            }
             "--seed" => {
                 i += 1;
                 seed = args
@@ -687,9 +1227,37 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     };
 
     let pri = load_priors(priors_path.as_deref())?;
+    let locked_assignments = if let Some(ref spec) = locks_spec {
+        parse_cli_locks_spec(spec, &ref_data.sequence, &ref_data.seq_ids)?
+    } else {
+        Vec::new()
+    };
     let score_cfg = ScoreConfig {
         assign_cost,
+        auto_reference,
+        locked_assignments,
         ..ScoreConfig::default()
+    };
+
+    let resolved_engine = resolve_solver_engine(solver, engine_opt)?;
+    let shared_gpu = if solver == SolverKind::Standard && resolved_engine == EngineKind::Gpu {
+        Some(GpuEngine::new_headless()?)
+    } else {
+        None
+    };
+    let shared_bayes_gpu = if solver == SolverKind::BayesSa && resolved_engine == EngineKind::Gpu {
+        match BayesSaGpuSolver::new_headless() {
+            Ok(bgpu) => Some(bgpu),
+            Err(err) if engine_opt.is_none() => {
+                eprintln!(
+                    "Warning: WebGPU unavailable for --solver bayes-sa ({err}); falling back to CPU (f64, bayes-sa)."
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
     };
 
     let mut total_assignable = 0usize;
@@ -704,6 +1272,10 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
     let mut engine_label = String::new();
     let mut replicas = 0usize;
     let mut steps_per_system = 0usize;
+    let mut sum_t_crit = 0.0f64;
+    let mut sum_max_cv = 0.0f64;
+    let mut sum_mu_null = 0.0f64;
+    let mut n_bayes_reports = 0usize;
 
     for s_idx in 0..num_seeds {
         let cur_seed = seed + (s_idx as u64);
@@ -717,17 +1289,20 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         let (peaks, truth) = simulate(&ref_data, &sim_cfg);
 
         let t0 = Instant::now();
-        let wf = execute_assignment_workflow(
+        let wf = execute_assignment_workflow_with_options(
             solver,
             engine_opt,
             &peaks,
             &ref_data.sequence,
             &pri,
             &score_cfg,
+            tol_overrides,
             runs,
             steps,
             STANDARD_CPU_CALIBRATED_RUNS,
             cur_seed,
+            shared_gpu.as_ref(),
+            shared_bayes_gpu.as_ref(),
         )?;
         let elapsed = t0.elapsed().as_secs_f64();
         total_elapsed += elapsed;
@@ -736,12 +1311,19 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         engine_label = wf.engine_label.clone();
         replicas = wf.replicas;
         steps_per_system = wf.steps_per_system;
+        if let Some(ref br) = wf.bayes_report {
+            sum_t_crit += br.t_crit;
+            sum_max_cv += br.max_cv;
+            sum_mu_null += br.mu_null;
+            n_bayes_reports += 1;
+        }
 
         log_workflow_diagnostics(
             &wf.engine_label,
             &wf.offsets,
             &wf.detailed_offsets,
             &wf.qc_report,
+            wf.bayes_report.as_ref(),
             verbose,
         );
 
@@ -849,6 +1431,15 @@ fn cmd_benchmark(args: &[String]) -> Result<(), String> {
         (total_systems as f64) / (num_seeds as f64)
     );
     println!("engine: {engine_label} ({replicas} replicas, {steps_per_system} steps/system)");
+    if n_bayes_reports > 0 {
+        let denom = n_bayes_reports as f64;
+        println!(
+            "bayes-sa: mean T_crit={:.4}, mean max_Cv={:.4}, mean mu_null={:+.4}",
+            sum_t_crit / denom,
+            sum_max_cv / denom,
+            sum_mu_null / denom,
+        );
+    }
     println!("experiments: {}", exps.join(", "));
     println!("{}", agg.report());
     println!("shift agreement with reference (within tolerance / predicted):");
@@ -2010,6 +2601,12 @@ pub(crate) fn execute_paramagnetic_workflow(
     let mode = match solver {
         SolverKind::Standard => ParamagneticSolverMode::Standard,
         SolverKind::EvoGraph => ParamagneticSolverMode::EvoGraph,
+        SolverKind::BayesSa => {
+            return Err(
+                "--solver bayes-sa is not supported with --regime paramagnetic; use --solver evo-graph or --solver standard"
+                    .to_string(),
+            );
+        }
     };
     let mut anneal_cfg = AnnealConfig {
         seed,
@@ -2070,6 +2667,7 @@ pub(crate) fn execute_paramagnetic_workflow(
                 "paramagnetic-evo-graph CPU (f64)".to_string(),
             )
         }
+        SolverKind::BayesSa => unreachable!(),
     };
 
     let fitted_tensor = if let (Some(pcs_p), Some(pdb_txt)) = (pcs_path, pdb_coordinates.as_deref())
@@ -2094,6 +2692,9 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut seq_arg: Option<String> = None;
     let mut star_arg: Option<String> = None;
     let mut out_arg: Option<String> = None;
+    let mut json_out_path: Option<PathBuf> = None;
+    let mut nef_out_path: Option<PathBuf> = None;
+    let mut report_out_path: Option<PathBuf> = None;
     let mut priors_path: Option<String> = None;
     let mut first_seq_id = 1i32;
     let mut regime = RegimeKind::Globular;
@@ -2119,6 +2720,9 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
     let mut assign_cost_explicit = false;
+    let mut auto_reference = true;
+    let mut locks_spec: Option<String> = None;
+    let mut tol_overrides = ToleranceOverrides::default();
     let mut seed = 0u64;
     let mut verbose = false;
 
@@ -2145,6 +2749,18 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
             "--out" | "-o" => {
                 i += 1;
                 out_arg = args.get(i).cloned();
+            }
+            "--json-out" => {
+                i += 1;
+                json_out_path = Some(PathBuf::from(args.get(i).ok_or("missing --json-out")?));
+            }
+            "--nef-out" => {
+                i += 1;
+                nef_out_path = Some(PathBuf::from(args.get(i).ok_or("missing --nef-out")?));
+            }
+            "--report-out" => {
+                i += 1;
+                report_out_path = Some(PathBuf::from(args.get(i).ok_or("missing --report-out")?));
             }
             "--priors" => {
                 i += 1;
@@ -2269,6 +2885,48 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                     .map_err(|e| format!("{e}"))?;
                 assign_cost_explicit = true;
             }
+            "--no-auto-ref" => {
+                auto_reference = false;
+            }
+            "--locks" => {
+                i += 1;
+                locks_spec = Some(args.get(i).ok_or("missing --locks")?.clone());
+            }
+            "--tol-h" => {
+                i += 1;
+                tol_overrides.h = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-h")?,
+                    "--tol-h",
+                )?);
+            }
+            "--tol-n" => {
+                i += 1;
+                tol_overrides.n = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-n")?,
+                    "--tol-n",
+                )?);
+            }
+            "--tol-ca" => {
+                i += 1;
+                tol_overrides.ca = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-ca")?,
+                    "--tol-ca",
+                )?);
+            }
+            "--tol-cb" => {
+                i += 1;
+                tol_overrides.cb = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-cb")?,
+                    "--tol-cb",
+                )?);
+            }
+            "--tol-c" => {
+                i += 1;
+                tol_overrides.c = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-c")?,
+                    "--tol-c",
+                )?);
+            }
             "--seed" => {
                 i += 1;
                 seed = args
@@ -2347,6 +3005,12 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
         if assign_cost_explicit {
             return Err("--assign-cost is not supported with --regime idp-13c".to_string());
         }
+        if !auto_reference || locks_spec.is_some() || tol_overrides.is_any() {
+            return Err(
+                "--no-auto-ref / --locks / --tol-* are not supported with --regime idp-13c"
+                    .to_string(),
+            );
+        }
     }
 
     let out_prefix = PathBuf::from(out_arg.ok_or("assign requires --out <prefix>")?);
@@ -2412,8 +3076,15 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 .ok_or("assign --regime paramagnetic requires --peaks <peaks.tsv>")?;
             let peaks = read_peaks(p_path)?;
             let pri = load_priors(priors_path.as_deref())?;
+            let locked_assignments = if let Some(ref spec) = locks_spec {
+                parse_cli_locks_spec(spec, &sequence, &seq_ids)?
+            } else {
+                Vec::new()
+            };
             let score_cfg = ScoreConfig {
                 assign_cost,
+                auto_reference,
+                locked_assignments,
                 ..ScoreConfig::default()
             };
             let engine_req = engine_req_opt.unwrap_or(EngineRequest::Auto);
@@ -2481,8 +3152,15 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 .ok_or("assign requires --peaks <peaks.tsv>")?;
             let peaks = read_peaks(p_path)?;
             let pri = load_priors(priors_path.as_deref())?;
+            let locked_assignments = if let Some(ref spec) = locks_spec {
+                parse_cli_locks_spec(spec, &sequence, &seq_ids)?
+            } else {
+                Vec::new()
+            };
             let score_cfg = ScoreConfig {
                 assign_cost,
+                auto_reference,
+                locked_assignments,
                 ..ScoreConfig::default()
             };
             let engine_opt = match engine_req_opt {
@@ -2490,23 +3168,29 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 Some(EngineRequest::Gpu) => Some(EngineKind::Gpu),
                 Some(EngineRequest::Cpu) => Some(EngineKind::Cpu),
             };
-            let wf = execute_assignment_workflow(
+            let t_solve = Instant::now();
+            let wf = execute_assignment_workflow_with_options(
                 solver,
                 engine_opt,
                 &peaks,
                 &sequence,
                 &pri,
                 &score_cfg,
+                tol_overrides,
                 runs,
                 steps,
                 STANDARD_CPU_CALIBRATED_RUNS,
                 seed,
+                None,
+                None,
             )?;
+            let dt_solve = t_solve.elapsed().as_secs_f64();
             log_workflow_diagnostics(
                 &wf.engine_label,
                 &wf.offsets,
                 &wf.detailed_offsets,
                 &wf.qc_report,
+                wf.bayes_report.as_ref(),
                 verbose,
             );
 
@@ -2524,24 +3208,77 @@ fn cmd_assign(args: &[String]) -> Result<(), String> {
                 &wf.offsets,
                 &wf.detailed_offsets,
                 &wf.qc_report,
+                wf.bayes_report.as_ref(),
             );
             write_star_with_header(&str_out, &pred, Some(&conf), star_hdr.as_deref())?;
             write_shifts_tsv(&tsv_out, &pred, &conf)?;
 
             let n_hc = conf.values().filter(|&&c| c >= 0.8).count();
+            if let Some(ref jp) = json_out_path {
+                if let Some(parent) = jp.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                    }
+                }
+                let json_txt = render_assign_workflow_json(&wf, conf.len(), n_hc)?;
+                fs::write(jp, format!("{json_txt}\n"))
+                    .map_err(|e| format!("failed to write {}: {e}", jp.display()))?;
+            }
+            if let Some(ref np) = nef_out_path {
+                let entry_name = out_prefix
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("nmr_assign_project");
+                let nef_doc =
+                    NefDocument::from_reference_and_peaks(entry_name, &pred, Some(&conf), &peaks);
+                write_nef_with_optional_header(np, &nef_doc, star_hdr.as_deref())?;
+            }
+            if let Some(ref rp) = report_out_path {
+                if let Some(parent) = rp.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+                    }
+                }
+                let proj_name = out_prefix
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("nmr_assign_project")
+                    .to_string();
+                let mut rep_in = ReportInput::new(proj_name, pred.clone(), conf.clone());
+                rep_in.n_peaks = Some(peaks.len());
+                rep_in.n_spin_systems = Some(wf.systems.len());
+                rep_in.solver_score = Some(wf.result.score);
+                rep_in.elapsed_secs = Some(dt_solve);
+                rep_in.engine_label = Some(format_report_engine_label(
+                    &wf.engine_label,
+                    wf.bayes_report.as_ref(),
+                ));
+                rep_in.systems_and_assignment = Some((wf.systems.clone(), wf.result.clone()));
+                rep_in.dihedrals = predict_csi_dihedrals(&pred);
+                write_quality_report_html(rp, &rep_in)?;
+            }
+
             let hc_msg = if n_hc == 0 && wf.qc_report.verdict == DatasetQcVerdict::Abstain {
                 "ABSTAIN (0 high-confidence calls; QC capped <= 0.45)".to_string()
             } else {
                 format!("{n_hc} with confidence >= 0.8")
             };
+            let bayes_suffix = if let Some(ref br) = wf.bayes_report {
+                format!(
+                    " | T_crit={:.4}, max_Cv={:.4}, mu_null={:+.4}",
+                    br.t_crit, br.max_cv, br.mu_null
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "[{}] QC={} | {} spin systems; {} residues assigned, {} | offsets: {}",
+                "[{}] QC={} | {} spin systems; {} residues assigned, {} | offsets: {}{bayes_suffix}",
                 wf.engine_label,
                 wf.qc_report.verdict,
                 wf.systems.len(),
                 conf.len(),
                 hc_msg,
-                wf.detailed_offsets.format_compact()
+                wf.detailed_offsets.format_compact(),
             );
             println!("wrote {} and {}", str_out.display(), tsv_out.display());
             Ok(())
@@ -3623,17 +4360,36 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
     let text = fs::read_to_string(&manifest)
         .map_err(|e| format!("failed to read {}: {e}", manifest.display()))?;
     let pri = load_priors(priors_path.as_deref())?;
-    let maybe_gpu = if engine == EngineKind::Gpu {
+    let maybe_gpu = if solver == SolverKind::Standard && engine == EngineKind::Gpu {
         Some(GpuEngine::new_headless()?)
     } else {
         None
     };
-    let engine_banner = match (solver, &maybe_gpu) {
-        (SolverKind::Standard, Some(g)) => {
+    let maybe_bayes_gpu = if solver == SolverKind::BayesSa && engine == EngineKind::Gpu {
+        match BayesSaGpuSolver::new_headless() {
+            Ok(bgpu) => Some(bgpu),
+            Err(err) if engine_opt.is_none() => {
+                eprintln!(
+                    "Warning: WebGPU unavailable for --solver bayes-sa ({err}); falling back to CPU (f64, bayes-sa)."
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+    let engine_banner = match (solver, &maybe_gpu, &maybe_bayes_gpu) {
+        (SolverKind::Standard, Some(g), _) => {
             format!("WebGPU ({}, {})", g.adapter_name, g.backend_name)
         }
-        (SolverKind::Standard, None) => "CPU (f64)".to_string(),
-        (SolverKind::EvoGraph, _) => "CPU (f64, evo-graph)".to_string(),
+        (SolverKind::Standard, None, _) => "CPU (f64)".to_string(),
+        (SolverKind::EvoGraph, _, _) => "CPU (f64, evo-graph)".to_string(),
+        (SolverKind::BayesSa, _, Some(bg)) => format!(
+            "WebGPU ({}, {}, bayes-sa)",
+            bg.engine.adapter_name, bg.engine.backend_name
+        ),
+        (SolverKind::BayesSa, _, None) => "CPU (f64, bayes-sa)".to_string(),
     };
 
     println!(
@@ -3690,17 +4446,20 @@ fn cmd_benchmark_suite(args: &[String]) -> Result<(), String> {
                 score(&res, &truth, 0.8)
             }
             _ => {
-                let wf = execute_assignment_workflow(
+                let wf = execute_assignment_workflow_with_options(
                     solver,
                     engine_opt,
                     &peaks,
                     &ref_data.sequence,
                     &pri,
                     &scfg,
+                    ToleranceOverrides::default(),
                     runs,
                     steps,
                     STANDARD_CPU_CALIBRATED_RUNS,
                     seed,
+                    maybe_gpu.as_ref(),
+                    maybe_bayes_gpu.as_ref(),
                 )?;
                 let eval_truth: Vec<i32> = match &wf.kept_hsqc_indices {
                     Some(kept) => kept
@@ -5501,6 +6260,9 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let mut steps: Option<usize> = None;
     let mut assign_cost = 0.0f64;
     let mut assign_cost_explicit = false;
+    let mut auto_reference = true;
+    let mut locks_spec: Option<String> = None;
+    let mut tol_overrides = ToleranceOverrides::default();
     let mut seed = 0u64;
     let mut name_arg: Option<String> = None;
     let mut out_dir: Option<PathBuf> = None;
@@ -5705,6 +6467,48 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                     .map_err(|e| format!("{e}"))?;
                 assign_cost_explicit = true;
             }
+            "--no-auto-ref" => {
+                auto_reference = false;
+            }
+            "--locks" => {
+                i += 1;
+                locks_spec = Some(args.get(i).ok_or("missing --locks")?.clone());
+            }
+            "--tol-h" => {
+                i += 1;
+                tol_overrides.h = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-h")?,
+                    "--tol-h",
+                )?);
+            }
+            "--tol-n" => {
+                i += 1;
+                tol_overrides.n = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-n")?,
+                    "--tol-n",
+                )?);
+            }
+            "--tol-ca" => {
+                i += 1;
+                tol_overrides.ca = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-ca")?,
+                    "--tol-ca",
+                )?);
+            }
+            "--tol-cb" => {
+                i += 1;
+                tol_overrides.cb = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-cb")?,
+                    "--tol-cb",
+                )?);
+            }
+            "--tol-c" => {
+                i += 1;
+                tol_overrides.c = Some(parse_bounded_tolerance(
+                    args.get(i).ok_or("missing --tol-c")?,
+                    "--tol-c",
+                )?);
+            }
             "--seed" => {
                 i += 1;
                 seed = args
@@ -5804,6 +6608,12 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         }
         if assign_cost_explicit {
             return Err("--assign-cost is not supported with --regime idp-13c".to_string());
+        }
+        if !auto_reference || locks_spec.is_some() || tol_overrides.is_any() {
+            return Err(
+                "--no-auto-ref / --locks / --tol-* are not supported with --regime idp-13c"
+                    .to_string(),
+            );
         }
         if hsqc_path.is_some()
             || fid_bundle_path.is_some()
@@ -6200,8 +7010,15 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
         Some(p) => Priors::from_json(p)?,
         None => Priors::default(),
     };
+    let locked_assignments = if let Some(ref spec) = locks_spec {
+        parse_cli_locks_spec(spec, &base_ref.sequence, &base_ref.seq_ids)?
+    } else {
+        Vec::new()
+    };
     let scfg = ScoreConfig {
         assign_cost,
+        auto_reference,
+        locked_assignments,
         ..ScoreConfig::default()
     };
     let t_solve = Instant::now();
@@ -6211,10 +7028,19 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     let nef_out = dir.join("result.nef");
     let html_out = dir.join("report.html");
     let qc_out = dir.join("qc_report.json");
+    let bayes_json_out = dir.join("bayes_sa_report.json");
 
-    let (pred_ref, conf, systems, result, engine_label, dt_solve, star_hdr, qc_opt) = if regime
-        == RegimeKind::Paramagnetic
-    {
+    let (
+        pred_ref,
+        conf,
+        systems,
+        result,
+        engine_label,
+        report_engine_label,
+        dt_solve,
+        star_hdr,
+        qc_opt,
+    ) = if regime == RegimeKind::Paramagnetic {
         let (sys, res, eff_priors, para_rep, pcs_tensor_opt, elbl) = execute_paramagnetic_workflow(
             solver,
             engine_req_opt.unwrap_or(EngineRequest::Auto),
@@ -6252,19 +7078,23 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
                 t.dchi_ax, t.dchi_rh, t.q_factor,
             ));
         }
-        (pr, cf, sys, res, elbl, dt, Some(hdr), None)
+        let rlbl = elbl.clone();
+        (pr, cf, sys, res, elbl, rlbl, dt, Some(hdr), None)
     } else {
-        let wf = execute_assignment_workflow(
+        let wf = execute_assignment_workflow_with_options(
             solver,
             engine_opt,
             &peaks,
             &base_ref.sequence,
             &pri,
             &scfg,
+            tol_overrides,
             runs,
             steps,
             STANDARD_CPU_CALIBRATED_RUNS,
             seed,
+            None,
+            None,
         )?;
         let dt = t_solve.elapsed().as_secs_f64();
         log_workflow_diagnostics(
@@ -6272,6 +7102,7 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             &wf.offsets,
             &wf.detailed_offsets,
             &wf.qc_report,
+            wf.bayes_report.as_ref(),
             verbose,
         );
         let (pr, cf) = to_reference(
@@ -6282,18 +7113,27 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
             0.0,
             Some(&wf.effective_priors),
         );
+        let n_hc = cf.values().filter(|&&c| c >= 0.8).count();
+        if wf.bayes_report.is_some() {
+            let json_txt = render_assign_workflow_json(&wf, cf.len(), n_hc)?;
+            fs::write(&bayes_json_out, format!("{json_txt}\n"))
+                .map_err(|e| format!("failed to write {}: {e}", bayes_json_out.display()))?;
+        }
         let hdr = format_star_offset_header(
             &wf.engine_label,
             &wf.offsets,
             &wf.detailed_offsets,
             &wf.qc_report,
+            wf.bayes_report.as_ref(),
         );
+        let rlbl = format_report_engine_label(&wf.engine_label, wf.bayes_report.as_ref());
         (
             pr,
             cf,
             wf.systems,
             wf.result,
             wf.engine_label,
+            rlbl,
             dt,
             hdr,
             Some(wf.qc_report),
@@ -6311,14 +7151,14 @@ fn cmd_pipeline(args: &[String]) -> Result<(), String> {
     }
     let nef_doc =
         NefDocument::from_reference_and_peaks(&project_name, &pred_ref, Some(&conf), &peaks);
-    write_nef_file(&nef_out, &nef_doc)?;
+    write_nef_with_optional_header(&nef_out, &nef_doc, star_hdr.as_deref())?;
 
     let mut rep = ReportInput::new(&project_name, pred_ref.clone(), conf.clone());
     rep.n_peaks = Some(peaks.len());
     rep.n_spin_systems = Some(systems.len());
     rep.solver_score = Some(result.score);
     rep.elapsed_secs = Some(dt_solve);
-    rep.engine_label = Some(engine_label.clone());
+    rep.engine_label = Some(report_engine_label);
     rep.systems_and_assignment = Some((systems, result));
     rep.dihedrals = predict_csi_dihedrals(&pred_ref);
     rep.axis_rescue_records = pipeline_axis_audits;
@@ -7729,12 +8569,12 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
         ])
         .unwrap_err();
         assert!(
-            tri_err.contains("expected standard or evo-graph"),
+            tri_err.contains("expected standard, evo-graph, or bayes-sa"),
             "expected unknown solver rejection for tripeptide, got: {tri_err}"
         );
 
-        // 3. Omitting `--solver` defaults to `evo-graph` (`P1-6`), while explicit `--solver standard`
-        //    and `--solver evo-graph` both work cleanly and preserve experimental TMS ppm shifts.
+        // 3. Omitting `--solver` defaults to `evo-graph` (`P1-6`), while explicit `--solver standard`,
+        //    `--solver evo-graph`, and `--solver bayes-sa` all work cleanly and preserve experimental TMS ppm shifts.
         let out_default = dir.join("out_default_solver.str");
         cmd_assign(&[
             "--peaks".into(),
@@ -7756,7 +8596,11 @@ seq#\tresidue\tH\tN\tC\tCA\tsidechains
             default_content.lines().next().unwrap_or("")
         );
 
-        for (tag, solver_name) in [("standard", "standard"), ("evo_graph", "evo-graph")] {
+        for (tag, solver_name) in [
+            ("standard", "standard"),
+            ("evo_graph", "evo-graph"),
+            ("bayes_sa", "bayes-sa"),
+        ] {
             let out_str = dir.join(format!("out_{tag}.str"));
             let args: Vec<String> = vec![
                 "--peaks".into(),
