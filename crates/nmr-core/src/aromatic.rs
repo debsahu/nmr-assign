@@ -4855,17 +4855,22 @@ fn aromatic_ring_position_key(res_name: &str, atom: &str) -> Option<&'static str
     match (res_name, atom) {
         ("PHE" | "TYR", "CD1" | "CD2" | "HD1" | "HD2") => Some("CD"),
         ("PHE" | "TYR", "CE1" | "CE2" | "HE1" | "HE2") => Some("CE"),
-        ("PHE", "CZ" | "HZ") => Some("CZ"),
+        ("PHE" | "TYR", "CZ" | "HZ" | "HH") => Some("CZ"),
+        ("PHE" | "TYR", "CG") => Some("CG"),
         ("TRP", "CD1" | "HD1") => Some("CD1"),
         ("TRP", "NE1" | "HE1") => Some("NE1"),
         ("TRP", "CE3" | "HE3") => Some("CE3"),
         ("TRP", "CZ3" | "HZ3") => Some("CZ3"),
         ("TRP", "CH2" | "HH2") => Some("CH2"),
         ("TRP", "CZ2" | "HZ2") => Some("CZ2"),
+        ("TRP", "CG") => Some("CG"),
+        ("TRP", "CD2") => Some("CD2"),
+        ("TRP", "CE2") => Some("CE2"),
         ("HIS", "CD2" | "HD2") => Some("CD2"),
         ("HIS", "CE1" | "HE1") => Some("CE1"),
-        ("HIS", "ND1") => Some("ND1"),
-        ("HIS", "NE2") => Some("NE2"),
+        ("HIS", "ND1" | "HD1") => Some("ND1"),
+        ("HIS", "NE2" | "HE2") => Some("NE2"),
+        ("HIS", "CG") => Some("CG"),
         _ => None,
     }
 }
@@ -4948,6 +4953,24 @@ fn cluster_atom_shifts_for_residue(
     out
 }
 
+fn his_evidence_from_ring_map(
+    atoms: &BTreeMap<String, f64>,
+    cb_ppm: Option<f64>,
+) -> HisTautomerEvidence {
+    HisTautomerEvidence {
+        nd1_ppm: atoms.get("ND1").copied(),
+        ne2_ppm: atoms.get("NE2").copied(),
+        cg_ppm: atoms.get("CG").copied(),
+        cd2_ppm: atoms.get("CD2").copied(),
+        hd2_ppm: atoms.get("HD2").copied(),
+        ce1_ppm: atoms.get("CE1").copied(),
+        he1_ppm: atoms.get("HE1").copied(),
+        cb_ppm,
+        sample_ph: None,
+        metal_coordinated_hint: false,
+    }
+}
+
 fn merge_aromatic_into_shifts_internal(
     existing_ref: &Reference,
     newly_assigned: &Reference,
@@ -4957,12 +4980,30 @@ fn merge_aromatic_into_shifts_internal(
 ) -> Reference {
     let mut merged = existing_ref.clone();
     if overwrite_existing {
+        // Selective per-atom overwrite: updates ONLY finite shifts explicitly present in
+        // `newly_assigned_atoms`, and NEVER strips curated ring atoms that are absent from
+        // a partial solver cluster!
         for key in newly_assigned_atoms.keys() {
-            if let Some(&val) = newly_assigned.shifts.get(key) {
-                merged.shifts.insert(key.clone(), val);
+            let Some(&val) = newly_assigned.shifts.get(key) else {
+                continue;
+            };
+            if !val.is_finite() {
+                continue;
             }
+            merged.shifts.insert(key.clone(), val);
             if let Some(&code) = newly_assigned.ambiguity_codes.get(key) {
                 merged.ambiguity_codes.insert(key.clone(), code);
+            } else {
+                let res_name = existing_ref
+                    .sequence
+                    .get(key.0)
+                    .or_else(|| newly_assigned.sequence.get(key.0))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                merged.ambiguity_codes.insert(
+                    key.clone(),
+                    default_aromatic_atom_ambiguity_code(res_name, &key.1),
+                );
             }
         }
         return merged;
@@ -4982,49 +5023,102 @@ fn merge_aromatic_into_shifts_internal(
             .unwrap_or("");
         let curated_ring = residue_curated_ring_atoms(existing_ref, k, res_name);
         if !curated_ring.is_empty() {
-            // (a) Reject if any overlapping ring shift in newly_assigned conflicts with curated_ring
+            // (a) Reject if any overlapping ring shift in newly_assigned is non-finite or conflicts with curated_ring
             let has_conflict = curated_ring.iter().any(|(atom, cur_v)| {
                 newly_assigned
                     .shifts
                     .get(&(k, atom.clone()))
-                    .is_some_and(|&new_v| (new_v - *cur_v).abs() > curated_aromatic_atom_tol(atom))
+                    .is_some_and(|&new_v| {
+                        !new_v.is_finite()
+                            || (new_v - *cur_v).abs() > curated_aromatic_atom_tol(atom)
+                    })
             });
             if has_conflict {
                 continue;
             }
 
-            // (b) Count distinct newly proposed CH/NH ring positions on residue k (`newly_assigned_atoms` only;
+            // (b) Count distinct newly proposed CH/NH/N ring positions on residue k (`newly_assigned_atoms` only;
             //     bare cloned shifts absent from `newly_assigned_atoms` are NEVER treated as solver-corroborated!).
             let mut new_positions: BTreeSet<&'static str> = BTreeSet::new();
             for (rk, atom) in newly_assigned_atoms.keys() {
-                if *rk == k {
+                if *rk == k
+                    && newly_assigned
+                        .shifts
+                        .get(&(k, atom.clone()))
+                        .is_some_and(|v| v.is_finite())
+                {
                     if let Some(pos) = aromatic_ring_position_key(res_name, atom) {
                         new_positions.insert(pos);
                     }
                 }
             }
 
-            if new_positions.len() < 2 {
-                // Single-slot (or CB-only) completion onto a pre-curated ring is ONLY permitted when
-                // `assign_aromatic_rings` supplies explicit cluster-observed ring positions (`clu_positions`)
-                // that (i) corroborate at least one curated ring position on `k` and (ii) cover the
-                // residue's complete aromatic ring topology (`{"CD","CE"}` on `TYR`, `{"CD","CE","CZ"}` on `PHE`,
-                // `{"CD2","CE1"}` or `>= 3` positions on `HIS`, `>= 5` indole positions on `TRP`).
-                let mut curated_positions: BTreeSet<&'static str> = BTreeSet::new();
-                for (atom, _) in &curated_ring {
-                    if let Some(pos) = aromatic_ring_position_key(res_name, atom) {
-                        curated_positions.insert(pos);
-                    }
+            let mut curated_positions: BTreeSet<&'static str> = BTreeSet::new();
+            for (atom, _) in &curated_ring {
+                if let Some(pos) = aromatic_ring_position_key(res_name, atom) {
+                    curated_positions.insert(pos);
                 }
-                let mut effective_solver_positions = new_positions.clone();
-                if let Some(corrob) = solver_corroborated_positions.and_then(|m| m.get(&k)) {
-                    for &p in corrob {
-                        effective_solver_positions.insert(p);
-                    }
+            }
+            let mut effective_solver_positions = new_positions.clone();
+            if let Some(corrob) = solver_corroborated_positions.and_then(|m| m.get(&k)) {
+                for &p in corrob {
+                    effective_solver_positions.insert(p);
                 }
-                let corroborates_curated = curated_positions
+            }
+
+            // (c) Mandatory overlap corroboration for ALL merges onto a residue with curated ring shifts
+            //     (regardless of whether `new_positions.len()` is 1, 2, or more!). This blocks chimeric
+            //     merges such as an uncorroborated 2-slot `CD+CE` cluster merging onto curated `CZ` on `PHE`,
+            //     or a cationic `CD2/CE1` cluster merging onto curated `tau` `ND1` on `HIS`.
+            let corroborates_curated = !curated_positions.is_empty()
+                && curated_positions
                     .iter()
                     .any(|p| effective_solver_positions.contains(p));
+            if !corroborates_curated || effective_solver_positions.len() < 2 {
+                continue;
+            }
+
+            // (d) For `HIS` with curated imidazole `15N` (`ND1` or `NE2`), verify that adding the
+            //     proposed CH/N shifts does not create a Pelton neutral-15N vs cationic-CH contradiction!
+            if res_name == "HIS" {
+                let curated_has_n = curated_ring.iter().any(|(a, _)| a == "ND1" || a == "NE2");
+                if curated_has_n {
+                    let cb_ppm = existing_ref
+                        .shifts
+                        .get(&(k, "CB".to_string()))
+                        .copied()
+                        .or_else(|| newly_assigned.shifts.get(&(k, "CB".to_string())).copied());
+                    let cur_map: BTreeMap<String, f64> = curated_ring.iter().cloned().collect();
+                    let mut comb_map = cur_map.clone();
+                    for (rk, atom) in newly_assigned_atoms.keys() {
+                        if *rk == k && !comb_map.contains_key(atom) {
+                            if let Some(&v) = newly_assigned.shifts.get(&(k, atom.clone())) {
+                                if v.is_finite() && is_aromatic_ring_atom("HIS", atom) {
+                                    comb_map.insert(atom.clone(), v);
+                                }
+                            }
+                        }
+                    }
+                    let ev_cur = his_evidence_from_ring_map(&cur_map, cb_ppm);
+                    let ev_comb = his_evidence_from_ring_map(&comb_map, cb_ppm);
+                    let fit_cur = fit_pelton_titration_manifold(&ev_cur);
+                    let fit_comb = fit_pelton_titration_manifold(&ev_comb);
+                    let cls_cur = classify_his_state(&ev_cur).0;
+                    let cls_comb = classify_his_state(&ev_comb).0;
+                    if (fit_cur.d_orth_sq_shift <= 5.991 && fit_comb.d_orth_sq_shift > 7.815)
+                        || (cls_cur != HisStateClassification::MetalCoordinatedCandidate
+                            && cls_comb == HisStateClassification::MetalCoordinatedCandidate)
+                    {
+                        continue;
+                    }
+                }
+            }
+
+            if new_positions.len() < 2 {
+                // Single-slot (or CB-only) completion onto a pre-curated ringadditionally requires
+                // covering the residue's complete aromatic ring topology (`{"CD","CE"}` on `TYR`,
+                // `{"CD","CE","CZ"}` on `PHE`, `{"CD2","CE1"}` or `>= 3` positions on `HIS`,
+                // `>= 5` indole positions on `TRP`).
                 let has_complete_ring = match res_name {
                     "TYR" => {
                         effective_solver_positions.contains("CD")
@@ -5043,7 +5137,7 @@ fn merge_aromatic_into_shifts_internal(
                     "TRP" => effective_solver_positions.len() >= 5,
                     _ => false,
                 };
-                if !(corroborates_curated && has_complete_ring) {
+                if !has_complete_ring {
                     continue;
                 }
             }
@@ -5054,7 +5148,13 @@ fn merge_aromatic_into_shifts_internal(
                 continue;
             }
             if let Some(&val) = newly_assigned.shifts.get(key) {
-                merged.shifts.insert(key.clone(), val);
+                if val.is_finite() {
+                    merged.shifts.insert(key.clone(), val);
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
             }
             if !merged.ambiguity_codes.contains_key(key) {
                 if let Some(&code) = newly_assigned.ambiguity_codes.get(key) {
@@ -5072,9 +5172,14 @@ fn merge_aromatic_into_shifts_internal(
 /// When `overwrite_existing == false` (the safe default):
 /// 1. Keys already present in `existing_ref.shifts` are **never** overwritten (`shifts` and `ambiguity_codes` preserved).
 /// 2. If residue `k` already carries curated aromatic ring shifts in `existing_ref`, any solver ring
-///    that conflicts on an overlapping ring atom OR proposes `< 2` ring positions in `newly_assigned_atoms`
-///    (e.g. a partial `CD`-only fragment or a bare cloned `Reference` plus a disconnected 1-slot `CZ`)
-///    is rejected cleanly rather than producing a chimeric mixed ring.
+///    that conflicts on an overlapping ring atom, fails to overlap and corroborate at least one curated
+///    ring position on `k` (e.g. a non-overlapping `CD+CE` cluster onto curated `CZ` on `PHE`, or cationic
+///    `CE1/HE1` onto curated $\tau$ `ND1` on `HIS`), or proposes `< 2` corroborated ring positions without
+///    full-ring topology is rejected cleanly rather than producing a chimeric mixed ring.
+///
+/// When `overwrite_existing == true`:
+/// - Overwrites only finite shift keys explicitly present in `newly_assigned_atoms` and **never** strips
+///   pre-existing curated ring atoms that are absent from a partial solver cluster.
 pub fn merge_aromatic_into_shifts_with_options(
     existing_ref: &Reference,
     newly_assigned: &Reference,
@@ -5921,17 +6026,10 @@ pub fn assign_aromatic_rings(
                     best_lock_ri = Some((ri, n_matched_scalars, mean_err));
                 }
             } else if n_matched_positions.is_empty() {
-                // Cluster has zero overlap with curated atoms on `ri`: forbid partial 1-slot clusters
-                // (`CD`-only) from ever attaching to a residue that already has curated `CE`/`CZ` shifts!
-                let mut clu_positions: BTreeSet<&'static str> = BTreeSet::new();
-                for &(c_atom, _) in &clu_atoms {
-                    if let Some(pos) = aromatic_ring_position_key(res_name, c_atom) {
-                        clu_positions.insert(pos);
-                    }
-                }
-                if clu_positions.len() < 2 {
-                    weights[ri][ci] = FORBID_SCORE;
-                }
+                // Cluster has zero overlap with curated ring atoms on `ri`: forbid uncorroborated
+                // clusters (even 2-slot `CD+CE` on curated `CZ` `PHE` or cationic `CD2/CE1` on
+                // curated `tau` `ND1` `HIS`) from attaching to a curated residue!
+                weights[ri][ci] = FORBID_SCORE;
             }
         }
 
@@ -6010,9 +6108,15 @@ pub fn assign_aromatic_rings(
                 .find(|&&(ca, _)| ca == cur_a.as_str())
                 .is_some_and(|&(_, cv)| (cv - *cur_v).abs() > curated_aromatic_atom_tol(cur_a))
         });
-        let allow_ring_atom_writes =
-            !clu_conflicts_curated && (curated_per_ri[ri].is_empty() || clu_positions.len() >= 2);
-        if !clu_conflicts_curated {
+        let clu_corroborates_curated = curated_per_ri[ri].is_empty()
+            || curated_per_ri[ri]
+                .iter()
+                .filter_map(|(cur_a, _)| aromatic_ring_position_key(&res_name, cur_a))
+                .any(|p| clu_positions.contains(p));
+        let allow_ring_atom_writes = !clu_conflicts_curated
+            && clu_corroborates_curated
+            && (curated_per_ri[ri].is_empty() || clu_positions.len() >= 2);
+        if !clu_conflicts_curated && clu_corroborates_curated {
             clu_positions_by_k.insert(k, clu_positions);
         }
 

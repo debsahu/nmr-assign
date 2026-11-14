@@ -24,32 +24,99 @@ use serde::{Deserialize, Serialize};
 use crate::noesy::{v_cross, v_dot, v_norm, v_scale, v_sub, PdbChain, PdbResidue, Vec3};
 use crate::rng::Rng;
 
-/// Standard libration-adjusted `1D_NH` dipolar prefactor (Hz) at `r_eff(N-H) = 1.04 A`
+/// Static Engh-Huber covalent `N-H^N` bond length (`1.010 A`) used to place amide protons and
+/// orient the unit vector `u_{NH} = (r_H - r_N) / ||r_H - r_N||`.
+pub const R_NH_GEOM_A: f64 = 1.010;
+/// Vibrationally/librationally averaged `<r^-3>^(-1/3)` effective `N-H^N` bond length (`1.040 A`)
+/// governing [`DMAX_NH_HZ`] (Ottiger & Bax, *J. Am. Chem. Soc.* 1998, 120, 12334-12341).
+pub const R_NH_EFF_A: f64 = 1.040;
+/// Static tetrahedral `CA-HA` bond length (`1.090 A`) used to place chiral L-`HA` and `GLY`
+/// prochiral `HA2`/`HA3` protons (`u_{CAHA} = (r_HA - r_CA) / ||r_HA - r_CA||` is scale-invariant).
+pub const R_CAHA_GEOM_A: f64 = 1.090;
+/// Vibrationally/librationally averaged `<r^-3>^(-1/3)` effective `CA-HA` bond length (`1.105 A`)
+/// governing [`DMAX_CAHA_HZ`] (`D_max(CAHA) / D_max(NH) = 2.068`; Ottiger & Bax, *JACS* 1998).
+pub const R_CAHA_EFF_A: f64 = 1.105;
+
+/// Standard libration-adjusted `1D_NH` dipolar prefactor (Hz) at `r_eff(N-H) = 1.040 A`
 /// (Ottiger & Bax, *J. Am. Chem. Soc.* 1998, 120, 12334-12341).
 pub const DMAX_NH_HZ: f64 = 21655.824475221038;
-/// Standard libration-adjusted `1D_CAHA` dipolar prefactor (Hz) at `r_eff(CA-HA) = 1.105 A`.
+/// Standard libration-adjusted `1D_CAHA` dipolar prefactor (Hz) at `r_eff(CA-HA) = 1.105 A`
+/// (`R_CAHA_EFF_A`; static proton placement uses `R_CAHA_GEOM_A = 1.090 A`).
 pub const DMAX_CAHA_HZ: f64 = 44782.43289695711;
 /// Standard `1D_CACO` dipolar prefactor (Hz) at Engh-Huber `r(CA-C') = 1.525 A`.
 pub const DMAX_CACO_HZ: f64 = 4284.749003486518;
 /// Standard `1D_NC'` dipolar prefactor (Hz) at Engh-Huber `r(N-C') = 1.329 A`.
 pub const DMAX_NCPRIME_HZ: f64 = 2610.0228269156532;
-/// Standard two-bond `2D_HNC'` dipolar prefactor (Hz) across trans-peptide `H_i - C'_{i-1}` (`r_eff = 2.10 A`).
+/// Standard two-bond `^2D(H^N, C')` (`2D_HNC'`, legacy TSV/NEF alias `1D_HNC'`) dipolar prefactor (Hz)
+/// across trans-peptide `H^N_i - C'_{i-1}` (`r_eff = 2.10 A`).
 pub const DMAX_HNCPRIME_HZ: f64 = 6525.095452421265;
 
 /// Maximum permitted condition number on the weighted `(n_work x 5)` Losonczi SVD design matrix.
 pub const MAX_SAUPE_SVD_COND: f64 = 1.0e8;
 
+/// Dipolar sign convention relating experimental `D_obs` (Hz) to `D_max` and gyromagnetic signs.
+///
+/// - [`Self::SignNormalized`] (default; Bax `1D3Z` / Clore `3GB1` convention): `D_max > 0` for all
+///   bond types (`D_calc = +|D_max| * (u^T S u)`), so `15N`-bearing couplings (`1D_NH`, `1D_NC'`,
+///   where `gamma_15N < 0` and isotropic `^1J < 0`) have their negative `gamma_15N` sign absorbed.
+/// - [`Self::PhysicalGammaSign`]: raw gyromagnetic product sign `sgn(gamma_I * gamma_S)` is retained
+///   in `D_obs`, so `15N`-bearing couplings (`1D_NH`, `1D_NC'`) carry negative `D_max < 0`
+///   (`-21655.82 Hz`, `-2610.02 Hz`) while `13C`/`1H` couplings (`1D_CAHA`, `1D_CACO`, `2D_HNC'`)
+///   carry positive `D_max > 0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RdcSignConvention {
+    #[default]
+    SignNormalized,
+    PhysicalGammaSign,
+}
+
+impl RdcSignConvention {
+    pub fn parse_label(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sign_normalized" | "normalized" | "positive_dmax" | "bax" => Ok(Self::SignNormalized),
+            "physical_gamma" | "physical_gamma_sign" | "signed_gamma" | "raw_gamma" => {
+                Ok(Self::PhysicalGammaSign)
+            }
+            other => Err(format!(
+                "unrecognized RDC sign_convention '{other}' (expected 'sign_normalized' or 'physical_gamma')"
+            )),
+        }
+    }
+}
+
+/// Cross-validation holdout stratification mode for `RdcFree` (`Q_free`).
+///
+/// - [`Self::ByPeptidePlane`] (default): groups all couplings on peptide plane `(i-1, i)` —
+///   `1D_NH(i)`, `1D_NC'(i-1, i)`, `2D_HNC'(i-1, i)` (`1D_HNC'`), `1D_CACO(i-1)` — together with
+///   `1D_CAHA(i)` (`HA` or `GLY` `HA2`/`HA3`) into a single holdout unit `plane_id = i`, holding out
+///   identical whole planes across all alignment media so zero coplanar couplings leak orientation
+///   into `Q_free`.
+/// - [`Self::ByCoupling`]: legacy independent per-coupling stratified holdout by `RdcBondType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RdcFreeStratification {
+    #[default]
+    ByPeptidePlane,
+    ByCoupling,
+}
+
 /// Supported backbone internuclear dipolar coupling vector types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RdcBondType {
+    /// One-bond amide `^1D(15N_i, 1H^N_i)` (`r_geom = 1.010 A`, `r_eff = 1.040 A`).
     NH,
+    /// One-bond alpha `^1D(13CA_i, 1HA_i)` (or `GLY` `HA2`/`HA3`; `r_geom = 1.090 A`, `r_eff = 1.105 A`).
     CAHA,
+    /// One-bond backbone `^1D(13CA_i, 13C'_i)` (`r = 1.525 A`).
     CACO,
+    /// One-bond peptide `^1D(13C'_{i-1}, 15N_i)` (`r = 1.329 A`).
     NCPrime,
+    /// Two-bond trans-peptide `^2D(1H^N_i, 13C'_{i-1})` (`2D_HNC'`; legacy TSV/CLI alias `1D_HNC'`).
     HNCPrime,
 }
 
 impl RdcBondType {
+    /// Canonical TSV/CLI identifier (`"1D_HNC'"` retained on [`Self::HNCPrime`] for CLI/NEF compatibility;
+    /// see [`Self::iupac_coupling_label`] for strict bond-order notation `"2D_HNC'"`).
     pub fn canonical_label(self) -> &'static str {
         match self {
             Self::NH => "1D_NH",
@@ -60,6 +127,27 @@ impl RdcBondType {
         }
     }
 
+    /// Strict IUPAC bond-order label (`"2D_HNC'"` for the two-bond `^2D(H^N_i, C'_{i-1})` coupling).
+    pub fn iupac_coupling_label(self) -> &'static str {
+        match self {
+            Self::NH => "1D_NH",
+            Self::CAHA => "1D_CAHA",
+            Self::CACO => "1D_CACO",
+            Self::NCPrime => "1D_NC'",
+            Self::HNCPrime => "2D_HNC'",
+        }
+    }
+
+    /// Sign of the gyromagnetic product `sgn(gamma_I * gamma_S)` (`-1.0` for `15N`-containing
+    /// couplings [`Self::NH`] and [`Self::NCPrime`] since `gamma_15N < 0`; `+1.0` otherwise).
+    #[inline]
+    pub fn physical_gamma_sign(self) -> f64 {
+        match self {
+            Self::NH | Self::NCPrime => -1.0,
+            Self::CAHA | Self::CACO | Self::HNCPrime => 1.0,
+        }
+    }
+
     pub fn default_d_max_hz(self) -> f64 {
         match self {
             Self::NH => DMAX_NH_HZ,
@@ -67,6 +155,17 @@ impl RdcBondType {
             Self::CACO => DMAX_CACO_HZ,
             Self::NCPrime => DMAX_NCPRIME_HZ,
             Self::HNCPrime => DMAX_HNCPRIME_HZ,
+        }
+    }
+
+    /// Default dipolar prefactor `D_max` (Hz) under the requested [`RdcSignConvention`].
+    #[inline]
+    pub fn signed_d_max_hz(self, convention: RdcSignConvention) -> f64 {
+        match convention {
+            RdcSignConvention::SignNormalized => self.default_d_max_hz(),
+            RdcSignConvention::PhysicalGammaSign => {
+                self.default_d_max_hz() * self.physical_gamma_sign()
+            }
         }
     }
 
@@ -179,9 +278,9 @@ impl RdcRestraint {
                 self.sigma_hz, self.seq_id_1, self.atom_name_1
             ));
         }
-        if !self.d_max_hz.is_finite() || self.d_max_hz <= 0.0 {
+        if !self.d_max_hz.is_finite() || self.d_max_hz.abs() <= 1e-9 {
             return Err(format!(
-                "invalid d_max_hz ({}) on {}:{}; must be finite and > 0",
+                "invalid d_max_hz ({}) on {}:{}; must be finite and non-zero (|d_max_hz| > 1e-9)",
                 self.d_max_hz, self.seq_id_1, self.atom_name_1
             ));
         }
@@ -287,6 +386,14 @@ pub fn rdc_q_is_better(candidate_q: f64, incumbent_q: f64) -> bool {
 
 /// Read multi-medium RDC restraints from a TSV file (ASCII-safe).
 pub fn read_rdc_tsv(path: impl AsRef<Path>) -> Result<Vec<RdcMediumSet>, String> {
+    read_rdc_tsv_with_convention(path, RdcSignConvention::SignNormalized)
+}
+
+/// Read multi-medium RDC restraints from a TSV file with an explicit default [`RdcSignConvention`].
+pub fn read_rdc_tsv_with_convention(
+    path: impl AsRef<Path>,
+    default_convention: RdcSignConvention,
+) -> Result<Vec<RdcMediumSet>, String> {
     let bytes = fs::read(path.as_ref())
         .map_err(|e| format!("failed to read RDC TSV '{}': {e}", path.as_ref().display()))?;
     if !bytes.is_ascii() {
@@ -301,19 +408,52 @@ pub fn read_rdc_tsv(path: impl AsRef<Path>) -> Result<Vec<RdcMediumSet>, String>
             path.as_ref().display()
         )
     })?;
-    parse_rdc_tsv_str(text)
+    parse_rdc_tsv_str_with_convention(text, default_convention)
 }
 
-/// Parse multi-medium RDC restraints from ASCII TSV text.
+/// Normalize all RDC restraints in `media` to canonical [`RdcSignConvention::SignNormalized`]
+/// (`d_max_hz > 0`), preserving `d_obs_hz / d_max_hz` identically:
+/// - If a restraint already carries a negative `d_max_hz < 0`, flips both `d_obs_hz` and `d_max_hz`.
+/// - If `source_convention == RdcSignConvention::PhysicalGammaSign` and `d_max_hz > 0` on a
+///   `15N`-bearing bond (`physical_gamma_sign() < 0`), negates `d_obs_hz` to absorb `gamma_15N < 0`.
+pub fn normalize_rdc_sign_convention(
+    media: &mut [RdcMediumSet],
+    source_convention: RdcSignConvention,
+) {
+    for m in media {
+        for r in &mut m.restraints {
+            if r.d_max_hz < 0.0 {
+                r.d_obs_hz = -r.d_obs_hz;
+                r.d_max_hz = -r.d_max_hz;
+            } else if source_convention == RdcSignConvention::PhysicalGammaSign
+                && r.bond_type.physical_gamma_sign() < 0.0
+            {
+                r.d_obs_hz = -r.d_obs_hz;
+            }
+        }
+    }
+}
+
+/// Parse multi-medium RDC restraints from ASCII TSV text (defaulting to [`RdcSignConvention::SignNormalized`]
+/// unless overridden by a `# sign_convention: physical_gamma` header directive or explicit signed `d_max_hz`).
 ///
 /// Expected columns (tab- or whitespace-separated after header):
 /// `medium_id  seq_id_1  res_name_1  atom_name_1  seq_id_2  res_name_2  atom_name_2  bond_type  d_obs_hz  sigma_hz  [d_max_hz]  [is_free]`
 pub fn parse_rdc_tsv_str(text: &str) -> Result<Vec<RdcMediumSet>, String> {
+    parse_rdc_tsv_str_with_convention(text, RdcSignConvention::SignNormalized)
+}
+
+/// Parse multi-medium RDC restraints from ASCII TSV text under an explicit default [`RdcSignConvention`].
+pub fn parse_rdc_tsv_str_with_convention(
+    text: &str,
+    default_convention: RdcSignConvention,
+) -> Result<Vec<RdcMediumSet>, String> {
     let raw_bytes = text.as_bytes();
     if !raw_bytes.is_ascii() {
         return Err("RDC TSV input contains non-ASCII characters".to_string());
     }
 
+    let mut active_convention = default_convention;
     let mut media_map: BTreeMap<String, Vec<RdcRestraint>> = BTreeMap::new();
     let mut media_order: Vec<String> = Vec::new();
 
@@ -324,7 +464,14 @@ pub fn parse_rdc_tsv_str(text: &str) -> Result<Vec<RdcMediumSet>, String> {
             continue;
         }
         let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(comment) = trimmed.strip_prefix('#') {
+            if let Some(rest) = comment.trim().strip_prefix("sign_convention:") {
+                active_convention = RdcSignConvention::parse_label(rest)
+                    .map_err(|e| format!("line {line_no}: {e}"))?;
+            }
             continue;
         }
         let cols: Vec<&str> = if trimmed.contains('\t') {
@@ -363,13 +510,22 @@ pub fn parse_rdc_tsv_str(text: &str) -> Result<Vec<RdcMediumSet>, String> {
             .map_err(|e| format!("line {line_no}: invalid sigma_hz '{}': {e}", cols[9]))?;
         let d_max_hz: f64 = if let Some(c10) = cols.get(10) {
             if c10.is_empty() || *c10 == "." {
-                bond_type.default_d_max_hz()
+                bond_type.signed_d_max_hz(active_convention)
             } else {
-                c10.parse()
-                    .map_err(|e| format!("line {line_no}: invalid d_max_hz '{c10}': {e}"))?
+                let parsed: f64 = c10
+                    .parse()
+                    .map_err(|e| format!("line {line_no}: invalid d_max_hz '{c10}': {e}"))?;
+                if active_convention == RdcSignConvention::PhysicalGammaSign
+                    && parsed > 0.0
+                    && bond_type.physical_gamma_sign() < 0.0
+                {
+                    -parsed
+                } else {
+                    parsed
+                }
             }
         } else {
-            bond_type.default_d_max_hz()
+            bond_type.signed_d_max_hz(active_convention)
         };
         let is_free = if let Some(c11) = cols.get(11) {
             matches!(
@@ -456,56 +612,164 @@ pub fn write_rdc_tsv(path: impl AsRef<Path>, media: &[RdcMediumSet]) -> Result<(
         .map_err(|e| format!("failed to write RDC TSV '{}': {e}", path.as_ref().display()))
 }
 
-/// Deterministically partition a fraction (`free_fraction`, e.g. `0.15` or `0.20`) of RDCs per
-/// alignment medium (stratified by `RdcBondType`) into the held-out `is_free = true` set while
-/// guaranteeing at least 6 working restraints remain per medium.
+/// Canonical peptide-plane / residue holdout identifier `p` for [`RdcFreeStratification::ByPeptidePlane`]:
+/// - Peptide plane `(i-1, i)` couplings (`1D_NH(i)`, `1D_NC'(i-1, i)`, `2D_HNC'(i-1, i)`, `1D_CACO(i-1)`)
+///   and `1D_CAHA(i)` (`HA` or `GLY` `HA2`/`HA3`) all map to `plane_id = i`, guaranteeing zero
+///   coplanar working/free leakage when `plane_id` is held out.
+#[inline]
+pub fn rdc_peptide_plane_id(r: &RdcRestraint) -> i32 {
+    match r.bond_type {
+        RdcBondType::NH | RdcBondType::CAHA => r.seq_id_1.max(r.seq_id_2),
+        RdcBondType::NCPrime | RdcBondType::HNCPrime => r.seq_id_1.max(r.seq_id_2),
+        RdcBondType::CACO => r.seq_id_1.min(r.seq_id_2) + 1,
+    }
+}
+
+/// Deterministically partition a fraction (`free_fraction`, e.g. `0.15` or `0.20`) of RDCs into
+/// the held-out `is_free = true` set using [`RdcFreeStratification::ByPeptidePlane`] by default,
+/// guaranteeing zero split peptide planes and at least 6 working restraints per medium.
 pub fn partition_rdc_free_set(media: &mut [RdcMediumSet], free_fraction: f64, seed: u64) {
+    partition_rdc_free_set_with_mode(
+        media,
+        free_fraction,
+        seed,
+        RdcFreeStratification::ByPeptidePlane,
+    );
+}
+
+/// Deterministically partition RDCs into working (`is_free = false`) and cross-validation free
+/// (`is_free = true`) sets under [`RdcFreeStratification::ByPeptidePlane`] or [`RdcFreeStratification::ByCoupling`].
+pub fn partition_rdc_free_set_with_mode(
+    media: &mut [RdcMediumSet],
+    free_fraction: f64,
+    seed: u64,
+    mode: RdcFreeStratification,
+) {
     let frac = free_fraction.clamp(0.0, 0.5);
     let mut rng = Rng::new(seed ^ 0x5244_435F_4652_4545);
 
-    for m in media {
+    for m in media.iter_mut() {
         for r in &mut m.restraints {
             r.is_free = false;
         }
-        let total = m.restraints.len();
-        if frac <= 0.0 || total <= 6 {
-            continue;
-        }
-        let max_free = total - 6;
-        let target_free = ((total as f64 * frac).round() as usize).clamp(1, max_free);
+    }
+    if frac <= 0.0 || media.is_empty() {
+        return;
+    }
 
-        // Stratified reservoir shuffle by bond_type
-        let mut by_bt: BTreeMap<RdcBondType, Vec<usize>> = BTreeMap::new();
-        for (idx, r) in m.restraints.iter().enumerate() {
-            by_bt.entry(r.bond_type).or_default().push(idx);
-        }
-
-        let mut picked = Vec::new();
-        for indices in by_bt.values_mut() {
-            // Fisher-Yates shuffle
-            for i in (1..indices.len()).rev() {
+    match mode {
+        RdcFreeStratification::ByPeptidePlane => {
+            // Collect unique peptide-plane IDs across all media and their per-medium coupling counts
+            let mut plane_counts: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+            let mut med_totals = vec![0usize; media.len()];
+            let mut grand_total = 0usize;
+            for (m_idx, m) in media.iter().enumerate() {
+                med_totals[m_idx] = m.restraints.len();
+                grand_total += m.restraints.len();
+                for r in &m.restraints {
+                    let pid = rdc_peptide_plane_id(r);
+                    let entry = plane_counts
+                        .entry(pid)
+                        .or_insert_with(|| vec![0usize; media.len()]);
+                    entry[m_idx] += 1;
+                }
+            }
+            if med_totals.iter().all(|&t| t <= 6) || plane_counts.is_empty() {
+                return;
+            }
+            let target_free_total = ((grand_total as f64) * frac).round().max(1.0) as usize;
+            let mut planes: Vec<i32> = plane_counts.keys().copied().collect();
+            for i in (1..planes.len()).rev() {
                 let j = (rng.next_u64() as usize) % (i + 1);
-                indices.swap(i, j);
+                planes.swap(i, j);
             }
-            let k = ((indices.len() as f64 * frac).round() as usize).min(indices.len());
-            picked.extend(indices.iter().copied().take(k));
-        }
-        picked.sort_unstable();
-        picked.dedup();
-        if picked.len() > max_free {
-            picked.truncate(max_free);
-        } else if picked.len() < target_free {
-            for idx in 0..total {
-                if picked.len() >= target_free {
-                    break;
+
+            let mut med_free = vec![0usize; media.len()];
+            let mut total_free = 0usize;
+            let mut selected_planes = std::collections::BTreeSet::new();
+
+            for pid in planes {
+                let counts = &plane_counts[&pid];
+                let add_total: usize = counts.iter().sum();
+                if add_total == 0 {
+                    continue;
                 }
-                if !picked.contains(&idx) {
-                    picked.push(idx);
+                // Ensure holding out `pid` across ALL media keeps n_work >= 6 in every medium with >6 couplings
+                let keeps_min_work = counts.iter().enumerate().all(|(m_idx, &c)| {
+                    if c == 0 {
+                        true
+                    } else if med_totals[m_idx] <= 6 {
+                        false
+                    } else {
+                        med_totals[m_idx] - (med_free[m_idx] + c) >= 6
+                    }
+                });
+                if !keeps_min_work {
+                    continue;
+                }
+                let cur_err = total_free.abs_diff(target_free_total);
+                let next_err = (total_free + add_total).abs_diff(target_free_total);
+                if total_free == 0 || next_err <= cur_err {
+                    selected_planes.insert(pid);
+                    for (m_idx, &c) in counts.iter().enumerate() {
+                        med_free[m_idx] += c;
+                    }
+                    total_free += add_total;
+                    if total_free >= target_free_total {
+                        break;
+                    }
+                }
+            }
+
+            for m in media.iter_mut() {
+                for r in &mut m.restraints {
+                    if selected_planes.contains(&rdc_peptide_plane_id(r)) {
+                        r.is_free = true;
+                    }
                 }
             }
         }
-        for idx in picked {
-            m.restraints[idx].is_free = true;
+        RdcFreeStratification::ByCoupling => {
+            for m in media.iter_mut() {
+                let total = m.restraints.len();
+                if total <= 6 {
+                    continue;
+                }
+                let max_free = total - 6;
+                let target_free = ((total as f64 * frac).round() as usize).clamp(1, max_free);
+
+                let mut by_bt: BTreeMap<RdcBondType, Vec<usize>> = BTreeMap::new();
+                for (idx, r) in m.restraints.iter().enumerate() {
+                    by_bt.entry(r.bond_type).or_default().push(idx);
+                }
+
+                let mut picked = Vec::new();
+                for indices in by_bt.values_mut() {
+                    for i in (1..indices.len()).rev() {
+                        let j = (rng.next_u64() as usize) % (i + 1);
+                        indices.swap(i, j);
+                    }
+                    let k = ((indices.len() as f64 * frac).round() as usize).min(indices.len());
+                    picked.extend(indices.iter().copied().take(k));
+                }
+                picked.sort_unstable();
+                picked.dedup();
+                if picked.len() > max_free {
+                    picked.truncate(max_free);
+                } else if picked.len() < target_free {
+                    for idx in 0..total {
+                        if picked.len() >= target_free {
+                            break;
+                        }
+                        if !picked.contains(&idx) {
+                            picked.push(idx);
+                        }
+                    }
+                }
+                for idx in picked {
+                    m.restraints[idx].is_free = true;
+                }
+            }
         }
     }
 }

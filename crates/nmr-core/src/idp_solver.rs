@@ -544,8 +544,17 @@ pub fn predict_ncidp_shifts(
 // Unlabelled Permutation-Invariant Global `(dN, dC', dCA, dCB)` Offset Estimator
 // ============================================================================
 
+/// Half the 95th-percentile quantile of $\chi^2_1$ ($\frac{1}{2}\chi^2_{1, 0.95} = \frac{1}{2}\times 3.8414588$),
+/// combined with $\ln(N_{\text{grid,eff}})$ for Wilks / Gross–Vitells look-elsewhere hypothesis testing
+/// (`Wilks, Ann. Math. Stat. 1938, 9, 60–62`; `Gross & Vitells, Eur. Phys. J. C 2010, 70, 525–530`).
+const WILKS_HALF_CHI2_1_95: f64 = 1.920_729_410_347_062;
+
 /// Fit a 1D shift offset `d` maximizing the unlabelled sequence-marginal outlier-robust mixture
-/// log-likelihood + Huber IRLS polish over canonically sorted observations `obs_sorted`.
+/// log-likelihood + Huber IRLS polish over canonically sorted observations `obs_sorted`, gated by a
+/// Godambe-adjusted composite-likelihood Wilks + look-elsewhere threshold
+/// (`Rotnitzky & Jewell, Biometrika 1990, 77, 485–497`; `Varin, Reid & Firth, Stat. Sinica 2011, 21, 5–42`;
+/// `Gross & Vitells, Eur. Phys. J. C 2010, 70, 525–530`):
+/// $$\Delta\ell_{\text{crit}} = \lambda_{\text{Godambe}}\left[\ln(N_{\text{grid,eff}}) + \frac{1}{2}\chi^2_{1,0.95}\right], \qquad \lambda_{\text{Godambe}} = s_{\text{harm}}^2\,\frac{1}{n}\sum_{i=1}^n h_i.$$
 fn fit_1d_unlabelled_marginal_offset(
     obs_sorted: &[f64],
     model_sorted: &[(f64, f64)],
@@ -559,6 +568,43 @@ fn fit_1d_unlabelled_marginal_offset(
     let inv_m = 1.0 / (model_sorted.len() as f64);
     let bg = 0.06 / range_ppm.max(4.0);
     let fg = 0.94;
+
+    let inv_s_sum: f64 = model_sorted
+        .iter()
+        .map(|&(_, sd)| 1.0 / (sd * 1.15).max(0.30))
+        .sum();
+    let s_harm = (model_sorted.len() as f64) / inv_s_sum.max(1e-12);
+    let corr_step = (std::f64::consts::SQRT_2 * s_harm).max(0.25);
+    let n_grid_eff = ((2.0 * max_abs_offset) / corr_step).ceil().max(6.0);
+
+    // Mean composite log-density curvature `bar_h = (1/n) sum_i [-d^2/dd^2 ln p(v_i | d)]` at `d = 0`,
+    // giving the dimensionless composite-to-labelled curvature ratio `lambda = s_harm^2 * bar_h`.
+    let godambe_lambda = |d_ref: f64| -> f64 {
+        let h_eps = 0.025f64;
+        let inv_h2 = 1.0 / (h_eps * h_eps);
+        let eval_one = |v: f64, d: f64| -> f64 {
+            let mut density = 0.0f64;
+            for &(mu, sd) in model_sorted {
+                let s_eff = (sd * 1.15).max(0.30);
+                let z = (v - (mu + d)) / s_eff;
+                if z.abs() < 8.0 {
+                    density += inv_m * (-0.5 * z * z).exp() / (s_eff * TAU.sqrt());
+                }
+            }
+            (fg * density + bg).max(1e-30).ln()
+        };
+        let mut h_sum = 0.0f64;
+        for &v in obs_sorted {
+            let lp = eval_one(v, d_ref + h_eps);
+            let l0 = eval_one(v, d_ref);
+            let lm = eval_one(v, d_ref - h_eps);
+            let hi = (-(lp - 2.0 * l0 + lm) * inv_h2).max(0.0);
+            h_sum += hi;
+        }
+        let bar_h = h_sum / (obs_sorted.len() as f64);
+        (s_harm * s_harm * bar_h).clamp(0.12, 1.0)
+    };
+    let ll_crit = godambe_lambda(0.0) * (n_grid_eff.ln() + WILKS_HALF_CHI2_1_95);
 
     let eval_ll = |d: f64| -> f64 {
         let mut ll = -0.04 * d * d;
@@ -655,7 +701,7 @@ fn fit_1d_unlabelled_marginal_offset(
         }
     }
 
-    if eval_ll(d_est) > base_ll + 0.35 && d_est.abs() >= 0.012 {
+    if eval_ll(d_est) > base_ll + ll_crit && d_est.abs() >= 0.015 {
         d_est
     } else {
         0.0
@@ -755,23 +801,48 @@ pub fn estimate_idp_reference_offsets(
 // Unsupervised Inter-Experiment Peak Registration & Spin-System Assembly
 // ============================================================================
 
-/// Estimate 1D relative drift `delta` (`obs ≈ ref + delta`) between two unlabelled shift sets
-/// via smooth Gaussian kernel cross-correlation, probing out to `±probe_max_in` so drifts exceeding
-/// `±max_shift` (`±0.70 ppm`) are explicitly detected and clamped rather than missed in the tail.
-/// Returns `(clamped_d, raw_d)`.
-fn fit_unlabelled_pairwise_drift(
-    diffs_sorted: &[f64],
+/// Estimate 1D relative drift `delta` (`obs ≈ ref + delta`) across per-query-peak / per-root
+/// difference groups via a two-component Gaussian-coincidence vs uniform-background profile
+/// mixture log-likelihood, probing out to `±probe_max_in` and applying the Wilks / Gross–Vitells
+/// look-elsewhere penalty $\Delta\ell_{\text{crit}} = \ln(N_{\text{grid,eff}}) + \frac{1}{2}\chi^2_{1, 0.95}$
+/// together with a minimum distinct-query-unit support guard (`>= 5` distinct query roots/peaks
+/// within `±2.5 * bw` of `best_d`) so sparse unanchored noise spikes never receive $O(M)$
+/// correlated Cartesian-product votes. Returns `(clamped_d, raw_d)`.
+fn fit_unlabelled_pairwise_drift_grouped(
+    groups: &[Vec<f64>],
     max_shift: f64,
     probe_max_in: f64,
     bw: f64,
 ) -> (f64, f64) {
-    if diffs_sorted.len() < 4 {
+    let active: Vec<&[f64]> = groups
+        .iter()
+        .filter(|g| !g.is_empty())
+        .map(|g| g.as_slice())
+        .collect();
+    if active.len() < 5 || bw <= 0.0 {
         return (0.0, 0.0);
     }
+    let mut diffs_sorted: Vec<f64> = Vec::new();
+    for g in &active {
+        diffs_sorted.extend_from_slice(g);
+    }
+    diffs_sorted.sort_by(|a, b| a.total_cmp(b));
+    if diffs_sorted.len() < 5 {
+        return (0.0, 0.0);
+    }
+
     let probe_max = probe_max_in.max(max_shift);
-    let eval = |d: f64| -> f64 {
+    let w_half = diffs_sorted
+        .iter()
+        .fold(probe_max + 3.0 * bw, |acc, &x| acc.max(x.abs()))
+        .max(0.25);
+    let u_bg = 1.0 / (2.0 * w_half);
+    let g_norm = 1.0 / (bw * TAU.sqrt());
+    let mut g_buf = vec![0.0f64; diffs_sorted.len()];
+
+    let eval_kernel = |d: f64| -> f64 {
         let mut s = 0.0f64;
-        for &df in diffs_sorted {
+        for &df in &diffs_sorted {
             let z = (df - d) / bw;
             if z.abs() < 6.0 {
                 s += (-0.5 * z * z).exp();
@@ -779,27 +850,75 @@ fn fit_unlabelled_pairwise_drift(
         }
         s
     };
-    let base = eval(0.0);
+
+    let mut eval_profile_ll = |d: f64| -> f64 {
+        for (slot, &df) in g_buf.iter_mut().zip(diffs_sorted.iter()) {
+            let z = (df - d) / bw;
+            *slot = if z.abs() < 8.0 {
+                g_norm * (-0.5 * z * z).exp()
+            } else {
+                0.0
+            };
+        }
+        // Strictly concave 1D EM maximization over coincidence fraction `pi in [0.0, 0.98]`
+        let inv_n = 1.0 / (diffs_sorted.len() as f64);
+        let mut pi = 0.18f64;
+        for _ in 0..14 {
+            let mut post_sum = 0.0f64;
+            for &g in &g_buf {
+                let num = pi * g;
+                let den = num + (1.0 - pi) * u_bg;
+                if den > 1e-30 {
+                    post_sum += num / den;
+                }
+            }
+            let next_pi = (post_sum * inv_n).clamp(0.0, 0.98);
+            if (next_pi - pi).abs() < 1e-6 {
+                pi = next_pi;
+                break;
+            }
+            pi = next_pi;
+        }
+        let mut ll = 0.0f64;
+        for &g in &g_buf {
+            ll += (pi * g + (1.0 - pi) * u_bg).max(1e-30).ln();
+        }
+        ll
+    };
+
     let mut best_d = 0.0f64;
-    let mut best_s = base;
+    let mut best_s = eval_kernel(0.0);
     for step in -140i32..=140 {
         let d = (step as f64) * (probe_max / 140.0);
-        let sc = eval(d);
+        let sc = eval_kernel(d);
         if sc > best_s {
             best_s = sc;
             best_d = d;
         }
     }
     let d0 = best_d;
+    let mut best_ll = eval_profile_ll(d0);
+    best_d = d0;
     for step in -10i32..=10 {
         let d = (d0 + (step as f64) * 0.002).clamp(-probe_max, probe_max);
-        let sc = eval(d);
-        if sc > best_s {
-            best_s = sc;
+        let ll = eval_profile_ll(d);
+        if ll > best_ll {
+            best_ll = ll;
             best_d = d;
         }
     }
-    if best_s > base * 1.05 && best_d.abs() >= 0.01 {
+
+    let distinct_hits = active
+        .iter()
+        .filter(|g| g.iter().any(|&df| (df - best_d).abs() <= 2.5 * bw))
+        .count();
+    let base_ll = eval_profile_ll(0.0);
+    let n_grid_eff = ((2.0 * probe_max) / (std::f64::consts::SQRT_2 * bw))
+        .ceil()
+        .max(12.0);
+    let ll_crit = n_grid_eff.ln() + WILKS_HALF_CHI2_1_95;
+
+    if distinct_hits >= 5 && best_ll > base_ll + ll_crit && best_d.abs() >= 0.012 {
         (best_d.clamp(-max_shift, max_shift), best_d)
     } else {
         (0.0, 0.0)
@@ -874,97 +993,152 @@ pub fn register_and_build_con_dipeptide_systems(
 
     // 1. Align `CBCACON` and `CCC(CO)N` indirect aliphatic axes onto `CANCO`'s `13CA` frame first
     let has_canco = canco_by_root.iter().any(|v| !v.is_empty());
-    let mut diffs_cbca_vs_canco = Vec::new();
+    let mut groups_cbca_vs_canco: Vec<Vec<f64>> = Vec::with_capacity(n_roots);
     if has_canco {
         for r in 0..n_roots {
+            let mut grp = Vec::new();
             for &(ca_cb, sgn, _) in &cbca_by_root[r] {
                 if sgn >= 0 && (39.0..=71.0).contains(&ca_cb) {
                     for &(ca_cn, _) in &canco_by_root[r] {
                         let df = ca_cb - ca_cn;
                         if df.abs() <= 1.80 {
-                            diffs_cbca_vs_canco.push(df);
+                            grp.push(df);
                         }
                     }
                 }
             }
+            if !grp.is_empty() {
+                groups_cbca_vs_canco.push(grp);
+            }
         }
     }
-    diffs_cbca_vs_canco.sort_by(|a, b| a.total_cmp(b));
-    let (d_cbca_aliph, raw_cbca_aliph) = fit_unlabelled_pairwise_drift(
-        &diffs_cbca_vs_canco,
+    let (d_cbca_aliph, raw_cbca_aliph) = fit_unlabelled_pairwise_drift_grouped(
+        &groups_cbca_vs_canco,
         SOLVER_MAX_INTER_EXP_DRIFT_PPM,
         1.60,
         0.045,
     );
     record_drift_warn("CBCACON_aliph", d_cbca_aliph, raw_cbca_aliph);
 
-    let mut diffs_cccon_vs_ref = Vec::new();
+    let mut groups_cccon_vs_ref: Vec<Vec<f64>> = Vec::with_capacity(n_roots);
     for r in 0..n_roots {
+        let mut grp = Vec::new();
         for &(c_cc, _) in &cccon_by_root[r] {
             for &(ca_cn, _) in &canco_by_root[r] {
                 let df = c_cc - ca_cn;
                 if df.abs() <= 1.80 {
-                    diffs_cccon_vs_ref.push(df);
+                    grp.push(df);
                 }
             }
             for &(c_cb, _, _) in &cbca_by_root[r] {
                 let df = c_cc - (c_cb - d_cbca_aliph);
                 if df.abs() <= 1.80 {
-                    diffs_cccon_vs_ref.push(df);
+                    grp.push(df);
                 }
             }
         }
+        if !grp.is_empty() {
+            groups_cccon_vs_ref.push(grp);
+        }
     }
-    diffs_cccon_vs_ref.sort_by(|a, b| a.total_cmp(b));
-    let (d_cccon_aliph, raw_cccon_aliph) = fit_unlabelled_pairwise_drift(
-        &diffs_cccon_vs_ref,
+    let (d_cccon_aliph, raw_cccon_aliph) = fit_unlabelled_pairwise_drift_grouped(
+        &groups_cccon_vs_ref,
         SOLVER_MAX_INTER_EXP_DRIFT_PPM,
         1.60,
         0.045,
     );
     record_drift_warn("CCCON_aliph", d_cccon_aliph, raw_cccon_aliph);
 
-    // 2. Align `2D CACO` `(C', CA)` onto `(CON C', CANCO/CBCACON CA)` frame BEFORE `NCACO` gating
+    // 2. Align `2D CACO` `(C', CA)` onto `(CON C', CANCO/CBCACON CA)` frame BEFORE `NCACO` gating,
+    // gating `C'` candidate differences by shared residue `(k-1)` `13CA` compatibility so narrow
+    // random-coil `13C'` dispersion never drowns diagonal matches in $O(N^2)$ cross-residue pairs.
     let (d_caco_c, d_caco_ca) = if picked.caco_peaks.len() >= 5 {
-        let mut diffs_c = Vec::new();
-        for cp in &picked.caco_peaks {
-            for r in &picked.con_roots {
-                let df = cp.c_curr_ppm - r.c_prev_ppm;
-                if df.abs() <= 0.90 {
-                    diffs_c.push(df);
+        let root_ca_refs: Vec<Vec<f64>> = (0..n_roots)
+            .map(|r_idx| {
+                let mut v: Vec<f64> = canco_by_root[r_idx].iter().map(|&(ca, _)| ca).collect();
+                for &(ca_cb, sgn, _) in &cbca_by_root[r_idx] {
+                    if sgn >= 0 && (39.0..=71.0).contains(&ca_cb) {
+                        v.push(ca_cb - d_cbca_aliph);
+                    }
                 }
-            }
-        }
-        diffs_c.sort_by(|a, b| a.total_cmp(b));
-        let (dc, raw_dc) =
-            fit_unlabelled_pairwise_drift(&diffs_c, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.035);
-        record_drift_warn("CACO_C'", dc, raw_dc);
+                v
+            })
+            .collect();
+        let has_any_root_ca = root_ca_refs.iter().any(|v| !v.is_empty());
 
-        let mut diffs_ca = Vec::new();
-        for cp in &picked.caco_peaks {
-            let c_corr = cp.c_curr_ppm - dc;
-            for (r_idx, r) in picked.con_roots.iter().enumerate() {
-                if (c_corr - r.c_prev_ppm).abs() <= 0.06 {
-                    for &(ca_cn, _) in &canco_by_root[r_idx] {
-                        let df = cp.ca_curr_ppm - ca_cn;
-                        if df.abs() <= 1.80 {
-                            diffs_ca.push(df);
+        let build_caco_c_groups = |ca_offset: f64, ca_gate_tol: f64| -> Vec<Vec<f64>> {
+            let mut grps: Vec<Vec<f64>> = Vec::with_capacity(picked.caco_peaks.len());
+            for cp in &picked.caco_peaks {
+                let ca_corr = cp.ca_curr_ppm - ca_offset;
+                let mut grp = Vec::new();
+                for (r_idx, r) in picked.con_roots.iter().enumerate() {
+                    let ca_ok = !has_any_root_ca
+                        || root_ca_refs[r_idx]
+                            .iter()
+                            .any(|&ca_r| (ca_corr - ca_r).abs() <= ca_gate_tol);
+                    if ca_ok {
+                        let df = cp.c_curr_ppm - r.c_prev_ppm;
+                        if df.abs() <= 0.90 {
+                            grp.push(df);
                         }
                     }
-                    for &(ca_cb, sgn, _) in &cbca_by_root[r_idx] {
-                        if sgn >= 0 {
-                            let df = cp.ca_curr_ppm - (ca_cb - d_cbca_aliph);
-                            if df.abs() <= 1.80 {
-                                diffs_ca.push(df);
-                            }
+                }
+                if !grp.is_empty() {
+                    grps.push(grp);
+                }
+            }
+            grps
+        };
+
+        let grps_c_1 = build_caco_c_groups(0.0, 1.65);
+        let (dc_1, raw_dc_1) = fit_unlabelled_pairwise_drift_grouped(
+            &grps_c_1,
+            SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+            0.80,
+            0.035,
+        );
+
+        let mut grps_ca: Vec<Vec<f64>> = Vec::with_capacity(picked.caco_peaks.len());
+        for cp in &picked.caco_peaks {
+            let c_corr = cp.c_curr_ppm - dc_1;
+            let mut grp = Vec::new();
+            for (r_idx, r) in picked.con_roots.iter().enumerate() {
+                if (c_corr - r.c_prev_ppm).abs() <= 0.065 {
+                    for &ca_r in &root_ca_refs[r_idx] {
+                        let df = cp.ca_curr_ppm - ca_r;
+                        if df.abs() <= 1.80 {
+                            grp.push(df);
                         }
                     }
                 }
             }
+            if !grp.is_empty() {
+                grps_ca.push(grp);
+            }
         }
-        diffs_ca.sort_by(|a, b| a.total_cmp(b));
-        let (dca, raw_dca) =
-            fit_unlabelled_pairwise_drift(&diffs_ca, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 1.60, 0.045);
+        let (dca, raw_dca) = fit_unlabelled_pairwise_drift_grouped(
+            &grps_ca,
+            SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+            1.60,
+            0.045,
+        );
+
+        let (dc, raw_dc) = if has_any_root_ca {
+            let grps_c_2 = build_caco_c_groups(dca, 0.22);
+            if grps_c_2.len() >= 5 {
+                fit_unlabelled_pairwise_drift_grouped(
+                    &grps_c_2,
+                    SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+                    0.80,
+                    0.035,
+                )
+            } else {
+                (dc_1, raw_dc_1)
+            }
+        } else {
+            (dc_1, raw_dc_1)
+        };
+        record_drift_warn("CACO_C'", dc, raw_dc);
         record_drift_warn("CACO_CA", dca, raw_dca);
         (dc, dca)
     } else {
@@ -988,16 +1162,15 @@ pub fn register_and_build_con_dipeptide_systems(
     // attachment and fanout-multiplicity downweighting so degenerate `15N` planes never broadcast
     // spurious or neighboring `NCACO` peaks unpenalized across unrelated `CON` roots!
     let d_ncaco_n_anch = if !anchored_ncaco.is_empty() {
-        let mut diffs_anch_n = Vec::new();
+        let mut grps_anch_n: Vec<Vec<f64>> = Vec::with_capacity(anchored_ncaco.len());
         for &(r_idx, _, n_p, _, _) in &anchored_ncaco {
             let df = n_p - picked.con_roots[r_idx].n_curr_ppm;
             if df.abs() <= 1.80 {
-                diffs_anch_n.push(df);
+                grps_anch_n.push(vec![df]);
             }
         }
-        diffs_anch_n.sort_by(|a, b| a.total_cmp(b));
-        let (d, raw_d) = fit_unlabelled_pairwise_drift(
-            &diffs_anch_n,
+        let (d, raw_d) = fit_unlabelled_pairwise_drift_grouped(
+            &grps_anch_n,
             SOLVER_MAX_INTER_EXP_DRIFT_PPM,
             1.60,
             0.055,
@@ -1008,63 +1181,84 @@ pub fn register_and_build_con_dipeptide_systems(
         0.0
     };
 
-    let d_ncaco_n_unanch = if !unanchored_ncaco.is_empty() {
-        let mut diffs_nc_n = Vec::new();
+    let d_ncaco_n_unanch = if unanchored_ncaco.is_empty() {
+        0.0
+    } else if unanchored_ncaco.len() < 10 && anchored_ncaco.len() >= unanchored_ncaco.len() {
+        // Residual unanchored peaks from the same 3D NCACO cube inherit its anchored 15N carrier drift
+        d_ncaco_n_anch
+    } else {
+        let mut grps_nc_n: Vec<Vec<f64>> = Vec::with_capacity(unanchored_ncaco.len());
         for &(_, n_p, _, _) in &unanchored_ncaco {
+            let mut grp = Vec::new();
             for r in &picked.con_roots {
                 let df = n_p - r.n_curr_ppm;
                 if df.abs() <= 0.92 {
-                    diffs_nc_n.push(df);
+                    grp.push(df);
                 }
             }
+            if !grp.is_empty() {
+                grps_nc_n.push(grp);
+            }
         }
-        diffs_nc_n.sort_by(|a, b| a.total_cmp(b));
-        let (d, raw_d) =
-            fit_unlabelled_pairwise_drift(&diffs_nc_n, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.055);
+        let (d, raw_d) = fit_unlabelled_pairwise_drift_grouped(
+            &grps_nc_n,
+            SOLVER_MAX_INTER_EXP_DRIFT_PPM,
+            0.80,
+            0.055,
+        );
         record_drift_warn("NCACO_unanch_N", d, raw_d);
         d
-    } else {
-        0.0
     };
 
-    let mut diffs_ncaco_vs_canco = Vec::new();
+    let mut grps_ncaco_vs_canco: Vec<Vec<f64>> = Vec::new();
     if has_canco {
         for &(r_idx, _, n_p, ca_p, _) in &anchored_ncaco {
             if ((n_p - d_ncaco_n_anch) - picked.con_roots[r_idx].n_curr_ppm).abs() <= 0.16 {
+                let mut grp = Vec::new();
                 for &(ca_cn, _) in &canco_by_root[r_idx] {
                     let df = ca_p - ca_cn;
                     if df.abs() <= 1.80 {
-                        diffs_ncaco_vs_canco.push(df);
+                        grp.push(df);
                     }
+                }
+                if !grp.is_empty() {
+                    grps_ncaco_vs_canco.push(grp);
                 }
             }
         }
         for &(_, n_p, ca_p, _) in &unanchored_ncaco {
             let n_corr = n_p - d_ncaco_n_unanch;
+            let mut grp = Vec::new();
             for (r_idx, r) in picked.con_roots.iter().enumerate() {
                 if (n_corr - r.n_curr_ppm).abs() <= 0.14 {
                     for &(ca_cn, _) in &canco_by_root[r_idx] {
                         let df = ca_p - ca_cn;
                         if df.abs() <= 1.80 {
-                            diffs_ncaco_vs_canco.push(df);
+                            grp.push(df);
                         }
                     }
                 }
             }
+            if !grp.is_empty() {
+                grps_ncaco_vs_canco.push(grp);
+            }
         }
     } else if !caco_corr.is_empty() {
         for &(_, _, ca_p, _) in &unanchored_ncaco {
+            let mut grp = Vec::new();
             for &(_, ca_co, _, _) in &caco_corr {
                 let df = ca_p - ca_co;
                 if df.abs() <= 0.92 {
-                    diffs_ncaco_vs_canco.push(df);
+                    grp.push(df);
                 }
+            }
+            if !grp.is_empty() {
+                grps_ncaco_vs_canco.push(grp);
             }
         }
     }
-    diffs_ncaco_vs_canco.sort_by(|a, b| a.total_cmp(b));
-    let (d_ncaco_ca, raw_ncaco_ca) = fit_unlabelled_pairwise_drift(
-        &diffs_ncaco_vs_canco,
+    let (d_ncaco_ca, raw_ncaco_ca) = fit_unlabelled_pairwise_drift_grouped(
+        &grps_ncaco_vs_canco,
         SOLVER_MAX_INTER_EXP_DRIFT_PPM,
         0.90,
         0.045,
@@ -1072,43 +1266,44 @@ pub fn register_and_build_con_dipeptide_systems(
     record_drift_warn("NCACO_CA", d_ncaco_ca, raw_ncaco_ca);
 
     let fit_ncaco_c_drift = |pks: &[(f64, f64)]| -> (f64, f64) {
-        if pks.len() < 4 {
+        if pks.len() < 5 {
             return (0.0, 0.0);
         }
-        let mut diffs = Vec::new();
+        let mut grps: Vec<Vec<f64>> = Vec::with_capacity(pks.len());
         if caco_corr.len() >= 5 {
             for &(c_p, ca_p) in pks {
                 let ca_corr = ca_p - d_ncaco_ca;
+                let mut grp = Vec::new();
                 for &(c_co, ca_co, _, _) in &caco_corr {
                     if (ca_corr - ca_co).abs() <= 0.16 {
                         let df = c_p - c_co;
                         if df.abs() <= 0.90 {
-                            diffs.push(df);
+                            grp.push(df);
                         }
                     }
                 }
-            }
-        }
-        if diffs.len() < 4 {
-            for &(c_p, _) in pks {
-                for r in &picked.con_roots {
-                    let df = c_p - r.c_prev_ppm;
-                    if df.abs() <= 0.90 {
-                        diffs.push(df);
-                    }
+                if !grp.is_empty() {
+                    grps.push(grp);
                 }
             }
         }
-        diffs.sort_by(|a, b| a.total_cmp(b));
-        fit_unlabelled_pairwise_drift(&diffs, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.035)
+        if grps.len() < 5 {
+            grps.clear();
+            for &(c_p, _) in pks {
+                let mut grp = Vec::new();
+                for r in &picked.con_roots {
+                    let df = c_p - r.c_prev_ppm;
+                    if df.abs() <= 0.90 {
+                        grp.push(df);
+                    }
+                }
+                if !grp.is_empty() {
+                    grps.push(grp);
+                }
+            }
+        }
+        fit_unlabelled_pairwise_drift_grouped(&grps, SOLVER_MAX_INTER_EXP_DRIFT_PPM, 0.80, 0.035)
     };
-
-    let unanch_pairs: Vec<(f64, f64)> = unanchored_ncaco
-        .iter()
-        .map(|&(c_p, _, ca_p, _)| (c_p, ca_p))
-        .collect();
-    let (d_ncaco_c_unanch, raw_ncaco_c_unanch) = fit_ncaco_c_drift(&unanch_pairs);
-    record_drift_warn("NCACO_unanch_C'", d_ncaco_c_unanch, raw_ncaco_c_unanch);
 
     let mut uniq_anch_pairs: Vec<(f64, f64)> = anchored_ncaco
         .iter()
@@ -1118,6 +1313,20 @@ pub fn register_and_build_con_dipeptide_systems(
     uniq_anch_pairs.dedup_by(|a, b| (a.0 - b.0).abs() <= 0.005 && (a.1 - b.1).abs() <= 0.01);
     let (d_ncaco_c_anch, raw_ncaco_c_anch) = fit_ncaco_c_drift(&uniq_anch_pairs);
     record_drift_warn("NCACO_anch_C'", d_ncaco_c_anch, raw_ncaco_c_anch);
+
+    let unanch_pairs: Vec<(f64, f64)> = unanchored_ncaco
+        .iter()
+        .map(|&(c_p, _, ca_p, _)| (c_p, ca_p))
+        .collect();
+    let d_ncaco_c_unanch = if unanch_pairs.is_empty() {
+        0.0
+    } else if unanch_pairs.len() < 10 && uniq_anch_pairs.len() >= unanch_pairs.len() {
+        d_ncaco_c_anch
+    } else {
+        let (d, raw_d) = fit_ncaco_c_drift(&unanch_pairs);
+        record_drift_warn("NCACO_unanch_C'", d, raw_d);
+        d
+    };
 
     #[derive(Clone, Copy)]
     struct ValidatedNcacoCand {
@@ -2791,8 +3000,8 @@ pub fn crossover_idp_states(
 ///   spurious 3D peaks) regimes (`N = 2,402` out-of-fold assigned spin systems; locked by
 ///   `test_idp_5fold_leave_one_protein_out_calibration_across_low_and_3x_realistic_noise`).
 /// - Exact 5-fold Leave-One-Protein-Out out-of-fold calibration metrics (`raw_posterior`):
-///   * Pooled 5-fold OOF `ECE = 0.0105` (`<= 0.055` gate),
-///   * Per-protein OOF `ECE = [0.0281, 0.0394, 0.0358, 0.0351, 0.0190]`.
+///   * Pooled 5-fold OOF `ECE = 0.0104` (`<= 0.055` gate),
+///   * Per-protein OOF `ECE = [0.0171, 0.0300, 0.0495, 0.0129, 0.0149]`.
 /// - Hyperparameter provenance:
 ///   * `TAU_ENS = 6.5`: multi-island Boltzmann ensemble consensus temperature (~2 multi-channel
 ///     LLR standard deviations across polished island elites).
@@ -2809,14 +3018,14 @@ pub fn crossover_idp_states(
 ///     at least one `CANCO`/`CBCACON`/`NCACO` peak vs `< 0.2%` of 3D-empty thermal spikes).
 pub const IDP_CALIBRATION_KNOTS: &[(f64, f64)] = &[
     (0.00, 0.0000),
-    (0.10, 0.2308),
-    (0.25, 0.3984),
-    (0.45, 0.6529),
-    (0.65, 0.8369),
-    (0.80, 0.9491),
-    (0.90, 0.9827),
-    (0.96, 0.9906),
-    (1.00, 0.9935),
+    (0.10, 0.2637),
+    (0.25, 0.4478),
+    (0.45, 0.6262),
+    (0.65, 0.8340),
+    (0.80, 0.9584),
+    (0.90, 0.9856),
+    (0.96, 0.9916),
+    (1.00, 0.9940),
 ];
 
 #[inline]
@@ -3146,6 +3355,8 @@ pub fn consensus_and_calibrate_idp(
     // density is elevated (preventing overconfident `ECE` inflation under `3x` realistic noise!).
     let mut ch_cand_sum = 0usize;
     let mut ch_nonempty = 0usize;
+    let mut prev_cand_sum = 0usize;
+    let mut prev_nonempty = 0usize;
     let mut margin_eval_2d_roots = 0usize;
     let mut compat_2d_out_sum = 0.0f64;
 
@@ -3154,6 +3365,12 @@ pub fn consensus_and_calibrate_idp(
             if !ch.is_empty() {
                 ch_nonempty += 1;
                 ch_cand_sum += ch.len().min(MAX_IDP_CANDS);
+            }
+        }
+        for ch in [&sys.ca_prev, &sys.cb_prev] {
+            if !ch.is_empty() {
+                prev_nonempty += 1;
+                prev_cand_sum += ch.len().min(MAX_IDP_CANDS);
             }
         }
         if !sys.ca_curr.is_empty() && !sys.c_curr.is_empty() && s_len >= 2 {
@@ -3173,6 +3390,11 @@ pub fn consensus_and_calibrate_idp(
     }
     let mean_cands_per_ch = if ch_nonempty > 0 {
         (ch_cand_sum as f64) / (ch_nonempty as f64)
+    } else {
+        1.0
+    };
+    let mean_prev_cands = if prev_nonempty > 0 {
+        (prev_cand_sum as f64) / (prev_nonempty as f64)
     } else {
         1.0
     };
@@ -3380,8 +3602,8 @@ pub fn consensus_and_calibrate_idp(
         let mult_excess = (mean_cands_per_ch - 1.54).max(0.0);
         let conn_deficit = (0.90 - connectivity_frac).max(0.0);
         let rms_excess = (emp_rms_seq_ca - 0.055).max(0.0);
-        (1.0 + 1.85 * ambig_excess + 0.95 * mult_excess + 4.40 * conn_deficit + 12.5 * rms_excess)
-            .clamp(1.0, 2.05)
+        (1.0 + 1.55 * ambig_excess + 0.80 * mult_excess + 3.80 * conn_deficit + 9.0 * rms_excess)
+            .clamp(1.0, 1.78)
     } else {
         1.0
     };
@@ -3496,15 +3718,23 @@ pub fn consensus_and_calibrate_idp(
         any_warn = true;
     }
 
-    // (d) Candidate sequential multiplicity / elevated realistic-noise gate (all metrics length-invariant!)
+    // (d) Candidate sequential multiplicity / elevated realistic-noise gate (all metrics length-invariant!):
+    // Because `ca_curr` merges `{CANCO, CACO, NCACO}` and `ca_prev` merges `{CANCO, CBCACON}`,
+    // clean single-peak 13CA jitter `sigma_peak ~ 0.03-0.045 ppm` (plus small cross-channel digital
+    // resolution variance on finite-size IDPs) produces sequential channel-difference RMS up to
+    // `~0.064 ppm`, so `emp_rms_seq_ca >= 0.068 ppm` cleanly separates clean 1x experimental
+    // precision (`Pass`) from degraded 3x / mis-picked broadening (`Warn`), while
+    // `mean_cands_per_ch >= 1.52`, anchored strip multiplicity `mean_prev_cands >= 1.25`,
+    // `ambig_placement_frac >= 0.22`, and `compat_2d_density >= 0.14` catch equal-height spurious floods.
     let compat_2d_density = if s_len > 0 {
         mean_compat_2d_out / (s_len as f64)
     } else {
         0.0
     };
     if n_3d_sup >= 8
-        && (emp_rms_seq_ca >= 0.034
-            || mean_cands_per_ch >= 1.47
+        && (emp_rms_seq_ca >= 0.068
+            || mean_cands_per_ch >= 1.52
+            || mean_prev_cands >= 1.25
             || ambig_placement_frac >= 0.22
             || compat_2d_density >= 0.14)
     {

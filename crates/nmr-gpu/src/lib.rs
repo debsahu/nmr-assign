@@ -104,6 +104,10 @@ struct BufferMapFuture<'a> {
     state: Arc<Mutex<BufferMapState>>,
     #[cfg(not(target_arch = "wasm32"))]
     submission_index: Option<wgpu::SubmissionIndex>,
+    #[cfg(not(target_arch = "wasm32"))]
+    completed_polls_without_callback: u8,
+    #[cfg(not(target_arch = "wasm32"))]
+    timeout_polls: u16,
 }
 
 impl Future for BufferMapFuture<'_> {
@@ -125,10 +129,27 @@ impl Future for BufferMapFuture<'_> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let sub_idx = self.submission_index.clone();
-            let _ = self.device.poll(wgpu::PollType::Wait {
+            let poll_status = self.device.poll(wgpu::PollType::Wait {
                 submission_index: sub_idx,
                 timeout: Some(std::time::Duration::from_millis(50)),
             });
+            let submission_completed = match poll_status {
+                Ok(wgpu::PollStatus::WaitSucceeded | wgpu::PollStatus::QueueEmpty) => true,
+                Ok(wgpu::PollStatus::Poll) => false,
+                Err(wgpu::PollError::Timeout) => {
+                    self.timeout_polls = self.timeout_polls.saturating_add(1);
+                    if self.timeout_polls >= 1200 {
+                        return Poll::Ready(Err(
+                            "GPU device poll timed out after 60s waiting for buffer map"
+                                .to_string(),
+                        ));
+                    }
+                    false
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(format!("GPU device poll failed: {e}")));
+                }
+            };
             let mut guard = self
                 .state
                 .lock()
@@ -139,9 +160,18 @@ impl Future for BufferMapFuture<'_> {
                 self.submission_index = None;
                 return Poll::Ready(res.map_err(|e| format!("GPU buffer map failed: {e}")));
             }
-            let waker = cx.waker().clone();
             drop(guard);
-            waker.wake();
+            if submission_completed {
+                self.completed_polls_without_callback =
+                    self.completed_polls_without_callback.saturating_add(1);
+                if self.completed_polls_without_callback >= 4 {
+                    return Poll::Ready(Err(
+                        "GPU buffer map callback did not fire after submission completed (device lost)"
+                            .to_string(),
+                    ));
+                }
+            }
+            cx.waker().wake_by_ref();
         }
 
         Poll::Pending
@@ -424,16 +454,21 @@ impl GpuEngine {
                 label: Some("nmr-readback-enc"),
             });
         encoder.copy_buffer_to_buffer(src, 0, &staging, 0, byte_len);
-        self.queue.submit(Some(encoder.finish()));
+        let submission_index = self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(0..byte_len);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        rx.recv()
-            .map_err(|e| format!("GPU map channel closed: {e}"))?
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission_index),
+                timeout: Some(std::time::Duration::from_secs(60)),
+            })
+            .map_err(|e| format!("GPU device poll failed: {e}"))?;
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("GPU map callback not received (device lost or poll error): {e}"))?
             .map_err(|e| format!("GPU buffer map failed: {e}"))?;
 
         let mapped = slice
@@ -517,6 +552,10 @@ impl GpuEngine {
             state,
             #[cfg(not(target_arch = "wasm32"))]
             submission_index: Some(submission_index),
+            #[cfg(not(target_arch = "wasm32"))]
+            completed_polls_without_callback: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            timeout_polls: 0,
         }
         .await?;
 

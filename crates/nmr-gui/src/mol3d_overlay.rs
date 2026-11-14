@@ -1790,6 +1790,7 @@ impl AtomCoordLookup {
 /// `seq_id_1  atom_1  seq_id_2  atom_2  upper_A  [lower_A]  [NOE|PRE]  [chain_1]  [chain_2]`
 pub fn parse_distance_restraints_tsv(text: &str) -> Result<Vec<DistanceRestraint3d>, String> {
     let mut out = Vec::new();
+    let mut saw_content_line = false;
     for (line_idx, raw) in text.lines().enumerate() {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1802,12 +1803,16 @@ pub fn parse_distance_restraints_tsv(text: &str) -> Result<Vec<DistanceRestraint
                 line_idx + 1
             ));
         }
-        // Skip header row if first token is non-integer label
-        if out.is_empty()
-            && cols[0]
-                .as_bytes()
-                .first()
-                .is_some_and(|b| b.is_ascii_alphabetic())
+        // Only treat the very first content line as a column header when seq_id_1, seq_id_2, and
+        // upper_A are all non-numeric column labels; malformed data rows starting with letters
+        // (e.g. `A27 HN 30 HA 4.5` or any row after line 1) must return an error rather than
+        // being silently swallowed.
+        let is_first_content_line = !saw_content_line;
+        saw_content_line = true;
+        if is_first_content_line
+            && cols[0].parse::<i32>().is_err()
+            && cols[2].parse::<i32>().is_err()
+            && cols[4].parse::<f64>().is_err()
         {
             continue;
         }
@@ -1933,5 +1938,37 @@ mod tests {
         let built_ok = lookup.evaluate_restraints(&ok, &RestraintFilterConfig::default());
         assert_eq!(built_ok.cylinders.len(), 1);
         assert_eq!(built_ok.unresolved_count, 0);
+    }
+
+    #[test]
+    fn p2_restraint_tsv_header_skip_does_not_swallow_letter_prefixed_data_rows() {
+        // Legitimate header row followed by data rows still parses cleanly
+        let with_header = "\
+# comment line
+seq_id_1 atom_1 seq_id_2 atom_2 upper_A
+10 H 14 HA 4.50
+11 H 15 HB 5.00
+";
+        let parsed = parse_distance_restraints_tsv(with_header).expect("header + 2 rows");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].members[0].0.seq_id, 10);
+        assert_eq!(parsed[1].members[0].1.seq_id, 15);
+
+        // Data row on line 1 starting with a residue prefix (`A10 H 14 HA 4.50`) must NOT be
+        // silently swallowed as a fake header!
+        let bad_first_row = "A10 H 14 HA 4.50\n11 H 15 HB 5.00\n";
+        let err1 = parse_distance_restraints_tsv(bad_first_row)
+            .expect_err("letter-prefixed seq_id_1 on first row must error");
+        assert!(err1.contains("Invalid seq_id_1 'A10'"), "got: {err1}");
+
+        // Second non-numeric row after a legitimate header must also error instead of being skipped
+        let double_header = "\
+seq_id_1 atom_1 seq_id_2 atom_2 upper_A
+bad_row atom_x other_y atom_z not_a_float
+10 H 14 HA 4.50
+";
+        let err2 = parse_distance_restraints_tsv(double_header)
+            .expect_err("second non-numeric row must error");
+        assert!(err2.contains("Invalid seq_id_1 'bad_row'"), "got: {err2}");
     }
 }

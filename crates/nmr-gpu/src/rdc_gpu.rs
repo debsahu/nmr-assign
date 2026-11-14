@@ -34,6 +34,179 @@ use wgpu::util::DeviceExt;
 
 use crate::GpuEngine;
 
+/// Maximum number of conformers evaluated per single WebGPU compute dispatch / `queue.submit`
+/// so large multi-hundred-conformer ensembles never trip OS GPU TDR watchdogs.
+pub const MAX_RDC_CONFORMERS_PER_DISPATCH: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct RdcGpuDispatchByteSizes {
+    scratch_bytes: u64,
+    energy_bytes: u64,
+    grad_bytes: u64,
+}
+
+/// Validate all 8 WebGPU RDC buffer sizes (`params_buf`, `flags_buf`, `torsions_buf`, `saupe_buf`,
+/// `terms_buf`, `scratch_buf`, `energies_buf`, `grads_buf`) against BOTH `limits.max_buffer_size`
+/// and `limits.max_storage_buffer_binding_size` / `limits.max_uniform_buffer_binding_size`, plus
+/// `limits.max_compute_workgroups_per_dimension` and 32-bit WGSL index bounds BEFORE creating any
+/// GPU buffer (preventing `wgpu` validation panics on oversize inputs).
+pub fn validate_rdc_gpu_dispatch_limits(
+    limits: &wgpu::Limits,
+    n_conf_dispatch: usize,
+    l_res: usize,
+    n_media: usize,
+    n_restraints: usize,
+) -> Result<(), String> {
+    let _ =
+        compute_and_validate_dispatch_sizes(limits, n_conf_dispatch, l_res, n_media, n_restraints)?;
+    Ok(())
+}
+
+fn compute_and_validate_dispatch_sizes(
+    limits: &wgpu::Limits,
+    n_conf_dispatch: usize,
+    l_res: usize,
+    n_media: usize,
+    n_restraints: usize,
+) -> Result<RdcGpuDispatchByteSizes, String> {
+    if n_conf_dispatch > u32::MAX as usize
+        || l_res > u32::MAX as usize
+        || n_media > u32::MAX as usize
+        || n_restraints > u32::MAX as usize
+    {
+        return Err("GPU RDC dimensions exceed 32-bit WGSL u32 index limit".to_string());
+    }
+
+    let n_wg = n_conf_dispatch.div_ceil(64);
+    if n_wg > limits.max_compute_workgroups_per_dimension as usize {
+        return Err(format!(
+            "GPU RDC dispatch workgroups ({n_wg}) exceed device max_compute_workgroups_per_dimension ({})",
+            limits.max_compute_workgroups_per_dimension
+        ));
+    }
+
+    let check_storage = |name: &str, bytes: u64| -> Result<(), String> {
+        if bytes > limits.max_buffer_size {
+            return Err(format!(
+                "GPU RDC {name} ({bytes} B) exceeds device max_buffer_size ({} B)",
+                limits.max_buffer_size
+            ));
+        }
+        let max_sb = limits.max_storage_buffer_binding_size;
+        if bytes > max_sb {
+            return Err(format!(
+                "GPU RDC {name} ({bytes} B) exceeds device max_storage_buffer_binding_size ({max_sb} B)"
+            ));
+        }
+        Ok(())
+    };
+
+    // 0. `params_buf` (UNIFORM)
+    let params_bytes = std::mem::size_of::<RdcRefineParamsGpu>() as u64;
+    if params_bytes > limits.max_buffer_size {
+        return Err(format!(
+            "GPU RDC params_buf ({params_bytes} B) exceeds device max_buffer_size ({} B)",
+            limits.max_buffer_size
+        ));
+    }
+    let max_ub = limits.max_uniform_buffer_binding_size;
+    if params_bytes > max_ub {
+        return Err(format!(
+            "GPU RDC params_buf ({params_bytes} B) exceeds device max_uniform_buffer_binding_size ({max_ub} B)"
+        ));
+    }
+
+    // 1. `flags_buf` (STORAGE)
+    let flags_bytes = (l_res as u64)
+        .checked_mul(4)
+        .ok_or_else(|| "GPU RDC flags_buf byte size overflow".to_string())?
+        .max(4);
+    check_storage("flags_buf", flags_bytes)?;
+
+    // 2. `torsions_buf` (STORAGE)
+    let torsions_elems = n_conf_dispatch
+        .checked_mul(l_res)
+        .ok_or_else(|| "GPU RDC torsions_buf element count overflow".to_string())?;
+    if torsions_elems > u32::MAX as usize {
+        return Err("GPU RDC torsions_buf index exceeds u32::MAX".to_string());
+    }
+    let torsions_bytes = (torsions_elems as u64)
+        .checked_mul(16)
+        .ok_or_else(|| "GPU RDC torsions_buf byte size overflow".to_string())?
+        .max(16);
+    check_storage("torsions_buf", torsions_bytes)?;
+
+    // 3. `saupe_buf` (STORAGE)
+    let saupe_rows = n_conf_dispatch
+        .checked_mul(n_media)
+        .and_then(|v| v.checked_mul(3))
+        .ok_or_else(|| "GPU RDC saupe_buf row count overflow".to_string())?;
+    if saupe_rows > u32::MAX as usize {
+        return Err("GPU RDC saupe_buf index exceeds u32::MAX".to_string());
+    }
+    let saupe_bytes = (saupe_rows as u64)
+        .checked_mul(16)
+        .ok_or_else(|| "GPU RDC saupe_buf byte size overflow".to_string())?
+        .max(16);
+    check_storage("saupe_buf", saupe_bytes)?;
+
+    // 4. `terms_buf` (STORAGE)
+    let terms_bytes = (n_restraints as u64)
+        .checked_mul(std::mem::size_of::<RdcTermGpu>() as u64)
+        .ok_or_else(|| "GPU RDC terms_buf byte size overflow".to_string())?
+        .max(std::mem::size_of::<RdcTermGpu>() as u64);
+    check_storage("terms_buf", terms_bytes)?;
+
+    // 5. `scratch_buf` (STORAGE)
+    let n_segs = l_res
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| "GPU RDC segment count overflow".to_string())?;
+    let stride_scratch = l_res
+        .checked_mul(7)
+        .and_then(|a| n_segs.checked_mul(2).and_then(|b| a.checked_add(b)))
+        .ok_or_else(|| "GPU RDC scratch stride overflow".to_string())?;
+    let scratch_vec4_count = n_conf_dispatch
+        .checked_mul(stride_scratch)
+        .ok_or_else(|| "GPU RDC scratch_buf element count overflow".to_string())?;
+    if scratch_vec4_count > u32::MAX as usize {
+        return Err("GPU RDC scratch_buf index exceeds u32::MAX".to_string());
+    }
+    let scratch_bytes = (scratch_vec4_count as u64)
+        .checked_mul(16)
+        .ok_or_else(|| "GPU RDC scratch_buf byte size overflow".to_string())?
+        .max(16);
+    check_storage("scratch_buf", scratch_bytes)?;
+
+    // 6. `energies_buf` (STORAGE | COPY_SRC)
+    let raw_energy_bytes = (n_conf_dispatch as u64)
+        .checked_mul(4)
+        .ok_or_else(|| "GPU RDC energies_buf byte size overflow".to_string())?;
+    let energy_bytes = raw_energy_bytes
+        .div_ceil(wgpu::COPY_BUFFER_ALIGNMENT)
+        .max(1)
+        .checked_mul(wgpu::COPY_BUFFER_ALIGNMENT)
+        .ok_or_else(|| "GPU RDC energies_buf aligned byte size overflow".to_string())?;
+    check_storage("energies_buf", energy_bytes)?;
+
+    // 7. `grads_buf` (STORAGE | COPY_SRC)
+    let raw_grad_bytes = (torsions_elems as u64)
+        .checked_mul(8)
+        .ok_or_else(|| "GPU RDC grads_buf byte size overflow".to_string())?;
+    let grad_bytes = raw_grad_bytes
+        .div_ceil(wgpu::COPY_BUFFER_ALIGNMENT)
+        .max(1)
+        .checked_mul(wgpu::COPY_BUFFER_ALIGNMENT)
+        .ok_or_else(|| "GPU RDC grads_buf aligned byte size overflow".to_string())?;
+    check_storage("grads_buf", grad_bytes)?;
+
+    Ok(RdcGpuDispatchByteSizes {
+        scratch_bytes,
+        energy_bytes,
+        grad_bytes,
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct RdcRefineParamsGpu {
@@ -321,6 +494,11 @@ async fn evaluate_rdc_batch_with_pipeline_async(
             .collect());
     }
 
+    let lim = engine.device.limits();
+    let chunk_cap = MAX_RDC_CONFORMERS_PER_DISPATCH.max(1);
+    let first_chunk_len = n_conf.min(chunk_cap);
+    let _ = compute_and_validate_dispatch_sizes(&lim, first_chunk_len, l, n_media, n_restraints)?;
+
     let res_flags: Vec<u32> = sequence
         .iter()
         .map(|r| {
@@ -334,77 +512,11 @@ async fn evaluate_rdc_batch_with_pipeline_async(
         })
         .collect();
 
-    let mut torsions_flat = Vec::with_capacity(n_conf * l);
-    let mut saupe_flat = Vec::with_capacity(n_conf * n_media * 3);
-    for c in conformers {
-        for i in 0..l {
-            torsions_flat.push([
-                c.phi_rad[i] as f32,
-                c.psi_rad[i] as f32,
-                c.omega_rad[i] as f32,
-                0.0f32,
-            ]);
-        }
-        for s in &c.saupe_matrices {
-            saupe_flat.push([s[0][0] as f32, s[0][1] as f32, s[0][2] as f32, 0.0f32]);
-            saupe_flat.push([s[1][0] as f32, s[1][1] as f32, s[1][2] as f32, 0.0f32]);
-            saupe_flat.push([s[2][0] as f32, s[2][1] as f32, s[2][2] as f32, 0.0f32]);
-        }
-    }
-
-    let params = RdcRefineParamsGpu {
-        n_conf: n_conf as u32,
-        l_res: l as u32,
-        n_media: n_media as u32,
-        n_restraints: n_restraints as u32,
-        w_rdc: w_rdc as f32,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
-    };
-
-    let n_segs = 2 * l + 1;
-    let scratch_vec4_count = n_conf
-        .checked_mul(7 * l + 2 * n_segs)
-        .ok_or_else(|| "GPU RDC scratch buffer size overflow".to_string())?;
-    let scratch_bytes = (scratch_vec4_count as u64)
-        .checked_mul(16)
-        .ok_or_else(|| "GPU RDC scratch byte size overflow".to_string())?;
-
-    let lim = engine.device.limits();
-    let max_bind = lim.max_storage_buffer_binding_size.min(lim.max_buffer_size);
-    if scratch_bytes > max_bind {
-        return Err(format!(
-            "GPU RDC scratch buffer ({scratch_bytes} B) exceeds device max storage binding ({max_bind} B)"
-        ));
-    }
-
-    let params_buf = engine
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nmr-rdc-params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
     let flags_buf = engine
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("nmr-rdc-res-flags"),
             contents: bytemuck::cast_slice(&res_flags),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-    let torsions_buf = engine
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nmr-rdc-torsions"),
-            contents: bytemuck::cast_slice(&torsions_flat),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-    let saupe_buf = engine
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("nmr-rdc-saupe"),
-            contents: bytemuck::cast_slice(&saupe_flat),
             usage: wgpu::BufferUsages::STORAGE,
         });
     let terms_buf = engine
@@ -414,109 +526,158 @@ async fn evaluate_rdc_batch_with_pipeline_async(
             contents: bytemuck::cast_slice(&terms),
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let scratch_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("nmr-rdc-scratch"),
-        size: scratch_bytes.max(16),
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-
-    let energy_bytes = ((n_conf * 4) as u64)
-        .div_ceil(wgpu::COPY_BUFFER_ALIGNMENT)
-        .max(1)
-        * wgpu::COPY_BUFFER_ALIGNMENT;
-    let energies_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("nmr-rdc-energies"),
-        size: energy_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
-    let grad_elems = n_conf * l;
-    let grad_bytes = ((grad_elems * 8) as u64)
-        .div_ceil(wgpu::COPY_BUFFER_ALIGNMENT)
-        .max(1)
-        * wgpu::COPY_BUFFER_ALIGNMENT;
-    let grads_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("nmr-rdc-grads"),
-        size: grad_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
-    let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("nmr-rdc-bg"),
-        layout: &rdc_pipe.bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: params_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: flags_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: torsions_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: saupe_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: terms_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: scratch_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: energies_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: grads_buf.as_entire_binding(),
-            },
-        ],
-    });
-
-    let mut encoder = engine
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("nmr-rdc-batch-enc"),
-        });
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("nmr-rdc-batch-pass"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&rdc_pipe.pipeline);
-        cpass.set_bind_group(0, &bg, &[]);
-        let n_wg = (n_conf as u32).div_ceil(64);
-        cpass.dispatch_workgroups(n_wg, 1, 1);
-    }
-    engine.queue.submit(Some(encoder.finish()));
-
-    let energies_f32: Vec<f32> = engine.read_buffer_vec_async(&energies_buf, n_conf).await?;
-    let grads_f32: Vec<[f32; 2]> = engine.read_buffer_vec_async(&grads_buf, grad_elems).await?;
 
     let mut outputs = Vec::with_capacity(n_conf);
-    for (ci, &e_f32) in energies_f32.iter().enumerate().take(n_conf) {
-        let mut gp = Vec::with_capacity(l);
-        let mut gs = Vec::with_capacity(l);
-        let off = ci * l;
-        for i in 0..l {
-            gp.push(grads_f32[off + i][0] as f64);
-            gs.push(grads_f32[off + i][1] as f64);
+
+    // Chunk conformer evaluations (`<= MAX_RDC_CONFORMERS_PER_DISPATCH` per `queue.submit`)
+    // so large ensembles never trigger OS GPU TDR watchdog resets or exceed per-dispatch memory.
+    for chunk in conformers.chunks(chunk_cap) {
+        let c_len = chunk.len();
+        let sizes = compute_and_validate_dispatch_sizes(&lim, c_len, l, n_media, n_restraints)?;
+
+        let mut torsions_flat = Vec::with_capacity(c_len * l);
+        let mut saupe_flat = Vec::with_capacity(c_len * n_media * 3);
+        for c in chunk {
+            for i in 0..l {
+                torsions_flat.push([
+                    c.phi_rad[i] as f32,
+                    c.psi_rad[i] as f32,
+                    c.omega_rad[i] as f32,
+                    0.0f32,
+                ]);
+            }
+            for s in &c.saupe_matrices {
+                saupe_flat.push([s[0][0] as f32, s[0][1] as f32, s[0][2] as f32, 0.0f32]);
+                saupe_flat.push([s[1][0] as f32, s[1][1] as f32, s[1][2] as f32, 0.0f32]);
+                saupe_flat.push([s[2][0] as f32, s[2][1] as f32, s[2][2] as f32, 0.0f32]);
+            }
         }
-        outputs.push(RdcGpuConformerOutput {
-            rdc_energy: e_f32 as f64,
-            grad_phi: gp,
-            grad_psi: gs,
+
+        let params = RdcRefineParamsGpu {
+            n_conf: c_len as u32,
+            l_res: l as u32,
+            n_media: n_media as u32,
+            n_restraints: n_restraints as u32,
+            w_rdc: w_rdc as f32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+
+        let params_buf = engine
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("nmr-rdc-params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let torsions_buf = engine
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("nmr-rdc-torsions"),
+                contents: bytemuck::cast_slice(&torsions_flat),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let saupe_buf = engine
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("nmr-rdc-saupe"),
+                contents: bytemuck::cast_slice(&saupe_flat),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let scratch_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nmr-rdc-scratch"),
+            size: sizes.scratch_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
+        let energies_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nmr-rdc-energies"),
+            size: sizes.energy_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let grad_elems = c_len * l;
+        let grads_buf = engine.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nmr-rdc-grads"),
+            size: sizes.grad_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bg = engine.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nmr-rdc-bg"),
+            layout: &rdc_pipe.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flags_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: torsions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: saupe_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: terms_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: scratch_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: energies_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: grads_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = engine
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("nmr-rdc-batch-enc"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("nmr-rdc-batch-pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&rdc_pipe.pipeline);
+            cpass.set_bind_group(0, &bg, &[]);
+            let n_wg = (c_len as u32).div_ceil(64);
+            cpass.dispatch_workgroups(n_wg, 1, 1);
+        }
+        engine.queue.submit(Some(encoder.finish()));
+
+        let energies_f32: Vec<f32> = engine.read_buffer_vec_async(&energies_buf, c_len).await?;
+        let grads_f32: Vec<[f32; 2]> = engine.read_buffer_vec_async(&grads_buf, grad_elems).await?;
+
+        for (ci, &e_f32) in energies_f32.iter().enumerate().take(c_len) {
+            let mut gp = Vec::with_capacity(l);
+            let mut gs = Vec::with_capacity(l);
+            let off = ci * l;
+            for i in 0..l {
+                gp.push(grads_f32[off + i][0] as f64);
+                gs.push(grads_f32[off + i][1] as f64);
+            }
+            outputs.push(RdcGpuConformerOutput {
+                rdc_energy: e_f32 as f64,
+                grad_phi: gp,
+                grad_psi: gs,
+            });
+        }
     }
     Ok(outputs)
 }
@@ -631,18 +792,32 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         })
         .collect();
 
-    // Flat-bottom dihedral tolerances (`>= 18 deg`) prevent Saupe mirror-image degeneracies
-    // without pulling `(phi, psi)` away from sub-Hz experimental RDCs inside the native basin.
+    let mut plane_has_work = vec![false; l];
+    for m in rdc_media {
+        for r in &m.restraints {
+            if !r.is_free {
+                let pid = nmr_core::rdc::rdc_peptide_plane_id(r);
+                if let Some(pos) = seq_ids.iter().position(|&sid| sid == pid) {
+                    plane_has_work[pos] = true;
+                }
+            }
+        }
+    }
+
+    // Flat-bottom dihedral tolerances (`>= 14 deg`) on working-RDC planes prevent Saupe mirror-image
+    // degeneracies without pulling `(phi, psi)` away from sub-Hz RDCs, while preserving tighter
+    // calibrated tolerances on peptide planes with zero working RDCs (`ByPeptidePlane` holdout).
     let reg_dihs: Vec<DihedralRestraint> = if dihedrals.len() == l {
         dihedrals
             .iter()
-            .map(|dr| {
+            .enumerate()
+            .map(|(i, dr)| {
                 let mut d = dr.clone();
-                if d.restrained_phi {
-                    d.phi_err_deg = d.phi_err_deg.max(18.0);
+                if d.restrained_phi && plane_has_work[i] {
+                    d.phi_err_deg = d.phi_err_deg.max(14.0);
                 }
-                if d.restrained_psi {
-                    d.psi_err_deg = d.psi_err_deg.max(18.0);
+                if d.restrained_psi && (i + 1 < l && plane_has_work[i + 1]) {
+                    d.psi_err_deg = d.psi_err_deg.max(14.0);
                 }
                 d
             })
@@ -657,11 +832,11 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         .sum();
     let eff_w_rdc = w_rdc * (185.0 / (n_work_tot.max(60) as f64)).clamp(0.34, 1.50);
     let weights = EnergyWeights {
-        w_noe: 0.90,
+        w_noe: 1.4,
         noe_soft_window: 2.0,
-        w_dihedral: 2.0,
+        w_dihedral: 9.0,
         w_vdw: 1.8,
-        w_rama: 8.0,
+        w_rama: 10.0,
         ..EnergyWeights::default()
     };
     let total_steps = n_iters.max(1);
@@ -807,7 +982,11 @@ pub async fn refine_ensemble_with_rdcs_gpu_async(
         });
     }
 
-    let polish_iters = n_iters.clamp(40, 140);
+    let polish_iters = if n_iters >= 100 {
+        n_iters.max(145)
+    } else {
+        n_iters.clamp(40, 140)
+    };
     nmr_core::structure::refine_ensemble_with_rdcs(
         &best_seeds,
         sequence,

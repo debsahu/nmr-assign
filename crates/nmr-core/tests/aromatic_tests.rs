@@ -1391,7 +1391,7 @@ fn test_p1_12_merge_preserving_existing_shifts_and_ambiguity_codes() {
     existing.ambiguity_codes.insert((1, "CZ".to_string()), 1);
     existing.ambiguity_codes.insert((1, "HZ".to_string()), 1);
 
-    // Experimental peaks observe ONLY CD*/HD* and CE*/HE* of PHE #1 (CB = 42.6 ppm; no CZ/HZ peak, no PHE #0 peaks)
+    // Experimental peaks observe the complete ring (CD*/HD*, CE*/HE*, and corroborating CZ/HZ) of PHE #1 (CB = 42.6 ppm; no PHE #0 peaks)
     let peaks = vec![
         Peak {
             exp: "AROM_C13HSQC".to_string(),
@@ -1410,6 +1410,16 @@ fn test_p1_12_merge_preserving_existing_shifts_and_ambiguity_codes() {
             c: Some(131.85),
             sign: 1,
             height: Some(205.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.28,
+            n: 0.0,
+            c: Some(129.45),
+            sign: 1,
+            height: Some(102.0),
             volume: None,
             h2: None,
         },
@@ -1452,6 +1462,26 @@ fn test_p1_12_merge_preserving_existing_shifts_and_ambiguity_codes() {
             height: Some(140.0),
             volume: None,
             h2: Some(7.34),
+        },
+        Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h: 7.51,
+            n: 0.0,
+            c: Some(131.85),
+            sign: 1,
+            height: Some(130.0),
+            volume: None,
+            h2: Some(7.28),
+        },
+        Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h: 7.28,
+            n: 0.0,
+            c: Some(129.45),
+            sign: 1,
+            height: Some(130.0),
+            volume: None,
+            h2: Some(7.51),
         },
     ];
 
@@ -1515,11 +1545,25 @@ fn test_p1_12_merge_preserving_existing_shifts_and_ambiguity_codes() {
     );
     assert!(res.atom_confidence.contains_key(&(1, "CD1".to_string())));
 
-    // Also test direct merge_aromatic_assignments_preserving_existing helper explicitly
+    // Also test direct merge_aromatic_assignments_preserving_existing helper on backbone-only solver output
+    let mut bb_only = Reference {
+        sequence: existing.sequence.clone(),
+        seq_ids: existing.seq_ids.clone(),
+        ..Default::default()
+    };
+    bb_only.shifts.insert((0, "CB".to_string()), 38.2);
+    bb_only.shifts.insert((1, "CB".to_string()), 42.6);
+    let res_bb = assign_aromatic_rings(
+        &bb_only,
+        None,
+        &peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
     let merged = merge_aromatic_assignments_preserving_existing(
         &existing,
-        &res.reference,
-        &res.atom_confidence,
+        &res_bb.reference,
+        &res_bb.atom_confidence,
     );
     assert_eq!(merged.shifts, res.reference.shifts);
     assert_eq!(merged.ambiguity_codes, res.reference.ambiguity_codes);
@@ -3111,5 +3155,310 @@ fn test_p1_2_his_require_15n_chi2_95_gate_and_sample_ph_contradiction() {
     assert!(
         conf_tit < 0.50,
         "incipient tau<->cat titration at pH 5.3 must return conf < 0.50, got {conf_tit}"
+    );
+}
+
+#[test]
+fn test_p13_p1_12_reject_uncorroborated_non_overlapping_merges_and_preserve_curated_on_partial_overwrite(
+) {
+    let priors = SidechainPriors::empirical_bmrb();
+
+    // (a1) Chimeric Phe guard: 2-slot `CD+CE` solver cluster with ZERO `CZ/HZ` observation must NEVER
+    //      merge onto a `PHE` that already has curated `CZ/HZ`, in either `assign_aromatic_rings` or
+    //      standalone `merge_aromatic_into_shifts`!
+    let mut curated_phe_cz = Reference {
+        sequence: vec!["PHE".to_string()],
+        seq_ids: vec![20],
+        ..Default::default()
+    };
+    curated_phe_cz.shifts.insert((0, "CB".to_string()), 42.6);
+    curated_phe_cz.shifts.insert((0, "CZ".to_string()), 129.45);
+    curated_phe_cz.shifts.insert((0, "HZ".to_string()), 7.28);
+    curated_phe_cz
+        .ambiguity_codes
+        .insert((0, "CZ".to_string()), 1);
+    curated_phe_cz
+        .ambiguity_codes
+        .insert((0, "HZ".to_string()), 1);
+
+    let cd_ce_only_peaks = vec![
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.34,
+            n: 0.0,
+            c: Some(132.20),
+            sign: 1,
+            height: Some(210.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.51,
+            n: 0.0,
+            c: Some(131.85),
+            sign: 1,
+            height: Some(205.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "HBCBCGCDHD".to_string(),
+            h: 7.34,
+            n: 0.0,
+            c: Some(42.6),
+            sign: 1,
+            height: Some(170.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "HBCBCGCDCEHE".to_string(),
+            h: 7.51,
+            n: 0.0,
+            c: Some(42.6),
+            sign: 1,
+            height: Some(150.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h: 7.34,
+            n: 0.0,
+            c: Some(132.20),
+            sign: 1,
+            height: Some(140.0),
+            volume: None,
+            h2: Some(7.51),
+        },
+        Peak {
+            exp: "AROM_HCCH_TOCSY".to_string(),
+            h: 7.51,
+            n: 0.0,
+            c: Some(131.85),
+            sign: 1,
+            height: Some(140.0),
+            volume: None,
+            h2: Some(7.34),
+        },
+    ];
+
+    let res_phe_direct = assign_aromatic_rings(
+        &curated_phe_cz,
+        None,
+        &cd_ce_only_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        !res_phe_direct
+            .reference
+            .shifts
+            .contains_key(&(0, "CD1".to_string()))
+            && !res_phe_direct
+                .reference
+                .shifts
+                .contains_key(&(0, "CE1".to_string())),
+        "uncorroborated CD+CE cluster must NOT merge onto curated CZ PHE (chimeric Phe): {:?}",
+        res_phe_direct.reference.shifts
+    );
+    assert!(res_phe_direct.atom_confidence.is_empty());
+
+    // Also test CLI pattern: backbone-only solver run merged into `curated_phe_cz`
+    let mut bb_phe = Reference {
+        sequence: vec!["PHE".to_string()],
+        seq_ids: vec![20],
+        ..Default::default()
+    };
+    bb_phe.shifts.insert((0, "CB".to_string()), 42.6);
+    let res_phe_bb = assign_aromatic_rings(
+        &bb_phe,
+        None,
+        &cd_ce_only_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        res_phe_bb
+            .atom_confidence
+            .contains_key(&(0, "CD1".to_string()))
+            && res_phe_bb
+                .atom_confidence
+                .contains_key(&(0, "CE1".to_string()))
+    );
+    let merged_phe = merge_aromatic_into_shifts(
+        &curated_phe_cz,
+        &res_phe_bb.reference,
+        &res_phe_bb.atom_confidence,
+    );
+    assert_eq!(
+        merged_phe.shifts, curated_phe_cz.shifts,
+        "standalone merge_aromatic_into_shifts must block uncorroborated CD+CE onto curated CZ PHE"
+    );
+
+    // (a2) Histidine tautomer chimera guard: cationic `CE1/HE1` (or `CD2/HD2 + CE1/HE1`) must NEVER
+    //      merge onto a `HIS` with curated neutral `tau` `ND1 = 249.5`, whether `ND1` is absent from
+    //      the solver cluster OR forged within tolerance alongside cationic `CE1/HE1`!
+    let mut curated_his_tau_nd1 = Reference {
+        sequence: vec!["HIS".to_string()],
+        seq_ids: vec![68],
+        ..Default::default()
+    };
+    curated_his_tau_nd1
+        .shifts
+        .insert((0, "CB".to_string()), 29.8);
+    curated_his_tau_nd1
+        .shifts
+        .insert((0, "ND1".to_string()), 249.50);
+    curated_his_tau_nd1
+        .ambiguity_codes
+        .insert((0, "ND1".to_string()), 1);
+
+    let cationic_his_ch_peaks = vec![
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 7.36,
+            n: 0.0,
+            c: Some(119.60),
+            sign: 1,
+            height: Some(180.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "AROM_C13HSQC".to_string(),
+            h: 8.66,
+            n: 0.0,
+            c: Some(136.10),
+            sign: 1,
+            height: Some(180.0),
+            volume: None,
+            h2: None,
+        },
+        Peak {
+            exp: "HBCBCGCDHD".to_string(),
+            h: 7.36,
+            n: 0.0,
+            c: Some(29.8),
+            sign: 1,
+            height: Some(140.0),
+            volume: None,
+            h2: None,
+        },
+    ];
+
+    let res_his_direct = assign_aromatic_rings(
+        &curated_his_tau_nd1,
+        None,
+        &cationic_his_ch_peaks,
+        &priors,
+        &AromaticSolverConfig::default(),
+    );
+    assert!(
+        !res_his_direct
+            .reference
+            .shifts
+            .contains_key(&(0, "CE1".to_string()))
+            && !res_his_direct
+                .reference
+                .shifts
+                .contains_key(&(0, "CD2".to_string())),
+        "uncorroborated cationic CD2/CE1 cluster must NOT merge onto curated tau ND1 = 249.5 HIS"
+    );
+
+    let mut proposed_cat_his = curated_his_tau_nd1.clone();
+    proposed_cat_his
+        .shifts
+        .insert((0, "CD2".to_string()), 119.60);
+    proposed_cat_his.shifts.insert((0, "HD2".to_string()), 7.36);
+    proposed_cat_his
+        .shifts
+        .insert((0, "CE1".to_string()), 136.10);
+    proposed_cat_his.shifts.insert((0, "HE1".to_string()), 8.66);
+    let mut cat_his_atoms = BTreeMap::new();
+    for a in ["CD2", "HD2", "CE1", "HE1"] {
+        cat_his_atoms.insert((0, a.to_string()), 0.91);
+    }
+    let merged_cat_no_n =
+        merge_aromatic_into_shifts(&curated_his_tau_nd1, &proposed_cat_his, &cat_his_atoms);
+    assert_eq!(
+        merged_cat_no_n.shifts, curated_his_tau_nd1.shifts,
+        "standalone merge must reject non-overlapping cationic CD2/CE1 onto curated tau ND1"
+    );
+
+    // Even if `ND1` is included in `newly_assigned_atoms` near 249.5, cationic `HE1 = 8.66` contradicts `ND1 = 249.5`
+    proposed_cat_his
+        .shifts
+        .insert((0, "ND1".to_string()), 249.40);
+    cat_his_atoms.insert((0, "ND1".to_string()), 0.85);
+    let merged_cat_contradict =
+        merge_aromatic_into_shifts(&curated_his_tau_nd1, &proposed_cat_his, &cat_his_atoms);
+    assert_eq!(
+        merged_cat_contradict.shifts, curated_his_tau_nd1.shifts,
+        "standalone merge must reject Pelton-contradictory cationic CE1/HE1 onto curated tau ND1"
+    );
+
+    // (b) Partial-cluster `overwrite_existing = true` guard: overwriting with a partial `CD+CE` solver
+    //     cluster must overwrite `CD`/`CE` and their ambiguity codes, while NEVER stripping curated
+    //     `CZ/HZ` (or `ND1`) atoms that are absent from the partial solver cluster!
+    let mut full_curated_phe = Reference {
+        sequence: vec!["PHE".to_string()],
+        seq_ids: vec![20],
+        ..Default::default()
+    };
+    for &(a, v, code) in &[
+        ("CB", 42.6, 1u8),
+        ("CD1", 130.90, 1),
+        ("CD2", 130.90, 1),
+        ("HD1", 7.10, 1),
+        ("HD2", 7.10, 1),
+        ("CE1", 129.10, 1),
+        ("CE2", 129.10, 1),
+        ("HE1", 7.20, 1),
+        ("HE2", 7.20, 1),
+        ("CZ", 127.80, 1),
+        ("HZ", 7.05, 1),
+    ] {
+        full_curated_phe.shifts.insert((0, a.to_string()), v);
+        full_curated_phe
+            .ambiguity_codes
+            .insert((0, a.to_string()), code);
+    }
+
+    let overwritten_partial = merge_aromatic_into_shifts_with_options(
+        &full_curated_phe,
+        &res_phe_bb.reference,
+        &res_phe_bb.atom_confidence,
+        true,
+    );
+    assert!(
+        (overwritten_partial.shifts[&(0, "CD1".to_string())] - 132.20).abs() < 0.05
+            && (overwritten_partial.shifts[&(0, "CE1".to_string())] - 131.85).abs() < 0.05,
+        "overwrite_existing = true must update atoms present in the partial solver cluster"
+    );
+    assert_eq!(
+        overwritten_partial
+            .ambiguity_codes
+            .get(&(0, "CD1".to_string())),
+        Some(&3),
+        "overwritten fast-flip CD1 must receive ambiguity_code = 3"
+    );
+    assert_eq!(
+        overwritten_partial.shifts.get(&(0, "CZ".to_string())),
+        Some(&127.80),
+        "overwrite_existing = true must NEVER strip curated CZ absent from partial solver cluster"
+    );
+    assert_eq!(
+        overwritten_partial.shifts.get(&(0, "HZ".to_string())),
+        Some(&7.05),
+        "overwrite_existing = true must NEVER strip curated HZ absent from partial solver cluster"
+    );
+    assert_eq!(
+        overwritten_partial
+            .ambiguity_codes
+            .get(&(0, "CZ".to_string())),
+        Some(&1),
+        "absent curated CZ must retain its original ambiguity_code = 1"
     );
 }
