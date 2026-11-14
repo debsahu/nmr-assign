@@ -35,6 +35,7 @@ pub mod peaks;
 pub mod picker;
 pub mod priors;
 pub mod process;
+pub mod pulprog;
 pub mod qc;
 pub mod rdc;
 pub mod report;

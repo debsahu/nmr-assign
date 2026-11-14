@@ -41,6 +41,13 @@ use crate::ops::{
     auto_phase_1d, auto_phase_direct_nd, auto_phase_indirect_nd, hilbert_transform_in_place,
     lock_all_positive_polarity_3d, lock_biphasic_ca_polarity_3d, AutoPhaseConfig, PolarityMode,
 };
+pub use crate::pulprog::{
+    apply_indirect_axis_transform_3d, evaluate_3d_axis_hypotheses_against_hsqc,
+    evaluate_3d_axis_hypotheses_against_roots, extract_hsqc_2d_roots_for_verification,
+    verify_3d_axis_hypotheses_against_hsqc, verify_3d_axis_hypotheses_against_roots,
+    AxisHypothesisScore, AxisHypothesisVerification, AxisTransformOp, NamedAxisHypothesis,
+    MIN_AXIS_RESCUE_LN_BF,
+};
 use crate::spectrum::{AxisPpm, Spectrum2D, Spectrum3D};
 
 // ============================================================================
@@ -3705,6 +3712,12 @@ pub fn register_3d_hn_to_hsqc_2d(
     {
         return (0.0, 0.0);
     }
+
+    // 0. Empirical `{sign, fold}` indirect-axis likelihood verification against `hsqc_2d`
+    //    (`docs/specs/11-fid-processing.md` §1.5): rescues inverted (`REVERSE`) or half-SW-shifted
+    //    (`States` <-> `States-TPPI`) indirect 15N/13C axes when log-Bayes factor exceeds
+    //    `MIN_AXIS_RESCUE_LN_BF` (`12.0` nats), leaving canonical well-referenced cubes untouched.
+    let _ = crate::pulprog::verify_3d_axis_hypotheses_against_hsqc(spec_3d, hsqc_2d, None);
 
     // 1. Build 2D `(15N, 1H)` max-abs sky-projection of `spec_3d` (supports both AllPositive & Biphasic cubes)
     let plane3 = ny3 * nx3;
